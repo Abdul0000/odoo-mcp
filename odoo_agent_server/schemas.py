@@ -1,0 +1,337 @@
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from enum import Enum
+from typing import Any, Literal
+from uuid import uuid4
+
+from pydantic import BaseModel, Field, field_validator
+
+
+class Severity(str, Enum):
+    error = "error"
+    warning = "warning"
+    info = "info"
+
+
+class Finding(BaseModel):
+    severity: Severity
+    code: str
+    message: str
+    file: str | None = None
+    line: int | None = None
+    hint: str | None = None
+
+
+class CommandResult(BaseModel):
+    command: list[str]
+    cwd: str
+    exit_code: int
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+
+
+class FileContent(BaseModel):
+    path: str
+    content: str
+    size: int
+
+
+class FileListItem(BaseModel):
+    path: str
+    kind: Literal["file", "dir"]
+    size: int | None = None
+
+
+class BaseProjectRequest(BaseModel):
+    project_path: str = Field(..., description="Absolute path to the checked-out Odoo repo")
+
+
+class ApprovalMixin(BaseModel):
+    approval_id: str | None = Field(default=None, description="Required when approval gating is enabled for this action")
+
+
+
+
+class EmptyRequest(BaseModel):
+    """Empty argument object for no-input tools."""
+
+
+class LimitRequest(BaseModel):
+    limit: int = Field(default=100, ge=1, le=2000)
+
+
+class AuditListRequest(BaseModel):
+    limit: int = Field(default=200, ge=1, le=2000)
+
+
+class JobGetRequest(BaseModel):
+    job_id: str = Field(..., min_length=1)
+
+
+class SelfRunRequest(BaseProjectRequest):
+    module_name: str = Field(..., description="Custom module folder name inside the repo")
+    run_pytest: bool = Field(default=True)
+    include_git_status: bool = Field(default=True)
+    timeout_seconds: int = Field(default=90, ge=5, le=600)
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        return validate_safe_name(value, "module_name")
+
+
+class SelfRunReport(BaseModel):
+    status: Literal["passed", "failed", "warning"]
+    project_path: str
+    module_path: str
+    module_name: str
+    findings: list[Finding]
+    commands: list[CommandResult] = Field(default_factory=list)
+    summary: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def error_count(self) -> int:
+        return sum(1 for finding in self.findings if finding.severity == Severity.error)
+
+
+class RepoListRequest(BaseProjectRequest):
+    relative_path: str = Field(default=".")
+    max_depth: int = Field(default=3, ge=1, le=8)
+    max_items: int = Field(default=500, ge=1, le=3000)
+
+
+class RepoReadRequest(BaseProjectRequest):
+    relative_path: str
+    max_bytes: int = Field(default=300_000, ge=100, le=2_000_000)
+
+
+class RepoWriteRequest(BaseProjectRequest, ApprovalMixin):
+    relative_path: str
+    content: str
+    create_dirs: bool = True
+
+
+class RepoDeleteRequest(BaseProjectRequest, ApprovalMixin):
+    relative_path: str
+
+
+class RepoPatchRequest(BaseProjectRequest, ApprovalMixin):
+    patch: str = Field(..., description="Unified diff to apply inside project_path")
+    check_only: bool = Field(default=False)
+    timeout_seconds: int = Field(default=60, ge=5, le=300)
+
+
+class RepoCleanPycRequest(BaseProjectRequest, ApprovalMixin):
+    relative_path: str = Field(default=".")
+
+
+class RepoCleanPycResult(BaseModel):
+    project_path: str
+    scanned_path: str
+    removed_files: list[str] = Field(default_factory=list)
+    removed_dirs: list[str] = Field(default_factory=list)
+
+
+class GitDiffRequest(BaseProjectRequest):
+    staged: bool = Field(default=False)
+    timeout_seconds: int = Field(default=30, ge=5, le=300)
+
+
+class GitCommitRequest(BaseProjectRequest, ApprovalMixin):
+    message: str = Field(..., min_length=3, max_length=300)
+    paths: list[str] = Field(default_factory=list, description="Relative paths to add before commit. Empty means git add -A.")
+    timeout_seconds: int = Field(default=60, ge=5, le=300)
+
+
+class GitPushRequest(BaseProjectRequest, ApprovalMixin):
+    remote: str = Field(default="origin")
+    branch: str | None = Field(default=None, description="Defaults to the current branch")
+    set_upstream: bool = Field(default=True)
+    timeout_seconds: int = Field(default=120, ge=10, le=600)
+
+
+class OdooShLogName(str, Enum):
+    install = "install"
+    odoo = "odoo"
+    update = "update"
+    pip = "pip"
+
+
+class OdooShLogRequest(BaseModel):
+    log_name: OdooShLogName = Field(default=OdooShLogName.odoo)
+    tail_lines: int = Field(default=200, ge=20, le=2000)
+
+
+class OdooShCommandRequest(BaseModel):
+    tail_lines: int = Field(default=200, ge=20, le=2000)
+
+
+class OdooShModuleUpdateRequest(ApprovalMixin):
+    module_name: str = Field(..., description="Technical module folder/name to update")
+    timeout_seconds: int = Field(default=600, ge=30, le=1800)
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        return validate_safe_name(value, "module_name")
+
+
+class OdooRpcModuleRequest(ApprovalMixin):
+    module_name: str = Field(..., description="Technical module name")
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        return validate_safe_name(value, "module_name")
+
+
+class OdooSearchReadRequest(BaseModel):
+    model: str
+    domain: list[Any] = Field(default_factory=list)
+    fields: list[str] = Field(default_factory=list)
+    limit: int = Field(default=20, ge=1, le=200)
+
+
+class OdooRpcResult(BaseModel):
+    status: Literal["ok", "failed"]
+    base_url: str | None = None
+    database: str | None = None
+    result: Any = None
+    error: str | None = None
+
+
+class BrowserCheckRequest(BaseModel):
+    base_url: str | None = Field(default=None)
+    login: str | None = Field(default=None)
+    password: str | None = Field(default=None)
+    start_path: str = Field(default="/web")
+    screenshot_name: str = Field(default="odoo_page.png")
+    timeout_seconds: int = Field(default=45, ge=10, le=180)
+    full_page: bool = True
+
+
+class BrowserCheckResult(BaseModel):
+    status: Literal["ok", "failed"]
+    url: str | None = None
+    title: str | None = None
+    screenshot_path: str | None = None
+    console_errors: list[str] = Field(default_factory=list)
+    network_errors: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
+class ApprovalStatus(str, Enum):
+    pending = "pending"
+    approved = "approved"
+    rejected = "rejected"
+    consumed = "consumed"
+
+
+class ApprovalCreateRequest(BaseModel):
+    action: str
+    summary: str
+    payload_preview: dict[str, Any] = Field(default_factory=dict)
+
+
+class ApprovalDecisionRequest(BaseModel):
+    approval_id: str
+    reason: str | None = None
+
+
+class ApprovalRecord(BaseModel):
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    action: str
+    summary: str
+    payload_preview: dict[str, Any] = Field(default_factory=dict)
+    status: ApprovalStatus = ApprovalStatus.pending
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    decided_at: str | None = None
+    reason: str | None = None
+
+
+class AuditEvent(BaseModel):
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    action: str
+    status: str
+    summary: str = ""
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class JobStatus(str, Enum):
+    queued = "queued"
+    running = "running"
+    passed = "passed"
+    warning = "warning"
+    failed = "failed"
+
+
+class JobStep(BaseModel):
+    name: str
+    status: str
+    started_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    finished_at: str | None = None
+    result: Any = None
+    error: str | None = None
+
+
+class JobRecord(BaseModel):
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    job_type: str
+    status: JobStatus = JobStatus.queued
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    finished_at: str | None = None
+    request: dict[str, Any] = Field(default_factory=dict)
+    steps: list[JobStep] = Field(default_factory=list)
+    result: Any = None
+
+
+class ToolDescriptor(BaseModel):
+    name: str
+    description: str
+    read_only: bool = False
+    requires_approval: bool = False
+
+
+class ToolCallRequest(BaseModel):
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolCallResult(BaseModel):
+    name: str
+    status: Literal["ok", "failed"]
+    result: Any = None
+    error: str | None = None
+
+
+class CapabilityCheckResult(BaseModel):
+    status: Literal["ready", "partial", "failed"]
+    checks: dict[str, dict[str, Any]]
+
+
+class FullVerifyRequest(SelfRunRequest):
+    clean_pyc: bool = False
+    include_git_diff: bool = True
+    include_odoosh_errors: bool = False
+    include_odoo_module_status: bool = False
+    take_browser_screenshot: bool = False
+    browser_start_path: str = "/web"
+    screenshot_name: str = "full_verify.png"
+
+
+class WorkflowReport(BaseModel):
+    status: Literal["passed", "failed", "warning"]
+    job_id: str
+    steps: list[JobStep]
+    summary: dict[str, Any]
+
+
+def validate_safe_name(value: str, field_name: str) -> str:
+    if "/" in value or "\\" in value or value.strip() != value or not value:
+        raise ValueError(f"{field_name} must be a safe folder/technical name")
+    if value in {".", ".."}:
+        raise ValueError(f"{field_name} must not be a relative path token")
+    return value
