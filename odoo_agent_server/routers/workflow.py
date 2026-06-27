@@ -210,6 +210,11 @@ def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport:
         return fail("git_status", status_result)
     step("git_status", "passed", status_result)
 
+    diff_result = git.diff(str(project_path), staged=False, timeout_seconds=30)
+    if diff_result.exit_code != 0:
+        return fail("git_diff", diff_result)
+    step("git_diff", "passed", diff_result)
+
     if payload.run_qa:
         qa_report = self_run(SelfRunRequest(project_path=str(project_path), module_name=payload.module_name, run_pytest=True, include_git_status=True, timeout_seconds=min(payload.timeout_seconds, 600)))
         step("qa_self_run", qa_report.status, qa_report)

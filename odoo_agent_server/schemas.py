@@ -186,6 +186,7 @@ class OdooShVerifyManifestRequest(BaseModel):
 class OdooShModuleUpdateRequest(ApprovalMixin):
     module_name: str = Field(..., description="Technical module folder/name to update")
     timeout_seconds: int = Field(default=600, ge=30, le=1800)
+    expected_sha: str | None = Field(default=None, description="Optional pushed Git SHA that must be deployed on Odoo.sh before update")
 
     @field_validator("module_name")
     @classmethod

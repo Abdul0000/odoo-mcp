@@ -66,6 +66,12 @@ def odoosh_grep_errors(payload: OdooShCommandRequest) -> CommandResult:
 def odoosh_module_update(payload: OdooShModuleUpdateRequest) -> CommandResult:
     approval = ApprovalService()
     approval.ensure_allowed("odoosh.module_update", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
-    result = _run("odoosh.module_update", lambda: OdooShService().module_update(payload.module_name, payload.timeout_seconds))
+    service = OdooShService()
+    if payload.expected_sha:
+        wait = service.wait_for_commit(payload.expected_sha, payload.timeout_seconds, None)
+        if wait.exit_code != 0:
+            approval.finalize_command(payload.approval_id, wait.exit_code, "odoosh.module_update precheck succeeded", "odoosh.module_update blocked by stale deployed commit")
+            return wait
+    result = _run("odoosh.module_update", lambda: service.module_update(payload.module_name, payload.timeout_seconds))
     approval.finalize_command(payload.approval_id, result.exit_code, "odoosh.module_update succeeded", "odoosh.module_update failed")
     return result

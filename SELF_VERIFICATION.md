@@ -54,3 +54,19 @@ pytest -q
 ```
 
 The suite now includes guard tests for Git identity setup, target branch validation, `.git` write blocking, Odoo.sh update log classification, and approval failure handling.
+
+## 2026-06-27 OAuth redeploy/session hardening
+
+Additional fix after live ChatGPT MCP testing showed intermittent `We couldn't connect your account` after Koyeb redeploys:
+
+- OAuth access/refresh tokens are now stateless HMAC-signed (`sat_`/`srt_`) using `ODOO_AGENT_OAUTH_TOKEN_SECRET` or `ODOO_AGENT_API_TOKEN`.
+- Refresh tokens survive container restarts and empty `/tmp` state directories.
+- Existing file-backed OAuth state remains for authorization codes and backward compatibility.
+- Standalone `odoosh.module_update` accepts `expected_sha` and waits for Odoo.sh to deploy it before upgrading.
+- `workflow.safe_deploy_module` now records a visible `git_diff` step before QA/commit.
+
+Verification:
+
+```text
+45 passed
+```

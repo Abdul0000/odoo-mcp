@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     oauth_auto_approve: bool = Field(default=False, alias="ODOO_AGENT_OAUTH_AUTO_APPROVE")
     oauth_static_client_id: str = Field(default="odoo-agent-chatgpt", alias="ODOO_AGENT_OAUTH_STATIC_CLIENT_ID")
     oauth_static_client_secret: str | None = Field(default=None, alias="ODOO_AGENT_OAUTH_STATIC_CLIENT_SECRET")
+    oauth_token_secret: str | None = Field(default=None, alias="ODOO_AGENT_OAUTH_TOKEN_SECRET")
     oauth_allowed_redirect_uris_raw: str = Field(default="", alias="ODOO_AGENT_OAUTH_ALLOWED_REDIRECT_URIS")
     oauth_authorization_code_ttl_seconds: int = Field(default=600, alias="ODOO_AGENT_OAUTH_AUTH_CODE_TTL_SECONDS")
     oauth_access_token_ttl_seconds: int = Field(default=3600, alias="ODOO_AGENT_OAUTH_ACCESS_TOKEN_TTL_SECONDS")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import secrets
 import time
@@ -24,6 +25,60 @@ class OAuthClient:
     client_secret: str | None = None
     token_endpoint_auth_method: str = "none"
 
+
+
+
+def _token_secret() -> bytes:
+    """Return the stable signing secret for stateless OAuth tokens.
+
+    Koyeb and similar platforms often restart/redeploy containers with an
+    empty /tmp. Earlier builds stored access/refresh tokens only in the
+    file-backed state directory, so ChatGPT would lose its OAuth session after
+    redeploy and tool calls failed with "couldn't connect your account".
+
+    New tokens are signed and self-validating. The file store remains for
+    short-lived authorization codes and backwards-compatible legacy tokens.
+    """
+    secret = settings.oauth_token_secret or settings.api_token
+    if not secret or secret == "change-me":
+        # Development-safe fallback. Production should set ODOO_AGENT_API_TOKEN
+        # or ODOO_AGENT_OAUTH_TOKEN_SECRET to a strong stable secret.
+        secret = "odoo-agent-development-token-secret"
+    return secret.encode("utf-8")
+
+
+def _b64url_encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def _encode_signed_token(prefix: str, payload: dict[str, Any]) -> str:
+    body = _b64url_encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    sig = _b64url_encode(hmac.new(_token_secret(), body.encode("ascii"), hashlib.sha256).digest())
+    return f"{prefix}_{body}.{sig}"
+
+
+def _decode_signed_token(token: str, prefix: str) -> dict[str, Any] | None:
+    expected_prefix = f"{prefix}_"
+    if not token.startswith(expected_prefix) or "." not in token:
+        return None
+    body, sig = token[len(expected_prefix):].split(".", 1)
+    expected_sig = _b64url_encode(hmac.new(_token_secret(), body.encode("ascii"), hashlib.sha256).digest())
+    if not secrets.compare_digest(sig, expected_sig):
+        return None
+    try:
+        payload = json.loads(_b64url_decode(body).decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if int(payload.get("exp", 0)) < int(time.time()):
+        return None
+    return payload
 
 class OAuthStore:
     """Dependency-light OAuth 2.1 storage for ChatGPT MCP auth.
@@ -175,6 +230,16 @@ class OAuthStore:
         client_id: str,
         client_secret: str | None = None,
     ) -> dict[str, Any]:
+        # Prefer stateless refresh tokens so ChatGPT remains connected across
+        # Koyeb/container redeploys even when the file-backed state directory is
+        # reset. The client_id check prevents a token issued for one client from
+        # being replayed by another.
+        stateless = _decode_signed_token(refresh_token, "srt")
+        if stateless:
+            if stateless.get("client_id") != client_id:
+                raise HTTPException(status_code=400, detail="Invalid refresh_token client")
+            return self._issue_tokens(self._read(), client_id=client_id, scope=stateless.get("scope") or settings.oauth_default_scope, reuse_refresh_token=refresh_token)
+
         client = self.get_client(client_id)
         _validate_client_secret(client, client_secret)
         state = self._read()
@@ -196,20 +261,40 @@ class OAuthStore:
         reuse_refresh_token: str | None = None,
     ) -> dict[str, Any]:
         now = int(time.time())
-        access_token = "atk_" + secrets.token_urlsafe(40)
-        refresh_token = reuse_refresh_token or "rtk_" + secrets.token_urlsafe(40)
-        state["access_tokens"][access_token] = {
+        access_payload = {
+            "typ": "access",
+            "client_id": client_id,
+            "scope": scope,
+            "iat": now,
+            "exp": now + settings.oauth_access_token_ttl_seconds,
+            "jti": secrets.token_urlsafe(12),
+        }
+        refresh_payload = {
+            "typ": "refresh",
+            "client_id": client_id,
+            "scope": scope,
+            "iat": now,
+            "exp": now + settings.oauth_refresh_token_ttl_seconds,
+            "jti": secrets.token_urlsafe(12),
+        }
+        access_token = _encode_signed_token("sat", access_payload)
+        refresh_token = reuse_refresh_token or _encode_signed_token("srt", refresh_payload)
+
+        # Keep a legacy copy in the state store for observability and backwards
+        # compatibility with older tests/tools. Validation does not depend on it
+        # for sat_/srt_ tokens.
+        state.setdefault("access_tokens", {})[access_token] = {
             "client_id": client_id,
             "scope": scope,
             "issued_at": now,
-            "expires_at": now + settings.oauth_access_token_ttl_seconds,
+            "expires_at": access_payload["exp"],
         }
         if not reuse_refresh_token:
-            state["refresh_tokens"][refresh_token] = {
+            state.setdefault("refresh_tokens", {})[refresh_token] = {
                 "client_id": client_id,
                 "scope": scope,
                 "issued_at": now,
-                "expires_at": now + settings.oauth_refresh_token_ttl_seconds,
+                "expires_at": refresh_payload["exp"],
             }
         return {
             "access_token": access_token,
@@ -222,6 +307,15 @@ class OAuthStore:
     def validate_access_token(self, token: str) -> dict[str, Any] | None:
         if not token:
             return None
+        stateless = _decode_signed_token(token, "sat")
+        if stateless and stateless.get("typ") == "access":
+            return {
+                "client_id": stateless.get("client_id"),
+                "scope": stateless.get("scope") or settings.oauth_default_scope,
+                "issued_at": stateless.get("iat"),
+                "expires_at": stateless.get("exp"),
+            }
+
         state = self._read()
         record = state["access_tokens"].get(token)
         if not record:
