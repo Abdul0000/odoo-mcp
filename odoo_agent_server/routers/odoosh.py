@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, status
 from ..auth import AuthDependency
 from ..schemas import (
     CommandResult,
+    OdooShCheckCommitRequest,
     OdooShCommandRequest,
     OdooShLogRequest,
     OdooShModuleUpdateRequest,
@@ -45,6 +46,12 @@ def odoosh_deployed_sha() -> CommandResult:
 @router.post("/wait-for-commit", response_model=CommandResult)
 def odoosh_wait_for_commit(payload: OdooShWaitForCommitRequest) -> CommandResult:
     return _run("odoosh.wait_for_commit", lambda: OdooShService().wait_for_commit(payload.expected_sha, payload.timeout_seconds, payload.interval_seconds))
+
+
+@router.post("/check-commit", response_model=CommandResult)
+def odoosh_check_commit(payload: OdooShCheckCommitRequest) -> CommandResult:
+    """Non-blocking single check — returns immediately with deployed=true/false in stdout JSON."""
+    return _run("odoosh.check_commit", lambda: OdooShService().check_commit_deployed(payload.expected_sha))
 
 
 @router.post("/verify-module-manifest", response_model=CommandResult)

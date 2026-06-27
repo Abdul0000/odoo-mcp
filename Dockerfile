@@ -5,11 +5,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git openssh-client curl ca-certificates \
+    && apt-get install -y --no-install-recommends \
+       git openssh-client curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && playwright install --with-deps chromium \
+    && rm -rf /var/cache/apt/archives /tmp/*
 
 COPY . .
 RUN chmod +x /app/start.sh

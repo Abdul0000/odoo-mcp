@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -15,10 +16,21 @@ class GitService:
     def __init__(self) -> None:
         self.repo = RepoService()
 
+    def _ssh_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        # GIT_SSH_COMMAND may already be set by start.sh (base64 key inject).
+        # If GIT_SSH_KEY_PATH is also configured, prefer that so the connector
+        # config is the single source of truth.
+        key = settings.git_ssh_key_path
+        if key:
+            env["GIT_SSH_COMMAND"] = (
+                f"ssh -i {key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+            )
+        return env
+
     def _project(self, project_path: str) -> Path:
         project = resolve_allowed_path(project_path)
         if not (project / ".git").exists():
-            # Still allow worktrees/subdirectories inside git repos by asking git.
             result = self._run(["git", "rev-parse", "--show-toplevel"], project, 20)
             if result.exit_code != 0:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="project_path is not a git repository")
@@ -88,7 +100,7 @@ class GitService:
         if paths:
             add_command = ["git", "add"]
             for rel in paths:
-                self.repo.target(str(project), rel)  # validates path
+                self.repo.target(str(project), rel)
                 add_command.append(rel)
         else:
             add_command = ["git", "add", "-A"]
@@ -129,7 +141,28 @@ class GitService:
 
     def _run(self, command: list[str], cwd: Path, timeout_seconds: int) -> CommandResult:
         try:
-            completed = subprocess.run(command, cwd=str(cwd), capture_output=True, text=True, timeout=timeout_seconds, check=False)
-            return CommandResult(command=command, cwd=str(cwd), exit_code=completed.returncode, stdout=completed.stdout[-20000:], stderr=completed.stderr[-20000:])
+            completed = subprocess.run(
+                command,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+                env=self._ssh_env(),
+            )
+            return CommandResult(
+                command=command,
+                cwd=str(cwd),
+                exit_code=completed.returncode,
+                stdout=completed.stdout[-20000:],
+                stderr=completed.stderr[-20000:],
+            )
         except subprocess.TimeoutExpired as exc:
-            return CommandResult(command=command, cwd=str(cwd), exit_code=124, stdout=(exc.stdout or "")[-20000:] if isinstance(exc.stdout, str) else "", stderr=(exc.stderr or "")[-20000:] if isinstance(exc.stderr, str) else "", timed_out=True)
+            return CommandResult(
+                command=command,
+                cwd=str(cwd),
+                exit_code=124,
+                stdout=(exc.stdout or "")[-20000:] if isinstance(exc.stdout, str) else "",
+                stderr=(exc.stderr or "")[-20000:] if isinstance(exc.stderr, str) else "",
+                timed_out=True,
+            )

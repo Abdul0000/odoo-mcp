@@ -411,7 +411,7 @@ class FullVerifyRequest(SelfRunRequest):
 
 
 class WorkflowReport(BaseModel):
-    status: Literal["passed", "failed", "warning"]
+    status: Literal["passed", "failed", "warning", "running"]
     job_id: str
     steps: list[JobStep]
     summary: dict[str, Any]
@@ -423,3 +423,7 @@ def validate_safe_name(value: str, field_name: str) -> str:
     if value in {".", ".."}:
         raise ValueError(f"{field_name} must not be a relative path token")
     return value
+
+
+class OdooShCheckCommitRequest(BaseModel):
+    expected_sha: str = Field(..., min_length=7, description="Git SHA to check on Odoo.sh ~/src/user")

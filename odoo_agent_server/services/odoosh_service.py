@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shlex
 import subprocess
 import time
@@ -19,13 +20,6 @@ class SshTarget:
 
 
 class OdooShService:
-    """Small, safe SSH connector for Odoo.sh builds.
-
-    Odoo.sh deploys user code asynchronously after Git push. This service exposes
-    verification primitives so callers can wait for the deployed commit before
-    running an update command.
-    """
-
     FAILURE_PATTERNS = [
         "not installable",
         "inconsistent states",
@@ -53,14 +47,10 @@ class OdooShService:
     def _base_ssh_command(self, target: SshTarget) -> list[str]:
         command = [
             "ssh",
-            "-p",
-            str(target.port),
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "-o",
-            "ConnectTimeout=15",
+            "-p", str(target.port),
+            "-o", "BatchMode=yes",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=15",
         ]
         if target.key_path:
             command.extend(["-i", str(target.key_path), "-o", "IdentitiesOnly=yes"])
@@ -107,6 +97,32 @@ class OdooShService:
         script = "set -e; cd ~/src/user; git rev-parse HEAD"
         return self.run_shell(script, timeout_seconds=30)
 
+    # NON-BLOCKING single check — ChatGPT polls this instead of blocking wait
+    def check_commit_deployed(self, expected_sha: str) -> CommandResult:
+        """Return immediately with deployed=true/false. Never blocks.
+        ChatGPT should call this in a polling loop with 15-second delays."""
+        result = self.deployed_sha()
+        current = result.stdout.strip()
+        deployed = (
+            result.exit_code == 0
+            and bool(current)
+            and (current.startswith(expected_sha) or expected_sha.startswith(current))
+        )
+        payload = json.dumps({
+            "deployed": deployed,
+            "current_sha": current or "unknown",
+            "expected_sha": expected_sha,
+            "message": "Deployed! Proceed to module update." if deployed
+                       else "Not yet deployed. Wait 15 seconds then call odoosh.check_commit again.",
+        })
+        return CommandResult(
+            command=["odoosh.check_commit", expected_sha],
+            cwd="odoosh:ssh",
+            exit_code=0 if deployed else 1,
+            stdout=payload,
+        )
+
+    # Kept for safe_deploy_module internal use only (not exposed as MCP tool)
     def wait_for_commit(self, expected_sha: str, timeout_seconds: int | None = None, interval_seconds: int | None = None) -> CommandResult:
         timeout_seconds = timeout_seconds or settings.odoosh_wait_timeout_seconds
         interval_seconds = interval_seconds or settings.odoosh_wait_interval_seconds
@@ -140,7 +156,7 @@ class OdooShService:
         script = (
             "set -e; "
             f"test -f {user_addons}/{safe_module}/__manifest__.py; "
-            f"grep -E \"['\\\"]installable['\\\"] *: *True\" {user_addons}/{safe_module}/__manifest__.py >/dev/null; "
+            f"grep -E \"['\\\"']installable['\\\"'] *: *True\" {user_addons}/{safe_module}/__manifest__.py >/dev/null; "
             f"echo MODULE_MANIFEST_OK:{module_name}"
         )
         return self.run_shell(script, timeout_seconds=30)
@@ -172,13 +188,11 @@ class OdooShService:
         safe_module = shlex.quote(module_name)
         safe_db = shlex.quote(settings.odoosh_db_name)
         odoo_path = shlex.quote(settings.odoosh_odoo_path)
-        addons_path = ",".join(
-            [
-                f"{settings.odoosh_odoo_path}/odoo/addons",
-                f"{settings.odoosh_odoo_path}/addons",
-                settings.odoosh_user_addons_path,
-            ]
-        )
+        addons_path = ",".join([
+            f"{settings.odoosh_odoo_path}/odoo/addons",
+            f"{settings.odoosh_odoo_path}/addons",
+            settings.odoosh_user_addons_path,
+        ])
         safe_addons = shlex.quote(addons_path)
         script = (
             "set -e; "
@@ -192,8 +206,10 @@ class OdooShService:
         text = f"{result.stdout}\n{result.stderr}"
         matched = [pattern for pattern in self.FAILURE_PATTERNS if pattern in text]
         if result.exit_code == 0 and matched:
-            result.exit_code = 3
-            result.stderr = (result.stderr or "") + "\nMCP_CLASSIFIED_FAILURE: module update logs contain failure pattern(s): " + ", ".join(matched)
+            return result.model_copy(update={
+                "exit_code": 3,
+                "stderr": (result.stderr or "") + "\nMCP_CLASSIFIED_FAILURE: " + ", ".join(matched),
+            })
         return result
 
     @staticmethod

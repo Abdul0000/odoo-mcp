@@ -21,6 +21,7 @@ from ..schemas import (
     LimitRequest,
     OdooRpcModuleRequest,
     OdooSearchReadRequest,
+    OdooShCheckCommitRequest,
     OdooShCommandRequest,
     OdooShLogRequest,
     OdooShModuleUpdateRequest,
@@ -77,7 +78,17 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="git.push", description="Push current branch to remote", requires_approval=True),
     ToolDescriptor(name="odoosh.health", description="Check Odoo.sh SSH health", read_only=True),
     ToolDescriptor(name="odoosh.git_status", description="Read Odoo.sh deployed git status", read_only=True),
-    ToolDescriptor(name="odoosh.wait_for_commit", description="Wait until Odoo.sh ~/src/user reaches an expected Git SHA", read_only=True),
+    ToolDescriptor(
+        name="odoosh.check_commit",
+        description=(
+            "NON-BLOCKING single check: returns immediately with deployed=true/false. "
+            "Use this in a polling loop after git.push: call once, read the 'deployed' field. "
+            "If false, wait 15 seconds then call again. Repeat max 20 times. "
+            "When deployed=true proceed to odoosh.module_update. Never use odoosh.wait_for_commit."
+        ),
+        read_only=True,
+    ),
+    ToolDescriptor(name="odoosh.wait_for_commit", description="[DEPRECATED - use odoosh.check_commit in a polling loop] Blocking wait for Odoo.sh deploy", read_only=True),
     ToolDescriptor(name="odoosh.verify_module_manifest", description="Verify a module manifest exists and is installable on Odoo.sh", read_only=True),
     ToolDescriptor(name="odoosh.log", description="Tail an Odoo.sh log", read_only=True),
     ToolDescriptor(name="odoosh.grep_errors", description="Search Odoo.sh logs for errors", read_only=True),
@@ -119,6 +130,7 @@ _TOOL_INPUT_MODELS = {
     "git.push": GitPushRequest,
     "odoosh.health": EmptyRequest,
     "odoosh.git_status": EmptyRequest,
+    "odoosh.check_commit": OdooShCheckCommitRequest,
     "odoosh.wait_for_commit": OdooShWaitForCommitRequest,
     "odoosh.verify_module_manifest": OdooShVerifyManifestRequest,
     "odoosh.log": OdooShLogRequest,
@@ -217,6 +229,9 @@ async def _dispatch(name: str, args: dict) -> object:
         return OdooShService().health()
     if name == "odoosh.git_status":
         return OdooShService().git_status()
+    if name == "odoosh.check_commit":
+        req = OdooShCheckCommitRequest.model_validate(args)
+        return OdooShService().check_commit_deployed(req.expected_sha)
     if name == "odoosh.wait_for_commit":
         return odoosh_wait_for_commit(OdooShWaitForCommitRequest.model_validate(args))
     if name == "odoosh.verify_module_manifest":
