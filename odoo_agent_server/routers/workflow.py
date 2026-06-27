@@ -10,6 +10,8 @@ from ..auth import AuthDependency
 from ..config import settings
 from ..schemas import (
     CapabilityCheckResult,
+    CodingTaskPlanRequest,
+    CodingTaskPlanResult,
     CommandResult,
     FullVerifyRequest,
     JobRecord,
@@ -31,6 +33,58 @@ from ..services.store_service import JsonStore
 from .qa import self_run
 
 router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDependency])
+
+
+@router.post("/coding-task-plan", response_model=CodingTaskPlanResult)
+def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
+    """Return the canonical repo-first coding workflow for ChatGPT/MCP clients."""
+    repo_url = payload.repo_url or settings.target_git_repo or "<repo_url>"
+    branch = payload.branch or settings.target_git_branch or "<target_branch>"
+    project_path = payload.project_path or settings.target_project_path or f"{settings.workspace_root.rstrip('/')}/<repo_name>"
+    module_name = payload.module_name or "<custom_module>"
+    steps = [
+        "Call repo.prepare with the target repo and branch. This clones if missing, otherwise fetches, checks out, and pulls the branch with --ff-only.",
+        "Call repo.list_custom_modules on the returned project_path; choose the target custom module from __manifest__.py files, not from Odoo's installed module list only.",
+        f"Read the target module files first: {module_name}/__manifest__.py, models, views, security, and relevant static files.",
+        "Apply the smallest possible patch with repo.apply_patch or repo.write; do not edit Odoo core, enterprise, .git, or unrelated modules.",
+        "Run git.diff and qa.self_run. Treat pytest environment failures separately from real module errors.",
+        "Commit only related paths with git.commit using a clear message.",
+        "Push to the exact target branch with git.push; branch must match TARGET_GIT_BRANCH when configured.",
+        "Wait for Odoo.sh to deploy the pushed SHA with odoosh.wait_for_commit.",
+        "Verify the manifest on Odoo.sh and upgrade the module with odoosh.module_update.",
+        "Finish with odoo.module_status, odoosh.grep_errors, and browser.screenshot for UI tasks.",
+    ]
+    return CodingTaskPlanResult(
+        summary="Canonical repo-first coding workflow for ChatGPT MCP Odoo development.",
+        ordered_steps=steps,
+        required_tools=[
+            "repo.prepare",
+            "repo.list_custom_modules",
+            "repo.read",
+            "repo.apply_patch",
+            "git.diff",
+            "qa.self_run",
+            "git.commit",
+            "git.push",
+            "odoosh.wait_for_commit",
+            "odoosh.verify_module_manifest",
+            "odoosh.module_update",
+        ],
+        guardrails=[
+            "Always prepare/pull the repo before reading or patching code.",
+            "Always use the configured target branch; never push to default/main by assumption.",
+            "Discover custom modules from repo manifests before relying on Odoo database state.",
+            "Only patch the requested module and related files.",
+            "Do not upgrade Odoo.sh until the expected pushed SHA is deployed.",
+        ],
+        defaults={
+            "repo_url": repo_url,
+            "branch": branch,
+            "project_path": project_path,
+            "module_name": module_name,
+            "task": payload.task,
+        },
+    )
 
 
 @router.get("/capability-check", response_model=CapabilityCheckResult)

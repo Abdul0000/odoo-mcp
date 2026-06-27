@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     # Approval safety. Keep false for local development/tests; enable in production.
     require_approval: bool = Field(default=False, alias="ODOO_AGENT_REQUIRE_APPROVAL")
     approval_required_actions_raw: str = Field(
-        default="repo.write,repo.delete,repo.apply_patch,repo.clean_pyc,git.commit,git.push,odoo.module_install,odoo.module_update,odoosh.module_update,workflow.safe_deploy_module",
+        default="repo.prepare,repo.write,repo.delete,repo.apply_patch,repo.clean_pyc,git.commit,git.push,odoo.module_install,odoo.module_update,odoosh.module_update,workflow.safe_deploy_module",
         alias="ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS",
     )
     protected_branches_raw: str = Field(default="main,master,production,prod,live", alias="ODOO_AGENT_PROTECTED_BRANCHES")
@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     # Git deployment guardrails. These are optional but strongly recommended in production.
     target_git_repo: str | None = Field(default=None, alias="TARGET_GIT_REPO")
     target_git_branch: str | None = Field(default=None, alias="TARGET_GIT_BRANCH")
+    target_project_path: str | None = Field(default=None, alias="TARGET_PROJECT_PATH")
+    workspace_root: str = Field(default="/workspace/repos", alias="WORKSPACE_ROOT")
+    git_ssh_key_path: str | None = Field(default=None, alias="GIT_SSH_KEY_PATH")
     git_author_name: str = Field(default="Odoo MCP Agent", alias="GIT_AUTHOR_NAME")
     git_author_email: str = Field(default="odoo-mcp@example.local", alias="GIT_AUTHOR_EMAIL")
 
@@ -77,6 +80,12 @@ class Settings(BaseSettings):
     @property
     def protected_branches(self) -> set[str]:
         return {item.strip() for item in self.protected_branches_raw.split(",") if item.strip()}
+
+    @property
+    def workspace_path(self) -> Path:
+        path = Path(self.workspace_root).expanduser().resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
 
     @property

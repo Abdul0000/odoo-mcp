@@ -7,11 +7,15 @@ from ..schemas import (
     CommandResult,
     FileContent,
     FileListItem,
+    CustomModuleItem,
     RepoCleanPycRequest,
     RepoCleanPycResult,
+    RepoCustomModulesRequest,
     RepoDeleteRequest,
     RepoListRequest,
     RepoPatchRequest,
+    RepoPrepareRequest,
+    RepoPrepareResult,
     RepoReadRequest,
     RepoWriteRequest,
 )
@@ -29,6 +33,33 @@ def _preview(payload: object) -> dict[str, object]:
     if "patch" in data:
         data["patch"] = f"<redacted patch length={len(str(data['patch']))}>"
     return data
+
+
+@router.post("/prepare", response_model=RepoPrepareResult)
+def repo_prepare(payload: RepoPrepareRequest) -> RepoPrepareResult:
+    approval = ApprovalService()
+    approval.ensure_allowed("repo.prepare", payload.approval_id, _preview(payload))
+    try:
+        result = RepoService().prepare_repo(
+            payload.repo_url,
+            payload.branch,
+            payload.repo_name,
+            payload.workspace_root,
+            payload.remote,
+            payload.timeout_seconds,
+        )
+    except Exception:
+        approval.mark_failed(payload.approval_id, "repo.prepare failed")
+        raise
+    approval.mark_consumed(payload.approval_id, "repo.prepare succeeded")
+    JsonStore().log_audit("repo.prepare", "ok", result.project_path, _preview(payload))
+    return result
+
+
+@router.post("/custom-modules", response_model=list[CustomModuleItem])
+def repo_custom_modules(payload: RepoCustomModulesRequest) -> list[CustomModuleItem]:
+    JsonStore().log_audit("repo.list_custom_modules", "ok", payload.project_path, _preview(payload))
+    return RepoService().list_custom_modules(payload.project_path, payload.max_depth, payload.include_uninstallable)
 
 
 @router.post("/list", response_model=list[FileListItem])

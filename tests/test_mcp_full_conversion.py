@@ -15,11 +15,14 @@ EXPECTED_OPERATIONAL_MCP_TOOLS = {
     "connector.health",
     # workflow
     "workflow.capability_check",
+    "workflow.coding_task_plan",
     "workflow.full_verify",
     "workflow.safe_deploy_module",
     # QA
     "qa.self_run",
     # repo
+    "repo.prepare",
+    "repo.list_custom_modules",
     "repo.list",
     "repo.read",
     "repo.write",
@@ -67,7 +70,7 @@ def test_mcp_tools_list_exposes_every_operational_api_tool():
     tools = response.json()["result"]["tools"]
     names = {tool["name"] for tool in tools}
     assert names == EXPECTED_OPERATIONAL_MCP_TOOLS
-    assert len(tools) == 36
+    assert len(tools) == 39
     for tool in tools:
         assert tool["inputSchema"]["type"] == "object"
         assert "description" in tool

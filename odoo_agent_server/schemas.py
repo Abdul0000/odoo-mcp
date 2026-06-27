@@ -96,6 +96,59 @@ class SelfRunReport(BaseModel):
         return sum(1 for finding in self.findings if finding.severity == Severity.error)
 
 
+
+
+class RepoPrepareRequest(ApprovalMixin):
+    repo_url: str | None = Field(default=None, description="Git repository URL. Defaults to TARGET_GIT_REPO.")
+    branch: str | None = Field(default=None, description="Target branch. Defaults to TARGET_GIT_BRANCH.")
+    repo_name: str | None = Field(default=None, description="Folder name under workspace_root. Defaults to repo URL name or TARGET_PROJECT_PATH name.")
+    workspace_root: str | None = Field(default=None, description="Workspace root for clones. Defaults to WORKSPACE_ROOT.")
+    remote: str = Field(default="origin")
+    timeout_seconds: int = Field(default=180, ge=30, le=900)
+
+
+class RepoPrepareResult(BaseModel):
+    project_path: str
+    repo_url: str
+    branch: str
+    sha: str
+    status: str
+    already_cloned: bool
+    steps: list[CommandResult] = Field(default_factory=list)
+
+
+class RepoCustomModulesRequest(BaseProjectRequest):
+    max_depth: int = Field(default=5, ge=1, le=10)
+    include_uninstallable: bool = Field(default=False)
+
+
+class CustomModuleItem(BaseModel):
+    module_name: str
+    path: str
+    manifest_path: str
+    installable: bool | None = None
+    name: str | None = None
+    version: str | None = None
+    author: str | None = None
+    application: bool | None = None
+
+
+class CodingTaskPlanRequest(BaseModel):
+    repo_url: str | None = Field(default=None, description="Git repository URL. Defaults to TARGET_GIT_REPO.")
+    branch: str | None = Field(default=None, description="Target branch. Defaults to TARGET_GIT_BRANCH.")
+    module_name: str | None = Field(default=None, description="Target custom module folder name, if known.")
+    task: str = Field(..., min_length=1, description="Natural-language coding task.")
+    project_path: str | None = Field(default=None, description="Existing checkout path, if already known.")
+
+
+class CodingTaskPlanResult(BaseModel):
+    summary: str
+    ordered_steps: list[str]
+    required_tools: list[str]
+    guardrails: list[str]
+    defaults: dict[str, Any] = Field(default_factory=dict)
+
+
 class RepoListRequest(BaseProjectRequest):
     relative_path: str = Field(default=".")
     max_depth: int = Field(default=3, ge=1, le=8)

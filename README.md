@@ -460,3 +460,29 @@ ODOOSH_USER_ADDONS_PATH=/home/odoo/src/user
 ODOOSH_WAIT_TIMEOUT_SECONDS=600
 ODOOSH_WAIT_INTERVAL_SECONDS=10
 ```
+
+## Repo-first ChatGPT/MCP coding workflow
+
+For every coding task, ChatGPT should start with the repository tools, not with Odoo database reads:
+
+```text
+repo.prepare → repo.list_custom_modules → repo.read → repo.apply_patch → git.diff → qa.self_run → git.commit → git.push → odoosh.wait_for_commit → odoosh.module_update
+```
+
+New MCP/REST tools:
+
+- `repo.prepare`: clones the target repo if missing, otherwise runs `git fetch`, `git checkout <branch>`, and `git pull --ff-only origin <branch>`. Defaults come from `TARGET_GIT_REPO`, `TARGET_GIT_BRANCH`, `TARGET_PROJECT_PATH`, and `WORKSPACE_ROOT`.
+- `repo.list_custom_modules`: scans the checkout for Odoo custom modules using `__manifest__.py`, instead of relying only on installed modules in Odoo.
+- `workflow.coding_task_plan`: returns the canonical ordered tool plan and guardrails for ChatGPT before patching code.
+
+Recommended environment:
+
+```env
+WORKSPACE_ROOT=/workspace/repos
+TARGET_GIT_REPO=git@github.com:Abdul0000/test_18.git
+TARGET_GIT_BRANCH=test_stagging_18
+TARGET_PROJECT_PATH=/workspace/repos/test_18
+GIT_SSH_KEY_PATH=/tmp/keys/github_key
+```
+
+For SSH GitHub repos, either set `GIT_SSH_COMMAND` yourself or set `GIT_SSH_KEY_PATH`; `repo.prepare` will build a safe `GIT_SSH_COMMAND` using that key.

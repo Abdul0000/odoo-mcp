@@ -10,6 +10,7 @@ from ..schemas import (
     AuditListRequest,
     BaseProjectRequest,
     BrowserCheckRequest,
+    CodingTaskPlanRequest,
     EmptyRequest,
     FullVerifyRequest,
     SafeDeployModuleRequest,
@@ -26,9 +27,11 @@ from ..schemas import (
     OdooShVerifyManifestRequest,
     OdooShWaitForCommitRequest,
     RepoCleanPycRequest,
+    RepoCustomModulesRequest,
     RepoDeleteRequest,
     RepoListRequest,
     RepoPatchRequest,
+    RepoPrepareRequest,
     RepoReadRequest,
     RepoWriteRequest,
     SelfRunRequest,
@@ -42,11 +45,11 @@ from ..services.odoosh_service import OdooShService
 from ..services.playwright_service import PlaywrightService
 from ..services.repo_service import RepoService
 from .qa import self_run
-from .repo import repo_delete, repo_write, repo_apply_patch, repo_clean_pyc
+from .repo import repo_delete, repo_write, repo_apply_patch, repo_clean_pyc, repo_prepare, repo_custom_modules
 from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update
 from .odoosh import odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
-from .workflow import capability_check, full_verify, safe_deploy_module
+from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
@@ -55,9 +58,12 @@ router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency
 _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="connector.health", description="Check connector service health", read_only=True),
     ToolDescriptor(name="workflow.capability_check", description="Check local connector capabilities and missing runtime configuration", read_only=True),
+    ToolDescriptor(name="workflow.coding_task_plan", description="Return the repo-first coding workflow guidance for ChatGPT MCP clients", read_only=True),
     ToolDescriptor(name="workflow.full_verify", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module", description="Safely commit, push, wait for Odoo.sh deployment, verify manifest, and upgrade an Odoo module", requires_approval=True),
     ToolDescriptor(name="qa.self_run", description="Run Odoo custom module static QA and optional pytest/git status", read_only=True),
+    ToolDescriptor(name="repo.prepare", description="Clone or refresh target repo and checkout/pull the target branch before coding", requires_approval=True),
+    ToolDescriptor(name="repo.list_custom_modules", description="Discover custom Odoo modules from repo __manifest__.py files", read_only=True),
     ToolDescriptor(name="repo.list", description="List files inside an allowed project path", read_only=True),
     ToolDescriptor(name="repo.read", description="Read a UTF-8 file inside an allowed project path", read_only=True),
     ToolDescriptor(name="repo.write", description="Write a file inside an allowed project path", requires_approval=True),
@@ -94,9 +100,12 @@ _TOOL_DESCRIPTORS = [
 _TOOL_INPUT_MODELS = {
     "connector.health": EmptyRequest,
     "workflow.capability_check": EmptyRequest,
+    "workflow.coding_task_plan": CodingTaskPlanRequest,
     "workflow.full_verify": FullVerifyRequest,
     "workflow.safe_deploy_module": SafeDeployModuleRequest,
     "qa.self_run": SelfRunRequest,
+    "repo.prepare": RepoPrepareRequest,
+    "repo.list_custom_modules": RepoCustomModulesRequest,
     "repo.list": RepoListRequest,
     "repo.read": RepoReadRequest,
     "repo.write": RepoWriteRequest,
@@ -165,12 +174,18 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "workflow.capability_check":
         EmptyRequest.model_validate(args)
         return capability_check()
+    if name == "workflow.coding_task_plan":
+        return coding_task_plan(CodingTaskPlanRequest.model_validate(args))
     if name == "workflow.full_verify":
         return await full_verify(FullVerifyRequest.model_validate(args))
     if name == "workflow.safe_deploy_module":
         return safe_deploy_module(SafeDeployModuleRequest.model_validate(args))
     if name == "qa.self_run":
         return self_run(SelfRunRequest.model_validate(args))
+    if name == "repo.prepare":
+        return repo_prepare(RepoPrepareRequest.model_validate(args))
+    if name == "repo.list_custom_modules":
+        return repo_custom_modules(RepoCustomModulesRequest.model_validate(args))
     if name == "repo.list":
         req = RepoListRequest.model_validate(args)
         return RepoService().list_files(req.project_path, req.relative_path, req.max_depth, req.max_items)
