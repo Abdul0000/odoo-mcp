@@ -107,7 +107,7 @@ def _authorization_form(params: dict[str, str], error: str | None = None) -> str
   <main class="card">
     <h1>Authorize Odoo Agent Connector</h1>
     <p>ChatGPT is requesting access to the MCP tools exposed by your local/VPS Odoo Agent Connector.</p>
-    <div class="warning">Only approve this if you started this connector and trust the tunnel/domain. Write tools are still approval-gated by the connector.</div>
+    <div class="warning">Only approve this if you started this connector and trust the tunnel/domain. Write tools run directly after connector authentication; keep this service private and token-protected.</div>
     {error_html}
     <form method="post" action="/oauth/authorize">
       {hidden}

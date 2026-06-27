@@ -28,23 +28,8 @@ def _is_protected_branch(branch: str | None) -> bool:
 
 
 def _ensure_protected_branch_approval(branch: str | None, approval_id: str | None) -> bool:
-    """Protected branches always require an approved git.push approval."""
-    if not _is_protected_branch(branch):
-        return False
-    if not approval_id:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={"approval_required": True, "action": "git.push", "message": f"Branch {branch} is protected and requires approval_id."},
-        )
-    store = JsonStore()
-    record = store.get_approval(approval_id)
-    if record.action != "git.push":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Approval action does not match protected git.push")
-    if record.status not in {ApprovalStatus.approved, ApprovalStatus.running}:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Approval is not approved: {record.status.value}")
-    if record.status == ApprovalStatus.approved:
-        store.set_approval_status(approval_id, ApprovalStatus.running, reason="Protected branch git.push started")
-    return True
+    """Protected branch approval enforcement is disabled in this build."""
+    return False
 
 
 @router.post("/status", response_model=CommandResult)

@@ -98,10 +98,12 @@ odoo.module_update
 odoosh.module_update
 ```
 
-Enable approval gating with:
+Approval gating is disabled in this build. Write, commit, push, module update, and safe deploy tools run without `approval_id`:
 
 ```env
-ODOO_AGENT_REQUIRE_APPROVAL=true
+ODOO_AGENT_REQUIRE_APPROVAL=false
+ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS=
+ODOO_AGENT_PROTECTED_BRANCHES=
 ```
 
 ## Install locally
@@ -236,34 +238,19 @@ curl -X POST http://localhost:8080/workflow/full-verify \
   }'
 ```
 
-## Example approval flow
+## Approval-free tool execution
 
-When `ODOO_AGENT_REQUIRE_APPROVAL=true`, a dangerous action without `approval_id` returns HTTP 409 with an approval ID.
-
-Approve it:
-
-```bash
-curl -X POST http://localhost:8080/approvals/approve \
-  -H "Authorization: Bearer change-me-to-a-long-random-secret" \
-  -H "Content-Type: application/json" \
-  -d '{"approval_id":"<id>","reason":"Reviewed diff"}'
-```
-
-Then repeat the original action with:
-
-```json
-{"approval_id":"<id>"}
-```
+This build removes approval blocking for MCP tools. Do not pass `approval_id`; tools such as `repo.apply_patch`, `git.commit`, `git.push`, `odoo.module_update`, `odoosh.module_update`, and `workflow.safe_deploy_module` execute directly when the API token and path guardrails allow the request.
 
 ## Production rules
 
 1. Keep `ODOO_AGENT_ALLOWED_ROOTS` strict.
 2. Use staging/development Odoo.sh first.
-3. Keep `ODOO_AGENT_REQUIRE_APPROVAL=true` when connected to ChatGPT.
+3. Keep `ODOO_AGENT_ALLOWED_ROOTS` and target branch/repo settings strict because approval gating is disabled.
 4. Store GitHub/Odoo.sh SSH keys only on this backend server.
 5. Do not expose Odoo passwords, SSH keys, API keys, or cookies to ChatGPT.
 6. Push only current branch unless a branch is explicitly provided.
-7. Keep protected branches in `ODOO_AGENT_PROTECTED_BRANCHES`.
+7. Avoid adding production branches to target settings unless you intentionally want direct deploy/push access.
 8. Review `GET /jobs/audit/events` regularly.
 
 ## Self-verification included in this build
@@ -300,7 +287,7 @@ symlink/path escape blocking
 patch check-only non-mutation
 unsafe patch path rejection
 single-use approvals
-protected branch push approval enforcement
+approval-free direct push/deploy execution
 runtime tool approval descriptors
 /mcp initialize + tools/list + tools/call
 failed full-verify job/audit persistence
@@ -430,7 +417,7 @@ Then enter this client ID in ChatGPT. Leave client secret empty unless you expli
 - The old `Authorization: Bearer ODOO_AGENT_API_TOKEN` still works for REST/OpenAPI Actions.
 - OAuth access tokens also work for `/mcp`, `/tools/list`, and protected APIs.
 - `WWW-Authenticate` now advertises protected-resource metadata when an unauthenticated MCP request is made.
-- Keep `ODOO_AGENT_REQUIRE_APPROVAL=true`; write tools like `git.push`, `repo.apply_patch`, and module updates remain approval-gated.
+- Approval gating is disabled; write tools like `git.push`, `repo.apply_patch`, and module updates execute directly after authentication.
 - Rotate `ODOO_AGENT_API_TOKEN` if it was pasted anywhere public.
 
 ## Safe Odoo.sh deployment workflow
