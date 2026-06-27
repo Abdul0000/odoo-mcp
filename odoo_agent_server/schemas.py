@@ -168,6 +168,21 @@ class OdooShCommandRequest(BaseModel):
     tail_lines: int = Field(default=200, ge=20, le=2000)
 
 
+class OdooShWaitForCommitRequest(BaseModel):
+    expected_sha: str = Field(..., min_length=7, description="Git SHA expected on Odoo.sh ~/src/user")
+    timeout_seconds: int = Field(default=600, ge=30, le=1800)
+    interval_seconds: int = Field(default=10, ge=5, le=60)
+
+
+class OdooShVerifyManifestRequest(BaseModel):
+    module_name: str = Field(..., description="Technical module folder/name to verify on Odoo.sh")
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        return validate_safe_name(value, "module_name")
+
+
 class OdooShModuleUpdateRequest(ApprovalMixin):
     module_name: str = Field(..., description="Technical module folder/name to update")
     timeout_seconds: int = Field(default=600, ge=30, le=1800)
@@ -225,8 +240,10 @@ class BrowserCheckResult(BaseModel):
 class ApprovalStatus(str, Enum):
     pending = "pending"
     approved = "approved"
+    running = "running"
     rejected = "rejected"
     consumed = "consumed"
+    failed = "failed"
 
 
 class ApprovalCreateRequest(BaseModel):
@@ -310,6 +327,23 @@ class ToolCallResult(BaseModel):
 class CapabilityCheckResult(BaseModel):
     status: Literal["ready", "partial", "failed"]
     checks: dict[str, dict[str, Any]]
+
+
+class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
+    module_name: str = Field(..., description="Technical module folder/name to deploy and update")
+    commit_message: str = Field(..., min_length=3, max_length=300)
+    paths: list[str] = Field(default_factory=list, description="Relative paths to add before commit. Empty means git add -A.")
+    remote: str = Field(default="origin")
+    branch: str | None = Field(default=None, description="Defaults to current branch or TARGET_GIT_BRANCH")
+    run_qa: bool = Field(default=True)
+    wait_for_odoosh: bool = Field(default=True)
+    upgrade_module: bool = Field(default=True)
+    timeout_seconds: int = Field(default=900, ge=60, le=2400)
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        return validate_safe_name(value, "module_name")
 
 
 class FullVerifyRequest(SelfRunRequest):

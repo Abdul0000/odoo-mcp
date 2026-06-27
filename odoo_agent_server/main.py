@@ -40,7 +40,7 @@ def root() -> dict[str, object]:
         "openapi": "/openapi.json",
         "tools": "/tools/list",
         "mcp": "/mcp",
-        "workflow": ["/workflow/capability-check", "/workflow/full-verify"],
+        "workflow": ["/workflow/capability-check", "/workflow/full-verify", "/workflow/safe-deploy-module"],
     }
 
 

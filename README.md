@@ -432,3 +432,31 @@ Then enter this client ID in ChatGPT. Leave client secret empty unless you expli
 - `WWW-Authenticate` now advertises protected-resource metadata when an unauthenticated MCP request is made.
 - Keep `ODOO_AGENT_REQUIRE_APPROVAL=true`; write tools like `git.push`, `repo.apply_patch`, and module updates remain approval-gated.
 - Rotate `ODOO_AGENT_API_TOKEN` if it was pasted anywhere public.
+
+## Safe Odoo.sh deployment workflow
+
+For code-changing work, prefer `workflow.safe_deploy_module` instead of manually chaining patch, commit, push, and module update tools. The workflow enforces the safe order:
+
+1. validate the repo and module path;
+2. optionally run module QA;
+3. configure repo-local Git author identity from `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL`;
+4. validate `TARGET_GIT_REPO` and `TARGET_GIT_BRANCH` before push;
+5. commit and push the selected paths;
+6. wait until Odoo.sh `~/src/user` reaches the pushed SHA;
+7. verify the deployed module manifest exists and has `installable: True`;
+8. run `odoo-bin -u` with an explicit addons path that includes `/home/odoo/src/user`;
+9. classify Odoo logs as failed when they contain patterns such as `not installable`, `inconsistent states`, `Traceback`, `ParseError`, or `ImportError`.
+
+Recommended production variables:
+
+```env
+TARGET_GIT_REPO=git@github.com:Abdul0000/test_18.git
+TARGET_GIT_BRANCH=test_stagging_18
+TARGET_PROJECT_PATH=/workspace/repos/test_18
+GIT_AUTHOR_NAME=Odoo MCP Agent
+GIT_AUTHOR_EMAIL=odoo-mcp@example.local
+ODOOSH_ODOO_PATH=/home/odoo/src/odoo
+ODOOSH_USER_ADDONS_PATH=/home/odoo/src/user
+ODOOSH_WAIT_TIMEOUT_SECONDS=600
+ODOOSH_WAIT_INTERVAL_SECONDS=10
+```

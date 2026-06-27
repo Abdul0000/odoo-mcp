@@ -45,32 +45,53 @@ def repo_read(payload: RepoReadRequest) -> FileContent:
 
 @router.post("/write", response_model=FileContent)
 def repo_write(payload: RepoWriteRequest) -> FileContent:
-    ApprovalService().ensure_allowed("repo.write", payload.approval_id, _preview(payload))
-    result = RepoService().write_file(payload.project_path, payload.relative_path, payload.content, payload.create_dirs)
+    approval = ApprovalService()
+    approval.ensure_allowed("repo.write", payload.approval_id, _preview(payload))
+    try:
+        result = RepoService().write_file(payload.project_path, payload.relative_path, payload.content, payload.create_dirs)
+    except Exception:
+        approval.mark_failed(payload.approval_id, "repo.write failed")
+        raise
+    approval.mark_consumed(payload.approval_id, "repo.write succeeded")
     JsonStore().log_audit("repo.write", "ok", payload.relative_path, _preview(payload))
     return result
 
 
 @router.post("/delete", response_model=dict[str, str])
 def repo_delete(payload: RepoDeleteRequest) -> dict[str, str]:
-    ApprovalService().ensure_allowed("repo.delete", payload.approval_id, _preview(payload))
-    result = RepoService().delete_file(payload.project_path, payload.relative_path)
+    approval = ApprovalService()
+    approval.ensure_allowed("repo.delete", payload.approval_id, _preview(payload))
+    try:
+        result = RepoService().delete_file(payload.project_path, payload.relative_path)
+    except Exception:
+        approval.mark_failed(payload.approval_id, "repo.delete failed")
+        raise
+    approval.mark_consumed(payload.approval_id, "repo.delete succeeded")
     JsonStore().log_audit("repo.delete", "ok", payload.relative_path, _preview(payload))
     return result
 
 
 @router.post("/apply-patch", response_model=CommandResult)
 def repo_apply_patch(payload: RepoPatchRequest) -> CommandResult:
+    approval = ApprovalService()
     if not payload.check_only:
-        ApprovalService().ensure_allowed("repo.apply_patch", payload.approval_id, _preview(payload))
+        approval.ensure_allowed("repo.apply_patch", payload.approval_id, _preview(payload))
     result = RepoService().apply_patch(payload.project_path, payload.patch, payload.check_only, payload.timeout_seconds)
+    if not payload.check_only:
+        approval.finalize_command(payload.approval_id, result.exit_code, "repo.apply_patch succeeded", "repo.apply_patch failed")
     JsonStore().log_audit("repo.apply_patch", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
     return result
 
 
 @router.post("/clean-pyc", response_model=RepoCleanPycResult)
 def repo_clean_pyc(payload: RepoCleanPycRequest) -> RepoCleanPycResult:
-    ApprovalService().ensure_allowed("repo.clean_pyc", payload.approval_id, _preview(payload))
-    result = RepoService().clean_pyc(payload.project_path, payload.relative_path)
+    approval = ApprovalService()
+    approval.ensure_allowed("repo.clean_pyc", payload.approval_id, _preview(payload))
+    try:
+        result = RepoService().clean_pyc(payload.project_path, payload.relative_path)
+    except Exception:
+        approval.mark_failed(payload.approval_id, "repo.clean_pyc failed")
+        raise
+    approval.mark_consumed(payload.approval_id, "repo.clean_pyc succeeded")
     JsonStore().log_audit("repo.clean_pyc", "ok", payload.relative_path, _preview(payload))
     return result

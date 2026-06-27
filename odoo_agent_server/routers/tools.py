@@ -12,6 +12,7 @@ from ..schemas import (
     BrowserCheckRequest,
     EmptyRequest,
     FullVerifyRequest,
+    SafeDeployModuleRequest,
     GitCommitRequest,
     GitDiffRequest,
     GitPushRequest,
@@ -22,6 +23,8 @@ from ..schemas import (
     OdooShCommandRequest,
     OdooShLogRequest,
     OdooShModuleUpdateRequest,
+    OdooShVerifyManifestRequest,
+    OdooShWaitForCommitRequest,
     RepoCleanPycRequest,
     RepoDeleteRequest,
     RepoListRequest,
@@ -42,8 +45,8 @@ from .qa import self_run
 from .repo import repo_delete, repo_write, repo_apply_patch, repo_clean_pyc
 from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update
-from .odoosh import odoosh_module_update
-from .workflow import capability_check, full_verify
+from .odoosh import odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
+from .workflow import capability_check, full_verify, safe_deploy_module
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
@@ -53,6 +56,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="connector.health", description="Check connector service health", read_only=True),
     ToolDescriptor(name="workflow.capability_check", description="Check local connector capabilities and missing runtime configuration", read_only=True),
     ToolDescriptor(name="workflow.full_verify", description="Run the full self-verification workflow for an Odoo module", read_only=True),
+    ToolDescriptor(name="workflow.safe_deploy_module", description="Safely commit, push, wait for Odoo.sh deployment, verify manifest, and upgrade an Odoo module", requires_approval=True),
     ToolDescriptor(name="qa.self_run", description="Run Odoo custom module static QA and optional pytest/git status", read_only=True),
     ToolDescriptor(name="repo.list", description="List files inside an allowed project path", read_only=True),
     ToolDescriptor(name="repo.read", description="Read a UTF-8 file inside an allowed project path", read_only=True),
@@ -67,6 +71,8 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="git.push", description="Push current branch to remote", requires_approval=True),
     ToolDescriptor(name="odoosh.health", description="Check Odoo.sh SSH health", read_only=True),
     ToolDescriptor(name="odoosh.git_status", description="Read Odoo.sh deployed git status", read_only=True),
+    ToolDescriptor(name="odoosh.wait_for_commit", description="Wait until Odoo.sh ~/src/user reaches an expected Git SHA", read_only=True),
+    ToolDescriptor(name="odoosh.verify_module_manifest", description="Verify a module manifest exists and is installable on Odoo.sh", read_only=True),
     ToolDescriptor(name="odoosh.log", description="Tail an Odoo.sh log", read_only=True),
     ToolDescriptor(name="odoosh.grep_errors", description="Search Odoo.sh logs for errors", read_only=True),
     ToolDescriptor(name="odoosh.module_update", description="Run Odoo module update through Odoo.sh SSH", requires_approval=True),
@@ -89,6 +95,7 @@ _TOOL_INPUT_MODELS = {
     "connector.health": EmptyRequest,
     "workflow.capability_check": EmptyRequest,
     "workflow.full_verify": FullVerifyRequest,
+    "workflow.safe_deploy_module": SafeDeployModuleRequest,
     "qa.self_run": SelfRunRequest,
     "repo.list": RepoListRequest,
     "repo.read": RepoReadRequest,
@@ -103,6 +110,8 @@ _TOOL_INPUT_MODELS = {
     "git.push": GitPushRequest,
     "odoosh.health": EmptyRequest,
     "odoosh.git_status": EmptyRequest,
+    "odoosh.wait_for_commit": OdooShWaitForCommitRequest,
+    "odoosh.verify_module_manifest": OdooShVerifyManifestRequest,
     "odoosh.log": OdooShLogRequest,
     "odoosh.grep_errors": OdooShCommandRequest,
     "odoosh.module_update": OdooShModuleUpdateRequest,
@@ -158,6 +167,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return capability_check()
     if name == "workflow.full_verify":
         return await full_verify(FullVerifyRequest.model_validate(args))
+    if name == "workflow.safe_deploy_module":
+        return safe_deploy_module(SafeDeployModuleRequest.model_validate(args))
     if name == "qa.self_run":
         return self_run(SelfRunRequest.model_validate(args))
     if name == "repo.list":
@@ -191,6 +202,10 @@ async def _dispatch(name: str, args: dict) -> object:
         return OdooShService().health()
     if name == "odoosh.git_status":
         return OdooShService().git_status()
+    if name == "odoosh.wait_for_commit":
+        return odoosh_wait_for_commit(OdooShWaitForCommitRequest.model_validate(args))
+    if name == "odoosh.verify_module_manifest":
+        return odoosh_verify_module_manifest(OdooShVerifyManifestRequest.model_validate(args))
     if name == "odoosh.log":
         req = OdooShLogRequest.model_validate(args)
         return OdooShService().tail_log(req.log_name, req.tail_lines)

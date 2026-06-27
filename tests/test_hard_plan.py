@@ -199,7 +199,7 @@ def test_full_verify_failure_creates_failed_job_and_audit(tmp_path, monkeypatch)
     assert any(event["action"] == "job.update" for event in audit.json())
 
 
-def test_protected_branch_push_consumes_approval_even_when_global_approval_off(tmp_path, monkeypatch):
+def test_protected_branch_push_marks_failed_approval_when_command_fails_even_when_global_approval_off(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     monkeypatch.setattr(settings, "require_approval", False)
@@ -210,11 +210,11 @@ def test_protected_branch_push_consumes_approval_even_when_global_approval_off(t
     approved = JsonStore().create_approval(ApprovalRecord(action="git.push", summary="push main", status=ApprovalStatus.approved))
     first = client.post("/git/push", headers=_auth(), json={"project_path": str(project), "remote": "origin", "branch": "main", "approval_id": approved.id})
     assert first.status_code == 200
-    assert JsonStore().get_approval(approved.id).status == ApprovalStatus.consumed
+    assert JsonStore().get_approval(approved.id).status == ApprovalStatus.failed
 
     second = client.post("/git/push", headers=_auth(), json={"project_path": str(project), "remote": "origin", "branch": "main", "approval_id": approved.id})
     assert second.status_code == 403
-    assert "consumed" in second.text
+    assert "failed" in second.text
 
 
 def test_protected_branch_matching_is_case_and_ref_normalized(tmp_path, monkeypatch):

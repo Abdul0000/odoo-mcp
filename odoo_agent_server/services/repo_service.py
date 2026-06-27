@@ -70,6 +70,7 @@ class RepoService:
         return FileContent(path=target.relative_to(self.project(project_path)).as_posix(), content=content, size=size)
 
     def write_file(self, project_path: str, relative_path: str, content: str, create_dirs: bool = True) -> FileContent:
+        self._reject_git_internal_path(relative_path)
         target = self.target(project_path, relative_path)
         if create_dirs:
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -79,6 +80,7 @@ class RepoService:
         return FileContent(path=target.relative_to(self.project(project_path)).as_posix(), content=content, size=target.stat().st_size)
 
     def delete_file(self, project_path: str, relative_path: str) -> dict[str, str]:
+        self._reject_git_internal_path(relative_path)
         target = self.target(project_path, relative_path)
         if not target.exists() or not target.is_file():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: {target}")
@@ -116,6 +118,15 @@ class RepoService:
             shutil.rmtree(cache_dir, ignore_errors=True)
         return RepoCleanPycResult(project_path=str(base), scanned_path=str(root), removed_files=removed_files, removed_dirs=removed_dirs)
 
+
+    def _reject_git_internal_path(self, relative_path: str) -> None:
+        normalized = relative_path.replace("\\", "/").strip("/")
+        if normalized == ".git" or normalized.startswith(".git/"):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Writing inside .git is blocked. Use dedicated git tools.",
+            )
+
     def _safe_join(self, project: Path, relative_path: str) -> Path:
         if not relative_path:
             relative_path = "."
@@ -145,6 +156,8 @@ class RepoService:
                 candidate = candidate[2:]
             parts = [part for part in candidate.replace("\\", "/").split("/") if part]
             if not parts:
+                return False
+            if parts[0] == ".git":
                 return False
             return all(part not in {".", ".."} for part in parts)
 

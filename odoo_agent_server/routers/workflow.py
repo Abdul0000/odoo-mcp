@@ -4,7 +4,7 @@ import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, status
 
 from ..auth import AuthDependency
 from ..config import settings
@@ -17,7 +17,10 @@ from ..schemas import (
     JobStep,
     Severity,
     WorkflowReport,
+    SafeDeployModuleRequest,
+    SelfRunRequest,
 )
+from ..services.approval_service import ApprovalService
 from ..services.git_service import GitService
 from ..services.odoo_rpc_service import OdooRpcService
 from ..services.odoosh_service import OdooShService
@@ -155,4 +158,118 @@ async def full_verify(payload: FullVerifyRequest) -> WorkflowReport:
             "step_count": len(finished.steps),
             "result": final_status,
         },
+    )
+
+
+@router.post("/safe-deploy-module", response_model=WorkflowReport)
+def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport:
+    """Atomic safe path: commit, push, wait for Odoo.sh deployment, then update module.
+
+    This endpoint intentionally performs the deployment as one approved workflow
+    so tools cannot accidentally upgrade stale Odoo.sh code after a push.
+    """
+    approval = ApprovalService()
+    approval.ensure_allowed("workflow.safe_deploy_module", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
+
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running, request=payload.model_dump(mode="json")))
+    git = GitService()
+    odoosh = OdooShService()
+
+    def step(name: str, status_: str, result=None, error: str | None = None) -> None:
+        current_job = store.get_job(job.id)
+        store.add_step(
+            current_job,
+            JobStep(
+                name=name,
+                status=status_,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                result=result.model_dump(mode="json") if hasattr(result, "model_dump") else result,
+                error=error,
+            ),
+        )
+
+    def fail(name: str, result=None, error: str | None = None) -> WorkflowReport:
+        step(name, "failed", result, error)
+        fresh = store.get_job(job.id)
+        finished = store.finish_job(fresh, JobStatus.failed, {"failed_step": name, "module_name": payload.module_name})
+        approval.mark_failed(payload.approval_id, f"workflow.safe_deploy_module failed at {name}")
+        return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={"failed_step": name, "module_name": payload.module_name})
+
+    try:
+        project_path = resolve_allowed_path(payload.project_path)
+        module_path = project_path / payload.module_name
+        if not module_path.exists():
+            return fail("resolve_project", error=f"Module path not found: {module_path}")
+        step("resolve_project", "passed", {"project_path": str(project_path), "module_path": str(module_path)})
+    except Exception as exc:  # noqa: BLE001
+        return fail("resolve_project", error=str(exc))
+
+    status_result = git.status(str(project_path))
+    if status_result.exit_code != 0:
+        return fail("git_status", status_result)
+    step("git_status", "passed", status_result)
+
+    if payload.run_qa:
+        qa_report = self_run(SelfRunRequest(project_path=str(project_path), module_name=payload.module_name, run_pytest=True, include_git_status=True, timeout_seconds=min(payload.timeout_seconds, 600)))
+        step("qa_self_run", qa_report.status, qa_report)
+        if qa_report.status == "failed":
+            return fail("qa_self_run", qa_report)
+
+    identity_result = git.configure_identity(str(project_path))
+    if identity_result.exit_code != 0:
+        return fail("git_configure_identity", identity_result)
+    step("git_configure_identity", "passed", identity_result)
+
+    branch = payload.branch or settings.target_git_branch
+    target_result = git.validate_target(str(project_path), branch, payload.remote)
+    if target_result.exit_code != 0:
+        return fail("git_validate_target", target_result)
+    step("git_validate_target", "passed", target_result)
+
+    commit_result = git.commit(str(project_path), payload.commit_message, payload.paths, min(payload.timeout_seconds, 300))
+    if commit_result.exit_code != 0:
+        return fail("git_commit", commit_result)
+    step("git_commit", "passed", commit_result)
+
+    sha_result = git.head_sha(str(project_path))
+    if sha_result.exit_code != 0:
+        return fail("git_head_sha", sha_result)
+    pushed_sha = sha_result.stdout.strip()
+    step("git_head_sha", "passed", sha_result)
+
+    push_result = git.push(str(project_path), payload.remote, branch, True, min(payload.timeout_seconds, 600))
+    if push_result.exit_code != 0:
+        return fail("git_push", push_result)
+    step("git_push", "passed", push_result)
+
+    if payload.wait_for_odoosh:
+        wait_result = odoosh.wait_for_commit(pushed_sha, min(payload.timeout_seconds, 1800), settings.odoosh_wait_interval_seconds)
+        if wait_result.exit_code != 0:
+            return fail("odoosh_wait_for_commit", wait_result)
+        step("odoosh_wait_for_commit", "passed", wait_result)
+
+    manifest_result = odoosh.verify_module_manifest(payload.module_name)
+    if manifest_result.exit_code != 0:
+        return fail("odoosh_verify_module_manifest", manifest_result)
+    step("odoosh_verify_module_manifest", "passed", manifest_result)
+
+    if payload.upgrade_module:
+        update_result = odoosh.module_update(payload.module_name, min(payload.timeout_seconds, 1800))
+        if update_result.exit_code != 0:
+            return fail("odoosh_module_update", update_result)
+        step("odoosh_module_update", "passed", update_result)
+
+    module_status = OdooRpcService().module_status(payload.module_name)
+    status_ = "passed" if module_status.status == "ok" else "warning"
+    step("odoo_module_status", status_, module_status)
+
+    fresh = store.get_job(job.id)
+    finished = store.finish_job(fresh, JobStatus.passed, {"module_name": payload.module_name, "sha": pushed_sha})
+    approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module succeeded")
+    return WorkflowReport(
+        status="passed",
+        job_id=job.id,
+        steps=finished.steps,
+        summary={"module_name": payload.module_name, "sha": pushed_sha, "result": "passed"},
     )

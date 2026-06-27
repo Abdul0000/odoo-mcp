@@ -14,6 +14,14 @@ class ApprovalService:
         self.store = JsonStore()
 
     def ensure_allowed(self, action: str, approval_id: str | None, payload_preview: dict[str, Any] | None = None) -> None:
+        """Validate approval without consuming it before the action runs.
+
+        The old implementation consumed approvals before command execution. If a
+        command failed for an environmental reason, for example missing Git user
+        identity, the same approval could not be retried. This method now marks
+        approved actions as running. Call mark_consumed/mark_failed after the
+        command result is known.
+        """
         if not settings.require_approval or action not in settings.approval_required_actions:
             self.store.log_audit(action, "allowed", "Approval not required", {"approval_required": False})
             return
@@ -37,6 +45,27 @@ class ApprovalService:
         record = self.store.get_approval(approval_id)
         if record.action != action:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Approval action does not match requested action")
-        if record.status != ApprovalStatus.approved:
+        if record.status not in {ApprovalStatus.approved, ApprovalStatus.running}:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Approval is not approved: {record.status.value}")
-        self.store.set_approval_status(approval_id, ApprovalStatus.consumed, reason="Consumed by action execution")
+        if record.status == ApprovalStatus.approved:
+            self.store.set_approval_status(approval_id, ApprovalStatus.running, reason="Action execution started")
+
+    def mark_consumed(self, approval_id: str | None, reason: str | None = None) -> None:
+        if approval_id:
+            self.store.set_approval_status(approval_id, ApprovalStatus.consumed, reason=reason or "Action succeeded")
+
+    def mark_failed(self, approval_id: str | None, reason: str | None = None) -> None:
+        if approval_id:
+            self.store.set_approval_status(approval_id, ApprovalStatus.failed, reason=reason or "Action failed")
+
+    def finalize_command(self, approval_id: str | None, exit_code: int, success_reason: str, failure_reason: str) -> None:
+        if exit_code == 0:
+            self.mark_consumed(approval_id, success_reason)
+        else:
+            self.mark_failed(approval_id, failure_reason)
+
+    def finalize_status(self, approval_id: str | None, ok: bool, success_reason: str, failure_reason: str) -> None:
+        if ok:
+            self.mark_consumed(approval_id, success_reason)
+        else:
+            self.mark_failed(approval_id, failure_reason)

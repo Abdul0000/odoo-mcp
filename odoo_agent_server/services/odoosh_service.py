@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,11 +21,22 @@ class SshTarget:
 class OdooShService:
     """Small, safe SSH connector for Odoo.sh builds.
 
-    Odoo.sh does not need a special deploy trigger in most projects: pushing the
-    GitHub branch is what starts a new build. This service is for verification:
-    reading logs, checking the build filesystem, and optionally running an
-    allowlisted module update command on a development/staging shell.
+    Odoo.sh deploys user code asynchronously after Git push. This service exposes
+    verification primitives so callers can wait for the deployed commit before
+    running an update command.
     """
+
+    FAILURE_PATTERNS = [
+        "not installable",
+        "inconsistent states",
+        "Traceback",
+        "CRITICAL",
+        "ParseError",
+        "ValidationError",
+        "ModuleNotFoundError",
+        "ImportError",
+        "Failed to load registry",
+    ]
 
     def _target(self) -> SshTarget:
         if not settings.odoosh_ssh_host:
@@ -91,6 +103,48 @@ class OdooShService:
         script = "set -e; cd ~/src/user; git status --short --branch; git rev-parse --abbrev-ref HEAD || true; git rev-parse HEAD"
         return self.run_shell(script, timeout_seconds=30)
 
+    def deployed_sha(self) -> CommandResult:
+        script = "set -e; cd ~/src/user; git rev-parse HEAD"
+        return self.run_shell(script, timeout_seconds=30)
+
+    def wait_for_commit(self, expected_sha: str, timeout_seconds: int | None = None, interval_seconds: int | None = None) -> CommandResult:
+        timeout_seconds = timeout_seconds or settings.odoosh_wait_timeout_seconds
+        interval_seconds = interval_seconds or settings.odoosh_wait_interval_seconds
+        deadline = time.time() + timeout_seconds
+        expected = expected_sha.strip()
+        attempts: list[str] = []
+        while time.time() < deadline:
+            result = self.deployed_sha()
+            current = result.stdout.strip()
+            attempts.append(current or f"exit={result.exit_code}:{result.stderr.strip()[:120]}")
+            if result.exit_code == 0 and current and (current.startswith(expected) or expected.startswith(current)):
+                return CommandResult(
+                    command=["odoosh.wait_for_commit", expected],
+                    cwd="odoosh:ssh",
+                    exit_code=0,
+                    stdout=f"ODOOSH_DEPLOYED_COMMIT_OK\nexpected={expected}\ncurrent={current}\n",
+                )
+            time.sleep(interval_seconds)
+        return CommandResult(
+            command=["odoosh.wait_for_commit", expected],
+            cwd="odoosh:ssh",
+            exit_code=124,
+            stdout="\n".join(attempts[-10:]),
+            stderr=f"Odoo.sh did not deploy expected commit within {timeout_seconds}s. Expected {expected}.",
+            timed_out=True,
+        )
+
+    def verify_module_manifest(self, module_name: str) -> CommandResult:
+        safe_module = shlex.quote(module_name)
+        user_addons = shlex.quote(settings.odoosh_user_addons_path)
+        script = (
+            "set -e; "
+            f"test -f {user_addons}/{safe_module}/__manifest__.py; "
+            f"grep -E \"['\\\"]installable['\\\"] *: *True\" {user_addons}/{safe_module}/__manifest__.py >/dev/null; "
+            f"echo MODULE_MANIFEST_OK:{module_name}"
+        )
+        return self.run_shell(script, timeout_seconds=30)
+
     def tail_log(self, log_name: OdooShLogName, tail_lines: int = 200) -> CommandResult:
         safe_lines = max(20, min(tail_lines, 2000))
         filename = f"~/logs/{log_name.value}.log"
@@ -108,8 +162,6 @@ class OdooShService:
         return self.run_shell(script, timeout_seconds=45)
 
     def module_update(self, module_name: str, timeout_seconds: int = 600) -> CommandResult:
-        # This is intentionally explicit and requires ODOOSH_DB_NAME. It should be
-        # used only on development/staging builds unless the user approves production.
         if not settings.odoosh_db_name:
             return CommandResult(
                 command=["odoosh_module_update"],
@@ -119,12 +171,30 @@ class OdooShService:
             )
         safe_module = shlex.quote(module_name)
         safe_db = shlex.quote(settings.odoosh_db_name)
+        odoo_path = shlex.quote(settings.odoosh_odoo_path)
+        addons_path = ",".join(
+            [
+                f"{settings.odoosh_odoo_path}/odoo/addons",
+                f"{settings.odoosh_odoo_path}/addons",
+                settings.odoosh_user_addons_path,
+            ]
+        )
+        safe_addons = shlex.quote(addons_path)
         script = (
             "set -e; "
-            "cd ~/src/odoo; "
-            f"./odoo-bin -d {safe_db} -u {safe_module} --stop-after-init --log-level=info"
+            f"cd {odoo_path}; "
+            f"./odoo-bin -d {safe_db} --addons-path={safe_addons} -u {safe_module} --stop-after-init --log-level=info"
         )
-        return self.run_shell(script, timeout_seconds=timeout_seconds)
+        result = self.run_shell(script, timeout_seconds=timeout_seconds)
+        return self._classify_module_update_result(result)
+
+    def _classify_module_update_result(self, result: CommandResult) -> CommandResult:
+        text = f"{result.stdout}\n{result.stderr}"
+        matched = [pattern for pattern in self.FAILURE_PATTERNS if pattern in text]
+        if result.exit_code == 0 and matched:
+            result.exit_code = 3
+            result.stderr = (result.stderr or "") + "\nMCP_CLASSIFIED_FAILURE: module update logs contain failure pattern(s): " + ", ".join(matched)
+        return result
 
     @staticmethod
     def _redacted_command(command: list[str]) -> list[str]:

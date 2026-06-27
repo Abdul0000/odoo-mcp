@@ -16,6 +16,7 @@ EXPECTED_OPERATIONAL_MCP_TOOLS = {
     # workflow
     "workflow.capability_check",
     "workflow.full_verify",
+    "workflow.safe_deploy_module",
     # QA
     "qa.self_run",
     # repo
@@ -34,6 +35,8 @@ EXPECTED_OPERATIONAL_MCP_TOOLS = {
     # Odoo.sh
     "odoosh.health",
     "odoosh.git_status",
+    "odoosh.wait_for_commit",
+    "odoosh.verify_module_manifest",
     "odoosh.log",
     "odoosh.grep_errors",
     "odoosh.module_update",
@@ -64,7 +67,7 @@ def test_mcp_tools_list_exposes_every_operational_api_tool():
     tools = response.json()["result"]["tools"]
     names = {tool["name"] for tool in tools}
     assert names == EXPECTED_OPERATIONAL_MCP_TOOLS
-    assert len(tools) == 33
+    assert len(tools) == 36
     for tool in tools:
         assert tool["inputSchema"]["type"] == "object"
         assert "description" in tool

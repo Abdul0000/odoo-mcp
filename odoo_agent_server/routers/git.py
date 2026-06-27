@@ -27,12 +27,8 @@ def _is_protected_branch(branch: str | None) -> bool:
     return bool(normalised and normalised in protected)
 
 
-def _consume_protected_branch_approval(branch: str | None, approval_id: str | None) -> bool:
-    """Protected branches always require a real single-use git.push approval.
-
-    This protection is independent from the global approval switch because an
-    accidental production push is high impact even on a development connector.
-    """
+def _ensure_protected_branch_approval(branch: str | None, approval_id: str | None) -> bool:
+    """Protected branches always require an approved git.push approval."""
     if not _is_protected_branch(branch):
         return False
     if not approval_id:
@@ -44,9 +40,10 @@ def _consume_protected_branch_approval(branch: str | None, approval_id: str | No
     record = store.get_approval(approval_id)
     if record.action != "git.push":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Approval action does not match protected git.push")
-    if record.status != ApprovalStatus.approved:
+    if record.status not in {ApprovalStatus.approved, ApprovalStatus.running}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Approval is not approved: {record.status.value}")
-    store.set_approval_status(approval_id, ApprovalStatus.consumed, reason="Consumed by protected branch git.push attempt")
+    if record.status == ApprovalStatus.approved:
+        store.set_approval_status(approval_id, ApprovalStatus.running, reason="Protected branch git.push started")
     return True
 
 
@@ -71,8 +68,10 @@ def git_diff(payload: GitDiffRequest) -> CommandResult:
 
 @router.post("/commit", response_model=CommandResult)
 def git_commit(payload: GitCommitRequest) -> CommandResult:
-    ApprovalService().ensure_allowed("git.commit", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
+    approval = ApprovalService()
+    approval.ensure_allowed("git.commit", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     result = GitService().commit(payload.project_path, payload.message, payload.paths, payload.timeout_seconds)
+    approval.finalize_command(payload.approval_id, result.exit_code, "git.commit succeeded", "git.commit failed")
     JsonStore().log_audit("git.commit", "ok" if result.exit_code == 0 else "failed", payload.message, {"paths": payload.paths})
     return result
 
@@ -84,9 +83,11 @@ def git_push(payload: GitPushRequest) -> CommandResult:
         branch_result = GitService().current_branch(payload.project_path)
         if branch_result.exit_code == 0:
             branch = branch_result.stdout.strip()
-    protected_approval_consumed = _consume_protected_branch_approval(branch, payload.approval_id)
-    if not protected_approval_consumed:
-        ApprovalService().ensure_allowed("git.push", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
+    protected_approval = _ensure_protected_branch_approval(branch, payload.approval_id)
+    approval = ApprovalService()
+    if not protected_approval:
+        approval.ensure_allowed("git.push", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     result = GitService().push(payload.project_path, payload.remote, payload.branch, payload.set_upstream, payload.timeout_seconds)
+    approval.finalize_command(payload.approval_id, result.exit_code, "git.push succeeded", "git.push failed")
     JsonStore().log_audit("git.push", "ok" if result.exit_code == 0 else "failed", branch or "current", {"remote": payload.remote})
     return result

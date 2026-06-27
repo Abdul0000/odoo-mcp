@@ -9,3 +9,21 @@ For SSH private keys, add base64 values:
 - `GITHUB_SSH_PRIVATE_KEY_B64`
 
 The startup script writes those keys to `/tmp/keys`, clones `TARGET_GIT_REPO` to `TARGET_PROJECT_PATH`, and starts uvicorn on `${PORT:-8080}`.
+
+## Safe deployment variables
+
+Set these in Koyeb when using Git/Odoo.sh deployment tools:
+
+```env
+TARGET_GIT_REPO=git@github.com:Abdul0000/test_18.git
+TARGET_GIT_BRANCH=test_stagging_18
+TARGET_PROJECT_PATH=/workspace/repos/test_18
+GIT_AUTHOR_NAME=Odoo MCP Agent
+GIT_AUTHOR_EMAIL=odoo-mcp@example.local
+ODOOSH_ODOO_PATH=/home/odoo/src/odoo
+ODOOSH_USER_ADDONS_PATH=/home/odoo/src/user
+ODOOSH_WAIT_TIMEOUT_SECONDS=600
+ODOOSH_WAIT_INTERVAL_SECONDS=10
+```
+
+Use `workflow.safe_deploy_module` for normal changes. It waits for Odoo.sh to deploy the pushed commit before running module upgrade.

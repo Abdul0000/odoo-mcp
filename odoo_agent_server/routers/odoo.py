@@ -27,16 +27,20 @@ def odoo_module_status(payload: OdooRpcModuleRequest) -> OdooRpcResult:
 
 @router.post("/module-install", response_model=OdooRpcResult)
 def odoo_module_install(payload: OdooRpcModuleRequest) -> OdooRpcResult:
-    ApprovalService().ensure_allowed("odoo.module_install", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
+    approval = ApprovalService()
+    approval.ensure_allowed("odoo.module_install", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     result = OdooRpcService().module_install(payload.module_name)
+    approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_install succeeded", "odoo.module_install failed")
     JsonStore().log_audit("odoo.module_install", result.status, payload.module_name)
     return result
 
 
 @router.post("/module-update", response_model=OdooRpcResult)
 def odoo_module_update(payload: OdooRpcModuleRequest) -> OdooRpcResult:
-    ApprovalService().ensure_allowed("odoo.module_update", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
+    approval = ApprovalService()
+    approval.ensure_allowed("odoo.module_update", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     result = OdooRpcService().module_update(payload.module_name)
+    approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_update succeeded", "odoo.module_update failed")
     JsonStore().log_audit("odoo.module_update", result.status, payload.module_name)
     return result
 

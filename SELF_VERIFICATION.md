@@ -44,3 +44,13 @@ ODOO_AGENT_PUBLIC_BASE_URL=https://your-current-tunnel.trycloudflare.com
 ```
 
 Then restart the connector.
+
+## Added safe-deploy checks
+
+Run:
+
+```bash
+pytest -q
+```
+
+The suite now includes guard tests for Git identity setup, target branch validation, `.git` write blocking, Odoo.sh update log classification, and approval failure handling.
