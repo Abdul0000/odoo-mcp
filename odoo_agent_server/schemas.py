@@ -166,6 +166,18 @@ class RepoWriteRequest(BaseProjectRequest, ApprovalMixin):
     create_dirs: bool = True
 
 
+class RepoWriteItem(BaseModel):
+    relative_path: str
+    content: str
+    create_dirs: bool = True
+
+
+class RepoWriteManyAtomicRequest(BaseProjectRequest, ApprovalMixin):
+    files: list[RepoWriteItem] = Field(..., min_length=1, max_length=200, description="Files to write as one atomic multi-file transaction")
+    check_only: bool = Field(default=False, description="Validate the transaction without changing the real checkout")
+    timeout_seconds: int = Field(default=60, ge=5, le=300)
+
+
 class RepoDeleteRequest(BaseProjectRequest, ApprovalMixin):
     relative_path: str
 
@@ -174,6 +186,14 @@ class RepoPatchRequest(BaseProjectRequest, ApprovalMixin):
     patch: str = Field(..., description="Unified diff to apply inside project_path")
     check_only: bool = Field(default=False)
     timeout_seconds: int = Field(default=60, ge=5, le=300)
+
+
+class RepoAtomicPatchRequest(RepoPatchRequest):
+    """Apply a multi-file patch through an isolated temporary worktree/branch.
+
+    The real checkout is not changed until the whole patch validates in the
+    isolated worktree and validates again against the current checkout.
+    """
 
 
 class RepoCleanPycRequest(BaseProjectRequest, ApprovalMixin):
@@ -408,6 +428,47 @@ class FullVerifyRequest(SelfRunRequest):
     take_browser_screenshot: bool = False
     browser_start_path: str = "/web"
     screenshot_name: str = "full_verify.png"
+
+
+class StartSessionRequest(BaseModel):
+    repo_url: str | None = Field(default=None, description="Git repository URL. Defaults to TARGET_GIT_REPO.")
+    branch: str | None = Field(default=None, description="Target branch. Defaults to TARGET_GIT_BRANCH.")
+    repo_name: str | None = Field(default=None, description="Folder name under workspace_root. Defaults to configured target project.")
+    workspace_root: str | None = Field(default=None, description="Workspace root for clones. Defaults to WORKSPACE_ROOT.")
+    remote: str = Field(default="origin")
+    max_depth: int = Field(default=5, ge=1, le=10)
+    include_odoosh: bool = True
+    include_odoo: bool = True
+    timeout_seconds: int = Field(default=180, ge=30, le=900)
+
+
+class RegistrySmokeTestRequest(BaseModel):
+    module_name: str = Field(..., description="Technical module name to validate in the live Odoo registry")
+    model_names: list[str] = Field(default_factory=list, description="Models that must exist and answer a limit=1 search_read. Empty means infer common module prefix.")
+    menu_names: list[str] = Field(default_factory=list, description="Menu labels that should be present. Empty skips menu check.")
+    strict: bool = Field(default=True, description="Fail if any requested model/menu check fails")
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        return validate_safe_name(value, "module_name")
+
+
+class RestoreLastGoodCommitRequest(BaseProjectRequest, ApprovalMixin):
+    bad_sha: str = Field(..., min_length=7, description="Bad pushed commit to revert")
+    remote: str = Field(default="origin")
+    branch: str | None = Field(default=None, description="Defaults to current branch or TARGET_GIT_BRANCH")
+    push: bool = Field(default=True, description="Push the revert commit after creating it")
+    timeout_seconds: int = Field(default=300, ge=30, le=900)
+
+
+class MenuCrawlerRequest(BaseModel):
+    base_url: str | None = Field(default=None)
+    login: str | None = Field(default=None)
+    password: str | None = Field(default=None)
+    paths: list[str] = Field(default_factory=lambda: ["/web"], max_length=50)
+    screenshot_prefix: str = Field(default="menu_crawl")
+    timeout_seconds: int = Field(default=45, ge=10, le=180)
 
 
 class WorkflowReport(BaseModel):

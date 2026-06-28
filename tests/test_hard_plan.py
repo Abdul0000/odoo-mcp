@@ -125,6 +125,7 @@ def test_protected_branch_push_requires_real_approved_git_push_approval_even_whe
 
 
 def test_tools_list_reflects_runtime_approval_policy(monkeypatch):
+    monkeypatch.setattr(settings, "require_approval", True)
     monkeypatch.setattr(settings, "approval_required_actions_raw", "git.push,repo.apply_patch")
     client = TestClient(app)
     response = client.get("/tools/list", headers=_auth())
@@ -265,3 +266,62 @@ def test_tool_bridge_respects_write_approval_gate(tmp_path, monkeypatch):
     assert "approval_required" in payload["error"]
     assert not (project / "a.txt").exists()
     monkeypatch.setattr(settings, "require_approval", False)
+
+
+
+def test_write_many_atomic_applies_all_files_or_none(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    _init_repo(project, branch="dev")
+    client = TestClient(app)
+
+    failing = client.post(
+        "/repo/write-many-atomic",
+        headers=_auth(),
+        json={
+            "project_path": str(project),
+            "files": [
+                {"relative_path": "a.txt", "content": "A\n"},
+                {"relative_path": "missing/b.txt", "content": "B\n", "create_dirs": False},
+            ],
+        },
+    )
+    assert failing.status_code == 200
+    assert failing.json()["exit_code"] != 0
+    assert not (project / "a.txt").exists()
+    assert not (project / "missing" / "b.txt").exists()
+
+    ok = client.post(
+        "/repo/write-many-atomic",
+        headers=_auth(),
+        json={
+            "project_path": str(project),
+            "files": [
+                {"relative_path": "a.txt", "content": "A\n"},
+                {"relative_path": "missing/b.txt", "content": "B\n"},
+            ],
+        },
+    )
+    assert ok.status_code == 200
+    assert ok.json()["exit_code"] == 0
+    assert (project / "a.txt").read_text(encoding="utf-8") == "A\n"
+    assert (project / "missing" / "b.txt").read_text(encoding="utf-8") == "B\n"
+    branches = subprocess.run(["git", "branch", "--list", "atomic-edit-*"], cwd=project, text=True, capture_output=True, check=True)
+    assert branches.stdout.strip() == ""
+
+
+def test_apply_patch_atomic_check_only_and_apply(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    _init_repo(project, branch="dev")
+    patch = """diff --git a/README.md b/README.md\nindex e79c5e8..b6fc4c6 100644\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-initial\n+atomic\n"""
+    client = TestClient(app)
+    checked = client.post("/repo/apply-patch-atomic", headers=_auth(), json={"project_path": str(project), "patch": patch, "check_only": True})
+    assert checked.status_code == 200
+    assert checked.json()["exit_code"] == 0
+    assert (project / "README.md").read_text(encoding="utf-8") == "initial\n"
+
+    applied = client.post("/repo/apply-patch-atomic", headers=_auth(), json={"project_path": str(project), "patch": patch})
+    assert applied.status_code == 200
+    assert applied.json()["exit_code"] == 0
+    assert (project / "README.md").read_text(encoding="utf-8") == "atomic\n"

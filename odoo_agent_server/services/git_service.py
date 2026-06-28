@@ -10,6 +10,7 @@ from ..config import settings
 from ..schemas import CommandResult
 from .path_service import resolve_allowed_path
 from .repo_service import RepoService
+from .lock_service import RepoLockService
 
 
 class GitService:
@@ -92,8 +93,31 @@ class GitService:
             )
         return CommandResult(command=["git", "validate-target"], cwd=str(project), exit_code=0, stdout="Target git remote/branch validated.\n")
 
+    def pull_rebase(self, project_path: str, remote: str = "origin", branch: str | None = None, timeout_seconds: int = 120) -> CommandResult:
+        project = self._project(project_path)
+        if not branch:
+            branch_result = self.current_branch(str(project))
+            if branch_result.exit_code != 0:
+                return branch_result
+            branch = branch_result.stdout.strip()
+        if branch in {"", "HEAD"}:
+            return CommandResult(command=["git", "pull", "--rebase"], cwd=str(project), exit_code=0, stdout="Detached HEAD; skipping pull --rebase.\n")
+        remote_result = self._run(["git", "remote", "get-url", remote], project, 20)
+        if remote_result.exit_code != 0:
+            return CommandResult(command=["git", "pull", "--rebase", "--autostash", remote, branch], cwd=str(project), exit_code=0, stdout=f"Remote {remote} not configured; skipping pull --rebase.\n")
+        fetch = self._run(["git", "fetch", remote], project, timeout_seconds)
+        if fetch.exit_code != 0:
+            return fetch
+        return self._run(["git", "pull", "--rebase", "--autostash", remote, branch], project, timeout_seconds)
+
     def commit(self, project_path: str, message: str, paths: list[str], timeout_seconds: int = 60) -> CommandResult:
         project = self._project(project_path)
+        branch_result = self.current_branch(str(project))
+        branch = branch_result.stdout.strip() if branch_result.exit_code == 0 else None
+        # Reduce push conflicts: rebase from the configured upstream before staging/committing.
+        rebase_result = self.pull_rebase(str(project), "origin", branch, min(timeout_seconds, 120))
+        if rebase_result.exit_code != 0 and settings.target_git_repo:
+            return rebase_result
         identity_result = self.configure_identity(str(project))
         if identity_result.exit_code != 0:
             return identity_result
@@ -104,13 +128,21 @@ class GitService:
                 add_command.append(rel)
         else:
             add_command = ["git", "add", "-A"]
-        add_result = self._run(add_command, project, timeout_seconds)
-        if add_result.exit_code != 0:
-            return add_result
-        diff_result = self._run(["git", "diff", "--cached", "--quiet"], project, timeout_seconds)
-        if diff_result.exit_code == 0:
-            return CommandResult(command=["git", "commit", "-m", message], cwd=str(project), exit_code=1, stderr="No staged changes to commit.")
-        return self._run(["git", "commit", "-m", message], project, timeout_seconds)
+        with RepoLockService().locked(str(project), owner="git.commit", timeout_seconds=min(timeout_seconds, 120)):
+            add_result = self._run(add_command, project, timeout_seconds)
+            if add_result.exit_code != 0:
+                return add_result
+            diff_result = self._run(["git", "diff", "--cached", "--quiet"], project, timeout_seconds)
+            if diff_result.exit_code == 0:
+                return CommandResult(command=["git", "commit", "-m", message], cwd=str(project), exit_code=1, stderr="No staged changes to commit.")
+            return self._run(["git", "commit", "-m", message], project, timeout_seconds)
+
+
+    def revert_commit(self, project_path: str, sha: str, timeout_seconds: int = 120) -> CommandResult:
+        project = self._project(project_path)
+        if not sha or not all(c in "0123456789abcdefABCDEF" for c in sha[:40]):
+            return CommandResult(command=["git", "revert", sha], cwd=str(project), exit_code=2, stderr="Unsafe or empty SHA for revert.")
+        return self._run(["git", "revert", "--no-edit", sha], project, timeout_seconds)
 
     def push(self, project_path: str, remote: str = "origin", branch: str | None = None, set_upstream: bool = True, timeout_seconds: int = 120) -> CommandResult:
         project = self._project(project_path)
@@ -133,7 +165,13 @@ class GitService:
             command.extend(["-u", remote, f"HEAD:{branch}"])
         else:
             command.extend([remote, f"HEAD:{branch}"])
-        result = self._run(command, project, timeout_seconds)
+        with RepoLockService().locked(str(project), owner="git.push", timeout_seconds=min(timeout_seconds, 120)):
+            result = self._run(command, project, timeout_seconds)
+            if result.exit_code != 0 and ("non-fast-forward" in (result.stderr or "") or "fetch first" in (result.stderr or "") or "rejected" in (result.stderr or "")):
+                rebase = self.pull_rebase(str(project), remote, branch, min(timeout_seconds, 120))
+                if rebase.exit_code != 0:
+                    return rebase
+                result = self._run(command, project, timeout_seconds)
         if result.exit_code == 0:
             sha = self.head_sha(str(project)).stdout.strip()
             result.stdout = (result.stdout or "") + f"\nPUSH_OK\nbranch={branch}\nsha={sha}\n"

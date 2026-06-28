@@ -10,6 +10,10 @@ from ..schemas import (
     AuditListRequest,
     BaseProjectRequest,
     BrowserCheckRequest,
+    StartSessionRequest,
+    RegistrySmokeTestRequest,
+    RestoreLastGoodCommitRequest,
+    MenuCrawlerRequest,
     CodingTaskPlanRequest,
     EmptyRequest,
     FullVerifyRequest,
@@ -27,6 +31,7 @@ from ..schemas import (
     OdooShModuleUpdateRequest,
     OdooShVerifyManifestRequest,
     OdooShWaitForCommitRequest,
+    RepoAtomicPatchRequest,
     RepoCleanPycRequest,
     RepoCustomModulesRequest,
     RepoDeleteRequest,
@@ -34,6 +39,7 @@ from ..schemas import (
     RepoPatchRequest,
     RepoPrepareRequest,
     RepoReadRequest,
+    RepoWriteManyAtomicRequest,
     RepoWriteRequest,
     SelfRunRequest,
     ToolCallRequest,
@@ -46,11 +52,11 @@ from ..services.odoosh_service import OdooShService
 from ..services.playwright_service import PlaywrightService
 from ..services.repo_service import RepoService
 from .qa import self_run
-from .repo import repo_delete, repo_write, repo_apply_patch, repo_clean_pyc, repo_prepare, repo_custom_modules
+from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_apply_patch, repo_apply_patch_atomic, repo_clean_pyc, repo_prepare, repo_custom_modules
 from .git import git_commit, git_push
-from .odoo import odoo_module_install, odoo_module_update
-from .odoosh import odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
-from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan
+from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy
+from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
+from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
@@ -62,14 +68,20 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.coding_task_plan", description="Return the repo-first coding workflow guidance for ChatGPT MCP clients", read_only=True),
     ToolDescriptor(name="workflow.full_verify", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module", description="Safely commit, push, wait for Odoo.sh deployment, verify manifest, and upgrade an Odoo module", requires_approval=True),
+    ToolDescriptor(name="workflow.start_session", description="Bootstrap a coding session: capability check, repo.prepare, git status, module discovery, Odoo/Odoo.sh health", requires_approval=True),
+    ToolDescriptor(name="workflow.registry_smoke_test", description="Verify live Odoo registry models/menus after install or upgrade", read_only=True),
+    ToolDescriptor(name="workflow.restore_last_good_commit", description="Emergency restore by reverting a bad commit and optionally pushing the revert", requires_approval=True),
+    ToolDescriptor(name="workflow.browser_menu_crawl", description="Open multiple Odoo paths and capture screenshot/console/network errors", read_only=True),
     ToolDescriptor(name="qa.self_run", description="Run Odoo custom module static QA and optional pytest/git status", read_only=True),
     ToolDescriptor(name="repo.prepare", description="Clone or refresh target repo and checkout/pull the target branch before coding", requires_approval=True),
     ToolDescriptor(name="repo.list_custom_modules", description="Discover custom Odoo modules from repo __manifest__.py files", read_only=True),
     ToolDescriptor(name="repo.list", description="List files inside an allowed project path", read_only=True),
     ToolDescriptor(name="repo.read", description="Read a UTF-8 file inside an allowed project path", read_only=True),
     ToolDescriptor(name="repo.write", description="Write a file inside an allowed project path", requires_approval=True),
+    ToolDescriptor(name="repo.write_many_atomic", description="Write many files as one atomic temp-worktree transaction", requires_approval=True),
     ToolDescriptor(name="repo.delete", description="Delete a file inside an allowed project path", requires_approval=True),
     ToolDescriptor(name="repo.apply_patch", description="Check/apply a unified diff patch", requires_approval=True),
+    ToolDescriptor(name="repo.apply_patch_atomic", description="Apply a patch through an isolated temp worktree/branch before touching the real checkout", requires_approval=True),
     ToolDescriptor(name="repo.clean_pyc", description="Remove .pyc and __pycache__ from a project", requires_approval=True),
     ToolDescriptor(name="git.status", description="Read git status", read_only=True),
     ToolDescriptor(name="git.current_branch", description="Read current git branch", read_only=True),
@@ -100,16 +112,18 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="odoosh.verify_module_manifest", description="Verify a module manifest exists and is installable on Odoo.sh", read_only=True),
     ToolDescriptor(name="odoosh.log", description="Tail an Odoo.sh log", read_only=True),
     ToolDescriptor(name="odoosh.grep_errors", description="Search Odoo.sh logs for errors", read_only=True),
+    ToolDescriptor(name="odoosh.error_pack", description="Return Odoo.sh tracebacks plus root-cause hints/files/XML/model names", read_only=True),
+    ToolDescriptor(name="odoosh.module_deploy_ssh", description="SSH smart install/upgrade via Odoo.sh. Background job. Use only when you explicitly need SSH; odoo.module_deploy falls back to this automatically.", requires_approval=True),
     ToolDescriptor(name="odoosh.module_update", description="Run Odoo module update through Odoo.sh SSH", requires_approval=True),
     ToolDescriptor(name="odoo.health", description="Check Odoo XML-RPC health", read_only=True),
     ToolDescriptor(name="odoo.module_status", description="Read Odoo module state (installed/uninstalled/not found)", read_only=True),
     ToolDescriptor(
         name="odoo.module_deploy",
         description=(
-            "SMART INSTALL — always use this instead of module_install/module_update. "
-            "Runs: update_list → check state → button_immediate_install (new) or button_immediate_upgrade (existing). "
-            "On failure returns exact error + step-by-step fix instructions. "
-            "Use this for ALL first-time installs and upgrades."
+            "SMART INSTALL/UPGRADE — always use this for ALL first-time installs and upgrades. "
+            "Runs XML-RPC when allowed; if update_list/buttons fail with Access Denied, "
+            "it automatically falls back to Odoo.sh SSH in the same background job. "
+            "Returns job_id immediately; poll jobs.get until passed/failed."
         ),
         requires_approval=True,
     ),
@@ -132,14 +146,20 @@ _TOOL_INPUT_MODELS = {
     "workflow.coding_task_plan": CodingTaskPlanRequest,
     "workflow.full_verify": FullVerifyRequest,
     "workflow.safe_deploy_module": SafeDeployModuleRequest,
+    "workflow.start_session": StartSessionRequest,
+    "workflow.registry_smoke_test": RegistrySmokeTestRequest,
+    "workflow.restore_last_good_commit": RestoreLastGoodCommitRequest,
+    "workflow.browser_menu_crawl": MenuCrawlerRequest,
     "qa.self_run": SelfRunRequest,
     "repo.prepare": RepoPrepareRequest,
     "repo.list_custom_modules": RepoCustomModulesRequest,
     "repo.list": RepoListRequest,
     "repo.read": RepoReadRequest,
     "repo.write": RepoWriteRequest,
+    "repo.write_many_atomic": RepoWriteManyAtomicRequest,
     "repo.delete": RepoDeleteRequest,
     "repo.apply_patch": RepoPatchRequest,
+    "repo.apply_patch_atomic": RepoAtomicPatchRequest,
     "repo.clean_pyc": RepoCleanPycRequest,
     "git.status": BaseProjectRequest,
     "git.current_branch": BaseProjectRequest,
@@ -154,6 +174,8 @@ _TOOL_INPUT_MODELS = {
     "odoosh.verify_module_manifest": OdooShVerifyManifestRequest,
     "odoosh.log": OdooShLogRequest,
     "odoosh.grep_errors": OdooShCommandRequest,
+    "odoosh.error_pack": OdooShCommandRequest,
+    "odoosh.module_deploy_ssh": OdooShModuleUpdateRequest,
     "odoosh.module_update": OdooShModuleUpdateRequest,
     "odoo.health": EmptyRequest,
     "odoo.module_status": OdooRpcModuleRequest,
@@ -182,7 +204,9 @@ def tool_input_schema(name: str) -> dict:
 
 @router.get("/list", response_model=list[ToolDescriptor])
 def list_tools() -> list[ToolDescriptor]:
-    required = settings.approval_required_actions
+    # If global approval is disabled, do not advertise approval as required even
+    # when an old ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS value is still present.
+    required = settings.approval_required_actions if settings.require_approval else set()
     return [item.model_copy(update={"requires_approval": item.name in required}) for item in _TOOL_DESCRIPTORS]
 
 
@@ -212,6 +236,14 @@ async def _dispatch(name: str, args: dict) -> object:
         return await full_verify(FullVerifyRequest.model_validate(args))
     if name == "workflow.safe_deploy_module":
         return safe_deploy_module(SafeDeployModuleRequest.model_validate(args))
+    if name == "workflow.start_session":
+        return start_session(StartSessionRequest.model_validate(args))
+    if name == "workflow.registry_smoke_test":
+        return registry_smoke_test(RegistrySmokeTestRequest.model_validate(args))
+    if name == "workflow.restore_last_good_commit":
+        return restore_last_good_commit(RestoreLastGoodCommitRequest.model_validate(args))
+    if name == "workflow.browser_menu_crawl":
+        return await browser_menu_crawl(MenuCrawlerRequest.model_validate(args))
     if name == "qa.self_run":
         return self_run(SelfRunRequest.model_validate(args))
     if name == "repo.prepare":
@@ -226,10 +258,14 @@ async def _dispatch(name: str, args: dict) -> object:
         return RepoService().read_file(req.project_path, req.relative_path, req.max_bytes)
     if name == "repo.write":
         return repo_write(RepoWriteRequest.model_validate(args))
+    if name == "repo.write_many_atomic":
+        return repo_write_many_atomic(RepoWriteManyAtomicRequest.model_validate(args))
     if name == "repo.delete":
         return repo_delete(RepoDeleteRequest.model_validate(args))
     if name == "repo.apply_patch":
         return repo_apply_patch(RepoPatchRequest.model_validate(args))
+    if name == "repo.apply_patch_atomic":
+        return repo_apply_patch_atomic(RepoAtomicPatchRequest.model_validate(args))
     if name == "repo.clean_pyc":
         return repo_clean_pyc(RepoCleanPycRequest.model_validate(args))
     if name == "git.status":
@@ -246,8 +282,7 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "git.push":
         return git_push(GitPushRequest.model_validate(args))
     if name == "odoosh.module_install_ssh":
-        req = OdooRpcModuleRequest.model_validate(args)
-        return OdooShService().module_install_ssh(req.module_name)
+        return odoosh_module_install_ssh(OdooRpcModuleRequest.model_validate(args))
     if name == "odoosh.health":
         return OdooShService().health()
     if name == "odoosh.git_status":
@@ -265,13 +300,17 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "odoosh.grep_errors":
         req = OdooShCommandRequest.model_validate(args)
         return OdooShService().grep_errors(req.tail_lines)
+    if name == "odoosh.error_pack":
+        req = OdooShCommandRequest.model_validate(args)
+        return OdooShService().error_pack(req.tail_lines)
+    if name == "odoosh.module_deploy_ssh":
+        return odoosh_module_deploy_ssh(OdooShModuleUpdateRequest.model_validate(args))
     if name == "odoosh.module_update":
         return odoosh_module_update(OdooShModuleUpdateRequest.model_validate(args))
     if name == "odoo.health":
         return OdooRpcService().health()
     if name == "odoo.module_deploy":
-        req = OdooRpcModuleRequest.model_validate(args)
-        return OdooRpcService().module_deploy(req.module_name)
+        return odoo_module_deploy(OdooRpcModuleRequest.model_validate(args))
     if name == "odoo.module_status":
         req = OdooRpcModuleRequest.model_validate(args)
         return OdooRpcService().module_status(req.module_name)

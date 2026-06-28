@@ -7,12 +7,14 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import HTTPException, status
 
 from ..config import settings
 from ..schemas import CommandResult, CustomModuleItem, FileContent, FileListItem, RepoCleanPycResult, RepoPrepareResult
 from .path_service import resolve_allowed_path
+from .lock_service import RepoLockService
 
 _TEXT_LIMIT_HINT = "File is too large for this endpoint. Increase max_bytes or use a narrower file."
 
@@ -197,21 +199,27 @@ class RepoService:
 
     def write_file(self, project_path: str, relative_path: str, content: str, create_dirs: bool = True) -> FileContent:
         self._reject_git_internal_path(relative_path)
-        target = self.target(project_path, relative_path)
-        if create_dirs:
-            target.parent.mkdir(parents=True, exist_ok=True)
-        elif not target.parent.exists():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Parent directory not found: {target.parent}")
-        target.write_text(content, encoding="utf-8")
-        return FileContent(path=target.relative_to(self.project(project_path)).as_posix(), content=content, size=target.stat().st_size)
+        with RepoLockService().locked(project_path, owner="repo.write", timeout_seconds=60):
+            target = self.target(project_path, relative_path)
+            if create_dirs:
+                target.parent.mkdir(parents=True, exist_ok=True)
+            elif not target.parent.exists():
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Parent directory not found: {target.parent}")
+            # Atomic write: write to a temp file in the same directory, then replace.
+            # This prevents half-written files when a client disconnects or Render restarts mid-write.
+            tmp = target.with_name(f".{target.name}.tmp")
+            tmp.write_text(content, encoding="utf-8")
+            tmp.replace(target)
+            return FileContent(path=target.relative_to(self.project(project_path)).as_posix(), content=content, size=target.stat().st_size)
 
     def delete_file(self, project_path: str, relative_path: str) -> dict[str, str]:
         self._reject_git_internal_path(relative_path)
-        target = self.target(project_path, relative_path)
-        if not target.exists() or not target.is_file():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: {target}")
-        target.unlink()
-        return {"deleted": target.relative_to(self.project(project_path)).as_posix()}
+        with RepoLockService().locked(project_path, owner="repo.delete", timeout_seconds=60):
+            target = self.target(project_path, relative_path)
+            if not target.exists() or not target.is_file():
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: {target}")
+            target.unlink()
+            return {"deleted": target.relative_to(self.project(project_path)).as_posix()}
 
     def apply_patch(self, project_path: str, patch: str, check_only: bool = False, timeout_seconds: int = 60) -> CommandResult:
         project = self.project(project_path)
@@ -224,9 +232,164 @@ class RepoService:
             check = self._run(check_cmd, project, timeout_seconds)
             if check.exit_code != 0 or check_only:
                 return check
-            return self._run(["git", "apply", str(patch_path)], project, timeout_seconds)
+            with RepoLockService().locked(project_path, owner="repo.apply_patch", timeout_seconds=timeout_seconds):
+                return self._run(["git", "apply", str(patch_path)], project, timeout_seconds)
         finally:
             patch_path.unlink(missing_ok=True)
+
+
+    def apply_patch_atomic(self, project_path: str, patch: str, check_only: bool = False, timeout_seconds: int = 60) -> CommandResult:
+        """Apply a patch through an isolated temporary git worktree/branch.
+
+        The real checkout remains untouched until:
+        1) patch paths are validated,
+        2) the patch applies cleanly in the isolated worktree,
+        3) the resulting whole-repo diff applies cleanly to the real checkout.
+        """
+        project = self.project(project_path)
+        self._validate_patch_paths(project, patch)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".patch", delete=False) as handle:
+            handle.write(patch)
+            patch_path = Path(handle.name)
+        try:
+            return self._run_atomic_worktree_transaction(
+                project=project,
+                transaction_name="repo.apply_patch_atomic",
+                timeout_seconds=timeout_seconds,
+                check_only=check_only,
+                mutate_worktree=lambda worktree: self._apply_patch_inside_worktree(worktree, patch_path, timeout_seconds),
+            )
+        finally:
+            patch_path.unlink(missing_ok=True)
+
+    def write_many_atomic(self, project_path: str, files: list[object], check_only: bool = False, timeout_seconds: int = 60) -> CommandResult:
+        """Write many files as one atomic transaction via temp worktree/branch."""
+        project = self.project(project_path)
+        seen: set[str] = set()
+        normalized_files: list[dict[str, object]] = []
+        for item in files:
+            raw_path = str(getattr(item, "relative_path", ""))
+            content = str(getattr(item, "content", ""))
+            create_dirs = bool(getattr(item, "create_dirs", True))
+            self._reject_git_internal_path(raw_path)
+            # Validate against the real project root first.
+            resolved = self._safe_join(project, raw_path)
+            rel = resolved.relative_to(project).as_posix()
+            if rel in seen:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Duplicate file in atomic write: {rel}")
+            seen.add(rel)
+            normalized_files.append({"relative_path": rel, "content": content, "create_dirs": create_dirs})
+        if not normalized_files:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="files must not be empty")
+
+        return self._run_atomic_worktree_transaction(
+            project=project,
+            transaction_name="repo.write_many_atomic",
+            timeout_seconds=timeout_seconds,
+            check_only=check_only,
+            mutate_worktree=lambda worktree: self._write_many_inside_worktree(worktree, normalized_files),
+        )
+
+    def _apply_patch_inside_worktree(self, worktree: Path, patch_path: Path, timeout_seconds: int) -> CommandResult:
+        check = self._run(["git", "apply", "--check", str(patch_path)], worktree, timeout_seconds)
+        if check.exit_code != 0:
+            return check
+        return self._run(["git", "apply", str(patch_path)], worktree, timeout_seconds)
+
+    def _write_many_inside_worktree(self, worktree: Path, files: list[dict[str, object]]) -> CommandResult:
+        changed: list[str] = []
+        for item in files:
+            rel = str(item["relative_path"])
+            target = self._safe_join(worktree, rel)
+            if bool(item.get("create_dirs", True)):
+                target.parent.mkdir(parents=True, exist_ok=True)
+            elif not target.parent.exists():
+                return CommandResult(
+                    command=["repo", "write_many_atomic"],
+                    cwd=str(worktree),
+                    exit_code=1,
+                    stderr=f"Parent directory not found: {target.parent}",
+                )
+            tmp = target.with_name(f".{target.name}.tmp")
+            tmp.write_text(str(item["content"]), encoding="utf-8")
+            tmp.replace(target)
+            changed.append(rel)
+        return CommandResult(command=["repo", "write_many_atomic"], cwd=str(worktree), exit_code=0, stdout="Prepared files: " + ", ".join(changed))
+
+    def _run_atomic_worktree_transaction(self, project: Path, transaction_name: str, timeout_seconds: int, check_only: bool, mutate_worktree) -> CommandResult:
+        if not (project / ".git").exists():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Atomic transactions require a git repository")
+        env = self._git_env()
+        temp_root = Path(tempfile.mkdtemp(prefix="repo_atomic_"))
+        worktree = temp_root / "worktree"
+        branch = f"atomic-edit-{uuid4().hex[:12]}"
+        steps: list[CommandResult] = []
+
+        def combined(exit_code: int, stdout: str = "", stderr: str = "", timed_out: bool = False) -> CommandResult:
+            step_text = []
+            for step in steps:
+                label = " ".join(step.command)
+                if step.exit_code != 0 or step.stdout or step.stderr:
+                    step_text.append(f"$ {label}\nexit={step.exit_code}\nstdout={step.stdout}\nstderr={step.stderr}".strip())
+            if stdout:
+                step_text.append(stdout)
+            return CommandResult(
+                command=["repo", transaction_name],
+                cwd=str(project),
+                exit_code=exit_code,
+                stdout="\n\n".join(step_text)[-20000:],
+                stderr=stderr[-20000:],
+                timed_out=timed_out,
+            )
+
+        try:
+            add = self._run(["git", "worktree", "add", "-b", branch, str(worktree), "HEAD"], project, timeout_seconds, env=env)
+            steps.append(add)
+            if add.exit_code != 0:
+                return combined(add.exit_code, stderr=add.stderr or add.stdout, timed_out=add.timed_out)
+
+            mutate = mutate_worktree(worktree)
+            steps.append(mutate)
+            if mutate.exit_code != 0:
+                return combined(mutate.exit_code, stderr=mutate.stderr or mutate.stdout, timed_out=mutate.timed_out)
+
+            # Make new files visible in git diff without staging content.
+            add_intent = self._run(["git", "add", "-N", "--", "."], worktree, timeout_seconds, env=env)
+            steps.append(add_intent)
+            if add_intent.exit_code != 0:
+                return combined(add_intent.exit_code, stderr=add_intent.stderr or add_intent.stdout, timed_out=add_intent.timed_out)
+
+            diff = self._run(["git", "diff", "--binary", "--no-ext-diff"], worktree, timeout_seconds, env=env)
+            steps.append(diff)
+            if diff.exit_code != 0:
+                return combined(diff.exit_code, stderr=diff.stderr or diff.stdout, timed_out=diff.timed_out)
+            if not diff.stdout.strip():
+                return combined(0, stdout="No changes produced by atomic transaction.")
+
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".patch", delete=False) as handle:
+                handle.write(diff.stdout)
+                final_patch = Path(handle.name)
+            try:
+                final_check = self._run(["git", "apply", "--check", str(final_patch)], project, timeout_seconds, env=env)
+                steps.append(final_check)
+                if final_check.exit_code != 0 or check_only:
+                    return combined(final_check.exit_code, stdout="Atomic check-only completed; real checkout unchanged." if check_only and final_check.exit_code == 0 else "", stderr=final_check.stderr or final_check.stdout, timed_out=final_check.timed_out)
+
+                with RepoLockService().locked(str(project), owner=transaction_name, timeout_seconds=timeout_seconds):
+                    final_apply = self._run(["git", "apply", str(final_patch)], project, timeout_seconds, env=env)
+                steps.append(final_apply)
+                return combined(final_apply.exit_code, stdout="Atomic transaction applied to real checkout." if final_apply.exit_code == 0 else "", stderr=final_apply.stderr or final_apply.stdout, timed_out=final_apply.timed_out)
+            finally:
+                final_patch.unlink(missing_ok=True)
+        finally:
+            remove = self._run(["git", "worktree", "remove", "--force", str(worktree)], project, timeout_seconds, env=env) if worktree.exists() else None
+            if remove:
+                steps.append(remove)
+            delete_branch = self._run(["git", "branch", "-D", branch], project, timeout_seconds, env=env)
+            # Do not fail a successful transaction only because cleanup sees no branch.
+            if delete_branch.exit_code != 0 and "not found" not in (delete_branch.stderr + delete_branch.stdout).lower():
+                steps.append(delete_branch)
+            shutil.rmtree(temp_root, ignore_errors=True)
 
     def clean_pyc(self, project_path: str, relative_path: str = ".") -> RepoCleanPycResult:
         root = self.target(project_path, relative_path)

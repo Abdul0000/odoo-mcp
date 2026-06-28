@@ -10,27 +10,23 @@ from typing import Iterable
 
 from ..schemas import Finding, Severity
 
-_FIELD_ASSIGNMENT_RE = re.compile(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*fields\.[A-Za-z_][A-Za-z0-9_]*\(")
-_MODEL_NAME_RE = re.compile(r"^\s*_name\s*=\s*['\"]([^'\"]+)['\"]")
-_MODEL_INHERIT_RE = re.compile(r"^\s*_inherit\s*=\s*['\"]([^'\"]+)['\"]")
-
-# Common fields every Odoo model may expose. This is intentionally conservative.
 COMMON_ODOO_FIELDS = {
-    "id",
-    "display_name",
-    "create_uid",
-    "create_date",
-    "write_uid",
-    "write_date",
-    "__last_update",
-    "message_ids",
-    "message_follower_ids",
-    "message_partner_ids",
-    "activity_ids",
-    "activity_state",
-    "activity_type_id",
-    "activity_user_id",
-    "activity_date_deadline",
+    "id", "display_name", "create_uid", "create_date", "write_uid", "write_date", "__last_update",
+    "message_ids", "message_follower_ids", "message_partner_ids", "activity_ids", "activity_state",
+    "activity_type_id", "activity_user_id", "activity_date_deadline", "activity_exception_decoration",
+    "active", "sequence", "company_id",
+}
+FIELD_TYPES_WITH_COMODEL = {"Many2one", "One2many", "Many2many"}
+INHERIT_DEPENDS = {
+    "account.": "account",
+    "sale.": "sale",
+    "purchase.": "purchase",
+    "stock.": "stock",
+    "hr.": "hr",
+    "product.": "product",
+    "payment.": "payment",
+    "website.": "website",
+    "calendar.": "calendar",
 }
 
 
@@ -39,6 +35,8 @@ class ParsedModel:
     technical_name: str
     inherited_model: str | None = None
     fields: set[str] = field(default_factory=set)
+    relations: dict[str, str] = field(default_factory=dict)
+    transient: bool = False
     file: Path | None = None
 
 
@@ -48,147 +46,70 @@ class OdooModuleValidator:
     def validate(self, module_path: Path) -> list[Finding]:
         findings: list[Finding] = []
         findings.extend(self._validate_basic_structure(module_path))
-        findings.extend(self._validate_manifest(module_path))
+        manifest, manifest_findings = self._read_manifest(module_path)
+        findings.extend(manifest_findings)
+        findings.extend(self._validate_manifest_files(module_path, manifest))
         findings.extend(self._validate_python_files(module_path))
         findings.extend(self._validate_xml_files(module_path))
         findings.extend(self._validate_security_csv(module_path))
         findings.extend(self._detect_pyc(module_path))
-        findings.extend(self._validate_custom_view_fields(module_path))
+        parsed_models = self._parse_custom_models(module_path)
+        findings.extend(self._validate_missing_access(module_path, parsed_models))
+        findings.extend(self._validate_manifest_dependency_hints(module_path, manifest, parsed_models))
+        findings.extend(self._validate_xml_references_and_order(module_path, manifest, parsed_models))
+        findings.extend(self._validate_custom_view_fields(module_path, parsed_models))
         return findings
 
     def _validate_basic_structure(self, module_path: Path) -> list[Finding]:
         findings: list[Finding] = []
         if not module_path.exists():
-            return [
-                Finding(
-                    severity=Severity.error,
-                    code="MODULE_NOT_FOUND",
-                    message=f"Module path does not exist: {module_path}",
-                    hint="Check project_path and module_name.",
-                )
-            ]
+            return [Finding(severity=Severity.error, code="MODULE_NOT_FOUND", message=f"Module path does not exist: {module_path}", hint="Check project_path and module_name.")]
         if not module_path.is_dir():
-            return [
-                Finding(
-                    severity=Severity.error,
-                    code="MODULE_NOT_DIRECTORY",
-                    message=f"Module path is not a directory: {module_path}",
-                )
-            ]
+            return [Finding(severity=Severity.error, code="MODULE_NOT_DIRECTORY", message=f"Module path is not a directory: {module_path}")]
         manifest = module_path / "__manifest__.py"
         if not manifest.exists():
-            findings.append(
-                Finding(
-                    severity=Severity.error,
-                    code="MISSING_MANIFEST",
-                    message="Missing __manifest__.py",
-                    file=str(manifest),
-                )
-            )
+            findings.append(Finding(severity=Severity.error, code="MISSING_MANIFEST", message="Missing __manifest__.py", file=str(manifest)))
         init_file = module_path / "__init__.py"
         if not init_file.exists():
-            findings.append(
-                Finding(
-                    severity=Severity.warning,
-                    code="MISSING_INIT",
-                    message="Missing __init__.py",
-                    file=str(init_file),
-                    hint="Most Odoo modules should have __init__.py even if it is empty.",
-                )
-            )
+            findings.append(Finding(severity=Severity.warning, code="MISSING_INIT", message="Missing __init__.py", file=str(init_file), hint="Most Odoo modules should have __init__.py even if it is empty."))
         return findings
 
-    def _validate_manifest(self, module_path: Path) -> list[Finding]:
+    def _read_manifest(self, module_path: Path) -> tuple[dict, list[Finding]]:
         manifest_path = module_path / "__manifest__.py"
         if not manifest_path.exists():
-            return []
+            return {}, []
         try:
-            manifest_text = manifest_path.read_text(encoding="utf-8")
-            manifest = ast.literal_eval(manifest_text)
+            manifest = ast.literal_eval(manifest_path.read_text(encoding="utf-8"))
         except SyntaxError as exc:
-            return [
-                Finding(
-                    severity=Severity.error,
-                    code="MANIFEST_SYNTAX_ERROR",
-                    message=str(exc),
-                    file=str(manifest_path),
-                    line=exc.lineno,
-                )
-            ]
-        except Exception as exc:  # noqa: BLE001 - user-facing diagnostic
-            return [
-                Finding(
-                    severity=Severity.error,
-                    code="MANIFEST_PARSE_ERROR",
-                    message=f"Could not parse manifest as a Python literal dict: {exc}",
-                    file=str(manifest_path),
-                )
-            ]
+            return {}, [Finding(severity=Severity.error, code="MANIFEST_SYNTAX_ERROR", message=str(exc), file=str(manifest_path), line=exc.lineno)]
+        except Exception as exc:  # noqa: BLE001
+            return {}, [Finding(severity=Severity.error, code="MANIFEST_PARSE_ERROR", message=f"Could not parse manifest as a Python literal dict: {exc}", file=str(manifest_path))]
         if not isinstance(manifest, dict):
-            return [
-                Finding(
-                    severity=Severity.error,
-                    code="MANIFEST_NOT_DICT",
-                    message="Manifest must be a Python dictionary.",
-                    file=str(manifest_path),
-                )
-            ]
-
+            return {}, [Finding(severity=Severity.error, code="MANIFEST_NOT_DICT", message="Manifest must be a Python dictionary.", file=str(manifest_path))]
         findings: list[Finding] = []
         for required_key in ("name", "version", "depends"):
             if required_key not in manifest:
-                findings.append(
-                    Finding(
-                        severity=Severity.warning if required_key == "version" else Severity.error,
-                        code="MANIFEST_MISSING_KEY",
-                        message=f"Manifest is missing key: {required_key}",
-                        file=str(manifest_path),
-                    )
-                )
+                findings.append(Finding(severity=Severity.warning if required_key == "version" else Severity.error, code="MANIFEST_MISSING_KEY", message=f"Manifest is missing key: {required_key}", file=str(manifest_path)))
         depends = manifest.get("depends", [])
         if not isinstance(depends, list) or not all(isinstance(dep, str) for dep in depends):
-            findings.append(
-                Finding(
-                    severity=Severity.error,
-                    code="MANIFEST_BAD_DEPENDS",
-                    message="Manifest 'depends' must be a list of module technical names.",
-                    file=str(manifest_path),
-                )
-            )
+            findings.append(Finding(severity=Severity.error, code="MANIFEST_BAD_DEPENDS", message="Manifest 'depends' must be a list of module technical names.", file=str(manifest_path)))
+        return manifest, findings
+
+    def _validate_manifest_files(self, module_path: Path, manifest: dict) -> list[Finding]:
+        findings: list[Finding] = []
+        manifest_path = module_path / "__manifest__.py"
         for key in ("data", "demo", "qweb"):
             entries = manifest.get(key, []) or []
             if not isinstance(entries, list):
-                findings.append(
-                    Finding(
-                        severity=Severity.error,
-                        code="MANIFEST_BAD_FILE_LIST",
-                        message=f"Manifest '{key}' must be a list of file paths.",
-                        file=str(manifest_path),
-                    )
-                )
+                findings.append(Finding(severity=Severity.error, code="MANIFEST_BAD_FILE_LIST", message=f"Manifest '{key}' must be a list of file paths.", file=str(manifest_path)))
                 continue
             for rel_path in entries:
                 if not isinstance(rel_path, str):
-                    findings.append(
-                        Finding(
-                            severity=Severity.error,
-                            code="MANIFEST_BAD_FILE_ENTRY",
-                            message=f"Manifest '{key}' contains a non-string file entry.",
-                            file=str(manifest_path),
-                        )
-                    )
+                    findings.append(Finding(severity=Severity.error, code="MANIFEST_BAD_FILE_ENTRY", message=f"Manifest '{key}' contains a non-string file entry.", file=str(manifest_path)))
                     continue
                 target = module_path / rel_path
                 if not target.exists():
-                    findings.append(
-                        Finding(
-                            severity=Severity.error,
-                            code="MANIFEST_FILE_MISSING",
-                            message=f"Manifest references missing file: {rel_path}",
-                            file=str(manifest_path),
-                            hint="Create the file or remove it from the manifest.",
-                        )
-                    )
+                    findings.append(Finding(severity=Severity.error, code="MANIFEST_FILE_MISSING", message=f"Manifest references missing file: {rel_path}", file=str(manifest_path), hint="Create the file or remove it from the manifest."))
         return findings
 
     def _validate_python_files(self, module_path: Path) -> list[Finding]:
@@ -197,27 +118,11 @@ class OdooModuleValidator:
             if "__pycache__" in py_file.parts:
                 continue
             try:
-                source = py_file.read_text(encoding="utf-8")
-                ast.parse(source, filename=str(py_file))
+                ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
             except SyntaxError as exc:
-                findings.append(
-                    Finding(
-                        severity=Severity.error,
-                        code="PYTHON_SYNTAX_ERROR",
-                        message=str(exc),
-                        file=str(py_file),
-                        line=exc.lineno,
-                    )
-                )
+                findings.append(Finding(severity=Severity.error, code="PYTHON_SYNTAX_ERROR", message=str(exc), file=str(py_file), line=exc.lineno))
             except UnicodeDecodeError as exc:
-                findings.append(
-                    Finding(
-                        severity=Severity.error,
-                        code="PYTHON_ENCODING_ERROR",
-                        message=str(exc),
-                        file=str(py_file),
-                    )
-                )
+                findings.append(Finding(severity=Severity.error, code="PYTHON_ENCODING_ERROR", message=str(exc), file=str(py_file)))
         return findings
 
     def _validate_xml_files(self, module_path: Path) -> list[Finding]:
@@ -227,38 +132,14 @@ class OdooModuleValidator:
                 ET.parse(xml_file)
             except ET.ParseError as exc:
                 line, _col = exc.position
-                findings.append(
-                    Finding(
-                        severity=Severity.error,
-                        code="XML_PARSE_ERROR",
-                        message=str(exc),
-                        file=str(xml_file),
-                        line=line,
-                    )
-                )
+                findings.append(Finding(severity=Severity.error, code="XML_PARSE_ERROR", message=str(exc), file=str(xml_file), line=line))
             except UnicodeDecodeError as exc:
-                findings.append(
-                    Finding(
-                        severity=Severity.error,
-                        code="XML_ENCODING_ERROR",
-                        message=str(exc),
-                        file=str(xml_file),
-                    )
-                )
+                findings.append(Finding(severity=Severity.error, code="XML_ENCODING_ERROR", message=str(exc), file=str(xml_file)))
         return findings
 
     def _validate_security_csv(self, module_path: Path) -> list[Finding]:
         findings: list[Finding] = []
-        expected_header = [
-            "id",
-            "name",
-            "model_id:id",
-            "group_id:id",
-            "perm_read",
-            "perm_write",
-            "perm_create",
-            "perm_unlink",
-        ]
+        expected_header = ["id", "name", "model_id:id", "group_id:id", "perm_read", "perm_write", "perm_create", "perm_unlink"]
         for csv_file in self._iter_files(module_path, "*.csv"):
             if csv_file.name != "ir.model.access.csv":
                 continue
@@ -266,65 +147,87 @@ class OdooModuleValidator:
                 with csv_file.open(newline="", encoding="utf-8") as handle:
                     reader = csv.DictReader(handle)
                     if reader.fieldnames != expected_header:
-                        findings.append(
-                            Finding(
-                                severity=Severity.error,
-                                code="ACCESS_CSV_BAD_HEADER",
-                                message="ir.model.access.csv header is not the standard Odoo access header.",
-                                file=str(csv_file),
-                                hint=",".join(expected_header),
-                            )
-                        )
+                        findings.append(Finding(severity=Severity.error, code="ACCESS_CSV_BAD_HEADER", message="ir.model.access.csv header is not the standard Odoo access header.", file=str(csv_file), hint=",".join(expected_header)))
                     for row_index, row in enumerate(reader, start=2):
                         for perm in ("perm_read", "perm_write", "perm_create", "perm_unlink"):
                             if row.get(perm) not in {"0", "1"}:
-                                findings.append(
-                                    Finding(
-                                        severity=Severity.error,
-                                        code="ACCESS_CSV_BAD_PERMISSION",
-                                        message=f"{perm} must be 0 or 1.",
-                                        file=str(csv_file),
-                                        line=row_index,
-                                    )
-                                )
+                                findings.append(Finding(severity=Severity.error, code="ACCESS_CSV_BAD_PERMISSION", message=f"{perm} must be 0 or 1.", file=str(csv_file), line=row_index))
             except UnicodeDecodeError as exc:
-                findings.append(
-                    Finding(
-                        severity=Severity.error,
-                        code="ACCESS_CSV_ENCODING_ERROR",
-                        message=str(exc),
-                        file=str(csv_file),
-                    )
-                )
+                findings.append(Finding(severity=Severity.error, code="ACCESS_CSV_ENCODING_ERROR", message=str(exc), file=str(csv_file)))
         return findings
 
     def _detect_pyc(self, module_path: Path) -> list[Finding]:
         findings: list[Finding] = []
         for path in module_path.rglob("*"):
             if path.name == "__pycache__" and path.is_dir():
-                findings.append(
-                    Finding(
-                        severity=Severity.warning,
-                        code="PYCACHE_FOUND",
-                        message="__pycache__ directory should not be committed.",
-                        file=str(path),
-                        hint="Delete __pycache__ before commit/push.",
-                    )
-                )
+                findings.append(Finding(severity=Severity.warning, code="PYCACHE_FOUND", message="__pycache__ directory should not be committed.", file=str(path), hint="Delete __pycache__ before commit/push."))
             elif path.suffix == ".pyc":
-                findings.append(
-                    Finding(
-                        severity=Severity.warning,
-                        code="PYC_FOUND",
-                        message=".pyc file should not be committed.",
-                        file=str(path),
-                        hint="Delete .pyc files before commit/push.",
-                    )
-                )
+                findings.append(Finding(severity=Severity.warning, code="PYC_FOUND", message=".pyc file should not be committed.", file=str(path), hint="Delete .pyc files before commit/push."))
         return findings
 
-    def _validate_custom_view_fields(self, module_path: Path) -> list[Finding]:
-        parsed_models = self._parse_custom_models(module_path)
+    def _validate_missing_access(self, module_path: Path, parsed_models: dict[str, ParsedModel]) -> list[Finding]:
+        access_models: set[str] = set()
+        for csv_file in self._iter_files(module_path, "ir.model.access.csv"):
+            with csv_file.open(newline="", encoding="utf-8") as handle:
+                for row in csv.DictReader(handle):
+                    model_ref = row.get("model_id:id") or ""
+                    if model_ref.startswith("model_"):
+                        access_models.add(model_ref[6:].replace("_", "."))
+        findings: list[Finding] = []
+        for model_name, model in sorted(parsed_models.items()):
+            if model.inherited_model or model.transient:
+                continue
+            if model_name not in access_models:
+                findings.append(Finding(severity=Severity.warning, code="ACCESS_ROW_MISSING_STATIC", message=f"No access row found for custom model {model_name}.", file=str(model.file) if model.file else None, hint=f"Add model_{model_name.replace('.', '_')} to security/ir.model.access.csv unless it is intentionally private."))
+        return findings
+
+    def _validate_manifest_dependency_hints(self, module_path: Path, manifest: dict, parsed_models: dict[str, ParsedModel]) -> list[Finding]:
+        depends = set(manifest.get("depends") or []) if isinstance(manifest.get("depends") or [], list) else set()
+        findings: list[Finding] = []
+        inherited = {model.inherited_model for model in parsed_models.values() if model.inherited_model}
+        for inherited_model in inherited:
+            for prefix, dep in INHERIT_DEPENDS.items():
+                if inherited_model and inherited_model.startswith(prefix) and dep not in depends:
+                    findings.append(Finding(severity=Severity.warning, code="MANIFEST_DEPENDENCY_MISSING_STATIC", message=f"Model inherits {inherited_model} but manifest does not depend on {dep}.", file=str(module_path / "__manifest__.py"), hint=f"Add '{dep}' to manifest depends if this inheritance is active."))
+        return findings
+
+    def _validate_xml_references_and_order(self, module_path: Path, manifest: dict, parsed_models: dict[str, ParsedModel]) -> list[Finding]:
+        findings: list[Finding] = []
+        entries = [item for item in (manifest.get("data") or []) if isinstance(item, str)]
+        defined: set[str] = set()
+        all_ids: set[str] = set()
+        parsed_files: list[tuple[str, ET.Element]] = []
+        for rel in entries:
+            path = module_path / rel
+            if path.exists() and path.suffix == ".xml":
+                try:
+                    root = ET.parse(path).getroot()
+                except ET.ParseError:
+                    continue
+                parsed_files.append((rel, root))
+                for node in root.iter():
+                    xml_id = node.attrib.get("id")
+                    if xml_id:
+                        all_ids.add(xml_id)
+        for rel, root in parsed_files:
+            for node in root:
+                xml_id = node.attrib.get("id")
+                if node.tag == "menuitem":
+                    for attr, code in (("action", "MENU_ACTION_DEFINED_LATE"), ("parent", "MENU_PARENT_DEFINED_LATE")):
+                        ref = node.attrib.get(attr)
+                        if ref and "." not in ref and ref not in defined:
+                            severity = Severity.error if ref not in all_ids else Severity.warning
+                            findings.append(Finding(severity=severity, code=code, message=f"Menu {node.attrib.get('id') or node.attrib.get('name')} references {attr}={ref} before it is defined in manifest load order.", file=str(module_path / rel), hint="Define actions before menus, or move the action XML file before menu XML in manifest data."))
+                if node.tag == "record" and node.attrib.get("model") == "ir.actions.act_window":
+                    action_id = node.attrib.get("id") or "<no id>"
+                    res_model = self._get_record_field_text(node, "res_model")
+                    if res_model and res_model not in parsed_models and res_model.split(".", 1)[0] == module_path.name.split("_", 1)[0]:
+                        findings.append(Finding(severity=Severity.warning, code="ACTION_RESMODEL_NOT_FOUND_STATIC", message=f"Action {action_id} uses model {res_model}, not found in parsed custom models.", file=str(module_path / rel)))
+                if xml_id:
+                    defined.add(xml_id)
+        return findings
+
+    def _validate_custom_view_fields(self, module_path: Path, parsed_models: dict[str, ParsedModel]) -> list[Finding]:
         if not parsed_models:
             return []
         findings: list[Finding] = []
@@ -342,59 +245,102 @@ class OdooModuleValidator:
                 arch_field = self._get_record_field_node(record, "arch")
                 if arch_field is None:
                     continue
-                model_fields = parsed_models[view_model].fields | COMMON_ODOO_FIELDS
-                for field_node in arch_field.iter("field"):
-                    field_name = field_node.attrib.get("name")
-                    if not field_name or field_name in {"model", "arch", "inherit_id", "name"}:
-                        continue
+                findings.extend(self._walk_view_fields(xml_file, arch_field, view_model, parsed_models))
+        return findings
+
+    def _walk_view_fields(self, xml_file: Path, node: ET.Element, current_model: str, parsed_models: dict[str, ParsedModel]) -> list[Finding]:
+        findings: list[Finding] = []
+        model = parsed_models.get(current_model)
+        model_fields = (model.fields if model else set()) | COMMON_ODOO_FIELDS
+        for child in list(node):
+            next_model = current_model
+            if child.tag == "field":
+                field_name = child.attrib.get("name")
+                if field_name and field_name not in {"model", "arch", "inherit_id", "name"}:
                     if field_name not in model_fields:
-                        findings.append(
-                            Finding(
-                                severity=Severity.warning,
-                                code="VIEW_FIELD_NOT_FOUND_STATIC",
-                                message=(
-                                    f"Field '{field_name}' is used in a view for custom model "
-                                    f"'{view_model}' but was not found in parsed Python fields."
-                                ),
-                                file=str(xml_file),
-                                hint=(
-                                    "Static check only. Confirm the field exists through inheritance, "
-                                    "or add it to the model."
-                                ),
-                            )
-                        )
+                        findings.append(Finding(severity=Severity.warning, code="VIEW_FIELD_NOT_FOUND_STATIC", message=f"Field '{field_name}' is used in a view for custom model '{current_model}' but was not found in parsed Python fields.", file=str(xml_file), hint="Static check only. Confirm the field exists through inheritance, or add it to the model."))
+                    elif model and field_name in model.relations:
+                        next_model = model.relations[field_name]
+            findings.extend(self._walk_view_fields(xml_file, child, next_model, parsed_models))
         return findings
 
     def _parse_custom_models(self, module_path: Path) -> dict[str, ParsedModel]:
         models: dict[str, ParsedModel] = {}
+        pending_inherits: list[ParsedModel] = []
         for py_file in self._iter_files(module_path, "*.py"):
             if "__pycache__" in py_file.parts:
                 continue
             try:
-                lines = py_file.read_text(encoding="utf-8").splitlines()
-            except UnicodeDecodeError:
+                tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+            except Exception:
                 continue
-            current_model: ParsedModel | None = None
-            for line in lines:
-                model_match = _MODEL_NAME_RE.match(line)
-                inherit_match = _MODEL_INHERIT_RE.match(line)
-                field_match = _FIELD_ASSIGNMENT_RE.match(line)
-                if model_match:
-                    technical_name = model_match.group(1)
-                    current_model = ParsedModel(technical_name=technical_name, file=py_file)
-                    models[technical_name] = current_model
-                elif inherit_match and current_model is None:
-                    technical_name = inherit_match.group(1)
-                    # Inherited standard models are not complete from static source, so we do not
-                    # validate their views strictly unless the module also declares _name.
-                    current_model = ParsedModel(
-                        technical_name=technical_name,
-                        inherited_model=technical_name,
-                        file=py_file,
-                    )
-                elif field_match and current_model is not None:
-                    current_model.fields.add(field_match.group(1))
+            for cls in [node for node in tree.body if isinstance(node, ast.ClassDef)]:
+                base_names = {self._name_from_ast(base) for base in cls.bases}
+                transient = any(name.endswith("TransientModel") for name in base_names if name)
+                attrs: dict[str, ast.AST] = {}
+                for stmt in cls.body:
+                    if isinstance(stmt, ast.Assign):
+                        for target in stmt.targets:
+                            if isinstance(target, ast.Name):
+                                attrs[target.id] = stmt.value
+                model_name = self._literal(attrs.get("_name"))
+                inherited = self._inherit_value(attrs.get("_inherit"))
+                if model_name:
+                    parsed = ParsedModel(technical_name=model_name, inherited_model=None, transient=transient, file=py_file)
+                    self._extract_fields(attrs, parsed)
+                    models[model_name] = parsed
+                elif inherited:
+                    parsed = ParsedModel(technical_name=inherited, inherited_model=inherited, transient=transient, file=py_file)
+                    self._extract_fields(attrs, parsed)
+                    pending_inherits.append(parsed)
+        for inherited in pending_inherits:
+            if inherited.technical_name in models:
+                models[inherited.technical_name].fields.update(inherited.fields)
+                models[inherited.technical_name].relations.update(inherited.relations)
+            else:
+                models[inherited.technical_name] = inherited
         return models
+
+    def _extract_fields(self, attrs: dict[str, ast.AST], parsed: ParsedModel) -> None:
+        for name, value in attrs.items():
+            if name.startswith("_"):
+                continue
+            if isinstance(value, ast.Call):
+                func_name = self._name_from_ast(value.func)
+                if func_name.startswith("fields."):
+                    parsed.fields.add(name)
+                    field_type = func_name.split(".")[-1]
+                    if field_type in FIELD_TYPES_WITH_COMODEL and value.args:
+                        comodel = self._literal(value.args[0])
+                        if isinstance(comodel, str):
+                            parsed.relations[name] = comodel
+
+    @staticmethod
+    def _literal(node: ast.AST | None):
+        if node is None:
+            return None
+        try:
+            return ast.literal_eval(node)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _inherit_value(node: ast.AST | None) -> str | None:
+        value = OdooModuleValidator._literal(node)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list) and value and isinstance(value[0], str):
+            return value[0]
+        return None
+
+    @staticmethod
+    def _name_from_ast(node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            base = OdooModuleValidator._name_from_ast(node.value)
+            return f"{base}.{node.attr}" if base else node.attr
+        return ""
 
     @staticmethod
     def _get_record_field_text(record: ET.Element, field_name: str) -> str | None:
@@ -412,6 +358,4 @@ class OdooModuleValidator:
 
     @staticmethod
     def _iter_files(module_path: Path, pattern: str) -> Iterable[Path]:
-        return sorted(
-            path for path in module_path.rglob(pattern) if path.is_file() and ".git" not in path.parts
-        )
+        return sorted(path for path in module_path.rglob(pattern) if path.is_file() and ".git" not in path.parts)

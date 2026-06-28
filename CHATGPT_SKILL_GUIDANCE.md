@@ -20,7 +20,7 @@ Always call `repo.prepare` before reading, patching, committing, pushing, or upg
 repo.prepare
 repo.list_custom_modules
 repo.read target module files
-repo.apply_patch or repo.write
+repo.apply_patch_atomic or repo.write_many_atomic for multi-file changes; repo.apply_patch or repo.write only for small single-file changes
 git.diff
 qa.self_run
 git.commit

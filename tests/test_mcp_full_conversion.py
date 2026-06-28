@@ -18,6 +18,10 @@ EXPECTED_OPERATIONAL_MCP_TOOLS = {
     "workflow.coding_task_plan",
     "workflow.full_verify",
     "workflow.safe_deploy_module",
+    "workflow.start_session",
+    "workflow.registry_smoke_test",
+    "workflow.restore_last_good_commit",
+    "workflow.browser_menu_crawl",
     # QA
     "qa.self_run",
     # repo
@@ -26,8 +30,10 @@ EXPECTED_OPERATIONAL_MCP_TOOLS = {
     "repo.list",
     "repo.read",
     "repo.write",
+    "repo.write_many_atomic",
     "repo.delete",
     "repo.apply_patch",
+    "repo.apply_patch_atomic",
     "repo.clean_pyc",
     # git
     "git.status",
@@ -38,14 +44,19 @@ EXPECTED_OPERATIONAL_MCP_TOOLS = {
     # Odoo.sh
     "odoosh.health",
     "odoosh.git_status",
+    "odoosh.check_commit",
     "odoosh.wait_for_commit",
     "odoosh.verify_module_manifest",
     "odoosh.log",
     "odoosh.grep_errors",
+    "odoosh.error_pack",
+    "odoosh.module_install_ssh",
+    "odoosh.module_deploy_ssh",
     "odoosh.module_update",
     # Odoo RPC
     "odoo.health",
     "odoo.module_status",
+    "odoo.module_deploy",
     "odoo.module_install",
     "odoo.module_update",
     "odoo.search_read",
@@ -70,7 +81,7 @@ def test_mcp_tools_list_exposes_every_operational_api_tool():
     tools = response.json()["result"]["tools"]
     names = {tool["name"] for tool in tools}
     assert names == EXPECTED_OPERATIONAL_MCP_TOOLS
-    assert len(tools) == 39
+    assert len(tools) == 50
     for tool in tools:
         assert tool["inputSchema"]["type"] == "object"
         assert "description" in tool

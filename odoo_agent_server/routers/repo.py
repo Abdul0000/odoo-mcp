@@ -13,10 +13,12 @@ from ..schemas import (
     RepoCustomModulesRequest,
     RepoDeleteRequest,
     RepoListRequest,
+    RepoAtomicPatchRequest,
     RepoPatchRequest,
     RepoPrepareRequest,
     RepoPrepareResult,
     RepoReadRequest,
+    RepoWriteManyAtomicRequest,
     RepoWriteRequest,
 )
 from ..services.approval_service import ApprovalService
@@ -32,6 +34,17 @@ def _preview(payload: object) -> dict[str, object]:
         data["content"] = f"<redacted text length={len(str(data['content']))}>"
     if "patch" in data:
         data["patch"] = f"<redacted patch length={len(str(data['patch']))}>"
+    if "files" in data and isinstance(data["files"], list):
+        redacted = []
+        for item in data["files"]:
+            if isinstance(item, dict):
+                copy = dict(item)
+                if "content" in copy:
+                    copy["content"] = f"<redacted text length={len(str(copy['content']))}>"
+                redacted.append(copy)
+            else:
+                redacted.append(item)
+        data["files"] = redacted
     return data
 
 
@@ -111,6 +124,32 @@ def repo_apply_patch(payload: RepoPatchRequest) -> CommandResult:
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.apply_patch succeeded", "repo.apply_patch failed")
     JsonStore().log_audit("repo.apply_patch", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
+    return result
+
+
+
+
+@router.post("/write-many-atomic", response_model=CommandResult)
+def repo_write_many_atomic(payload: RepoWriteManyAtomicRequest) -> CommandResult:
+    approval = ApprovalService()
+    if not payload.check_only:
+        approval.ensure_allowed("repo.write_many_atomic", payload.approval_id, _preview(payload))
+    result = RepoService().write_many_atomic(payload.project_path, payload.files, payload.check_only, payload.timeout_seconds)
+    if not payload.check_only:
+        approval.finalize_command(payload.approval_id, result.exit_code, "repo.write_many_atomic succeeded", "repo.write_many_atomic failed")
+    JsonStore().log_audit("repo.write_many_atomic", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
+    return result
+
+
+@router.post("/apply-patch-atomic", response_model=CommandResult)
+def repo_apply_patch_atomic(payload: RepoAtomicPatchRequest) -> CommandResult:
+    approval = ApprovalService()
+    if not payload.check_only:
+        approval.ensure_allowed("repo.apply_patch_atomic", payload.approval_id, _preview(payload))
+    result = RepoService().apply_patch_atomic(payload.project_path, payload.patch, payload.check_only, payload.timeout_seconds)
+    if not payload.check_only:
+        approval.finalize_command(payload.approval_id, result.exit_code, "repo.apply_patch_atomic succeeded", "repo.apply_patch_atomic failed")
+    JsonStore().log_audit("repo.apply_patch_atomic", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
     return result
 
 

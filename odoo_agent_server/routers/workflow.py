@@ -16,6 +16,10 @@ from ..schemas import (
     CodingTaskPlanResult,
     CommandResult,
     FullVerifyRequest,
+    StartSessionRequest,
+    RegistrySmokeTestRequest,
+    RestoreLastGoodCommitRequest,
+    MenuCrawlerRequest,
     JobRecord,
     JobStatus,
     JobStep,
@@ -23,6 +27,7 @@ from ..schemas import (
     WorkflowReport,
     SafeDeployModuleRequest,
     SelfRunRequest,
+    OdooRpcResult,
 )
 from ..services.approval_service import ApprovalService
 from ..services.git_service import GitService
@@ -48,7 +53,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
         "Call repo.prepare with the target repo and branch. This clones if missing, otherwise fetches, checks out, and pulls the branch with --ff-only.",
         "Call repo.list_custom_modules on the returned project_path; choose the target custom module from __manifest__.py files, not from Odoo's installed module list only.",
         f"Read the target module files first: {module_name}/__manifest__.py, models, views, security, and relevant static files.",
-        "Apply the smallest possible patch with repo.apply_patch or repo.write; do not edit Odoo core, enterprise, .git, or unrelated modules.",
+        "Apply edits atomically: use repo.apply_patch_atomic for multi-file diffs or repo.write_many_atomic for multi-file/new-module writes. Use repo.apply_patch/repo.write only for small single-file changes. Do not edit Odoo core, enterprise, .git, or unrelated modules.",
         "Run git.diff and qa.self_run. Treat pytest environment failures separately from real module errors.",
         "Commit only related paths with git.commit using a clear message.",
         "Push to the exact target branch with git.push; branch must match TARGET_GIT_BRANCH when configured. Note the 'sha' in the push response.",
@@ -63,6 +68,8 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "repo.prepare",
             "repo.list_custom_modules",
             "repo.read",
+            "repo.apply_patch_atomic",
+            "repo.write_many_atomic",
             "repo.apply_patch",
             "git.diff",
             "qa.self_run",
@@ -76,6 +83,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Always prepare/pull the repo before reading or patching code.",
             "Always use the configured target branch; never push to default/main by assumption.",
             "Discover custom modules from repo manifests before relying on Odoo database state.",
+            "Use atomic multi-file tools for broad changes so incomplete states are not left in the checkout.",
             "Only patch the requested module and related files.",
             "Do not upgrade Odoo.sh until the expected pushed SHA is deployed.",
         ],
@@ -113,6 +121,125 @@ def capability_check() -> CapabilityCheckResult:
     else:
         status = "failed"
     return CapabilityCheckResult(status=status, checks=checks)
+
+
+
+
+@router.post("/start-session", response_model=WorkflowReport)
+def start_session(payload: StartSessionRequest) -> WorkflowReport:
+    """One-call bootstrap for every ChatGPT session.
+
+    It confirms runtime capability, prepares the repo so Render sleep/wipe is
+    handled, reads git status, lists custom modules, and checks Odoo/Odoo.sh
+    connectivity when configured.
+    """
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="start_session", status=JobStatus.running, request=payload.model_dump(mode="json")))
+
+    def step(name: str, status_: str, result=None, error: str | None = None) -> None:
+        current = store.get_job(job.id)
+        store.add_step(current, JobStep(name=name, status=status_, finished_at=datetime.now(timezone.utc).isoformat(), result=result.model_dump(mode="json") if hasattr(result, "model_dump") else result, error=error))
+
+    flags: list[str] = []
+    cap = capability_check()
+    step("capability_check", cap.status, cap)
+    if cap.status != "ready":
+        flags.append("warning")
+
+    prepared = None
+    try:
+        prepared = RepoService().prepare_repo(payload.repo_url, payload.branch, payload.repo_name, payload.workspace_root, payload.remote, payload.timeout_seconds)
+        step("repo_prepare", "passed", prepared)
+        status_result = GitService().status(prepared.project_path)
+        step("git_status", "passed" if status_result.exit_code == 0 else "warning", status_result)
+        modules = RepoService().list_custom_modules(prepared.project_path, payload.max_depth, include_uninstallable=False)
+        step("repo_list_custom_modules", "passed", {"count": len(modules), "modules": [m.model_dump(mode="json") for m in modules]})
+    except Exception as exc:  # noqa: BLE001
+        step("repo_prepare", "failed", error=str(exc))
+        flags.append("failed")
+
+    if payload.include_odoo:
+        try:
+            odoo_health = OdooRpcService().health()
+            step("odoo_health", "passed" if odoo_health.status == "ok" else "warning", odoo_health)
+            if odoo_health.status != "ok":
+                flags.append("warning")
+        except Exception as exc:  # noqa: BLE001
+            step("odoo_health", "warning", error=str(exc))
+            flags.append("warning")
+
+    if payload.include_odoosh:
+        try:
+            sh_health = OdooShService().health()
+            step("odoosh_health", "passed" if sh_health.exit_code == 0 else "warning", sh_health)
+            if sh_health.exit_code != 0:
+                flags.append("warning")
+        except Exception as exc:  # noqa: BLE001
+            step("odoosh_health", "warning", error=str(exc))
+            flags.append("warning")
+
+    final = "failed" if "failed" in flags else "warning" if "warning" in flags else "passed"
+    final_job_status = JobStatus.failed if final == "failed" else JobStatus.warning if final == "warning" else JobStatus.passed
+    finished = store.finish_job(store.get_job(job.id), final_job_status, {"status": final, "project_path": prepared.project_path if prepared else None})
+    return WorkflowReport(status=final, job_id=job.id, steps=finished.steps, summary={"status": final, "project_path": prepared.project_path if prepared else None, "sha": prepared.sha if prepared else None})
+
+
+@router.post("/registry-smoke-test", response_model=OdooRpcResult)
+def registry_smoke_test(payload: RegistrySmokeTestRequest) -> OdooRpcResult:
+    return OdooRpcService().registry_smoke_test(payload.module_name, payload.model_names, payload.menu_names, payload.strict)
+
+
+@router.post("/restore-last-good-commit", response_model=WorkflowReport)
+def restore_last_good_commit(payload: RestoreLastGoodCommitRequest) -> WorkflowReport:
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="restore_last_good_commit", status=JobStatus.running, request=payload.model_dump(mode="json")))
+    git = GitService()
+
+    def step(name: str, status_: str, result=None, error: str | None = None) -> None:
+        current = store.get_job(job.id)
+        store.add_step(current, JobStep(name=name, status=status_, finished_at=datetime.now(timezone.utc).isoformat(), result=result.model_dump(mode="json") if hasattr(result, "model_dump") else result, error=error))
+
+    try:
+        project_path = str(resolve_allowed_path(payload.project_path))
+        step("resolve_project", "passed", {"project_path": project_path})
+        target = git.validate_target(project_path, payload.branch or settings.target_git_branch, payload.remote)
+        step("git_validate_target", "passed" if target.exit_code == 0 else "failed", target)
+        if target.exit_code != 0:
+            finished = store.finish_job(store.get_job(job.id), JobStatus.failed, {"failed_step": "git_validate_target"})
+            return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={"failed_step": "git_validate_target"})
+        revert = git.revert_commit(project_path, payload.bad_sha, payload.timeout_seconds)
+        step("git_revert_bad_sha", "passed" if revert.exit_code == 0 else "failed", revert)
+        if revert.exit_code != 0:
+            finished = store.finish_job(store.get_job(job.id), JobStatus.failed, {"failed_step": "git_revert_bad_sha"})
+            return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={"failed_step": "git_revert_bad_sha"})
+        if payload.push:
+            pushed = git.push(project_path, payload.remote, payload.branch or settings.target_git_branch, True, payload.timeout_seconds)
+            step("git_push_restore", "passed" if pushed.exit_code == 0 else "failed", pushed)
+            if pushed.exit_code != 0:
+                finished = store.finish_job(store.get_job(job.id), JobStatus.failed, {"failed_step": "git_push_restore"})
+                return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={"failed_step": "git_push_restore"})
+    except Exception as exc:  # noqa: BLE001
+        step("exception", "failed", error=str(exc))
+        finished = store.finish_job(store.get_job(job.id), JobStatus.failed, {"error": str(exc)})
+        return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={"error": str(exc)})
+    finished = store.finish_job(store.get_job(job.id), JobStatus.passed, {"bad_sha": payload.bad_sha, "pushed": payload.push})
+    return WorkflowReport(status="passed", job_id=job.id, steps=finished.steps, summary={"bad_sha": payload.bad_sha, "pushed": payload.push})
+
+
+@router.post("/browser-menu-crawl", response_model=WorkflowReport)
+async def browser_menu_crawl(payload: MenuCrawlerRequest) -> WorkflowReport:
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="browser_menu_crawl", status=JobStatus.running, request=payload.model_dump(mode="json")))
+    flags: list[str] = []
+    for index, path in enumerate(payload.paths, start=1):
+        result = await PlaywrightService().screenshot_odoo_page(payload.base_url, payload.login, payload.password, path, f"{payload.screenshot_prefix}_{index}.png", payload.timeout_seconds, full_page=True)
+        status_ = "passed" if result.status == "ok" and not result.console_errors and not result.network_errors else "warning"
+        if status_ != "passed":
+            flags.append("warning")
+        store.add_step(store.get_job(job.id), JobStep(name=f"browser_path:{path}", status=status_, finished_at=datetime.now(timezone.utc).isoformat(), result=result.model_dump(mode="json")))
+    final = "warning" if flags else "passed"
+    finished = store.finish_job(store.get_job(job.id), JobStatus.warning if flags else JobStatus.passed, {"status": final, "paths": payload.paths})
+    return WorkflowReport(status=final, job_id=job.id, steps=finished.steps, summary={"status": final, "paths": payload.paths})
 
 
 @router.post("/full-verify", response_model=WorkflowReport)
@@ -258,6 +385,8 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     git = GitService()
     odoosh = OdooShService()
     approval = ApprovalService()
+    pushed_sha: str | None = None
+    rollback_attempted = False
 
     def _step(name: str, status_: str, result=None, error: str | None = None) -> None:
         job = store.get_job(job_id)
@@ -272,10 +401,26 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             ),
         )
 
+    def _rollback_after_failure(reason: str) -> None:
+        nonlocal rollback_attempted
+        if rollback_attempted or not pushed_sha:
+            return
+        rollback_attempted = True
+        try:
+            revert_result = git.revert_commit(str(project_path), pushed_sha, 180)  # type: ignore[name-defined]
+            _step("rollback_git_revert", "passed" if revert_result.exit_code == 0 else "failed", revert_result)
+            if revert_result.exit_code == 0:
+                push_back = git.push(str(project_path), payload.remote, branch, True, min(payload.timeout_seconds, 600))  # type: ignore[name-defined]
+                _step("rollback_git_push", "passed" if push_back.exit_code == 0 else "failed", push_back)
+        except Exception as exc:  # noqa: BLE001
+            _step("rollback_exception", "failed", error=f"{reason}: {exc}")
+
     def _fail(name: str, result=None, error: str | None = None) -> None:
         _step(name, "failed", result, error)
+        if name in {"odoosh_wait_for_commit", "odoosh_verify_module_manifest", "odoosh_module_update", "odoo_module_status"}:
+            _rollback_after_failure(name)
         job = store.get_job(job_id)
-        store.finish_job(job, JobStatus.failed, {"failed_step": name, "module_name": payload.module_name})
+        store.finish_job(job, JobStatus.failed, {"failed_step": name, "module_name": payload.module_name, "rollback_attempted": rollback_attempted})
         approval.mark_failed(payload.approval_id, f"workflow.safe_deploy_module failed at {name}")
 
     try:
@@ -361,6 +506,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     _step("odoosh_verify_module_manifest", "passed", manifest_result)
 
     if payload.upgrade_module:
+        _step("db_rollback_checkpoint", "warning", {"note": "Code rollback is automatic, but database schema/data rollback requires an Odoo.sh backup or duplicate staging before upgrade. Create/confirm backup before destructive migrations."})
         update_result = odoosh.module_update(payload.module_name, min(payload.timeout_seconds, 1800))
         if update_result.exit_code != 0:
             _fail("odoosh_module_update", update_result)
@@ -370,6 +516,9 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     module_status = OdooRpcService().module_status(payload.module_name)
     status_ = "passed" if module_status.status == "ok" else "warning"
     _step("odoo_module_status", status_, module_status)
+
+    smoke = OdooRpcService().registry_smoke_test(payload.module_name, [], [], strict=False)
+    _step("registry_smoke_test", "passed" if smoke.status == "ok" else "warning", smoke)
 
     fresh_job = store.get_job(job_id)
     store.finish_job(fresh_job, JobStatus.passed, {"module_name": payload.module_name, "sha": pushed_sha})

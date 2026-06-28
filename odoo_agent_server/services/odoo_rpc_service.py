@@ -82,24 +82,109 @@ class OdooRpcService:
             {"fields": ["name", "state", "latest_version", "installed_version"], "limit": 1},
         )
 
+
+    def module_dependencies_status(self, module_name: str) -> OdooRpcResult:
+        """Return dependency states for an Odoo module.
+
+        This catches missing/uninstalled dependencies before long installs/upgrades.
+        It uses superuser uid where possible because Settings users often cannot read
+        ir.module.module.dependency directly.
+        """
+        module_id_result = self._module_id(module_name)
+        if module_id_result.status != "ok":
+            return module_id_result
+        deps = self.execute_kw(
+            "ir.module.module.dependency",
+            "search_read",
+            [[("module_id", "=", module_id_result.result)]],
+            {"fields": ["name", "state"], "limit": 200},
+            superuser=True,
+        )
+        if deps.status != "ok":
+            return deps
+        rows = deps.result or []
+        missing = [row for row in rows if row.get("state") not in ("installed", "to install", "to upgrade")]
+        return OdooRpcResult(status="ok", result={"dependencies": rows, "missing": missing})
+
+    def _dependency_guard(self, module_name: str) -> OdooRpcResult | None:
+        deps = self.module_dependencies_status(module_name)
+        if deps.status != "ok":
+            return None
+        missing = (deps.result or {}).get("missing") or []
+        if missing:
+            names = ", ".join(sorted({str(row.get("name")) for row in missing}))
+            return OdooRpcResult(status="failed", error=f"Missing/uninstalled dependencies for {module_name}: {names}")
+        return None
+
+
+    def _ssh_fallback_result(self, module_name: str, operation: str, cause: str) -> OdooRpcResult:
+        """Fallback to Odoo.sh SSH when XML-RPC is blocked by access rights.
+
+        This keeps odoo.module_deploy as the single tool an agent should call for
+        both installs and upgrades. The router already runs this method in a
+        background job, so SSH can take several minutes without Render HTTP
+        timeouts.
+        """
+        try:
+            from .odoosh_service import OdooShService
+
+            service = OdooShService()
+            if operation == "install":
+                ssh = service.module_install_ssh(module_name, timeout_seconds=1800)
+            elif operation == "update":
+                ssh = service.module_update(module_name, timeout_seconds=1800)
+            else:
+                ssh = service.module_deploy_ssh(module_name, timeout_seconds=1800)
+            status = "ok" if ssh.exit_code == 0 else "failed"
+            return OdooRpcResult(
+                status=status,
+                result={
+                    "fallback": "odoosh",
+                    "operation": operation,
+                    "module": module_name,
+                    "ssh": ssh.model_dump(mode="json"),
+                    "cause": cause,
+                } if status == "ok" else None,
+                error=None if status == "ok" else (
+                    f"XML-RPC failed and SSH fallback also failed. XML-RPC cause: {cause}\n"
+                    f"SSH stdout:\n{ssh.stdout}\nSSH stderr:\n{ssh.stderr}"
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return OdooRpcResult(status="failed", error=f"XML-RPC failed and SSH fallback could not start: {cause}; fallback_error={exc}")
+
+    @staticmethod
+    def _looks_access_denied(result: OdooRpcResult) -> bool:
+        return result.status == "failed" and "Access Denied" in (result.error or "")
+
     def module_install(self, module_name: str) -> OdooRpcResult:
+        dep_error = self._dependency_guard(module_name)
+        if dep_error:
+            return dep_error
         module_id_result = self._module_id(module_name)
         if module_id_result.status != "ok":
             return module_id_result
         module_id = module_id_result.result
         result = self.execute_kw("ir.module.module", "button_immediate_install", [[module_id]], superuser=True)
         if result.status == "failed":
-            result = OdooRpcResult(status="failed", error=f"button_immediate_install failed: {result.error}\nACTION: Call odoosh.grep_errors → fix code → recommit → push → redeploy.")
+            if self._looks_access_denied(result):
+                return self._ssh_fallback_result(module_name, "install", f"button_immediate_install failed: {result.error}")
+            result = OdooRpcResult(status="failed", error=f"button_immediate_install failed: {result.error}\nACTION: Call odoosh.error_pack → fix code → recommit → push → redeploy.")
         return result
 
     def module_update(self, module_name: str) -> OdooRpcResult:
+        dep_error = self._dependency_guard(module_name)
+        if dep_error:
+            return dep_error
         module_id_result = self._module_id(module_name)
         if module_id_result.status != "ok":
             return module_id_result
         module_id = module_id_result.result
         result = self.execute_kw("ir.module.module", "button_immediate_upgrade", [[module_id]], superuser=True)
         if result.status == "failed":
-            result = OdooRpcResult(status="failed", error=f"button_immediate_upgrade failed: {result.error}\nACTION: Call odoosh.grep_errors → fix code → recommit → push → redeploy.")
+            if self._looks_access_denied(result):
+                return self._ssh_fallback_result(module_name, "update", f"button_immediate_upgrade failed: {result.error}")
+            result = OdooRpcResult(status="failed", error=f"button_immediate_upgrade failed: {result.error}\nACTION: Call odoosh.error_pack → fix code → recommit → push → redeploy.")
         return result
 
     def module_deploy(self, module_name: str) -> OdooRpcResult:
@@ -114,6 +199,8 @@ class OdooRpcService:
 
         update_result = self.execute_kw("ir.module.module", "update_list", [], superuser=True)
         if update_result.status == "failed":
+            if self._looks_access_denied(update_result):
+                return self._ssh_fallback_result(module_name, "deploy", f"update_list failed: {update_result.error}")
             return OdooRpcResult(status="failed", error=f"update_list failed: {update_result.error}")
 
         time.sleep(3)
@@ -135,6 +222,10 @@ class OdooRpcService:
                 )
             )
 
+        dep_error = self._dependency_guard(module_name)
+        if dep_error:
+            return dep_error
+
         state = records[0].get("state", "unknown")
         module_id = records[0].get("id")
 
@@ -148,14 +239,14 @@ class OdooRpcService:
             result = self.execute_kw("ir.module.module", method, [[module_id]], superuser=True)
 
         if result.status == "failed":
+            if self._looks_access_denied(result):
+                return self._ssh_fallback_result(module_name, "deploy", f"{method} failed on {module_name!r}: {result.error}")
             return OdooRpcResult(
                 status="failed",
                 error=(
                     f"{method} FAILED on {module_name!r} (was: {state})\n"
                     f"ERROR: {result.error}\n"
-                    "If error is Access Denied: call odoosh.module_install_ssh instead — "
-                    "it uses SSH -i flag which bypasses XML-RPC permission restrictions.\n"
-                    "If error is code error: odoosh.grep_errors → fix → recommit → redeploy."
+                    "If error is code error: odoosh.error_pack → fix → recommit → redeploy."
                 )
             )
 
@@ -166,6 +257,61 @@ class OdooRpcService:
 
     def search_read(self, model: str, domain: list[Any], fields: list[str], limit: int) -> OdooRpcResult:
         return self.execute_kw(model, "search_read", [domain], {"fields": fields, "limit": limit})
+
+
+    def registry_smoke_test(self, module_name: str, model_names: list[str] | None = None, menu_names: list[str] | None = None, strict: bool = True) -> OdooRpcResult:
+        """Verify the upgraded Odoo registry actually contains expected models/menus.
+
+        This catches the class of failures where a menu/action points to a model
+        like school.student but the server registry did not load that model.
+        """
+        model_names = list(model_names or [])
+        menu_names = list(menu_names or [])
+        checks: dict[str, Any] = {"module": module_name, "models": [], "menus": [], "module_status": None}
+        failures: list[str] = []
+
+        status_result = self.module_status(module_name)
+        checks["module_status"] = status_result.model_dump(mode="json")
+        if status_result.status != "ok" or not status_result.result:
+            failures.append(f"Module {module_name} not found in ir.module.module")
+        else:
+            state = (status_result.result[0] or {}).get("state")
+            if state != "installed":
+                failures.append(f"Module {module_name} state is {state}, expected installed")
+
+        if not model_names:
+            prefix = module_name.split("_", 1)[0]
+            if prefix and prefix not in {"odoo", "base"}:
+                inferred = self.execute_kw("ir.model", "search_read", [[("model", "=ilike", prefix + ".%")]], {"fields": ["model", "name"], "limit": 200})
+                if inferred.status == "ok":
+                    model_names = sorted({row.get("model") for row in (inferred.result or []) if row.get("model")})
+
+        for model_name in model_names:
+            exists = self.execute_kw("ir.model", "search_read", [[("model", "=", model_name)]], {"fields": ["model", "name"], "limit": 1})
+            item: dict[str, Any] = {"model": model_name, "exists": False, "search_read_ok": False}
+            if exists.status == "ok" and exists.result:
+                item["exists"] = True
+                sr = self.search_read(model_name, [], ["id"], 1)
+                item["search_read_ok"] = sr.status == "ok"
+                if sr.status != "ok":
+                    item["error"] = sr.error
+                    failures.append(f"Model {model_name} exists but search_read failed: {sr.error}")
+            else:
+                item["error"] = exists.error or "missing in ir.model"
+                failures.append(f"Model {model_name} missing from registry")
+            checks["models"].append(item)
+
+        for menu_name in menu_names:
+            menu = self.execute_kw("ir.ui.menu", "search_read", [[("name", "=", menu_name)]], {"fields": ["name", "complete_name", "action", "active"], "limit": 20})
+            ok = menu.status == "ok" and bool(menu.result)
+            checks["menus"].append({"name": menu_name, "exists": ok, "records": menu.result if menu.status == "ok" else [], "error": menu.error})
+            if not ok:
+                failures.append(f"Menu {menu_name} missing or inaccessible")
+
+        checks["failures"] = failures
+        if strict and failures:
+            return OdooRpcResult(status="failed", result=checks, error="; ".join(failures))
+        return OdooRpcResult(status="ok", result=checks)
 
     def _module_id(self, module_name: str) -> OdooRpcResult:
         status_result = self.execute_kw("ir.module.module", "search", [[("name", "=", module_name)]], {"limit": 1})

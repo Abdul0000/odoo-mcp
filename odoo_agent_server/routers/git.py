@@ -4,7 +4,7 @@ from fastapi import APIRouter, HTTPException, status
 
 from ..auth import AuthDependency
 from ..config import settings
-from ..schemas import ApprovalStatus, BaseProjectRequest, CommandResult, GitCommitRequest, GitDiffRequest, GitPushRequest
+from ..schemas import ApprovalRecord, ApprovalStatus, BaseProjectRequest, CommandResult, GitCommitRequest, GitDiffRequest, GitPushRequest
 from ..services.approval_service import ApprovalService
 from ..services.git_service import GitService
 from ..services.store_service import JsonStore
@@ -23,13 +23,32 @@ def _normalise_branch(branch: str | None) -> str | None:
 
 def _is_protected_branch(branch: str | None) -> bool:
     normalised = _normalise_branch(branch)
-    protected = {_normalise_branch(item) for item in settings.protected_branches}
+    protected = {"main", "master", "production"} | {_normalise_branch(item) for item in settings.protected_branches}
     return bool(normalised and normalised in protected)
 
 
 def _ensure_protected_branch_approval(branch: str | None, approval_id: str | None) -> bool:
-    """Protected branch approval enforcement is disabled in this build."""
-    return False
+    if not _is_protected_branch(branch):
+        return False
+    store = JsonStore()
+    if not approval_id:
+        record = store.create_approval(ApprovalRecord(action="git.push", summary=f"Push protected branch {branch}", payload_preview={"branch": branch}))
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "approval_required": True,
+                "approval_id": record.id,
+                "action": "git.push",
+                "message": "Protected branch push requires explicit git.push approval.",
+            },
+        )
+    record = store.get_approval(approval_id)
+    if record.action != "git.push":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Approval {approval_id} is for {record.action}, not git.push")
+    if record.status != ApprovalStatus.approved:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Approval {approval_id} is {record.status.value}, not approved")
+    store.set_approval_status(approval_id, ApprovalStatus.running, reason="Protected branch push started")
+    return True
 
 
 @router.post("/status", response_model=CommandResult)

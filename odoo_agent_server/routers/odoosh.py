@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import json
+import threading
+from datetime import datetime, timezone
+from typing import Callable
+
 from fastapi import APIRouter, HTTPException, status
 
 from ..auth import AuthDependency
 from ..schemas import (
     CommandResult,
+    JobRecord,
+    JobStatus,
+    JobStep,
+    OdooRpcModuleRequest,
     OdooShCheckCommitRequest,
     OdooShCommandRequest,
     OdooShLogRequest,
@@ -26,6 +35,57 @@ def _run(name: str, callback) -> CommandResult:
         return result
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+def _background_command_job(name: str, request: dict, callback: Callable[[], CommandResult], approval_id: str | None = None) -> CommandResult:
+    """Start a long Odoo.sh SSH command in the background and return immediately.
+
+    Render and many MCP HTTP clients can drop long requests at about 30 seconds.
+    This wrapper persists the command as a job so ChatGPT can poll jobs.get.
+    """
+    store = JsonStore()
+    approval = ApprovalService()
+    job = store.create_job(JobRecord(job_type=name, status=JobStatus.running, request=request))
+
+    def _step(status_: str, result: CommandResult | None = None, error: str | None = None) -> None:
+        current = store.get_job(job.id)
+        store.add_step(
+            current,
+            JobStep(
+                name=name,
+                status=status_,
+                finished_at=datetime.now(timezone.utc).isoformat(),
+                result=result.model_dump(mode="json") if result else None,
+                error=error,
+            ),
+        )
+
+    def _bg() -> None:
+        try:
+            result = callback()
+            _step("passed" if result.exit_code == 0 else "failed", result)
+            current = store.get_job(job.id)
+            store.finish_job(current, JobStatus.passed if result.exit_code == 0 else JobStatus.failed, result.model_dump(mode="json"))
+            approval.finalize_command(approval_id, result.exit_code, f"{name} succeeded", f"{name} failed")
+            store.log_audit(name, "ok" if result.exit_code == 0 else "failed", request.get("module_name", name), {"job_id": job.id})
+        except Exception as exc:  # noqa: BLE001
+            _step("failed", error=str(exc))
+            current = store.get_job(job.id)
+            store.finish_job(current, JobStatus.failed, {"error": str(exc)})
+            approval.mark_failed(approval_id, f"{name} failed")
+            store.log_audit(name, "failed", request.get("module_name", name), {"job_id": job.id, "error": str(exc)})
+
+    threading.Thread(target=_bg, daemon=True, name=f"{name}_{job.id}").start()
+    return CommandResult(
+        command=[name, "background"],
+        cwd="odoosh:ssh",
+        exit_code=0,
+        stdout=json.dumps({
+            "job_id": job.id,
+            "status": "running",
+            "message": "Command started in background. Poll jobs.get with this job_id until status is passed or failed.",
+        }),
+    )
 
 
 @router.post("/health", response_model=CommandResult)
@@ -69,16 +129,57 @@ def odoosh_grep_errors(payload: OdooShCommandRequest) -> CommandResult:
     return _run("odoosh.grep_errors", lambda: OdooShService().grep_errors(payload.tail_lines))
 
 
+@router.post("/module-install-ssh", response_model=CommandResult)
+def odoosh_module_install_ssh(payload: OdooRpcModuleRequest) -> CommandResult:
+    approval = ApprovalService()
+    approval.ensure_allowed("odoosh.module_install_ssh", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
+    service = OdooShService()
+    return _background_command_job(
+        "odoosh.module_install_ssh",
+        payload.model_dump(exclude={"approval_id"}, mode="json"),
+        lambda: service.module_install_ssh(payload.module_name, 1800),
+        payload.approval_id,
+    )
+
+
+@router.post("/module-deploy-ssh", response_model=CommandResult)
+def odoosh_module_deploy_ssh(payload: OdooShModuleUpdateRequest) -> CommandResult:
+    """SSH smart install/upgrade. Background job: poll jobs.get."""
+    approval = ApprovalService()
+    approval.ensure_allowed("odoosh.module_deploy_ssh", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
+    service = OdooShService()
+
+    def _callback() -> CommandResult:
+        if payload.expected_sha:
+            wait = service.wait_for_commit(payload.expected_sha, payload.timeout_seconds, None)
+            if wait.exit_code != 0:
+                return wait
+        return service.module_deploy_ssh(payload.module_name, payload.timeout_seconds)
+
+    return _background_command_job(
+        "odoosh.module_deploy_ssh",
+        payload.model_dump(exclude={"approval_id"}, mode="json"),
+        _callback,
+        payload.approval_id,
+    )
+
+
 @router.post("/module-update", response_model=CommandResult)
 def odoosh_module_update(payload: OdooShModuleUpdateRequest) -> CommandResult:
     approval = ApprovalService()
     approval.ensure_allowed("odoosh.module_update", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     service = OdooShService()
-    if payload.expected_sha:
-        wait = service.wait_for_commit(payload.expected_sha, payload.timeout_seconds, None)
-        if wait.exit_code != 0:
-            approval.finalize_command(payload.approval_id, wait.exit_code, "odoosh.module_update precheck succeeded", "odoosh.module_update blocked by stale deployed commit")
-            return wait
-    result = _run("odoosh.module_update", lambda: service.module_update(payload.module_name, payload.timeout_seconds))
-    approval.finalize_command(payload.approval_id, result.exit_code, "odoosh.module_update succeeded", "odoosh.module_update failed")
-    return result
+
+    def _callback() -> CommandResult:
+        if payload.expected_sha:
+            wait = service.wait_for_commit(payload.expected_sha, payload.timeout_seconds, None)
+            if wait.exit_code != 0:
+                return wait
+        return service.module_update(payload.module_name, payload.timeout_seconds)
+
+    return _background_command_job(
+        "odoosh.module_update",
+        payload.model_dump(exclude={"approval_id"}, mode="json"),
+        _callback,
+        payload.approval_id,
+    )
