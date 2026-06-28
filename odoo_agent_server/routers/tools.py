@@ -123,7 +123,7 @@ _TOOL_DESCRIPTORS = [
             "SMART INSTALL/UPGRADE — always use this for ALL first-time installs and upgrades. "
             "Runs XML-RPC when allowed; if update_list/buttons fail with Access Denied, "
             "it automatically falls back to Odoo.sh SSH in the same background job. "
-            "Returns job_id immediately; poll jobs.get until passed/failed."
+            "Waits server-side by default; returns final result if quick, otherwise returns job_id for jobs.get which also waits."
         ),
         requires_approval=True,
     ),
@@ -136,7 +136,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="approvals.approve", description="Approve an approval request", requires_approval=True),
     ToolDescriptor(name="approvals.reject", description="Reject an approval request", requires_approval=True),
     ToolDescriptor(name="jobs.list", description="List recent connector jobs", read_only=True),
-    ToolDescriptor(name="jobs.get", description="Read one connector job by id", read_only=True),
+    ToolDescriptor(name="jobs.get", description="Read one connector job by id; waits server-side by default until done or timeout to avoid fragile client polling", read_only=True),
     ToolDescriptor(name="audit.list", description="List recent audit events", read_only=True),
 ]
 
@@ -349,6 +349,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return JsonStore().list_jobs(limit=req.limit)
     if name == "jobs.get":
         req = JobGetRequest.model_validate(args)
+        if req.wait_for_result:
+            return JsonStore().wait_job(req.job_id, req.wait_timeout_seconds, req.poll_interval_seconds)
         return JsonStore().get_job(req.job_id)
     if name == "audit.list":
         req = AuditListRequest.model_validate(args)

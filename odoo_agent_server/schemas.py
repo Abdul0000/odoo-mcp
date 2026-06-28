@@ -68,6 +68,9 @@ class AuditListRequest(BaseModel):
 
 class JobGetRequest(BaseModel):
     job_id: str = Field(..., min_length=1)
+    wait_for_result: bool = Field(default=True, description="Wait server-side until the job finishes or the wait timeout expires")
+    wait_timeout_seconds: int = Field(default=20, ge=0, le=25, description="Maximum server-side wait. Kept under Render request timeout.")
+    poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
 
 
 class SelfRunRequest(BaseProjectRequest):
@@ -260,6 +263,9 @@ class OdooShModuleUpdateRequest(ApprovalMixin):
     module_name: str = Field(..., description="Technical module folder/name to update")
     timeout_seconds: int = Field(default=600, ge=30, le=1800)
     expected_sha: str | None = Field(default=None, description="Optional pushed Git SHA that must be deployed on Odoo.sh before update")
+    wait_for_result: bool = Field(default=True, description="Wait server-side for background SSH job until done or wait timeout")
+    wait_timeout_seconds: int = Field(default=20, ge=0, le=25, description="Maximum server-side wait. Kept under Render request timeout.")
+    poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
 
     @field_validator("module_name")
     @classmethod
@@ -269,6 +275,9 @@ class OdooShModuleUpdateRequest(ApprovalMixin):
 
 class OdooRpcModuleRequest(ApprovalMixin):
     module_name: str = Field(..., description="Technical module name")
+    wait_for_result: bool = Field(default=True, description="For background install/upgrade/deploy, wait server-side until the job finishes or times out")
+    wait_timeout_seconds: int = Field(default=20, ge=0, le=25, description="Maximum server-side wait. Kept under Render request timeout.")
+    poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
 
     @field_validator("module_name")
     @classmethod

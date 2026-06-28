@@ -12,6 +12,40 @@ from ..services.store_service import JsonStore
 router = APIRouter(prefix="/odoo", tags=["odoo"], dependencies=[AuthDependency])
 
 
+def _background_job_response(store: JsonStore, job: JobRecord, payload: OdooRpcModuleRequest, started_message: str) -> OdooRpcResult:
+    """Return a final result when the job finishes quickly, otherwise a clean running state.
+
+    This avoids fragile ChatGPT-side polling loops and keeps every HTTP request
+    below Render's practical timeout window.
+    """
+    if not payload.wait_for_result:
+        return OdooRpcResult(status="ok", result={"job_id": job.id, "job_status": job.status.value, "finished": False, "message": started_message})
+
+    waited = store.wait_job(job.id, payload.wait_timeout_seconds, payload.poll_interval_seconds)
+    data = waited.model_dump(mode="json")
+    if waited.status == JobStatus.passed:
+        return OdooRpcResult(status="ok", result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data})
+    if waited.status in {JobStatus.failed, JobStatus.warning}:
+        result_error = None
+        if isinstance(waited.result, dict):
+            result_error = waited.result.get("error")
+        return OdooRpcResult(
+            status="failed" if waited.status == JobStatus.failed else "ok",
+            result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data},
+            error=result_error or f"Job finished with status={waited.status.value}",
+        )
+    return OdooRpcResult(
+        status="ok",
+        result={
+            "job_id": waited.id,
+            "job_status": waited.status.value,
+            "finished": False,
+            "message": f"{started_message} Still running after {payload.wait_timeout_seconds}s server-side wait. Call jobs.get with this job_id; jobs.get also waits by default.",
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": waited.id, "wait_for_result": True}},
+        },
+    )
+
+
 @router.post("/health", response_model=OdooRpcResult)
 def odoo_health() -> OdooRpcResult:
     result = OdooRpcService().health()
@@ -42,7 +76,7 @@ def odoo_module_install(payload: OdooRpcModuleRequest) -> OdooRpcResult:
         store.log_audit("odoo.module_install", result.status, payload.module_name)
 
     threading.Thread(target=_bg, daemon=True).start()
-    return OdooRpcResult(status="ok", result={"job_id": job.id, "message": "Install started. Poll jobs.get with this job_id until status=passed/failed."})
+    return _background_job_response(store, job, payload, "Install started.")
 
 
 @router.post("/module-update", response_model=OdooRpcResult)
@@ -61,7 +95,7 @@ def odoo_module_update(payload: OdooRpcModuleRequest) -> OdooRpcResult:
         store.log_audit("odoo.module_update", result.status, payload.module_name)
 
     threading.Thread(target=_bg, daemon=True).start()
-    return OdooRpcResult(status="ok", result={"job_id": job.id, "message": "Upgrade started. Poll jobs.get with this job_id until status=passed/failed."})
+    return _background_job_response(store, job, payload, "Upgrade started.")
 
 
 @router.post("/module-deploy", response_model=OdooRpcResult)
@@ -80,7 +114,7 @@ def odoo_module_deploy(payload: OdooRpcModuleRequest) -> OdooRpcResult:
         store.log_audit("odoo.module_deploy", result.status, payload.module_name)
 
     threading.Thread(target=_bg, daemon=True).start()
-    return OdooRpcResult(status="ok", result={"job_id": job.id, "message": "Deploy started. Poll jobs.get with this job_id every 10s until status=passed/failed."})
+    return _background_job_response(store, job, payload, "Deploy started.")
 
 
 @router.post("/search-read", response_model=OdooRpcResult)

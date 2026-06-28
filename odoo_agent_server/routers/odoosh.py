@@ -37,7 +37,15 @@ def _run(name: str, callback) -> CommandResult:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
-def _background_command_job(name: str, request: dict, callback: Callable[[], CommandResult], approval_id: str | None = None) -> CommandResult:
+def _background_command_job(
+    name: str,
+    request: dict,
+    callback: Callable[[], CommandResult],
+    approval_id: str | None = None,
+    wait_for_result: bool = True,
+    wait_timeout_seconds: int = 20,
+    poll_interval_seconds: float = 2.0,
+) -> CommandResult:
     """Start a long Odoo.sh SSH command in the background and return immediately.
 
     Render and many MCP HTTP clients can drop long requests at about 30 seconds.
@@ -76,6 +84,26 @@ def _background_command_job(name: str, request: dict, callback: Callable[[], Com
             store.log_audit(name, "failed", request.get("module_name", name), {"job_id": job.id, "error": str(exc)})
 
     threading.Thread(target=_bg, daemon=True, name=f"{name}_{job.id}").start()
+    if wait_for_result:
+        waited = store.wait_job(job.id, wait_timeout_seconds, poll_interval_seconds)
+        payload = {
+            "job_id": waited.id,
+            "status": waited.status.value,
+            "finished": waited.status not in {JobStatus.queued, JobStatus.running},
+            "job": waited.model_dump(mode="json"),
+        }
+        if not payload["finished"]:
+            payload["message"] = (
+                f"Command still running after {wait_timeout_seconds}s server-side wait. "
+                "Call jobs.get with this job_id; jobs.get also waits by default."
+            )
+        return CommandResult(
+            command=[name, "background"],
+            cwd="odoosh:ssh",
+            exit_code=0 if waited.status in {JobStatus.queued, JobStatus.running, JobStatus.passed} else 1,
+            stdout=json.dumps(payload),
+            stderr="" if waited.status != JobStatus.failed else json.dumps(waited.result or {}),
+        )
     return CommandResult(
         command=[name, "background"],
         cwd="odoosh:ssh",
@@ -83,7 +111,8 @@ def _background_command_job(name: str, request: dict, callback: Callable[[], Com
         stdout=json.dumps({
             "job_id": job.id,
             "status": "running",
-            "message": "Command started in background. Poll jobs.get with this job_id until status is passed or failed.",
+            "finished": False,
+            "message": "Command started in background. jobs.get waits by default until done or timeout.",
         }),
     )
 
@@ -139,6 +168,9 @@ def odoosh_module_install_ssh(payload: OdooRpcModuleRequest) -> CommandResult:
         payload.model_dump(exclude={"approval_id"}, mode="json"),
         lambda: service.module_install_ssh(payload.module_name, 1800),
         payload.approval_id,
+        payload.wait_for_result,
+        payload.wait_timeout_seconds,
+        payload.poll_interval_seconds,
     )
 
 
@@ -161,6 +193,9 @@ def odoosh_module_deploy_ssh(payload: OdooShModuleUpdateRequest) -> CommandResul
         payload.model_dump(exclude={"approval_id"}, mode="json"),
         _callback,
         payload.approval_id,
+        payload.wait_for_result,
+        payload.wait_timeout_seconds,
+        payload.poll_interval_seconds,
     )
 
 
@@ -182,4 +217,7 @@ def odoosh_module_update(payload: OdooShModuleUpdateRequest) -> CommandResult:
         payload.model_dump(exclude={"approval_id"}, mode="json"),
         _callback,
         payload.approval_id,
+        payload.wait_for_result,
+        payload.wait_timeout_seconds,
+        payload.poll_interval_seconds,
     )

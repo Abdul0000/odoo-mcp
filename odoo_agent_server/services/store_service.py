@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -89,6 +90,23 @@ class JsonStore:
             if row.get("id") == job_id:
                 return JobRecord.model_validate(row)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    def wait_job(self, job_id: str, timeout_seconds: int = 20, poll_interval_seconds: float = 2.0) -> JobRecord:
+        """Wait for a job to finish without requiring repeated client/tool calls.
+
+        The default timeout is intentionally below common Render HTTP timeouts so
+        callers get either the final result or a clean still-running response
+        instead of a broken message stream.
+        """
+        deadline = time.monotonic() + max(timeout_seconds, 0)
+        interval = max(min(poll_interval_seconds, 10.0), 0.25)
+        while True:
+            job = self.get_job(job_id)
+            if job.status not in {JobStatus.queued, JobStatus.running}:
+                return job
+            if timeout_seconds <= 0 or time.monotonic() >= deadline:
+                return job
+            time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
     def update_job(self, job: JobRecord) -> JobRecord:
         rows = self._read_list(self.jobs_file)

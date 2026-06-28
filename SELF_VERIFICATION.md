@@ -70,3 +70,21 @@ Verification:
 ```text
 45 passed
 ```
+
+## v10 server-side wait / polling verification
+
+Implemented and verified that background module deploy/install/update and `jobs.get` support server-side wait mode. This prevents repeated ChatGPT-side polling loops from causing message stream failures.
+
+Verification:
+
+```text
+63 passed
+python compile passed
+```
+
+New behavior:
+
+- `jobs.get` waits by default up to `wait_timeout_seconds`.
+- `odoo.module_deploy`, `odoo.module_install`, and `odoo.module_update` wait by default after starting their background job.
+- Direct SSH module tools also wait by default after starting the background job.
+- If still running, responses return `finished=false`, `job_id`, and the next `jobs.get` call to use.

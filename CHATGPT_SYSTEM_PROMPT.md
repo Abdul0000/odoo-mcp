@@ -171,7 +171,7 @@ Some tools require approval. When you get an approval request:
 | `odoo.module_status` | Check installed/uninstalled state |
 | `odoo.module_install` | Install uninstalled module (button_immediate_install) |
 | `odoo.module_update` | Upgrade installed module (button_immediate_upgrade) |
-| `jobs.get` | Check background job status |
+| `jobs.get` | Check background job status; waits server-side by default until done or timeout |
 
 ---
 
@@ -191,8 +191,8 @@ You do:
 9. odoosh.check_commit(abc123) → deployed: false → wait 15s → repeat
 18. odoosh.check_commit(abc123) → deployed: true → proceed
 19. odoo.module_status → state: not found
-20. odoosh.module_update → register module
-21. wait 30s → odoo.module_status → state: uninstalled
+20. odoo.module_deploy → waits server-side; if still running returns job_id
+21. jobs.get(job_id) → also waits server-side until passed/failed or timeout
 22. odoo.module_install → install
 23. odoo.module_status → state: installed ✅
 24. Report: "clinic_management installed successfully!"

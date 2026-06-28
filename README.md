@@ -335,9 +335,22 @@ approvals.request
 approvals.approve
 approvals.reject
 jobs.list
-jobs.get
+jobs.get  # waits server-side by default until job is done or timeout
 audit.list
 ```
+
+
+### v10 polling/wait behavior
+
+Long install/upgrade commands still run in background jobs, but `odoo.module_deploy`, `odoo.module_install`, `odoo.module_update`, direct Odoo.sh SSH module tools, and `jobs.get` now wait server-side by default for a short safe window. This avoids fragile repeated ChatGPT polling and prevents Render HTTP timeouts.
+
+Recommended call:
+
+```json
+{"module_name":"karachi_school_management","wait_for_result":true,"wait_timeout_seconds":20}
+```
+
+If the job is still running, the response contains `job_id`; call `jobs.get` with the same `job_id`. `jobs.get` also waits by default.
 
 `/tools/list` and MCP `tools/list` now expose the same operational tool surface. `/mcp` also returns proper per-tool input schemas generated from the Pydantic request models instead of a generic object schema.
 

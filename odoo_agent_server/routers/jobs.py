@@ -20,5 +20,13 @@ def list_audit(limit: int = 200) -> list[AuditEvent]:
 
 
 @router.get("/{job_id}", response_model=JobRecord)
-def get_job(job_id: str) -> JobRecord:
-    return JsonStore().get_job(job_id)
+def get_job(
+    job_id: str,
+    wait_for_result: bool = True,
+    wait_timeout_seconds: int = 20,
+    poll_interval_seconds: float = 2.0,
+) -> JobRecord:
+    store = JsonStore()
+    if wait_for_result:
+        return store.wait_job(job_id, wait_timeout_seconds, poll_interval_seconds)
+    return store.get_job(job_id)
