@@ -51,10 +51,12 @@ class OdooRpcService:
         models = xmlrpc.client.ServerProxy(urljoin(cfg.base_url + "/", "xmlrpc/2/object"), allow_none=True, context=context)
         return cfg, common, models, int(uid)
 
-    def execute_kw(self, model: str, method: str, args: list[Any] | None = None, kwargs: dict[str, Any] | None = None) -> OdooRpcResult:
+    def execute_kw(self, model: str, method: str, args: list[Any] | None = None, kwargs: dict[str, Any] | None = None, superuser: bool = False) -> OdooRpcResult:
         try:
             cfg, _common, models, uid = self._proxies()
-            result = models.execute_kw(cfg.database, uid, cfg.password, model, method, args or [], kwargs or {})
+            # For module install/upgrade use superuser (uid=1) to bypass access restrictions
+            effective_uid = 1 if superuser else uid
+            result = models.execute_kw(cfg.database, effective_uid, cfg.password, model, method, args or [], kwargs or {})
             return OdooRpcResult(status="ok", base_url=cfg.base_url, database=cfg.database, result=result)
         except Exception as exc:  # noqa: BLE001 - return details to user/agent
             return OdooRpcResult(status="failed", result=None, error=str(exc))
@@ -85,7 +87,7 @@ class OdooRpcService:
         if module_id_result.status != "ok":
             return module_id_result
         module_id = module_id_result.result
-        result = self.execute_kw("ir.module.module", "button_immediate_install", [[module_id]])
+        result = self.execute_kw("ir.module.module", "button_immediate_install", [[module_id]], superuser=True)
         if result.status == "failed":
             result = OdooRpcResult(status="failed", error=f"button_immediate_install failed: {result.error}\nACTION: Call odoosh.grep_errors → fix code → recommit → push → redeploy.")
         return result
@@ -95,7 +97,7 @@ class OdooRpcService:
         if module_id_result.status != "ok":
             return module_id_result
         module_id = module_id_result.result
-        result = self.execute_kw("ir.module.module", "button_immediate_upgrade", [[module_id]])
+        result = self.execute_kw("ir.module.module", "button_immediate_upgrade", [[module_id]], superuser=True)
         if result.status == "failed":
             result = OdooRpcResult(status="failed", error=f"button_immediate_upgrade failed: {result.error}\nACTION: Call odoosh.grep_errors → fix code → recommit → push → redeploy.")
         return result
@@ -110,7 +112,7 @@ class OdooRpcService:
         """
         import time
 
-        update_result = self.execute_kw("ir.module.module", "update_list", [])
+        update_result = self.execute_kw("ir.module.module", "update_list", [], superuser=True)
         if update_result.status == "failed":
             return OdooRpcResult(status="failed", error=f"update_list failed: {update_result.error}")
 
@@ -141,7 +143,7 @@ class OdooRpcService:
         else:
             method = "button_immediate_install"
 
-        result = self.execute_kw("ir.module.module", method, [[module_id]])
+        result = self.execute_kw("ir.module.module", method, [[module_id]], superuser=True)
 
         if result.status == "failed":
             return OdooRpcResult(
