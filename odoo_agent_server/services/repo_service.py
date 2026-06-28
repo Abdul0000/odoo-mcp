@@ -197,20 +197,136 @@ class RepoService:
             raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Only UTF-8 text files are supported") from exc
         return FileContent(path=target.relative_to(self.project(project_path)).as_posix(), content=content, size=size)
 
-    def write_file(self, project_path: str, relative_path: str, content: str, create_dirs: bool = True) -> FileContent:
+    # Fix 2/6: line-count threshold above which chunked mode is mandatory
+    _LARGE_FILE_LINE_THRESHOLD = 300
+    # Fix 6: unified-diff line limit to include in response (keeps payload small)
+    _DIFF_PREVIEW_LINES = 60
+
+    def write_file(
+        self,
+        project_path: str,
+        relative_path: str,
+        content: str,
+        create_dirs: bool = True,
+        chunk_index: int = 0,
+        total_chunks: int = 1,
+    ) -> FileContent:
+        """Write a file, with optional chunked mode for large files (>300 lines).
+
+        Chunked mode (total_chunks > 1):
+          chunk_index=0 → create/overwrite file with first chunk
+          chunk_index=1..N-1 → append to existing partial file
+          chunk_index=N-1 (last) → append final chunk, return complete file info
+
+        Fix 2: Files written in a single call (total_chunks==1) that exceed
+        _LARGE_FILE_LINE_THRESHOLD lines will carry a 'large_file_warning' in
+        the response extra — ChatGPT must use chunked mode next time.
+
+        Fix 6: When overwriting an existing file in single-write mode (chunk_index==0,
+        total_chunks==1), the response always includes a short unified diff showing
+        what changed, allowing the agent to verify correctness before committing.
+        """
         self._reject_git_internal_path(relative_path)
         with RepoLockService().locked(project_path, owner="repo.write", timeout_seconds=60):
             target = self.target(project_path, relative_path)
             if create_dirs:
                 target.parent.mkdir(parents=True, exist_ok=True)
             elif not target.parent.exists():
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Parent directory not found: {target.parent}")
-            # Atomic write: write to a temp file in the same directory, then replace.
-            # This prevents half-written files when a client disconnects or Render restarts mid-write.
-            tmp = target.with_name(f".{target.name}.tmp")
-            tmp.write_text(content, encoding="utf-8")
-            tmp.replace(target)
-            return FileContent(path=target.relative_to(self.project(project_path)).as_posix(), content=content, size=target.stat().st_size)
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Parent directory not found: {target.parent}"
+                )
+
+            # Fix 6: capture old content before overwrite for diff preview
+            old_content: str | None = None
+            if total_chunks == 1 and target.exists() and target.is_file():
+                try:
+                    old_content = target.read_text(encoding="utf-8")
+                except Exception:
+                    old_content = None
+
+            if total_chunks == 1:
+                # Normal single-write: atomic replace
+                tmp = target.with_name(f".{target.name}.tmp")
+                tmp.write_text(content, encoding="utf-8")
+                tmp.replace(target)
+            elif chunk_index == 0:
+                # First chunk: create/overwrite
+                tmp = target.with_name(f".{target.name}.chunk.tmp")
+                tmp.write_text(content, encoding="utf-8")
+                tmp.replace(target)
+            else:
+                # Subsequent chunks: append
+                if not target.exists():
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f"Chunk {chunk_index}: base file missing — send chunk_index=0 first"
+                    )
+                with open(target, "a", encoding="utf-8") as f:
+                    f.write(content)
+
+            size = target.stat().st_size
+            written_text = target.read_text(encoding="utf-8") if target.exists() else ""
+            lines = written_text.count("\n")
+            is_complete = (chunk_index == total_chunks - 1) or total_chunks == 1
+
+            # Build extra metadata
+            extra: dict = {}
+            if total_chunks > 1:
+                extra = {
+                    "chunk_index": chunk_index,
+                    "total_chunks": total_chunks,
+                    "complete": is_complete,
+                    "total_lines": lines,
+                    "message": (
+                        f"File complete ({lines} lines, {size} bytes)"
+                        if is_complete
+                        else f"Chunk {chunk_index+1}/{total_chunks} written. Send next chunk with chunk_index={chunk_index+1}"
+                    ),
+                }
+            else:
+                # Fix 2: large file warning
+                if lines > self._LARGE_FILE_LINE_THRESHOLD:
+                    extra["large_file_warning"] = (
+                        f"File has {lines} lines. For files >250 lines use chunked mode "
+                        f"(total_chunks>1) to avoid token-limit partial writes."
+                    )
+                # Fix 6: diff preview on overwrite
+                if old_content is not None:
+                    diff_preview = self._unified_diff_preview(
+                        old_content,
+                        content,
+                        str(target.relative_to(self.project(project_path)).as_posix()),
+                        max_lines=self._DIFF_PREVIEW_LINES,
+                    )
+                    extra["diff_preview"] = diff_preview if diff_preview else "[no changes — content identical]"
+                else:
+                    extra["diff_preview"] = "[new file created]"
+
+            return FileContent(
+                path=target.relative_to(self.project(project_path)).as_posix(),
+                content=content if is_complete else f"[chunk {chunk_index+1}/{total_chunks} appended]",
+                size=size,
+                extra=extra,
+            )
+
+    @staticmethod
+    def _unified_diff_preview(old: str, new: str, filename: str, max_lines: int = 60) -> str:
+        """Return a short unified diff string (truncated to max_lines)."""
+        import difflib
+        diff_lines = list(difflib.unified_diff(
+            old.splitlines(keepends=True),
+            new.splitlines(keepends=True),
+            fromfile=f"a/{filename}",
+            tofile=f"b/{filename}",
+            n=3,
+        ))
+        if not diff_lines:
+            return ""
+        if len(diff_lines) > max_lines:
+            diff_lines = diff_lines[:max_lines]
+            diff_lines.append(f"\n... (diff truncated at {max_lines} lines)\n")
+        return "".join(diff_lines)
 
     def delete_file(self, project_path: str, relative_path: str) -> dict[str, str]:
         self._reject_git_internal_path(relative_path)

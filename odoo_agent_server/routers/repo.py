@@ -92,7 +92,7 @@ def repo_write(payload: RepoWriteRequest) -> FileContent:
     approval = ApprovalService()
     approval.ensure_allowed("repo.write", payload.approval_id, _preview(payload))
     try:
-        result = RepoService().write_file(payload.project_path, payload.relative_path, payload.content, payload.create_dirs)
+        result = RepoService().write_file(payload.project_path, payload.relative_path, payload.content, payload.create_dirs, chunk_index=payload.chunk_index, total_chunks=payload.total_chunks)
     except Exception:
         approval.mark_failed(payload.approval_id, "repo.write failed")
         raise

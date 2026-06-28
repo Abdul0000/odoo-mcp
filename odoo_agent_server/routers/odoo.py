@@ -69,13 +69,16 @@ def odoo_module_install(payload: OdooRpcModuleRequest) -> OdooRpcResult:
     job = store.create_job(JobRecord(job_type="odoo.module_install", status=JobStatus.running, request={"module_name": payload.module_name}))
 
     def _bg():
-        result = OdooRpcService().module_install(payload.module_name)
+        try:
+            result = OdooRpcService().module_install(payload.module_name)
+        except Exception as exc:
+            result = OdooRpcResult(status="failed", error=f"Unexpected error: {exc}")
         j = store.get_job(job.id)
         store.finish_job(j, JobStatus.passed if result.status == "ok" else JobStatus.failed, result.model_dump(mode="json"))
         approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_install succeeded", "odoo.module_install failed")
         store.log_audit("odoo.module_install", result.status, payload.module_name)
 
-    threading.Thread(target=_bg, daemon=True).start()
+    threading.Thread(target=_bg, daemon=True, name=f"module_install_{job.id}").start()
     return _background_job_response(store, job, payload, "Install started.")
 
 
@@ -88,13 +91,16 @@ def odoo_module_update(payload: OdooRpcModuleRequest) -> OdooRpcResult:
     job = store.create_job(JobRecord(job_type="odoo.module_update", status=JobStatus.running, request={"module_name": payload.module_name}))
 
     def _bg():
-        result = OdooRpcService().module_update(payload.module_name)
+        try:
+            result = OdooRpcService().module_update(payload.module_name)
+        except Exception as exc:
+            result = OdooRpcResult(status="failed", error=f"Unexpected error: {exc}")
         j = store.get_job(job.id)
         store.finish_job(j, JobStatus.passed if result.status == "ok" else JobStatus.failed, result.model_dump(mode="json"))
         approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_update succeeded", "odoo.module_update failed")
         store.log_audit("odoo.module_update", result.status, payload.module_name)
 
-    threading.Thread(target=_bg, daemon=True).start()
+    threading.Thread(target=_bg, daemon=True, name=f"module_update_{job.id}").start()
     return _background_job_response(store, job, payload, "Upgrade started.")
 
 
@@ -107,13 +113,16 @@ def odoo_module_deploy(payload: OdooRpcModuleRequest) -> OdooRpcResult:
     job = store.create_job(JobRecord(job_type="odoo.module_deploy", status=JobStatus.running, request={"module_name": payload.module_name}))
 
     def _bg():
-        result = OdooRpcService().module_deploy(payload.module_name)
+        try:
+            result = OdooRpcService().module_deploy(payload.module_name)
+        except Exception as exc:
+            result = OdooRpcResult(status="failed", error=f"Unexpected error: {exc}")
         j = store.get_job(job.id)
         store.finish_job(j, JobStatus.passed if result.status == "ok" else JobStatus.failed, result.model_dump(mode="json"))
         approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_deploy succeeded", "odoo.module_deploy failed")
         store.log_audit("odoo.module_deploy", result.status, payload.module_name)
 
-    threading.Thread(target=_bg, daemon=True).start()
+    threading.Thread(target=_bg, daemon=True, name=f"module_deploy_{job.id}").start()
     return _background_job_response(store, job, payload, "Deploy started.")
 
 

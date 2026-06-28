@@ -167,6 +167,12 @@ class RepoWriteRequest(BaseProjectRequest, ApprovalMixin):
     relative_path: str
     content: str
     create_dirs: bool = True
+    # Chunked write support for large files (>300 lines)
+    # chunk_index: 0-based index of this chunk
+    # total_chunks: total number of chunks to expect
+    # When total_chunks > 1, content is appended to existing file chunks
+    chunk_index: int = Field(default=0, ge=0, description="0-based chunk index for large file writes")
+    total_chunks: int = Field(default=1, ge=1, description="Total chunks. Use 1 for normal writes. >1 enables chunked mode.")
 
 
 class RepoWriteItem(BaseModel):
@@ -497,3 +503,52 @@ def validate_safe_name(value: str, field_name: str) -> str:
 
 class OdooShCheckCommitRequest(BaseModel):
     expected_sha: str = Field(..., min_length=7, description="Git SHA to check on Odoo.sh ~/src/user")
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: Resume job from last successful step
+# ---------------------------------------------------------------------------
+
+class ResumeJobRequest(BaseModel):
+    """Fix 3: Resume a safe_deploy_module job from its last successful step.
+
+    Useful when a long multi-step pipeline (10+ steps) fails partway through.
+    Instead of starting over from step 1, the agent calls workflow.resume_job
+    with the job_id from the failed run.
+    """
+    job_id: str = Field(..., description="Job ID returned by a previous safe_deploy_module or start_session call")
+    override_step: str | None = Field(
+        default=None,
+        description=(
+            "If provided, start from this step name instead of the auto-detected last successful step. "
+            "Supported values: 'qa', 'commit', 'push', 'wait_odoosh', 'upgrade', 'smoke_test'."
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fix 7: Session state request schemas
+# ---------------------------------------------------------------------------
+
+class SessionStateSaveRequest(BaseModel):
+    """Fix 7: Save arbitrary key/value pairs to the session state store."""
+    state: dict[str, Any] = Field(..., description="Key/value pairs to merge into the session state")
+
+
+class SessionStateLoadRequest(BaseModel):
+    """Fix 7: Load the last persisted session state."""
+    pass  # no input needed
+
+
+# ---------------------------------------------------------------------------
+# Fix 10: Explicit ensure-dependencies tool request
+# ---------------------------------------------------------------------------
+
+class EnsureDependenciesRequest(ApprovalMixin):
+    """Fix 10: Auto-install any missing/uninstalled Odoo module dependencies."""
+    module_name: str = Field(..., description="Technical module name whose dependencies should be satisfied")
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        return validate_safe_name(value, "module_name")

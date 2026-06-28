@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from .routers.approvals import router as approvals_router
 from .routers.browser import router as browser_router
@@ -14,6 +18,8 @@ from .routers.qa import router as qa_router
 from .routers.repo import router as repo_router
 from .routers.tools import router as tools_router
 from .routers.workflow import router as workflow_router
+
+limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 
 app = FastAPI(
     title="Odoo ChatGPT Direct Connector",
@@ -54,5 +60,17 @@ app.include_router(browser_router)
 app.include_router(approvals_router)
 app.include_router(jobs_router)
 app.include_router(tools_router)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    import uuid
+    request_id = request.headers.get("X-Request-ID", uuid.uuid4().hex[:12])
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
 app.include_router(mcp_router)
 app.include_router(workflow_router)

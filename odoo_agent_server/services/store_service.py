@@ -4,6 +4,8 @@ import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+import fcntl
+from contextlib import contextmanager
 from threading import Lock
 from typing import Any
 
@@ -20,7 +22,19 @@ class JsonStore:
     PostgreSQL when multiple workers/servers are used.
     """
 
-    _lock = Lock()
+    _lock = Lock()  # in-process thread safety
+
+    @contextmanager
+    def _file_lock(self, path: Path):
+        """Cross-process file lock using fcntl to prevent JSON corruption."""
+        lock_path = path.with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "w") as lf:
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
 
     def __init__(self) -> None:
         self.root = settings.state_path
@@ -29,6 +43,7 @@ class JsonStore:
         self.audit_file = self.root / "audit.json"
 
     def _read_list(self, path: Path) -> list[dict[str, Any]]:
+        # file_lock is acquired by callers via _write_list for write ops
         with self._lock:
             if not path.exists():
                 return []
@@ -39,6 +54,8 @@ class JsonStore:
             return raw if isinstance(raw, list) else []
 
     def _write_list(self, path: Path, rows: list[dict[str, Any]]) -> None:
+        # Always use _file_lock context when calling _write_list
+        # e.g.: with self._file_lock(path): self._write_list(path, rows)
         with self._lock:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
@@ -139,3 +156,46 @@ class JsonStore:
     def list_audit(self, limit: int = 200) -> list[AuditEvent]:
         rows = self._read_list(self.audit_file)
         return [AuditEvent.model_validate(row) for row in rows[-limit:]][::-1]
+
+    # ---------------------------------------------------------------------------
+    # Fix 7: Session state persistence — survives Render/Koyeb restarts.
+    # The agent can save and reload: last_sha, module_name, step_history, and
+    # any arbitrary context across sessions.
+    # ---------------------------------------------------------------------------
+
+    @property
+    def _session_file(self) -> Path:
+        return self.root / "session_state.json"
+
+    def save_session_state(self, state: dict) -> dict:
+        """Persist arbitrary session state (sha, module, step history, etc.).
+
+        Called by workflow.start_session after success and by safe_deploy on
+        each milestone so the agent can resume without repeating step 1.
+        state dict is shallow-merged into the existing persisted state.
+        """
+        current: dict = {}
+        if self._session_file.exists():
+            try:
+                current = json.loads(self._session_file.read_text(encoding="utf-8"))
+            except Exception:
+                current = {}
+        from datetime import datetime, timezone
+        current.update(state)
+        current["updated_at"] = datetime.now(timezone.utc).isoformat()
+        with self._file_lock(self._session_file):
+            self._session_file.write_text(json.dumps(current, indent=2), encoding="utf-8")
+        return current
+
+    def load_session_state(self) -> dict:
+        """Return last persisted session state, or empty dict if none."""
+        if not self._session_file.exists():
+            return {}
+        try:
+            return json.loads(self._session_file.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def clear_session_state(self) -> None:
+        """Wipe the session state file (e.g. after a successful full deploy)."""
+        self._session_file.unlink(missing_ok=True)

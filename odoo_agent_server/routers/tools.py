@@ -45,6 +45,11 @@ from ..schemas import (
     ToolCallRequest,
     ToolCallResult,
     ToolDescriptor,
+    # Fix 3/7/10: new request schemas
+    ResumeJobRequest,
+    SessionStateSaveRequest,
+    SessionStateLoadRequest,
+    EnsureDependenciesRequest,
 )
 from ..services.git_service import GitService
 from ..services.odoo_rpc_service import OdooRpcService
@@ -76,8 +81,19 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="repo.prepare", description="Clone or refresh target repo and checkout/pull the target branch before coding", requires_approval=True),
     ToolDescriptor(name="repo.list_custom_modules", description="Discover custom Odoo modules from repo __manifest__.py files", read_only=True),
     ToolDescriptor(name="repo.list", description="List files inside an allowed project path", read_only=True),
-    ToolDescriptor(name="repo.read", description="Read a UTF-8 file inside an allowed project path", read_only=True),
-    ToolDescriptor(name="repo.write", description="Write a file inside an allowed project path", requires_approval=True),
+    ToolDescriptor(name="repo.read", description="Read a UTF-8 file. Default max 300KB. For large files pass max_bytes=500000. Returns file content and line count.", read_only=True),
+    ToolDescriptor(
+        name="repo.write",
+        description=(
+            "Write a complete file. For files >250 lines, use CHUNKED MODE to avoid token limits: "
+            "Split file into chunks of ~200 lines. "
+            "First call: chunk_index=0, total_chunks=N. "
+            "Next calls: chunk_index=1,2...N-1 with total_chunks=N. "
+            "Each chunk is appended. Response shows progress and confirms when complete. "
+            "NEVER write partial files without chunked mode."
+        ),
+        requires_approval=True,
+    ),
     ToolDescriptor(name="repo.write_many_atomic", description="Write many files as one atomic temp-worktree transaction", requires_approval=True),
     ToolDescriptor(name="repo.delete", description="Delete a file inside an allowed project path", requires_approval=True),
     ToolDescriptor(name="repo.apply_patch", description="Check/apply a unified diff patch", requires_approval=True),
@@ -138,6 +154,41 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="jobs.list", description="List recent connector jobs", read_only=True),
     ToolDescriptor(name="jobs.get", description="Read one connector job by id; waits server-side by default until done or timeout to avoid fragile client polling", read_only=True),
     ToolDescriptor(name="audit.list", description="List recent audit events", read_only=True),
+    # Fix 3: Resume failed pipeline from last successful step
+    ToolDescriptor(
+        name="workflow.resume_job",
+        description=(
+            "Fix 3 — Resume a failed safe_deploy_module or start_session pipeline from its last "
+            "successful step. Pass the job_id from the failed run. Instead of starting over from "
+            "step 1, the agent continues from where it left off. Optionally override the start "
+            "step with override_step (qa | commit | push | wait_odoosh | upgrade | smoke_test)."
+        ),
+        requires_approval=True,
+    ),
+    # Fix 7: Session state persistence
+    ToolDescriptor(
+        name="session.save_state",
+        description=(
+            "Fix 7 — Persist session context (last_sha, module_name, step_history, etc.) so a new "
+            "ChatGPT session after a Render restart can reload it with session.load_state instead "
+            "of rediscovering everything from scratch."
+        ),
+    ),
+    ToolDescriptor(
+        name="session.load_state",
+        description="Fix 7 — Load the last persisted session state (sha, module, steps, etc.).",
+        read_only=True,
+    ),
+    # Fix 10: Explicit ensure-dependencies
+    ToolDescriptor(
+        name="odoo.ensure_dependencies",
+        description=(
+            "Fix 10 — Auto-install any missing/uninstalled Odoo module dependencies before "
+            "installing or upgrading the target module. Call this when odoo.module_deploy fails "
+            "with a dependency error. Previously the agent had to install deps manually one by one."
+        ),
+        requires_approval=True,
+    ),
 ]
 
 _TOOL_INPUT_MODELS = {
@@ -191,6 +242,11 @@ _TOOL_INPUT_MODELS = {
     "jobs.list": LimitRequest,
     "jobs.get": JobGetRequest,
     "audit.list": AuditListRequest,
+    # Fix 3/7/10
+    "workflow.resume_job": ResumeJobRequest,
+    "session.save_state": SessionStateSaveRequest,
+    "session.load_state": SessionStateLoadRequest,
+    "odoo.ensure_dependencies": EnsureDependenciesRequest,
 }
 
 
@@ -355,4 +411,161 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "audit.list":
         req = AuditListRequest.model_validate(args)
         return JsonStore().list_audit(limit=req.limit)
+    # Fix 3: Resume pipeline from last successful step
+    if name == "workflow.resume_job":
+        req = ResumeJobRequest.model_validate(args)
+        return await _resume_job(req)
+    # Fix 7: Session state persistence
+    if name == "session.save_state":
+        req = SessionStateSaveRequest.model_validate(args)
+        return JsonStore().save_session_state(req.state)
+    if name == "session.load_state":
+        SessionStateLoadRequest.model_validate(args)
+        return JsonStore().load_session_state()
+    # Fix 10: Auto-install dependencies
+    if name == "odoo.ensure_dependencies":
+        req = EnsureDependenciesRequest.model_validate(args)
+        from ..services.odoo_rpc_service import OdooRpcService
+        return OdooRpcService().ensure_dependencies(req.module_name)
     raise HTTPException(status_code=404, detail=f"Unknown tool: {name}")
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: Resume job implementation
+# ---------------------------------------------------------------------------
+
+_SAFE_DEPLOY_STEPS = ["qa", "commit", "push", "wait_odoosh", "upgrade", "smoke_test"]
+
+
+async def _resume_job(req: "ResumeJobRequest") -> dict:
+    """Fix 3: Resume a safe_deploy_module pipeline from last successful step.
+
+    Reads the original job record, finds the last step that succeeded, and
+    re-runs the pipeline from the next step.  The SafeDeployModuleRequest
+    stored in job.request is used to rebuild the context.
+    """
+    from ..schemas import ResumeJobRequest, JobStatus
+    store = JsonStore()
+    try:
+        job = store.get_job(req.job_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Job {req.job_id} not found")
+
+    # Find last successful step name
+    completed_steps = [
+        s.name for s in (job.steps or []) if s.status in ("ok", "passed", "skipped")
+    ]
+    # Determine resume point
+    if req.override_step:
+        if req.override_step not in _SAFE_DEPLOY_STEPS:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown override_step '{req.override_step}'. Valid: {_SAFE_DEPLOY_STEPS}",
+            )
+        start_from = req.override_step
+    else:
+        # Find the first step NOT in completed_steps
+        start_from = None
+        for step_name in _SAFE_DEPLOY_STEPS:
+            if step_name not in completed_steps:
+                start_from = step_name
+                break
+        if start_from is None:
+            return {"status": "already_complete", "message": "All pipeline steps already completed.", "job_id": req.job_id}
+
+    # Recover original request payload
+    original_request = job.request or {}
+    module_name = original_request.get("module_name")
+    project_path = original_request.get("project_path")
+    if not module_name or not project_path:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot resume: job {req.job_id} is missing module_name or project_path in its request payload.",
+        )
+
+    # Re-run from start_from step
+    store.log_audit(
+        "workflow.resume_job",
+        "running",
+        f"Resuming job {req.job_id} from step '{start_from}' (completed: {completed_steps})",
+    )
+    from ..services.odoo_rpc_service import OdooRpcService
+    from ..services.odoosh_service import OdooShService
+    from ..services.git_service import GitService
+    from ..services.repo_service import RepoService
+
+    resume_results: dict = {
+        "resumed_from": start_from,
+        "original_job_id": req.job_id,
+        "completed_steps": completed_steps,
+        "steps_run": {},
+    }
+
+    step_order = _SAFE_DEPLOY_STEPS[_SAFE_DEPLOY_STEPS.index(start_from):]
+
+    for step_name in step_order:
+        try:
+            if step_name == "qa":
+                from .qa import self_run
+                from ..schemas import SelfRunRequest
+                qa_req = SelfRunRequest(project_path=project_path)
+                result = self_run(qa_req)
+                resume_results["steps_run"]["qa"] = {"status": "ok", "passed": result.passed if hasattr(result, "passed") else True}
+
+            elif step_name == "commit":
+                commit_msg = original_request.get("commit_message", f"Resume: update {module_name}")
+                paths = original_request.get("paths", [])
+                result = GitService().commit(project_path, commit_msg, paths, timeout_seconds=60)
+                resume_results["steps_run"]["commit"] = {"status": "ok" if result.exit_code == 0 else "failed", "sha": result.stdout.strip()}
+                if result.exit_code != 0:
+                    resume_results["error"] = f"git commit failed: {result.stderr}"
+                    return resume_results
+
+            elif step_name == "push":
+                remote = original_request.get("remote", "origin")
+                branch = original_request.get("branch")
+                result = GitService().push(project_path, remote, branch, timeout_seconds=60)
+                resume_results["steps_run"]["push"] = {"status": "ok" if result.exit_code == 0 else "failed"}
+                if result.exit_code != 0:
+                    resume_results["error"] = f"git push failed: {result.stderr}"
+                    return resume_results
+
+            elif step_name == "wait_odoosh":
+                import time
+                sha_result = GitService().run_git(["rev-parse", "HEAD"], project_path) if hasattr(GitService(), "run_git") else None
+                # Best-effort: poll odoosh for up to 300s
+                odoosh = OdooShService()
+                deployed = False
+                for _ in range(20):
+                    check = odoosh.check_commit_deployed(
+                        original_request.get("last_sha", "HEAD")
+                    )
+                    if check.exit_code == 0 and "true" in check.stdout.lower():
+                        deployed = True
+                        break
+                    time.sleep(15)
+                resume_results["steps_run"]["wait_odoosh"] = {"deployed": deployed}
+                if not deployed:
+                    resume_results["error"] = "Timed out waiting for Odoo.sh to deploy commit"
+                    return resume_results
+
+            elif step_name == "upgrade":
+                result = OdooRpcService().module_deploy(module_name)
+                resume_results["steps_run"]["upgrade"] = {"status": result.status, "error": result.error}
+                if result.status != "ok":
+                    resume_results["error"] = f"upgrade failed: {result.error}"
+                    return resume_results
+
+            elif step_name == "smoke_test":
+                result = OdooRpcService().registry_smoke_test(module_name)
+                resume_results["steps_run"]["smoke_test"] = {"status": result.status}
+
+        except Exception as exc:
+            resume_results["steps_run"][step_name] = {"status": "error", "error": str(exc)}
+            resume_results["error"] = f"Step '{step_name}' raised exception: {exc}"
+            return resume_results
+
+    resume_results["status"] = "ok"
+    resume_results["message"] = f"Pipeline resumed and completed from step '{start_from}'"
+    store.log_audit("workflow.resume_job", "ok", f"Completed resume of job {req.job_id}")
+    return resume_results

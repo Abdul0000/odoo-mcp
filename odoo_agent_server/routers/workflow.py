@@ -181,6 +181,14 @@ def start_session(payload: StartSessionRequest) -> WorkflowReport:
     final = "failed" if "failed" in flags else "warning" if "warning" in flags else "passed"
     final_job_status = JobStatus.failed if final == "failed" else JobStatus.warning if final == "warning" else JobStatus.passed
     finished = store.finish_job(store.get_job(job.id), final_job_status, {"status": final, "project_path": prepared.project_path if prepared else None})
+    # Fix 7: persist session state so a new session after Render restart can reload it
+    store.save_session_state({
+        "last_job_id": job.id,
+        "last_sha": prepared.sha if prepared else None,
+        "project_path": prepared.project_path if prepared else None,
+        "branch": prepared.branch if prepared else None,
+        "start_session_status": final,
+    })
     return WorkflowReport(status=final, job_id=job.id, steps=finished.steps, summary={"status": final, "project_path": prepared.project_path if prepared else None, "sha": prepared.sha if prepared else None})
 
 
@@ -362,7 +370,13 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
     ))
 
     def _background():
-        _run_safe_deploy(payload, job.id)
+        try:
+            _run_safe_deploy(payload, job.id)
+        except Exception as exc:
+            store2 = JsonStore()
+            j = store2.get_job(job.id)
+            if j.status == JobStatus.running:
+                store2.finish_job(j, JobStatus.failed, {"error": f"Unhandled exception: {exc}"})
 
     t = threading.Thread(target=_background, daemon=True, name=f"safe_deploy_{job.id}")
     t.start()
@@ -523,3 +537,11 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     fresh_job = store.get_job(job_id)
     store.finish_job(fresh_job, JobStatus.passed, {"module_name": payload.module_name, "sha": pushed_sha})
     approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module succeeded")
+    # Fix 7: persist milestone so resume_job and future sessions know where we are
+    store.save_session_state({
+        "last_safe_deploy_job_id": job_id,
+        "last_sha": pushed_sha,
+        "module_name": payload.module_name,
+        "project_path": payload.project_path,
+        "safe_deploy_status": "passed",
+    })

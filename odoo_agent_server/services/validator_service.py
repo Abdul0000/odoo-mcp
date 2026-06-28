@@ -112,17 +112,87 @@ class OdooModuleValidator:
                     findings.append(Finding(severity=Severity.error, code="MANIFEST_FILE_MISSING", message=f"Manifest references missing file: {rel_path}", file=str(manifest_path), hint="Create the file or remove it from the manifest."))
         return findings
 
+    # Fix 8: Odoo-specific wrong-import patterns that pass Python syntax but fail at runtime.
+    # Keyed by the bad import string → (correct_alternative, severity).
+    _ODOO_WRONG_IMPORTS: dict[str, tuple[str, Severity]] = {
+        # Wrong attribute access paths inside odoo package
+        "from odoo.models import BaseModel": ("from odoo import models", Severity.error),
+        "from odoo.models import Model": ("from odoo import models", Severity.error),
+        "from odoo.fields import Field": ("from odoo import fields  # then use fields.Char etc.", Severity.error),
+        "from odoo.api import Environment": ("from odoo import api  # env is self.env", Severity.warning),
+        "from odoo.exceptions import UserError": (None, Severity.info),  # this one IS correct, skip
+        # Common wrong form: importing Command from wrong place
+        "from odoo import Command": ("from odoo.fields import Command", Severity.error),
+        # Relative import of odoo internals
+        "import odoo.models as models": ("from odoo import models", Severity.warning),
+        "import odoo.fields as fields": ("from odoo import fields", Severity.warning),
+        # Deprecated / removed in 17+
+        "from odoo.addons.base.models.ir_ui_view import": (
+            "Avoid importing ir.ui.view internals; use self.env.ref() instead.", Severity.warning
+        ),
+    }
+
+    # Correct patterns — must NOT be flagged
+    _ODOO_CORRECT_IMPORTS: set[str] = {
+        "from odoo import models, fields, api",
+        "from odoo import models",
+        "from odoo import fields",
+        "from odoo import api",
+        "from odoo import _",
+        "from odoo import tools",
+        "from odoo import SUPERUSER_ID",
+        "from odoo.fields import Command",
+        "from odoo.exceptions import UserError",
+        "from odoo.exceptions import ValidationError",
+        "from odoo.exceptions import AccessError",
+        "from odoo.tools import",
+        "from odoo.tools.translate import",
+        "from odoo.http import",
+        "from odoo.addons.",
+    }
+
     def _validate_python_files(self, module_path: Path) -> list[Finding]:
         findings: list[Finding] = []
         for py_file in self._iter_files(module_path, "*.py"):
             if "__pycache__" in py_file.parts:
                 continue
             try:
-                ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+                source = py_file.read_text(encoding="utf-8")
+                ast.parse(source, filename=str(py_file))
             except SyntaxError as exc:
                 findings.append(Finding(severity=Severity.error, code="PYTHON_SYNTAX_ERROR", message=str(exc), file=str(py_file), line=exc.lineno))
+                continue
             except UnicodeDecodeError as exc:
                 findings.append(Finding(severity=Severity.error, code="PYTHON_ENCODING_ERROR", message=str(exc), file=str(py_file)))
+                continue
+            # Fix 8: validate Odoo-specific import patterns line-by-line
+            findings.extend(self._validate_odoo_imports(py_file, source))
+        return findings
+
+    def _validate_odoo_imports(self, py_file: Path, source: str) -> list[Finding]:
+        """Check for wrong Odoo import paths that pass Python syntax but blow up at runtime."""
+        findings: list[Finding] = []
+        for lineno, raw_line in enumerate(source.splitlines(), start=1):
+            line = raw_line.strip()
+            if not line.startswith(("import ", "from ")):
+                continue
+            # Skip lines that are known-correct
+            if any(line.startswith(pat) for pat in self._ODOO_CORRECT_IMPORTS):
+                continue
+            # Match against known-wrong patterns
+            for wrong_pat, (fix_hint, severity) in self._ODOO_WRONG_IMPORTS.items():
+                if wrong_pat == "from odoo.exceptions import UserError":
+                    continue  # marked as info/skip above
+                if line.startswith(wrong_pat) or wrong_pat in line:
+                    hint = f"Use instead: {fix_hint}" if fix_hint else None
+                    findings.append(Finding(
+                        severity=severity,
+                        code="ODOO_WRONG_IMPORT",
+                        message=f"Wrong Odoo import pattern: '{line}' — this will fail at module load.",
+                        file=str(py_file),
+                        line=lineno,
+                        hint=hint,
+                    ))
         return findings
 
     def _validate_xml_files(self, module_path: Path) -> list[Finding]:

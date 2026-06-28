@@ -4,12 +4,97 @@ import json
 import re
 import shlex
 import subprocess
+import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import settings
 from ..schemas import CommandResult, OdooShLogName
+
+
+# ---------------------------------------------------------------------------
+# Fix 5: SSH ControlMaster connection pool.
+# One persistent SSH master per (host, port, user) reuses the mux socket for
+# all subsequent calls — eliminating the 2-3 sec TCP/crypto handshake per call.
+# ---------------------------------------------------------------------------
+
+class _SshMasterPool:
+    """Singleton pool of SSH ControlMaster background processes, one per target."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._masters: dict[str, tuple[subprocess.Popen, Path]] = {}
+        self._tmpdir = Path(tempfile.mkdtemp(prefix="odoosh_ssh_pool_"))
+
+    def _key(self, host: str, port: int, user: str) -> str:
+        return f"{user}@{host}:{port}"
+
+    def _socket_path(self, key: str) -> Path:
+        safe = key.replace("/", "_").replace(":", "_").replace("@", "_")
+        return self._tmpdir / f"cm_{safe}.sock"
+
+    def ensure_master(
+        self,
+        host: str,
+        port: int,
+        user: str,
+        key_path: Path | None,
+        timeout: int = 15,
+    ) -> Path | None:
+        """Ensure a ControlMaster is alive; return socket path or None on failure."""
+        key = self._key(host, port, user)
+        with self._lock:
+            entry = self._masters.get(key)
+            if entry is not None:
+                proc, sock = entry
+                if proc.poll() is None and sock.exists():
+                    return sock  # healthy
+            sock = self._socket_path(key)
+            sock.parent.mkdir(parents=True, exist_ok=True)
+            cmd = [
+                "ssh", "-N", "-f", "-M",
+                "-S", str(sock),
+                "-p", str(port),
+                "-o", "BatchMode=yes",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", f"ConnectTimeout={timeout}",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ServerAliveCountMax=3",
+            ]
+            if key_path:
+                cmd.extend(["-i", str(key_path), "-o", "IdentitiesOnly=yes"])
+            cmd.append(f"{user}@{host}")
+            try:
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                deadline = time.monotonic() + 6
+                while time.monotonic() < deadline:
+                    if sock.exists():
+                        self._masters[key] = (proc, sock)
+                        return sock
+                    time.sleep(0.2)
+            except Exception:
+                pass
+            return None
+
+    def mux_args(self, sock: Path | None) -> list[str]:
+        """Extra ssh args to route a call through an existing ControlMaster."""
+        if sock and sock.exists():
+            return ["-o", f"ControlPath={sock}", "-o", "ControlMaster=no"]
+        return []
+
+    def close_master(self, host: str, port: int, user: str) -> None:
+        key = self._key(host, port, user)
+        with self._lock:
+            entry = self._masters.pop(key, None)
+            if entry:
+                proc, sock = entry
+                proc.terminate()
+                sock.unlink(missing_ok=True)
+
+
+_SSH_POOL = _SshMasterPool()
 
 
 @dataclass(frozen=True)
@@ -46,6 +131,13 @@ class OdooShService:
         )
 
     def _base_ssh_command(self, target: SshTarget) -> list[str]:
+        # Fix 5: try to reuse a ControlMaster socket; fall back to a fresh connection.
+        sock = _SSH_POOL.ensure_master(
+            host=target.host,
+            port=target.port,
+            user=target.user,
+            key_path=target.key_path,
+        )
         command = [
             "ssh",
             "-p", str(target.port),
@@ -55,6 +147,8 @@ class OdooShService:
         ]
         if target.key_path:
             command.extend(["-i", str(target.key_path), "-o", "IdentitiesOnly=yes"])
+        # Inject mux args when a master socket is available
+        command.extend(_SSH_POOL.mux_args(sock))
         command.append(f"{target.user}@{target.host}")
         return command
 

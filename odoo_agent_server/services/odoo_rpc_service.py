@@ -42,21 +42,24 @@ class OdooRpcService:
 
     def _proxies(self) -> tuple[OdooRpcConfig, xmlrpc.client.ServerProxy, xmlrpc.client.ServerProxy, int]:
         cfg = self._config()
-        # Odoo.sh can use valid certs; this context is default-verified.
+        import socket as _socket
+        _socket.setdefaulttimeout(30)  # Prevent infinite blocking on hung Odoo server
         context = ssl.create_default_context()
         common = xmlrpc.client.ServerProxy(urljoin(cfg.base_url + "/", "xmlrpc/2/common"), allow_none=True, context=context)
         uid = common.authenticate(cfg.database, cfg.login, cfg.password, {})
         if not uid:
-            raise ValueError("Odoo XML-RPC authentication failed")
+            raise ValueError("Odoo XML-RPC authentication failed — check ODOO_LOGIN and ODOO_PASSWORD")
         models = xmlrpc.client.ServerProxy(urljoin(cfg.base_url + "/", "xmlrpc/2/object"), allow_none=True, context=context)
         return cfg, common, models, int(uid)
 
     def execute_kw(self, model: str, method: str, args: list[Any] | None = None, kwargs: dict[str, Any] | None = None, superuser: bool = False) -> OdooRpcResult:
         try:
             cfg, _common, models, uid = self._proxies()
-            # For module install/upgrade use superuser (uid=1) to bypass access restrictions
-            effective_uid = 1 if superuser else uid
-            result = models.execute_kw(cfg.database, effective_uid, cfg.password, model, method, args or [], kwargs or {})
+            # NOTE: superuser=True is kept for API compatibility but uid=1 does NOT work
+            # on Odoo.sh because the user's password != admin password.
+            # All operations use the configured ODOO_LOGIN uid.
+            # Access Denied → use SSH fallback (_ssh_fallback_result).
+            result = models.execute_kw(cfg.database, uid, cfg.password, model, method, args or [], kwargs or {})
             return OdooRpcResult(status="ok", base_url=cfg.base_url, database=cfg.database, result=result)
         except Exception as exc:  # noqa: BLE001 - return details to user/agent
             return OdooRpcResult(status="failed", result=None, error=str(exc))
@@ -107,14 +110,63 @@ class OdooRpcService:
         return OdooRpcResult(status="ok", result={"dependencies": rows, "missing": missing})
 
     def _dependency_guard(self, module_name: str) -> OdooRpcResult | None:
+        """Fix 10: Auto-install missing dependencies instead of just failing.
+
+        When dependencies are uninstalled, install them automatically one by
+        one before the main module is touched. Returns an OdooRpcResult error
+        only if auto-install itself fails.  Returns None when all deps are met.
+        """
         deps = self.module_dependencies_status(module_name)
         if deps.status != "ok":
+            # Can't read deps (e.g. module not in registry yet) — let the main
+            # install surface the real error.
             return None
         missing = (deps.result or {}).get("missing") or []
-        if missing:
-            names = ", ".join(sorted({str(row.get("name")) for row in missing}))
-            return OdooRpcResult(status="failed", error=f"Missing/uninstalled dependencies for {module_name}: {names}")
+        if not missing:
+            return None  # all dependencies satisfied
+        missing_names = sorted({str(row.get("name")) for row in missing})
+        auto_install_results: list[str] = []
+        for dep_name in missing_names:
+            dep_id_result = self._module_id(dep_name)
+            if dep_id_result.status != "ok":
+                return OdooRpcResult(
+                    status="failed",
+                    error=(
+                        f"Dependency '{dep_name}' is not registered in Odoo. "
+                        f"Add it to your custom addons path or install it first."
+                    ),
+                )
+            install_result = self.execute_kw(
+                "ir.module.module",
+                "button_immediate_install",
+                [[dep_id_result.result]],
+                superuser=True,
+            )
+            if install_result.status != "ok":
+                return OdooRpcResult(
+                    status="failed",
+                    error=(
+                        f"Auto-install of dependency '{dep_name}' failed: {install_result.error}. "
+                        f"Install it manually then retry."
+                    ),
+                )
+            auto_install_results.append(dep_name)
+        # Stash a note so callers can surface it; not an error.
+        if auto_install_results:
+            import logging
+            logging.getLogger(__name__).info(
+                "odoo.ensure_dependencies: auto-installed %s for %s",
+                auto_install_results,
+                module_name,
+            )
         return None
+
+    def ensure_dependencies(self, module_name: str) -> OdooRpcResult:
+        """Fix 10: Public tool-callable method to auto-install missing dependencies."""
+        err = self._dependency_guard(module_name)
+        if err:
+            return err
+        return OdooRpcResult(status="ok", result={"message": f"All dependencies satisfied for {module_name}"})
 
 
     def _ssh_fallback_result(self, module_name: str, operation: str, cause: str) -> OdooRpcResult:
