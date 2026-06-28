@@ -85,14 +85,83 @@ class OdooRpcService:
         if module_id_result.status != "ok":
             return module_id_result
         module_id = module_id_result.result
-        return self.execute_kw("ir.module.module", "button_immediate_install", [[module_id]])
+        result = self.execute_kw("ir.module.module", "button_immediate_install", [[module_id]])
+        if result.status == "failed":
+            result = OdooRpcResult(status="failed", error=f"button_immediate_install failed: {result.error}\nACTION: Call odoosh.grep_errors → fix code → recommit → push → redeploy.")
+        return result
 
     def module_update(self, module_name: str) -> OdooRpcResult:
         module_id_result = self._module_id(module_name)
         if module_id_result.status != "ok":
             return module_id_result
         module_id = module_id_result.result
-        return self.execute_kw("ir.module.module", "button_immediate_upgrade", [[module_id]])
+        result = self.execute_kw("ir.module.module", "button_immediate_upgrade", [[module_id]])
+        if result.status == "failed":
+            result = OdooRpcResult(status="failed", error=f"button_immediate_upgrade failed: {result.error}\nACTION: Call odoosh.grep_errors → fix code → recommit → push → redeploy.")
+        return result
+
+    def module_deploy(self, module_name: str) -> OdooRpcResult:
+        """Smart deploy sequence:
+        1. update_list (register new modules)
+        2. check state
+        3a. uninstalled → button_immediate_install
+        3b. installed   → button_immediate_upgrade
+        On failure: returns exact error + action steps for agent.
+        """
+        import time
+
+        update_result = self.execute_kw("ir.module.module", "update_list", [])
+        if update_result.status == "failed":
+            return OdooRpcResult(status="failed", error=f"update_list failed: {update_result.error}")
+
+        time.sleep(3)
+
+        status_result = self.module_status(module_name)
+        if status_result.status != "ok":
+            return status_result
+
+        records = status_result.result or []
+        if not records:
+            return OdooRpcResult(
+                status="failed",
+                error=(
+                    f"Module {module_name!r} not found after update_list.\n"
+                    "ACTIONS:\n"
+                    "1. Call odoosh.grep_errors — check for Python import errors\n"
+                    "2. Verify __manifest__.py has installable=True\n"
+                    "3. Call odoosh.module_update (SSH) then retry odoo.module_deploy"
+                )
+            )
+
+        state = records[0].get("state", "unknown")
+        module_id = records[0].get("id")
+
+        if state == "installed":
+            method = "button_immediate_upgrade"
+        else:
+            method = "button_immediate_install"
+
+        result = self.execute_kw("ir.module.module", method, [[module_id]])
+
+        if result.status == "failed":
+            return OdooRpcResult(
+                status="failed",
+                error=(
+                    f"{method} FAILED on {module_name!r} (was: {state})\n"
+                    f"ERROR: {result.error}\n"
+                    "ROOT CAUSE: Python/XML error in module code.\n"
+                    "REQUIRED STEPS:\n"
+                    "1. odoosh.grep_errors — read full traceback\n"
+                    "2. repo.read the broken file\n"
+                    "3. repo.write with fix\n"
+                    "4. git.commit → git.push → odoosh.check_commit → odoo.module_deploy"
+                )
+            )
+
+        return OdooRpcResult(
+            status="ok",
+            result={"method": method, "previous_state": state, "module": module_name}
+        )
 
     def search_read(self, model: str, domain: list[Any], fields: list[str], limit: int) -> OdooRpcResult:
         return self.execute_kw(model, "search_read", [domain], {"fields": fields, "limit": limit})

@@ -94,9 +94,19 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="odoosh.grep_errors", description="Search Odoo.sh logs for errors", read_only=True),
     ToolDescriptor(name="odoosh.module_update", description="Run Odoo module update through Odoo.sh SSH", requires_approval=True),
     ToolDescriptor(name="odoo.health", description="Check Odoo XML-RPC health", read_only=True),
-    ToolDescriptor(name="odoo.module_status", description="Read Odoo module status", read_only=True),
-    ToolDescriptor(name="odoo.module_install", description="Install an Odoo module via XML-RPC", requires_approval=True),
-    ToolDescriptor(name="odoo.module_update", description="Upgrade an Odoo module via XML-RPC", requires_approval=True),
+    ToolDescriptor(name="odoo.module_status", description="Read Odoo module state (installed/uninstalled/not found)", read_only=True),
+    ToolDescriptor(
+        name="odoo.module_deploy",
+        description=(
+            "SMART INSTALL — always use this instead of module_install/module_update. "
+            "Runs: update_list → check state → button_immediate_install (new) or button_immediate_upgrade (existing). "
+            "On failure returns exact error + step-by-step fix instructions. "
+            "Use this for ALL first-time installs and upgrades."
+        ),
+        requires_approval=True,
+    ),
+    ToolDescriptor(name="odoo.module_install", description="[LEGACY] Direct button_immediate_install — use odoo.module_deploy instead", requires_approval=True),
+    ToolDescriptor(name="odoo.module_update", description="[LEGACY] Direct button_immediate_upgrade — use odoo.module_deploy instead", requires_approval=True),
     ToolDescriptor(name="odoo.search_read", description="Run Odoo search_read via XML-RPC", read_only=True),
     ToolDescriptor(name="browser.screenshot", description="Capture Odoo page screenshot with console/network errors", read_only=True),
     ToolDescriptor(name="approvals.list", description="List pending/recent approval records", read_only=True),
@@ -138,6 +148,7 @@ _TOOL_INPUT_MODELS = {
     "odoosh.module_update": OdooShModuleUpdateRequest,
     "odoo.health": EmptyRequest,
     "odoo.module_status": OdooRpcModuleRequest,
+    "odoo.module_deploy": OdooRpcModuleRequest,
     "odoo.module_install": OdooRpcModuleRequest,
     "odoo.module_update": OdooRpcModuleRequest,
     "odoo.search_read": OdooSearchReadRequest,
@@ -246,6 +257,9 @@ async def _dispatch(name: str, args: dict) -> object:
         return odoosh_module_update(OdooShModuleUpdateRequest.model_validate(args))
     if name == "odoo.health":
         return OdooRpcService().health()
+    if name == "odoo.module_deploy":
+        req = OdooRpcModuleRequest.model_validate(args)
+        return OdooRpcService().module_deploy(req.module_name)
     if name == "odoo.module_status":
         req = OdooRpcModuleRequest.model_validate(args)
         return OdooRpcService().module_status(req.module_name)
