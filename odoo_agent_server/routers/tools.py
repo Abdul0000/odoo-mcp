@@ -376,7 +376,7 @@ async def _dispatch(name: str, args: dict) -> object:
         return odoo_module_update(OdooRpcModuleRequest.model_validate(args))
     if name == "odoo.search_read":
         req = OdooSearchReadRequest.model_validate(args)
-        return OdooRpcService().search_read(req.model, req.domain, req.fields, req.limit)
+        return OdooRpcService().search_read(req.model, req.domain, req.fields, req.limit, req.offset, req.order, req.context)
     if name == "browser.screenshot":
         req = BrowserCheckRequest.model_validate(args)
         return await PlaywrightService().screenshot_odoo_page(
@@ -425,7 +425,6 @@ async def _dispatch(name: str, args: dict) -> object:
     # Fix 10: Auto-install dependencies
     if name == "odoo.ensure_dependencies":
         req = EnsureDependenciesRequest.model_validate(args)
-        from ..services.odoo_rpc_service import OdooRpcService
         return OdooRpcService().ensure_dependencies(req.module_name)
     raise HTTPException(status_code=404, detail=f"Unknown tool: {name}")
 
@@ -444,7 +443,6 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
     re-runs the pipeline from the next step.  The SafeDeployModuleRequest
     stored in job.request is used to rebuild the context.
     """
-    from ..schemas import ResumeJobRequest, JobStatus
     store = JsonStore()
     try:
         job = store.get_job(req.job_id)
@@ -489,11 +487,6 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
         "running",
         f"Resuming job {req.job_id} from step '{start_from}' (completed: {completed_steps})",
     )
-    from ..services.odoo_rpc_service import OdooRpcService
-    from ..services.odoosh_service import OdooShService
-    from ..services.git_service import GitService
-    from ..services.repo_service import RepoService
-
     resume_results: dict = {
         "resumed_from": start_from,
         "original_job_id": req.job_id,
@@ -506,8 +499,6 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
     for step_name in step_order:
         try:
             if step_name == "qa":
-                from .qa import self_run
-                from ..schemas import SelfRunRequest
                 qa_req = SelfRunRequest(project_path=project_path)
                 result = self_run(qa_req)
                 resume_results["steps_run"]["qa"] = {"status": "ok", "passed": result.passed if hasattr(result, "passed") else True}
@@ -532,7 +523,6 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
 
             elif step_name == "wait_odoosh":
                 import time
-                sha_result = GitService().run_git(["rev-parse", "HEAD"], project_path) if hasattr(GitService(), "run_git") else None
                 # Best-effort: poll odoosh for up to 300s
                 odoosh = OdooShService()
                 deployed = False

@@ -296,6 +296,9 @@ class OdooSearchReadRequest(BaseModel):
     domain: list[Any] = Field(default_factory=list)
     fields: list[str] = Field(default_factory=list)
     limit: int = Field(default=20, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+    order: str | None = Field(default=None, description="Optional Odoo order string, e.g. 'create_date desc'")
+    context: dict[str, Any] | None = Field(default=None, description="Optional Odoo context passed to search_read")
 
 
 class OdooRpcResult(BaseModel):

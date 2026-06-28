@@ -6,7 +6,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
+from threading import RLock
 from uuid import uuid4
 
 from fastapi import HTTPException, status
@@ -21,6 +23,10 @@ _TEXT_LIMIT_HINT = "File is too large for this endpoint. Increase max_bytes or u
 
 class RepoService:
     """Safe local repository operations constrained by configured allowed roots."""
+
+    _module_cache_lock = RLock()
+    _module_cache: dict[tuple[str, int, bool, int, float], tuple[float, list[CustomModuleItem]]] = {}
+    _module_cache_ttl_seconds = 30.0
 
     def project(self, project_path: str) -> Path:
         project = resolve_allowed_path(project_path)
@@ -126,16 +132,28 @@ class RepoService:
         )
 
     def list_custom_modules(self, project_path: str, max_depth: int = 5, include_uninstallable: bool = False) -> list[CustomModuleItem]:
-        """Discover custom Odoo modules from repo files, not from the Odoo database."""
+        """Discover custom Odoo modules from repo files, not from the Odoo database.
+
+        Uses a short in-memory cache keyed by manifest count/latest mtime. This
+        keeps repo.prepare → repo.list_custom_modules fast in agent loops while
+        still invalidating as soon as manifests are added or edited.
+        """
         project = self.project(project_path)
+        manifest_count, latest_mtime = self._manifest_cache_stamp(project, max_depth)
+        cache_key = (str(project), max_depth, include_uninstallable, manifest_count, latest_mtime)
+        now = time.monotonic()
+        with self._module_cache_lock:
+            cached = self._module_cache.get(cache_key)
+            if cached and cached[0] > now:
+                return list(cached[1])
+
         modules: list[CustomModuleItem] = []
-        skip_dirs = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv", "odoo", "enterprise"}
-        for manifest in project.rglob("__manifest__.py"):
-            rel_parts = manifest.relative_to(project).parts
-            if any(part in skip_dirs for part in rel_parts):
-                continue
-            if len(rel_parts) > max_depth + 1:
-                continue
+        skip_dirs = {
+            ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+            "node_modules", ".venv", "venv", "env", "odoo", "enterprise",
+            "src/odoo", "src/enterprise", "static/lib",
+        }
+        for manifest in self._iter_manifest_files(project, max_depth, skip_dirs):
             meta = self._read_manifest_metadata(manifest)
             installable = meta.get("installable")
             if installable is False and not include_uninstallable:
@@ -153,7 +171,44 @@ class RepoService:
                     application=meta.get("application") if isinstance(meta.get("application"), bool) else None,
                 )
             )
-        return sorted(modules, key=lambda item: item.module_name)
+        result = sorted(modules, key=lambda item: item.module_name)
+        with self._module_cache_lock:
+            # Keep the cache bounded so long-running connector processes do not grow unbounded.
+            if len(self._module_cache) > 32:
+                self._module_cache.clear()
+            self._module_cache[cache_key] = (time.monotonic() + self._module_cache_ttl_seconds, result)
+        return list(result)
+
+    def _iter_manifest_files(self, project: Path, max_depth: int, skip_dirs: set[str]):
+        base_depth = len(project.parts)
+        for current, dirs, files in os.walk(project):
+            current_path = Path(current)
+            rel_parts = current_path.relative_to(project).parts if current_path != project else ()
+            depth = len(current_path.parts) - base_depth
+            dirs[:] = [
+                d for d in dirs
+                if d not in skip_dirs
+                and "/".join((*rel_parts, d)) not in skip_dirs
+                and depth < max_depth
+            ]
+            if "__manifest__.py" in files and depth <= max_depth:
+                yield current_path / "__manifest__.py"
+
+    def _manifest_cache_stamp(self, project: Path, max_depth: int) -> tuple[int, float]:
+        skip_dirs = {
+            ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+            "node_modules", ".venv", "venv", "env", "odoo", "enterprise",
+            "src/odoo", "src/enterprise", "static/lib",
+        }
+        count = 0
+        latest = 0.0
+        for manifest in self._iter_manifest_files(project, max_depth, skip_dirs):
+            count += 1
+            try:
+                latest = max(latest, manifest.stat().st_mtime)
+            except OSError:
+                pass
+        return count, latest
 
     def list_files(self, project_path: str, relative_path: str = ".", max_depth: int = 3, max_items: int = 500) -> list[FileListItem]:
         root = self.target(project_path, relative_path)

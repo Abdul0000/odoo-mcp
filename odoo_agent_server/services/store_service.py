@@ -23,6 +23,7 @@ class JsonStore:
     """
 
     _lock = Lock()  # in-process thread safety
+    _read_cache: dict[str, tuple[float, int, list[dict[str, Any]]]] = {}
 
     @contextmanager
     def _file_lock(self, path: Path):
@@ -43,22 +44,40 @@ class JsonStore:
         self.audit_file = self.root / "audit.json"
 
     def _read_list(self, path: Path) -> list[dict[str, Any]]:
-        # file_lock is acquired by callers via _write_list for write ops
         with self._lock:
             if not path.exists():
+                self._read_cache.pop(str(path), None)
                 return []
             try:
+                stat = path.stat()
+                cache_key = str(path)
+                cached = self._read_cache.get(cache_key)
+                if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
+                    return [dict(row) for row in cached[2]]
                 raw = json.loads(path.read_text(encoding="utf-8") or "[]")
             except json.JSONDecodeError:
                 raw = []
-            return raw if isinstance(raw, list) else []
+            rows = raw if isinstance(raw, list) else []
+            try:
+                stat = path.stat()
+                self._read_cache[str(path)] = (stat.st_mtime, stat.st_size, [dict(row) for row in rows])
+            except OSError:
+                pass
+            return [dict(row) for row in rows]
 
     def _write_list(self, path: Path, rows: list[dict[str, Any]]) -> None:
-        # Always use _file_lock context when calling _write_list
-        # e.g.: with self._file_lock(path): self._write_list(path, rows)
         with self._lock:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(rows, indent=2, sort_keys=True), encoding="utf-8")
+            payload = json.dumps(rows, indent=2, sort_keys=True)
+            with self._file_lock(path):
+                tmp_path = path.with_suffix(path.suffix + ".tmp")
+                tmp_path.write_text(payload, encoding="utf-8")
+                tmp_path.replace(path)
+            try:
+                stat = path.stat()
+                self._read_cache[str(path)] = (stat.st_mtime, stat.st_size, [dict(row) for row in rows])
+            except OSError:
+                self._read_cache.pop(str(path), None)
 
     def create_approval(self, record: ApprovalRecord) -> ApprovalRecord:
         rows = self._read_list(self.approvals_file)

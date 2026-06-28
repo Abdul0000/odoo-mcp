@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import threading
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -24,6 +23,7 @@ from ..schemas import (
 from ..services.approval_service import ApprovalService
 from ..services.odoosh_service import OdooShService
 from ..services.store_service import JsonStore
+from ..services.background_executor import submit_background
 
 router = APIRouter(prefix="/odoosh", tags=["odoosh"], dependencies=[AuthDependency])
 
@@ -83,7 +83,7 @@ def _background_command_job(
             approval.mark_failed(approval_id, f"{name} failed")
             store.log_audit(name, "failed", request.get("module_name", name), {"job_id": job.id, "error": str(exc)})
 
-    threading.Thread(target=_bg, daemon=True, name=f"{name}_{job.id}").start()
+    submit_background(_bg)
     if wait_for_result:
         waited = store.wait_job(job.id, wait_timeout_seconds, poll_interval_seconds)
         payload = {

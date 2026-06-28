@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import logging
+import socket
 import ssl
+import time
 import xmlrpc.client
 from dataclasses import dataclass
+from threading import RLock
 from typing import Any
 from urllib.parse import urljoin
 
 from ..config import settings
 from ..schemas import OdooRpcResult
+
+_LOGGER = logging.getLogger(__name__)
+socket.setdefaulttimeout(30)  # Prevent infinite blocking on hung Odoo server
 
 
 @dataclass(frozen=True)
@@ -19,7 +26,18 @@ class OdooRpcConfig:
 
 
 class OdooRpcService:
-    """Minimal Odoo XML-RPC connector for module installation/update and read checks."""
+    """Minimal Odoo XML-RPC connector for module installation/update and read checks.
+
+    The service keeps XML-RPC authentication cached for a short time. This avoids
+    a common.authenticate round trip for every small tool call while still
+    re-authenticating automatically when credentials or target DB settings change.
+    ServerProxy objects are created per call to avoid cross-thread transport
+    sharing issues during background deploy jobs.
+    """
+
+    _auth_lock = RLock()
+    _auth_cache: dict[tuple[str, str, str, str], tuple[int, float]] = {}
+    _auth_ttl_seconds = 600.0
 
     def _config(self) -> OdooRpcConfig:
         missing = []
@@ -40,17 +58,46 @@ class OdooRpcService:
             password=settings.odoo_password,
         )
 
-    def _proxies(self) -> tuple[OdooRpcConfig, xmlrpc.client.ServerProxy, xmlrpc.client.ServerProxy, int]:
-        cfg = self._config()
-        import socket as _socket
-        _socket.setdefaulttimeout(30)  # Prevent infinite blocking on hung Odoo server
+    def _common_proxy(self, cfg: OdooRpcConfig) -> xmlrpc.client.ServerProxy:
         context = ssl.create_default_context()
-        common = xmlrpc.client.ServerProxy(urljoin(cfg.base_url + "/", "xmlrpc/2/common"), allow_none=True, context=context)
+        return xmlrpc.client.ServerProxy(
+            urljoin(cfg.base_url + "/", "xmlrpc/2/common"),
+            allow_none=True,
+            context=context,
+        )
+
+    def _models_proxy(self, cfg: OdooRpcConfig) -> xmlrpc.client.ServerProxy:
+        context = ssl.create_default_context()
+        return xmlrpc.client.ServerProxy(
+            urljoin(cfg.base_url + "/", "xmlrpc/2/object"),
+            allow_none=True,
+            context=context,
+        )
+
+    def _auth_cache_key(self, cfg: OdooRpcConfig) -> tuple[str, str, str, str]:
+        return (cfg.base_url, cfg.database, cfg.login, cfg.password)
+
+    def _authenticated_uid(self, cfg: OdooRpcConfig, *, force_refresh: bool = False) -> int:
+        key = self._auth_cache_key(cfg)
+        now = time.monotonic()
+        with self._auth_lock:
+            cached = self._auth_cache.get(key)
+            if cached and not force_refresh and cached[1] > now:
+                return cached[0]
+
+        common = self._common_proxy(cfg)
         uid = common.authenticate(cfg.database, cfg.login, cfg.password, {})
         if not uid:
             raise ValueError("Odoo XML-RPC authentication failed — check ODOO_LOGIN and ODOO_PASSWORD")
-        models = xmlrpc.client.ServerProxy(urljoin(cfg.base_url + "/", "xmlrpc/2/object"), allow_none=True, context=context)
-        return cfg, common, models, int(uid)
+
+        with self._auth_lock:
+            self._auth_cache[key] = (int(uid), time.monotonic() + self._auth_ttl_seconds)
+        return int(uid)
+
+    def _proxies(self) -> tuple[OdooRpcConfig, xmlrpc.client.ServerProxy, xmlrpc.client.ServerProxy, int]:
+        cfg = self._config()
+        uid = self._authenticated_uid(cfg)
+        return cfg, self._common_proxy(cfg), self._models_proxy(cfg), uid
 
     def execute_kw(self, model: str, method: str, args: list[Any] | None = None, kwargs: dict[str, Any] | None = None, superuser: bool = False) -> OdooRpcResult:
         try:
@@ -67,12 +114,9 @@ class OdooRpcService:
     def health(self) -> OdooRpcResult:
         try:
             cfg = self._config()
-            context = ssl.create_default_context()
-            common = xmlrpc.client.ServerProxy(urljoin(cfg.base_url + "/", "xmlrpc/2/common"), allow_none=True, context=context)
+            common = self._common_proxy(cfg)
             version = common.version()
-            uid = common.authenticate(cfg.database, cfg.login, cfg.password, {})
-            if not uid:
-                return OdooRpcResult(status="failed", base_url=cfg.base_url, database=cfg.database, error="Authentication failed")
+            uid = self._authenticated_uid(cfg)
             return OdooRpcResult(status="ok", base_url=cfg.base_url, database=cfg.database, result={"uid": uid, "version": version})
         except Exception as exc:  # noqa: BLE001
             return OdooRpcResult(status="failed", error=str(exc))
@@ -86,20 +130,22 @@ class OdooRpcService:
         )
 
 
-    def module_dependencies_status(self, module_name: str) -> OdooRpcResult:
+    def module_dependencies_status(self, module_name: str, module_id: int | None = None) -> OdooRpcResult:
         """Return dependency states for an Odoo module.
 
         This catches missing/uninstalled dependencies before long installs/upgrades.
         It uses superuser uid where possible because Settings users often cannot read
         ir.module.module.dependency directly.
         """
-        module_id_result = self._module_id(module_name)
-        if module_id_result.status != "ok":
-            return module_id_result
+        if module_id is None:
+            module_id_result = self._module_id(module_name)
+            if module_id_result.status != "ok":
+                return module_id_result
+            module_id = int(module_id_result.result)
         deps = self.execute_kw(
             "ir.module.module.dependency",
             "search_read",
-            [[("module_id", "=", module_id_result.result)]],
+            [[("module_id", "=", module_id)]],
             {"fields": ["name", "state"], "limit": 200},
             superuser=True,
         )
@@ -109,14 +155,14 @@ class OdooRpcService:
         missing = [row for row in rows if row.get("state") not in ("installed", "to install", "to upgrade")]
         return OdooRpcResult(status="ok", result={"dependencies": rows, "missing": missing})
 
-    def _dependency_guard(self, module_name: str) -> OdooRpcResult | None:
+    def _dependency_guard(self, module_name: str, module_id: int | None = None) -> OdooRpcResult | None:
         """Fix 10: Auto-install missing dependencies instead of just failing.
 
         When dependencies are uninstalled, install them automatically one by
         one before the main module is touched. Returns an OdooRpcResult error
         only if auto-install itself fails.  Returns None when all deps are met.
         """
-        deps = self.module_dependencies_status(module_name)
+        deps = self.module_dependencies_status(module_name, module_id=module_id)
         if deps.status != "ok":
             # Can't read deps (e.g. module not in registry yet) — let the main
             # install surface the real error.
@@ -153,8 +199,7 @@ class OdooRpcService:
             auto_install_results.append(dep_name)
         # Stash a note so callers can surface it; not an error.
         if auto_install_results:
-            import logging
-            logging.getLogger(__name__).info(
+            _LOGGER.info(
                 "odoo.ensure_dependencies: auto-installed %s for %s",
                 auto_install_results,
                 module_name,
@@ -210,13 +255,13 @@ class OdooRpcService:
         return result.status == "failed" and "Access Denied" in (result.error or "")
 
     def module_install(self, module_name: str) -> OdooRpcResult:
-        dep_error = self._dependency_guard(module_name)
-        if dep_error:
-            return dep_error
         module_id_result = self._module_id(module_name)
         if module_id_result.status != "ok":
             return module_id_result
-        module_id = module_id_result.result
+        module_id = int(module_id_result.result)
+        dep_error = self._dependency_guard(module_name, module_id=module_id)
+        if dep_error:
+            return dep_error
         result = self.execute_kw("ir.module.module", "button_immediate_install", [[module_id]], superuser=True)
         if result.status == "failed":
             if self._looks_access_denied(result):
@@ -225,13 +270,13 @@ class OdooRpcService:
         return result
 
     def module_update(self, module_name: str) -> OdooRpcResult:
-        dep_error = self._dependency_guard(module_name)
-        if dep_error:
-            return dep_error
         module_id_result = self._module_id(module_name)
         if module_id_result.status != "ok":
             return module_id_result
-        module_id = module_id_result.result
+        module_id = int(module_id_result.result)
+        dep_error = self._dependency_guard(module_name, module_id=module_id)
+        if dep_error:
+            return dep_error
         result = self.execute_kw("ir.module.module", "button_immediate_upgrade", [[module_id]], superuser=True)
         if result.status == "failed":
             if self._looks_access_denied(result):
@@ -247,17 +292,13 @@ class OdooRpcService:
         3b. installed   → button_immediate_upgrade
         On failure: returns exact error + action steps for agent.
         """
-        import time
-
         update_result = self.execute_kw("ir.module.module", "update_list", [], superuser=True)
         if update_result.status == "failed":
             if self._looks_access_denied(update_result):
                 return self._ssh_fallback_result(module_name, "deploy", f"update_list failed: {update_result.error}")
             return OdooRpcResult(status="failed", error=f"update_list failed: {update_result.error}")
 
-        time.sleep(3)
-
-        status_result = self.module_status(module_name)
+        status_result = self._module_status_after_update_list(module_name)
         if status_result.status != "ok":
             return status_result
 
@@ -274,12 +315,15 @@ class OdooRpcService:
                 )
             )
 
-        dep_error = self._dependency_guard(module_name)
-        if dep_error:
-            return dep_error
-
         state = records[0].get("state", "unknown")
         module_id = records[0].get("id")
+        if not module_id:
+            return OdooRpcResult(status="failed", error=f"Module {module_name!r} has no id in ir.module.module search_read result")
+        module_id = int(module_id)
+
+        dep_error = self._dependency_guard(module_name, module_id=module_id)
+        if dep_error:
+            return dep_error
 
         if state == "installed":
             method = "button_immediate_upgrade"
@@ -307,8 +351,33 @@ class OdooRpcService:
             result={"method": method, "previous_state": state, "module": module_name}
         )
 
-    def search_read(self, model: str, domain: list[Any], fields: list[str], limit: int) -> OdooRpcResult:
-        return self.execute_kw(model, "search_read", [domain], {"fields": fields, "limit": limit})
+    def _module_status_after_update_list(self, module_name: str, attempts: int = 6, interval_seconds: float = 0.5) -> OdooRpcResult:
+        """Poll briefly after update_list without imposing a fixed multi-second sleep."""
+        last_result: OdooRpcResult | None = None
+        for attempt in range(max(attempts, 1)):
+            last_result = self.module_status(module_name)
+            if last_result.status == "ok" and last_result.result:
+                return last_result
+            if attempt < attempts - 1:
+                time.sleep(interval_seconds)
+        return last_result or self.module_status(module_name)
+
+    def search_read(
+        self,
+        model: str,
+        domain: list[Any] | None,
+        fields: list[str] | None,
+        limit: int,
+        offset: int = 0,
+        order: str | None = None,
+        context: dict[str, Any] | None = None,
+    ) -> OdooRpcResult:
+        kwargs: dict[str, Any] = {"fields": fields or [], "limit": limit, "offset": offset}
+        if order:
+            kwargs["order"] = order
+        if context:
+            kwargs["context"] = context
+        return self.execute_kw(model, "search_read", [domain or []], kwargs)
 
 
     def registry_smoke_test(self, module_name: str, model_names: list[str] | None = None, menu_names: list[str] | None = None, strict: bool = True) -> OdooRpcResult:

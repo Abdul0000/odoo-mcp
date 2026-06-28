@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,6 +36,7 @@ from ..services.path_service import resolve_allowed_path
 from ..services.playwright_service import PlaywrightService
 from ..services.repo_service import RepoService
 from ..services.store_service import JsonStore
+from ..services.background_executor import submit_background
 from .qa import self_run
 
 router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDependency])
@@ -378,8 +378,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             if j.status == JobStatus.running:
                 store2.finish_job(j, JobStatus.failed, {"error": f"Unhandled exception: {exc}"})
 
-    t = threading.Thread(target=_background, daemon=True, name=f"safe_deploy_{job.id}")
-    t.start()
+    submit_background(_background)
 
     return WorkflowReport(
         status="running",
