@@ -76,6 +76,14 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="git.diff", description="Read git diff", read_only=True),
     ToolDescriptor(name="git.commit", description="Create a git commit", requires_approval=True),
     ToolDescriptor(name="git.push", description="Push current branch to remote", requires_approval=True),
+    ToolDescriptor(
+        name="odoosh.module_install_ssh",
+        description=(
+            "Install a NEW module via Odoo.sh SSH using odoo-bin -i flag. "
+            "Use this when odoo.module_deploy fails with Access Denied. "
+            "Only for first-time installs — for upgrades use odoosh.module_update."
+        ),
+    ),
     ToolDescriptor(name="odoosh.health", description="Check Odoo.sh SSH health", read_only=True),
     ToolDescriptor(name="odoosh.git_status", description="Read Odoo.sh deployed git status", read_only=True),
     ToolDescriptor(
@@ -138,6 +146,7 @@ _TOOL_INPUT_MODELS = {
     "git.diff": GitDiffRequest,
     "git.commit": GitCommitRequest,
     "git.push": GitPushRequest,
+    "odoosh.module_install_ssh": OdooRpcModuleRequest,
     "odoosh.health": EmptyRequest,
     "odoosh.git_status": EmptyRequest,
     "odoosh.check_commit": OdooShCheckCommitRequest,
@@ -236,6 +245,9 @@ async def _dispatch(name: str, args: dict) -> object:
         return git_commit(GitCommitRequest.model_validate(args))
     if name == "git.push":
         return git_push(GitPushRequest.model_validate(args))
+    if name == "odoosh.module_install_ssh":
+        req = OdooRpcModuleRequest.model_validate(args)
+        return OdooShService().module_install_ssh(req.module_name)
     if name == "odoosh.health":
         return OdooShService().health()
     if name == "odoosh.git_status":

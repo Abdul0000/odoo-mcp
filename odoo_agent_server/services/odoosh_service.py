@@ -177,6 +177,27 @@ class OdooShService:
         )
         return self.run_shell(script, timeout_seconds=45)
 
+    def module_install_ssh(self, module_name: str, timeout_seconds: int = 600) -> CommandResult:
+        """Install module via SSH using -i flag (first-time install only)."""
+        if not settings.odoosh_db_name:
+            return CommandResult(command=["odoosh_module_install_ssh"], cwd="odoosh:ssh", exit_code=2, stderr="ODOOSH_DB_NAME not configured.")
+        safe_module = shlex.quote(module_name)
+        safe_db = shlex.quote(settings.odoosh_db_name)
+        odoo_path = shlex.quote(settings.odoosh_odoo_path)
+        addons_path = ",".join([
+            f"{settings.odoosh_odoo_path}/odoo/addons",
+            f"{settings.odoosh_odoo_path}/addons",
+            settings.odoosh_user_addons_path,
+        ])
+        safe_addons = shlex.quote(addons_path)
+        script = (
+            "set -e; "
+            f"cd {odoo_path}; "
+            f"./odoo-bin -d {safe_db} --addons-path={safe_addons} -i {safe_module} --stop-after-init --log-level=info"
+        )
+        result = self.run_shell(script, timeout_seconds=timeout_seconds)
+        return self._classify_module_update_result(result)
+
     def module_update(self, module_name: str, timeout_seconds: int = 600) -> CommandResult:
         if not settings.odoosh_db_name:
             return CommandResult(

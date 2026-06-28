@@ -140,10 +140,12 @@ class OdooRpcService:
 
         if state == "installed":
             method = "button_immediate_upgrade"
+            result = self.execute_kw("ir.module.module", method, [[module_id]], superuser=True)
         else:
+            # For new installs: XML-RPC may be blocked on Odoo.sh
+            # Fallback instruction to use odoosh.module_install_ssh
             method = "button_immediate_install"
-
-        result = self.execute_kw("ir.module.module", method, [[module_id]], superuser=True)
+            result = self.execute_kw("ir.module.module", method, [[module_id]], superuser=True)
 
         if result.status == "failed":
             return OdooRpcResult(
@@ -151,12 +153,9 @@ class OdooRpcService:
                 error=(
                     f"{method} FAILED on {module_name!r} (was: {state})\n"
                     f"ERROR: {result.error}\n"
-                    "ROOT CAUSE: Python/XML error in module code.\n"
-                    "REQUIRED STEPS:\n"
-                    "1. odoosh.grep_errors — read full traceback\n"
-                    "2. repo.read the broken file\n"
-                    "3. repo.write with fix\n"
-                    "4. git.commit → git.push → odoosh.check_commit → odoo.module_deploy"
+                    "If error is Access Denied: call odoosh.module_install_ssh instead — "
+                    "it uses SSH -i flag which bypasses XML-RPC permission restrictions.\n"
+                    "If error is code error: odoosh.grep_errors → fix → recommit → redeploy."
                 )
             )
 
