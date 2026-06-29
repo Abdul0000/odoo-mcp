@@ -509,6 +509,130 @@ class OdooShCheckCommitRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# V14: Self-Learning Agent — Core File Discovery Schemas
+# ---------------------------------------------------------------------------
+
+class FindCoreFileRequest(BaseModel):
+    """V14: Locate an Odoo core source file by module + type + keyword.
+
+    Search priority:
+      1. /home/odoo/src/user       (custom, already installed)
+      2. /home/odoo/src/enterprise
+      3. /home/odoo/src/odoo
+
+    Use before any _inherit, view inherit, or depends to read exact
+    fields/methods/xpath structure directly from source.
+    """
+    module_name: str = Field(
+        ...,
+        description="Odoo module technical name, e.g. 'sale', 'stock', 'account'",
+    )
+    file_type: str = Field(
+        ...,
+        description=(
+            "Type of file to search: 'model', 'view', 'wizard', 'controller', "
+            "'report', 'data', 'security', 'static', 'manifest', or 'any'"
+        ),
+    )
+    keyword: str = Field(
+        ...,
+        min_length=1,
+        description="Keyword to match in filename, e.g. 'order', 'invoice', 'picking'",
+    )
+    search_roots: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Override search roots (absolute paths). Defaults to "
+            "['/home/odoo/src/user', '/home/odoo/src/enterprise', '/home/odoo/src/odoo']"
+        ),
+    )
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        return validate_safe_name(value, "module_name")
+
+    @field_validator("file_type")
+    @classmethod
+    def file_type_must_be_valid(cls, value: str) -> str:
+        allowed = {"model", "view", "wizard", "controller", "report", "data", "security", "static", "manifest", "any"}
+        if value not in allowed:
+            raise ValueError(f"file_type must be one of: {', '.join(sorted(allowed))}")
+        return value
+
+
+class CoreFileMatch(BaseModel):
+    """A single match returned by workflow.find_core_file."""
+    path: str = Field(..., description="Absolute path to the found file")
+    relative_path: str = Field(..., description="Path relative to its search root")
+    root: str = Field(..., description="Which search root this file was found in")
+    priority: int = Field(..., description="1=user, 2=enterprise, 3=odoo — lower is higher priority")
+    size: int = Field(..., description="File size in bytes")
+
+
+class FindCoreFileResult(BaseModel):
+    """Result from workflow.find_core_file."""
+    module_name: str
+    file_type: str
+    keyword: str
+    matches: list[CoreFileMatch] = Field(default_factory=list)
+    best_match: str | None = Field(default=None, description="Absolute path of the highest-priority match (read this with repo.read)")
+    searched_roots: list[str] = Field(default_factory=list)
+    total_found: int = 0
+
+
+class FindSimilarViewRequest(BaseModel):
+    """V14: Locate an Odoo core view XML file by model + view_type.
+
+    Use before inheriting/extending any view so the agent reads the
+    exact xpath structure, field names, and string attributes before
+    writing a <xpath expr="..."> element.
+
+    Search priority: user → enterprise → odoo (same as find_core_file).
+    """
+    model: str = Field(
+        ...,
+        description="Odoo model technical name, e.g. 'sale.order', 'account.move', 'stock.picking'",
+    )
+    view_type: str = Field(
+        ...,
+        description="View type: 'form', 'tree', 'list', 'kanban', 'search', 'pivot', 'graph', 'calendar', 'any'",
+    )
+    search_roots: list[str] = Field(
+        default_factory=list,
+        description="Override search roots. Defaults to user → enterprise → odoo.",
+    )
+
+    @field_validator("view_type")
+    @classmethod
+    def view_type_must_be_valid(cls, value: str) -> str:
+        allowed = {"form", "tree", "list", "kanban", "search", "pivot", "graph", "calendar", "activity", "any"}
+        if value not in allowed:
+            raise ValueError(f"view_type must be one of: {', '.join(sorted(allowed))}")
+        return value
+
+
+class SimilarViewMatch(BaseModel):
+    """A single match returned by workflow.find_similar_view."""
+    path: str = Field(..., description="Absolute path to the view XML file")
+    relative_path: str = Field(..., description="Relative path within its search root")
+    root: str = Field(..., description="Which search root this was found in")
+    priority: int = Field(..., description="1=user, 2=enterprise, 3=odoo")
+    model_hint: str = Field(..., description="Model name extracted from file/path heuristic")
+    size: int
+
+
+class FindSimilarViewResult(BaseModel):
+    """Result from workflow.find_similar_view."""
+    model: str
+    view_type: str
+    matches: list[SimilarViewMatch] = Field(default_factory=list)
+    best_match: str | None = Field(default=None, description="Absolute path of best match — read with repo.read before writing xpath")
+    searched_roots: list[str] = Field(default_factory=list)
+    total_found: int = 0
+
+
+# ---------------------------------------------------------------------------
 # Fix 3: Resume job from last successful step
 # ---------------------------------------------------------------------------
 
@@ -555,3 +679,149 @@ class EnsureDependenciesRequest(ApprovalMixin):
     @classmethod
     def module_name_must_be_safe(cls, value: str) -> str:
         return validate_safe_name(value, "module_name")
+
+
+# ===========================================================================
+# V14+ — Pillar 2: Adaptive Scope Advisor
+# ===========================================================================
+
+class ScopeLevel(str, Enum):
+    """Adaptive scope level reached during analysis."""
+    L0 = "L0"  # Baseline: custom + core direct files
+    L1 = "L1"  # _inherit chain: read parent model
+    L2 = "L2"  # Mixin/abstract: read all mixins
+    L3 = "L3"  # Computed fields / ir.model: scan full models/ dir
+    L4 = "L4"  # Cross-module comodel: read related module core too
+
+
+class ScopeReadInstruction(BaseModel):
+    """A single mandatory read instruction returned by scope_advice."""
+    level: ScopeLevel = Field(..., description="Scope level that triggered this instruction")
+    reason: str = Field(..., description="Why this file must be read")
+    read_type: str = Field(
+        ...,
+        description=(
+            "Instruction type: custom_manifest | core_model | core_model_missing | "
+            "core_mixin | core_models_dir_scan | cross_module_manifest"
+        ),
+    )
+    path: str = Field(..., description="Absolute path (use repo.read on this path)")
+    mandatory: bool = Field(True, description="If True, must be completed before any code is written")
+
+
+class ScopeAdviceRequest(BaseModel):
+    """V14+: Request adaptive scope analysis for a coding task.
+
+    Call this AFTER reading custom module files (repo.read) and BEFORE
+    writing any code. The service scans the custom files for _inherit,
+    mixins, computed fields, and cross-module refs, then returns an
+    ordered list of mandatory reads.
+    """
+    custom_module_name: str = Field(
+        ...,
+        description="Technical name of the custom module being developed, e.g. 'my_sale_ext'",
+    )
+    custom_file_paths: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Absolute paths of custom Python files already read by the agent "
+            "(e.g. /workspace/repos/myrepo/my_module/models/sale_order.py). "
+            "Used to detect _inherit, mixins, computed fields for adaptive level detection."
+        ),
+    )
+    task_description: str = Field(
+        default="",
+        description="Brief description of the coding task (used for logging only)",
+    )
+    search_roots: list[str] = Field(
+        default_factory=list,
+        description="Override search roots. Defaults to user → enterprise → odoo.",
+    )
+
+
+class ScopeAdviceResult(BaseModel):
+    """Adaptive scope advice — ordered list of mandatory read instructions."""
+    custom_module: str
+    reached_level: ScopeLevel = Field(
+        ...,
+        description="Highest scope level triggered by the analysis",
+    )
+    instructions: list[ScopeReadInstruction] = Field(
+        default_factory=list,
+        description="Ordered list of reads the agent MUST execute before writing code",
+    )
+    mandatory_count: int = Field(0, description="Number of mandatory (blocking) instructions")
+    total_count: int = Field(0, description="Total instructions including optional")
+    warning: str = Field(
+        "",
+        description="Always-present warning: push blocked until verify_against_core passes",
+    )
+
+
+# ===========================================================================
+# V14+ — Pillar 3: Pre-Push Syntax Verifier
+# ===========================================================================
+
+class VerifySeverity(str, Enum):
+    """Severity of a syntax verify finding."""
+    CRITICAL = "CRITICAL"  # Push is BLOCKED until fixed
+    WARNING  = "WARNING"   # Should be reviewed but does not block push
+    INFO     = "INFO"      # Informational — cross-check passed
+
+
+class VerifyFinding(BaseModel):
+    """A single finding from verify_against_core."""
+    file: str = Field(..., description="Absolute path of the file containing the issue")
+    severity: VerifySeverity = Field(..., description="CRITICAL blocks push; WARNING is advisory")
+    check: str = Field(..., description="Name of the check that fired")
+    message: str = Field(..., description="Human-readable description of the mismatch")
+    fix_hint: str = Field("", description="What to do to fix this issue")
+
+
+class SyntaxVerifyRequest(BaseModel):
+    """V14+: Pre-push cross-check of written files against Odoo core source.
+
+    Call this BEFORE every git.push. If push_blocked=True in the response,
+    fix all CRITICAL findings and call again (max 3 fix cycles).
+
+    Checks performed:
+      Python (.py):
+        - _inherit model exists in core
+        - depends=[] field names exist in core model
+        - comodel_name module exists in src roots
+        - related= first field exists in core model
+        - compute= method defined in the same file
+
+      XML (.xml):
+        - xpath @name nodes exist in core view source
+        - <field name=...> fields checked against core model
+
+      Manifest (__manifest__.py):
+        - depends[] module names exist in /home/odoo/src/* roots
+    """
+    written_files: list[str] = Field(
+        ...,
+        description=(
+            "Absolute paths of files written by the agent that need pre-push verification. "
+            "Include ALL .py, .xml, and __manifest__.py files changed in this task."
+        ),
+    )
+    fix_cycle: int | None = Field(
+        default=0,
+        description="Current fix cycle number (0-indexed). After 3 cycles, the service reports and stops.",
+    )
+
+
+class SyntaxVerifyResult(BaseModel):
+    """Result of workflow.verify_against_core pre-push check."""
+    push_blocked: bool = Field(
+        ...,
+        description="True = push BLOCKED, fix CRITICAL findings first. False = push is allowed.",
+    )
+    status: str = Field(..., description="Human-readable summary of the verification result")
+    files_checked: list[str] = Field(default_factory=list, description="Files that were successfully verified")
+    findings: list[VerifyFinding] = Field(default_factory=list, description="All findings (CRITICAL + WARNING + INFO)")
+    critical_count: int = 0
+    warning_count: int = 0
+    info_count: int = 0
+    fix_cycle: int = 0

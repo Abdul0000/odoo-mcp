@@ -171,32 +171,35 @@ class OdooRpcService:
         if not missing:
             return None  # all dependencies satisfied
         missing_names = sorted({str(row.get("name")) for row in missing})
-        auto_install_results: list[str] = []
-        for dep_name in missing_names:
-            dep_id_result = self._module_id(dep_name)
-            if dep_id_result.status != "ok":
-                return OdooRpcResult(
-                    status="failed",
-                    error=(
-                        f"Dependency '{dep_name}' is not registered in Odoo. "
-                        f"Add it to your custom addons path or install it first."
-                    ),
-                )
-            install_result = self.execute_kw(
-                "ir.module.module",
-                "button_immediate_install",
-                [[dep_id_result.result]],
-                superuser=True,
+        # Speed fix: batch all missing IDs in one search then one install call
+        ids_result = self.execute_kw(
+            "ir.module.module", "search",
+            [[[("name", "in", missing_names), ("state", "!=", "installed")]]]
+        )
+        if ids_result.status != "ok":
+            return OdooRpcResult(
+                status="failed",
+                error=f"Could not find dependency IDs for: {missing_names}"
             )
-            if install_result.status != "ok":
-                return OdooRpcResult(
-                    status="failed",
-                    error=(
-                        f"Auto-install of dependency '{dep_name}' failed: {install_result.error}. "
-                        f"Install it manually then retry."
-                    ),
-                )
-            auto_install_results.append(dep_name)
+        missing_ids = ids_result.result or []
+        if not missing_ids:
+            return None  # all already installed
+        # Single batch install — much faster than sequential loop
+        install_result = self.execute_kw(
+            "ir.module.module",
+            "button_immediate_install",
+            [missing_ids],
+            superuser=True,
+        )
+        if install_result.status != "ok":
+            return OdooRpcResult(
+                status="failed",
+                error=(
+                    f"Batch auto-install of dependencies {missing_names} failed: {install_result.error}. "
+                    f"Install them manually then retry."
+                ),
+            )
+        auto_install_results = missing_names
         # Stash a note so callers can surface it; not an error.
         if auto_install_results:
             _LOGGER.info(
@@ -227,11 +230,11 @@ class OdooRpcService:
 
             service = OdooShService()
             if operation == "install":
-                ssh = service.module_install_ssh(module_name, timeout_seconds=1800)
+                ssh = service.module_install_ssh(module_name, timeout_seconds=300)
             elif operation == "update":
-                ssh = service.module_update(module_name, timeout_seconds=1800)
+                ssh = service.module_update(module_name, timeout_seconds=600)
             else:
-                ssh = service.module_deploy_ssh(module_name, timeout_seconds=1800)
+                ssh = service.module_deploy_ssh(module_name, timeout_seconds=600)
             status = "ok" if ssh.exit_code == 0 else "failed"
             return OdooRpcResult(
                 status=status,

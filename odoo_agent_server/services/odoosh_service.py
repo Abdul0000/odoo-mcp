@@ -193,6 +193,15 @@ class OdooShService:
         return self.run_shell(script, timeout_seconds=30)
 
     # NON-BLOCKING single check — ChatGPT polls this instead of blocking wait
+    def adaptive_poll_interval(self, attempt: int) -> float:
+        """Adaptive polling: fast early, slower later to reduce SSH calls."""
+        if attempt < 3:
+            return 5.0   # first 3 checks: every 5s
+        elif attempt < 8:
+            return 10.0  # next 5 checks: every 10s
+        else:
+            return 15.0  # remaining: every 15s
+
     def check_commit_deployed(self, expected_sha: str) -> CommandResult:
         """Return immediately with deployed=true/false. Never blocks.
         ChatGPT should call this in a polling loop with 15-second delays."""
@@ -208,7 +217,7 @@ class OdooShService:
             "current_sha": current or "unknown",
             "expected_sha": expected_sha,
             "message": "Deployed! Proceed to module update." if deployed
-                       else "Not yet deployed. Wait 15 seconds then call odoosh.check_commit again.",
+                       else "Not yet deployed. Use adaptive_poll_interval: attempts 0-2→wait 5s, 3-7→wait 10s, 8+→wait 15s, then call again.",
         })
         return CommandResult(
             command=["odoosh.check_commit", expected_sha],
@@ -374,7 +383,7 @@ class OdooShService:
             )
         return None
 
-    def module_install_ssh(self, module_name: str, timeout_seconds: int = 600) -> CommandResult:
+    def module_install_ssh(self, module_name: str, timeout_seconds: int = 300) -> CommandResult:
         """Install module via SSH using -i flag (first-time install only)."""
         dep_error = self._dependency_guard(module_name)
         if dep_error:

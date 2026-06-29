@@ -50,6 +50,13 @@ from ..schemas import (
     SessionStateSaveRequest,
     SessionStateLoadRequest,
     EnsureDependenciesRequest,
+    # V14: Self-Learning Agent — Core Discovery
+    FindCoreFileRequest,
+    FindSimilarViewRequest,
+    # V14+: Pillar 2 — Adaptive Scope Advisor
+    ScopeAdviceRequest,
+    # V14+: Pillar 3 — Pre-Push Syntax Verifier
+    SyntaxVerifyRequest,
 )
 from ..services.git_service import GitService
 from ..services.odoo_rpc_service import OdooRpcService
@@ -61,7 +68,7 @@ from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_apply_pa
 from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
-from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl
+from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, scope_advice, verify_against_core
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
@@ -69,6 +76,15 @@ router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency
 
 _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="connector.health", description="Check connector service health", read_only=True),
+    ToolDescriptor(
+        name="workflow.agent_instructions",
+        description=(
+            "CALL THIS FIRST in every session before any other tool. "
+            "Returns full agent rules, flow, error guide, and repo config from the connector. "
+            "Follow these instructions exactly for every task."
+        ),
+        read_only=True,
+    ),
     ToolDescriptor(name="workflow.capability_check", description="Check local connector capabilities and missing runtime configuration", read_only=True),
     ToolDescriptor(name="workflow.coding_task_plan", description="Return the repo-first coding workflow guidance for ChatGPT MCP clients", read_only=True),
     ToolDescriptor(name="workflow.full_verify", description="Run the full self-verification workflow for an Odoo module", read_only=True),
@@ -189,10 +205,67 @@ _TOOL_DESCRIPTORS = [
         ),
         requires_approval=True,
     ),
+    # ---------------------------------------------------------------------------
+    # V14 — Self-Learning Agent: Core File Discovery
+    # ---------------------------------------------------------------------------
+    ToolDescriptor(
+        name="workflow.find_core_file",
+        description=(
+            "V14 SELF-LEARNING: Locate an Odoo core source file by module + type + keyword. "
+            "CALL THIS before any _inherit or depends addition to read the real field/method definitions. "
+            "Search priority: /home/odoo/src/user → /home/odoo/src/enterprise → /home/odoo/src/odoo. "
+            "Returns best_match path — then call repo.read(best_match) to read the actual source. "
+            "Example: module_name='sale', file_type='model', keyword='order' "
+            "→ /home/odoo/src/odoo/addons/sale/models/sale_order.py"
+        ),
+        read_only=True,
+    ),
+    ToolDescriptor(
+        name="workflow.find_similar_view",
+        description=(
+            "V14 SELF-LEARNING: Locate an Odoo core view XML file by model + view_type. "
+            "CALL THIS before writing any <xpath expr='...'> to read the exact node structure. "
+            "Search priority: user → enterprise → odoo. "
+            "Returns best_match path — then call repo.read(best_match) to inspect real xpath/attrs. "
+            "Example: model='sale.order', view_type='form' "
+            "→ /home/odoo/src/enterprise/sale/views/sale_order_views.xml"
+        ),
+        read_only=True,
+    ),
+    # ---------------------------------------------------------------------------
+    # V14+ — Pillar 2: Adaptive Scope Advisor
+    # ---------------------------------------------------------------------------
+    ToolDescriptor(
+        name="workflow.scope_advice",
+        description=(
+            "V14+ MANDATORY DUAL READ: Analyse custom module files and return adaptive read plan. "
+            "Call AFTER repo.read on custom files and BEFORE writing any code. "
+            "Scans for _inherit (L1), mixins (L2), computed/relational fields (L3), cross-module refs (L4). "
+            "Returns ordered list of ScopeReadInstruction — execute ALL mandatory instructions before coding. "
+            "Example: custom_module_name='my_sale_ext', custom_file_paths=['/path/to/models/sale_order.py']"
+        ),
+        read_only=True,
+    ),
+    # ---------------------------------------------------------------------------
+    # V14+ — Pillar 3: Pre-Push Syntax Verifier
+    # ---------------------------------------------------------------------------
+    ToolDescriptor(
+        name="workflow.verify_against_core",
+        description=(
+            "V14+ PRE-PUSH MANDATORY: Cross-check written files against Odoo core source before git.push. "
+            "CALL THIS before every git.push. If push_blocked=True, fix CRITICAL findings and call again (max 3 cycles). "
+            "Verifies: Python — _inherit model existence, depends[] field names, comodel_name modules, related= chains, compute= method presence. "
+            "XML — xpath @name nodes in core view, <field name=...> vs core model fields. "
+            "Manifest — depends[] module names in /home/odoo/src/* roots. "
+            "push_blocked=False means push is safe to proceed."
+        ),
+        read_only=True,
+    ),
 ]
 
 _TOOL_INPUT_MODELS = {
     "connector.health": EmptyRequest,
+    "workflow.agent_instructions": EmptyRequest,
     "workflow.capability_check": EmptyRequest,
     "workflow.coding_task_plan": CodingTaskPlanRequest,
     "workflow.full_verify": FullVerifyRequest,
@@ -247,6 +320,11 @@ _TOOL_INPUT_MODELS = {
     "session.save_state": SessionStateSaveRequest,
     "session.load_state": SessionStateLoadRequest,
     "odoo.ensure_dependencies": EnsureDependenciesRequest,
+    # V14: Self-Learning Agent
+    "workflow.find_core_file": FindCoreFileRequest,
+    "workflow.find_similar_view": FindSimilarViewRequest,
+    "workflow.scope_advice": ScopeAdviceRequest,
+    "workflow.verify_against_core": SyntaxVerifyRequest,
 }
 
 
@@ -283,6 +361,15 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "connector.health":
         EmptyRequest.model_validate(args)
         return {"status": "ok", "service": "odoo-chatgpt-direct-connector"}
+    if name == "workflow.agent_instructions":
+        import httpx, asyncio
+        from ..config import settings
+        base = settings.public_base_url or "http://localhost:8080"
+        try:
+            resp = httpx.get(f"{base}/agent-instructions", timeout=5)
+            return resp.json()
+        except Exception as exc:
+            return {"error": str(exc), "fallback": "Call workflow.coding_task_plan for workflow guidance"}
     if name == "workflow.capability_check":
         EmptyRequest.model_validate(args)
         return capability_check()
@@ -426,6 +513,17 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "odoo.ensure_dependencies":
         req = EnsureDependenciesRequest.model_validate(args)
         return OdooRpcService().ensure_dependencies(req.module_name)
+    # ---------------------------------------------------------------------------
+    # V14 — Self-Learning Agent: Core File Discovery
+    # ---------------------------------------------------------------------------
+    if name == "workflow.find_core_file":
+        return find_core_file(FindCoreFileRequest.model_validate(args))
+    if name == "workflow.find_similar_view":
+        return find_similar_view(FindSimilarViewRequest.model_validate(args))
+    if name == "workflow.scope_advice":
+        return scope_advice(ScopeAdviceRequest.model_validate(args))
+    if name == "workflow.verify_against_core":
+        return verify_against_core(SyntaxVerifyRequest.model_validate(args))
     raise HTTPException(status_code=404, detail=f"Unknown tool: {name}")
 
 

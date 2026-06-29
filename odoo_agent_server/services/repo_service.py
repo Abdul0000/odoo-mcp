@@ -92,7 +92,12 @@ class RepoService:
             configured_remote = remote_result.stdout.strip()
             if settings.target_git_repo and configured_remote != settings.target_git_repo:
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Configured remote mismatch: {configured_remote} != {settings.target_git_repo}")
-            fetch = self._run(["git", "fetch", remote], project, timeout_seconds, env=env)
+            # Speed: dry-run fetch first — skip full fetch if nothing changed
+            dry = self._run(["git", "fetch", "--dry-run", remote], project, 10, env=env)
+            if dry.stdout.strip() or dry.stderr.strip():
+                fetch = self._run(["git", "fetch", remote], project, timeout_seconds, env=env)
+            else:
+                fetch = CommandResult(command=["git", "fetch", "--skipped"], cwd=str(project), exit_code=0, stdout="Already up to date — fetch skipped.\n")
             steps.append(fetch)
             if fetch.exit_code != 0:
                 raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=fetch.stderr or fetch.stdout or "git fetch failed")

@@ -114,8 +114,14 @@ class GitService:
         project = self._project(project_path)
         branch_result = self.current_branch(str(project))
         branch = branch_result.stdout.strip() if branch_result.exit_code == 0 else None
-        # Reduce push conflicts: rebase from the configured upstream before staging/committing.
-        rebase_result = self.pull_rebase(str(project), "origin", branch, min(timeout_seconds, 120))
+        # Speed fix: only pull --rebase if remote has commits we don't have.
+        # Check behind/ahead status first — skip network call if already ahead-only.
+        behind_check = self._run(["git", "rev-list", "--count", f"HEAD..origin/{branch}"], project, 10)
+        behind_count = behind_check.stdout.strip()
+        if behind_check.exit_code == 0 and behind_count == "0":
+            rebase_result = CommandResult(command=["git", "pull", "--rebase", "--skipped"], cwd=str(project), exit_code=0, stdout="Already ahead of remote — rebase skipped.\n")
+        else:
+            rebase_result = self.pull_rebase(str(project), "origin", branch, min(timeout_seconds, 120))
         if rebase_result.exit_code != 0 and settings.target_git_repo:
             return rebase_result
         identity_result = self.configure_identity(str(project))

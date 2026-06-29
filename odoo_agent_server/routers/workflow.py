@@ -27,6 +27,17 @@ from ..schemas import (
     SafeDeployModuleRequest,
     SelfRunRequest,
     OdooRpcResult,
+    # V14: Self-Learning Agent — Core Discovery
+    FindCoreFileRequest,
+    FindCoreFileResult,
+    FindSimilarViewRequest,
+    FindSimilarViewResult,
+    # V14+: Pillar 2 — Adaptive Scope Advisor
+    ScopeAdviceRequest,
+    ScopeAdviceResult,
+    # V14+: Pillar 3 — Pre-Push Syntax Verifier
+    SyntaxVerifyRequest,
+    SyntaxVerifyResult,
 )
 from ..services.approval_service import ApprovalService
 from ..services.git_service import GitService
@@ -37,6 +48,8 @@ from ..services.playwright_service import PlaywrightService
 from ..services.repo_service import RepoService
 from ..services.store_service import JsonStore
 from ..services.background_executor import submit_background
+from ..services.core_finder_service import CoreFinderService          # V14
+from ..services.syntax_verifier_service import SyntaxVerifierService  # V14+
 from .qa import self_run
 
 router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDependency])
@@ -544,3 +557,141 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         "project_path": payload.project_path,
         "safe_deploy_status": "passed",
     })
+
+
+# ---------------------------------------------------------------------------
+# V14 — Self-Learning Agent: Core File Discovery
+# ---------------------------------------------------------------------------
+
+@router.post("/find-core-file", response_model=FindCoreFileResult)
+def find_core_file(payload: FindCoreFileRequest) -> FindCoreFileResult:
+    """V14: Locate an Odoo core source file by module + type + keyword.
+
+    Search priority (mirrors Odoo.sh module load order):
+      1. /home/odoo/src/user       — custom addons
+      2. /home/odoo/src/enterprise — Odoo enterprise
+      3. /home/odoo/src/odoo       — Odoo community
+
+    Use before any ``_inherit`` so the agent reads the exact field
+    definitions, method signatures, and model structure from source
+    rather than hallucinating them.
+
+    Example:
+        module_name="sale", file_type="model", keyword="order"
+        → /home/odoo/src/odoo/addons/sale/models/sale_order.py
+    """
+    return CoreFinderService().find_core_file(
+        module_name=payload.module_name,
+        file_type=payload.file_type,
+        keyword=payload.keyword,
+        search_roots=payload.search_roots or None,
+    )
+
+
+@router.post("/find-similar-view", response_model=FindSimilarViewResult)
+def find_similar_view(payload: FindSimilarViewRequest) -> FindSimilarViewResult:
+    """V14: Locate an Odoo core view XML file by model + view_type.
+
+    Use before writing any ``<xpath expr="...">`` block so the agent
+    reads the exact attribute names, field references, and node structure
+    from the real source file rather than guessing.
+
+    Search priority: user → enterprise → odoo (same as find_core_file).
+
+    Example:
+        model="sale.order", view_type="form"
+        → /home/odoo/src/enterprise/sale/views/sale_order_views.xml
+    """
+    return CoreFinderService().find_similar_view(
+        model=payload.model,
+        view_type=payload.view_type,
+        search_roots=payload.search_roots or None,
+    )
+
+
+# ===========================================================================
+# V14+ — Pillar 2: Adaptive Scope Advisor
+# ===========================================================================
+
+@router.post("/scope-advice", response_model=ScopeAdviceResult)
+def scope_advice(payload: ScopeAdviceRequest) -> ScopeAdviceResult:
+    """V14+: Analyse custom module files and return adaptive mandatory read plan.
+
+    MANDATORY: Call this AFTER reading custom module files and BEFORE writing
+    any code. The service scans the provided custom file paths for _inherit
+    declarations, mixin usage, computed/relational fields, and cross-module
+    comodel references. It then returns an ordered list of ScopeReadInstruction
+    objects specifying everything that must be read from Odoo core before coding.
+
+    Adaptive scope levels triggered automatically:
+      L0 — always: custom module manifest (baseline, always included)
+      L1 — _inherit detected → parent core model file(s)
+      L2 — mixin / abstract detected → mail.thread, portal.mixin, etc.
+      L3 — computed or relational fields / ir.model → full models/ dir scan
+      L4 — cross-module comodel → that module's core manifest + model
+
+    Each ScopeReadInstruction includes:
+      - level: which level triggered it
+      - reason: why it must be read
+      - path: absolute path → call repo.read(path) on each mandatory instruction
+      - mandatory: True = blocking (must be done before any code write)
+
+    Returns:
+      reached_level: highest level triggered
+      mandatory_count: number of blocking reads required
+      warning: "Push BLOCKED until verify_against_core passes"
+
+    Example:
+        custom_module_name='my_sale_ext',
+        custom_file_paths=['/workspace/repos/repo/my_sale_ext/models/sale_order.py'],
+        task_description='Add custom field to sale.order'
+    """
+    return CoreFinderService().scope_advice(
+        custom_module_name=payload.custom_module_name,
+        custom_file_paths=payload.custom_file_paths,
+        task_description=payload.task_description,
+        search_roots=payload.search_roots or None,
+    )
+
+
+# ===========================================================================
+# V14+ — Pillar 3: Pre-Push Syntax Verifier
+# ===========================================================================
+
+@router.post("/verify-against-core", response_model=SyntaxVerifyResult)
+def verify_against_core(payload: SyntaxVerifyRequest) -> SyntaxVerifyResult:
+    """V14+: Pre-push cross-check of written files against Odoo core source.
+
+    MANDATORY: Call this BEFORE every git.push. If push_blocked=True, fix all
+    CRITICAL findings and call verify_against_core again (max 3 fix cycles).
+
+    What is verified (per file type):
+
+    Python model files (.py):
+      - _inherit model name exists in core (warns if not found)
+      - depends=[] field names exist in the inherited core model (CRITICAL if not)
+      - comodel_name module exists in /home/odoo/src/* (CRITICAL if not)
+      - related= first field exists in core model (CRITICAL if not)
+      - compute= method is defined in the same file (CRITICAL if missing)
+
+    XML view files (.xml):
+      - xpath @name nodes found in core view source (CRITICAL if not)
+      - <field name=...> cross-checked against core model fields (WARNING if not)
+
+    Manifest files (__manifest__.py):
+      - depends[] module names exist in /home/odoo/src/* roots (CRITICAL if not)
+
+    Push logic:
+      push_blocked=True  → Fix CRITICAL findings, then call verify_against_core again
+      push_blocked=False → Proceed with git.push
+      fix_cycle >= 3     → Report to user and STOP retrying
+
+    Example:
+        written_files=[
+            '/workspace/repos/repo/my_sale_ext/__manifest__.py',
+            '/workspace/repos/repo/my_sale_ext/models/sale_order.py',
+            '/workspace/repos/repo/my_sale_ext/views/sale_order_views.xml',
+        ],
+        fix_cycle=0
+    """
+    return SyntaxVerifierService().verify(payload)

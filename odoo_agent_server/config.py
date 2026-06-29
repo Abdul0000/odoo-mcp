@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     api_token: str = Field(default="change-me", alias="ODOO_AGENT_API_TOKEN")
-    allowed_roots_raw: str = Field(default="/workspace/repos,/tmp", alias="ODOO_AGENT_ALLOWED_ROOTS")
+    allowed_roots_raw: str = Field(default="/workspace/repos,/tmp,/home/odoo/src", alias="ODOO_AGENT_ALLOWED_ROOTS")
     state_dir: str = Field(default="/tmp/odoo_agent_state", alias="ODOO_AGENT_STATE_DIR")
     screenshot_dir: str = Field(default="/tmp/odoo_agent_screenshots", alias="ODOO_AGENT_SCREENSHOT_DIR")
 
