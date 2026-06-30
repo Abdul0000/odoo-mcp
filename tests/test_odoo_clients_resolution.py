@@ -212,6 +212,17 @@ def test_coding_task_plan_defaults_from_single_client(monkeypatch, tmp_path):
     assert result.defaults["project_path"] == str(tmp_path / "checkout")
 
 
+def test_coding_task_plan_uses_fast_path_for_small_field_change(monkeypatch, tmp_path):
+    _set_clients(monkeypatch, [_client("Client", "git@example.com:c.git", "dev", str(tmp_path / "checkout"), token="")])
+
+    result = coding_task_plan(CodingTaskPlanRequest(task="add one field test_ai in sale order notebook"))
+
+    assert result.defaults["small_patch_fast_path"] is True
+    assert "repo.list_custom_modules" not in result.required_tools
+    assert "odoo.search_read" in result.required_tools
+    assert "small-patch path" in result.ordered_steps[0]
+
+
 def test_start_session_saves_safe_client_metadata(monkeypatch, tmp_path):
     origin = _init_origin(tmp_path, "dev")
     checkout = tmp_path / "session-checkout"

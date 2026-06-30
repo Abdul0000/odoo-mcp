@@ -74,7 +74,28 @@ def agent_instructions() -> dict:
                 "On error: diagnose first, fix, retry max 3x — never blind retry",
                 "Binary files (.png/.jpg/.ico/.woff/.ttf) cannot be read via repo.read — skip them (415 error expected)",
                 "For files >300KB pass max_bytes=500000 to repo.read",
+                "For simple field/view/notebook edits, use the small_patch_fast_path: reuse session state, read only targeted files, skip broad discovery/health/screenshots unless needed.",
             ],
+            "small_patch_fast_path": {
+                "when": "Use for small tasks like adding one field, one xpath, one notebook page, or a tiny label/view change in a known module.",
+                "goal": "Keep simple edits near the minimum tool calls; most time should be Odoo.sh deploy, not discovery.",
+                "steps": [
+                    "1. session.load_state; if it has project_path/client_name, do not call workflow.start_session.",
+                    "2. If no session exists, call workflow.start_session(include_odoo=false, include_odoosh=false) to avoid slow health probes.",
+                    "3. repo.prepare once, then read only the target manifest/model/view files.",
+                    "4. Read core/enterprise only for the exact inherited model/view pattern that is not already clear from existing custom code.",
+                    "5. Patch with repo.apply_patch_atomic or repo.write_many_atomic.",
+                    "6. Run git.diff and qa.self_run(run_pytest=false) unless tests/shared logic are touched.",
+                    "7. workflow.verify_against_core only for changed files, then git.commit and git.push.",
+                    "8. Poll odoosh.check_commit for the pushed SHA, then odoo.module_deploy(wait_timeout_seconds=5).",
+                    "9. Verify exact field/model with odoo.search_read or registry_smoke_test; skip browser.screenshot unless UI proof was requested.",
+                ],
+                "do_not": [
+                    "Do not repeatedly look up the tool list after the first successful tool call.",
+                    "Do not crawl all custom modules when the target module is already known.",
+                    "Do not run browser screenshots for a backend field unless the user asks for visible UI proof.",
+                ],
+            },
             "mandatory_dual_read": {
                 "rule": "BOTH custom module AND core module must ALWAYS be read — neither is optional",
                 "step_1_custom": "repo.read ALL relevant files in the custom module first",

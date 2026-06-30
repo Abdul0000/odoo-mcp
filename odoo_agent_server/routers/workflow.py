@@ -59,6 +59,13 @@ from .qa import self_run
 router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDependency])
 
 
+def _looks_like_small_patch(task: str) -> bool:
+    value = task.lower()
+    small_terms = ("add field", "new field", "simple field", "notebook", "tab", "page", "xpath", "label")
+    broad_terms = ("new module", "report", "dashboard", "integration", "migration", "workflow", "portal", "api")
+    return any(term in value for term in small_terms) and not any(term in value for term in broad_terms)
+
+
 @router.post("/coding-task-plan", response_model=CodingTaskPlanResult)
 def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
     """Return the canonical repo-first coding workflow for ChatGPT/MCP clients."""
@@ -71,22 +78,48 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
     branch = payload.branch or (client.branch if client else None) or settings.target_git_branch or "<target_branch>"
     project_path = payload.project_path or (client.path if client else None) or settings.target_project_path or f"{settings.workspace_root.rstrip('/')}/<repo_name>"
     module_name = payload.module_name or "<custom_module>"
-    steps = [
-        "Call repo.prepare with the target repo and branch. This clones if missing, otherwise fetches, checks out, and pulls the branch with --ff-only.",
-        "Call repo.list_custom_modules on the returned project_path; choose the target custom module from __manifest__.py files, not from Odoo's installed module list only.",
-        f"Read the target module files first: {module_name}/__manifest__.py, models, views, security, and relevant static files.",
-        "Apply edits atomically: use repo.apply_patch_atomic for multi-file diffs or repo.write_many_atomic for multi-file/new-module writes. Use repo.apply_patch/repo.write only for small single-file changes. Do not edit Odoo core, enterprise, .git, or unrelated modules.",
-        "Run git.diff and qa.self_run. Treat pytest environment failures separately from real module errors.",
-        "Commit only related paths with git.commit using a clear message.",
-        "Push to the exact target branch with git.push; branch must match TARGET_GIT_BRANCH when configured. Note the 'sha' in the push response.",
-        "Poll Odoo.sh deploy using odoosh.check_commit with the pushed sha. It returns immediately with deployed=true/false. If false, wait 15 seconds and call again. Max 20 retries.",
-        "When odoosh.check_commit returns deployed=true, call odoosh.verify_module_manifest then odoosh.module_update.",
-        "Finish with odoo.module_status, odoosh.grep_errors, and browser.screenshot for UI tasks.",
-    ]
-    return CodingTaskPlanResult(
-        summary="Canonical repo-first coding workflow for ChatGPT MCP Odoo development.",
-        ordered_steps=steps,
-        required_tools=[
+    small_patch = _looks_like_small_patch(payload.task)
+    if small_patch:
+        steps = [
+            "Use the small-patch path: if session.load_state already has project_path/client_name, skip workflow.start_session; otherwise call workflow.start_session with include_odoo=false and include_odoosh=false.",
+            "Call repo.prepare once, then read only the target module manifest plus the specific model/view files needed for the requested field or notebook change.",
+            "For a field on an existing inherited model, read the matching core model/view once with workflow.find_core_file or workflow.find_similar_view only when the existing custom file does not already prove the pattern.",
+            "Patch the smallest file set with repo.apply_patch_atomic or repo.write_many_atomic; do not run broad module discovery again after the target module is known.",
+            "Run git.diff and qa.self_run with run_pytest=false unless Python tests are present or the patch touches shared logic.",
+            "Run workflow.verify_against_core only for the changed .py/.xml/__manifest__.py files, then git.commit and git.push.",
+            "After push, poll odoosh.check_commit for the pushed SHA, then call odoo.module_deploy with wait_timeout_seconds=5; use jobs.get only if it returns a running job.",
+            "Verify the exact field with odoo.search_read or workflow.registry_smoke_test; skip browser.screenshot unless the user specifically asks for UI proof.",
+        ]
+        required_tools = [
+            "session.load_state",
+            "repo.prepare",
+            "repo.read",
+            "repo.apply_patch_atomic",
+            "repo.write_many_atomic",
+            "git.diff",
+            "qa.self_run",
+            "workflow.verify_against_core",
+            "git.commit",
+            "git.push",
+            "odoosh.check_commit",
+            "odoo.module_deploy",
+            "odoo.search_read",
+        ]
+        summary = "Fast path for a small targeted Odoo code patch."
+    else:
+        steps = [
+            "Call repo.prepare with the target repo and branch. This clones if missing, otherwise fetches, checks out, and pulls the branch with --ff-only.",
+            "Call repo.list_custom_modules on the returned project_path; choose the target custom module from __manifest__.py files, not from Odoo's installed module list only.",
+            f"Read the target module files first: {module_name}/__manifest__.py, models, views, security, and relevant static files.",
+            "Apply edits atomically: use repo.apply_patch_atomic for multi-file diffs or repo.write_many_atomic for multi-file/new-module writes. Use repo.apply_patch/repo.write only for small single-file changes. Do not edit Odoo core, enterprise, .git, or unrelated modules.",
+            "Run git.diff and qa.self_run. Treat pytest environment failures separately from real module errors.",
+            "Commit only related paths with git.commit using a clear message.",
+            "Push to the exact target branch with git.push; branch must match TARGET_GIT_BRANCH when configured. Note the 'sha' in the push response.",
+            "Poll Odoo.sh deploy using odoosh.check_commit with the pushed sha. It returns immediately with deployed=true/false. If false, wait 15 seconds and call again. Max 20 retries.",
+            "When odoosh.check_commit returns deployed=true, call odoosh.verify_module_manifest then odoosh.module_update.",
+            "Finish with odoo.module_status, odoosh.grep_errors, and browser.screenshot for UI tasks.",
+        ]
+        required_tools = [
             "repo.prepare",
             "repo.list_custom_modules",
             "repo.read",
@@ -100,7 +133,12 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "odoosh.check_commit",
             "odoosh.verify_module_manifest",
             "odoosh.module_update",
-        ],
+        ]
+        summary = "Canonical repo-first coding workflow for ChatGPT MCP Odoo development."
+    return CodingTaskPlanResult(
+        summary=summary,
+        ordered_steps=steps,
+        required_tools=required_tools,
         guardrails=[
             "Always prepare/pull the repo before reading or patching code.",
             "Always use the configured target branch; never push to default/main by assumption.",
@@ -108,6 +146,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Use atomic multi-file tools for broad changes so incomplete states are not left in the checkout.",
             "Only patch the requested module and related files.",
             "Do not upgrade Odoo.sh until the expected pushed SHA is deployed.",
+            "For small patches, avoid repeated tool discovery, broad source reads, full health checks, and screenshots unless they are needed to prove the requested change.",
         ],
         defaults={
             "repo_url": repo_url,
@@ -116,6 +155,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "client_name": client.name if client else payload.client_name,
             "module_name": module_name,
             "task": payload.task,
+            "small_patch_fast_path": small_patch,
         },
     )
 
