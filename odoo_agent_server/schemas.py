@@ -484,9 +484,17 @@ class FullVerifyRequest(SelfRunRequest):
 
 
 class StartSessionRequest(BaseModel):
-    repo_url: str | None = Field(default=None, description="Git repository URL. Defaults to TARGET_GIT_REPO.")
-    branch: str | None = Field(default=None, description="Target branch. Defaults to TARGET_GIT_BRANCH.")
-    repo_name: str | None = Field(default=None, description="Folder name under workspace_root. Defaults to configured target project.")
+    client_name: str | None = Field(
+        default=None,
+        description=(
+            "V15 Multi-Client: name of client from ODOO_CLIENTS env var. "
+            "e.g. 'Client A'. When set, repo/branch/path/token/Odoo creds "
+            "are resolved automatically. No other fields needed."
+        ),
+    )
+    repo_url: str | None = Field(default=None, description="Git repo URL. Auto-resolved from client_name or falls back to TARGET_GIT_REPO.")
+    branch: str | None = Field(default=None, description="Target branch. Auto-resolved from client_name or falls back to TARGET_GIT_BRANCH.")
+    repo_name: str | None = Field(default=None, description="Folder name under workspace_root.")
     workspace_root: str | None = Field(default=None, description="Workspace root for clones. Defaults to WORKSPACE_ROOT.")
     remote: str = Field(default="origin")
     max_depth: int = Field(default=5, ge=1, le=10)

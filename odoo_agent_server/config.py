@@ -97,3 +97,60 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+# ===========================================================================
+# V15 — Multi-Client Support
+# ===========================================================================
+
+import json as _json
+import os as _os
+import re as _re
+
+
+def get_odoo_clients() -> list[dict]:
+    """Parse ODOO_CLIENTS JSON env variable and return list of client configs.
+
+    Each client dict should have:
+      name, repo, branch, path, token,
+      odoo_url, odoo_db, odoo_login, odoo_password
+    """
+    raw = _os.getenv("ODOO_CLIENTS", "[]")
+    try:
+        clients = _json.loads(raw)
+        if isinstance(clients, list):
+            return clients
+    except Exception:
+        pass
+    return []
+
+
+def get_client_names() -> list[str]:
+    """Return just the client display names — safe to expose to agent."""
+    return [c.get("name", "") for c in get_odoo_clients() if c.get("name")]
+
+
+def get_client(name: str) -> dict:
+    """Lookup a client by name (case-insensitive). Raises ValueError if not found."""
+    for c in get_odoo_clients():
+        if c.get("name", "").lower() == name.lower():
+            return c
+    available = get_client_names()
+    raise ValueError(
+        f"Client '{name}' not found in ODOO_CLIENTS. "
+        f"Available: {available}"
+    )
+
+
+def make_authenticated_repo_url(repo: str, token: str | None) -> str:
+    """Inject GitHub token into HTTPS repo URL for authenticated git operations."""
+    if not token:
+        return repo
+    if "oauth2:" in repo or f"{token}@" in repo:
+        return repo  # already injected
+    return repo.replace("https://", f"https://oauth2:{token}@")
+
+
+def mask_repo_url(repo: str) -> str:
+    """Mask token in repo URL for safe logging — never log raw tokens."""
+    return _re.sub(r"oauth2:[^@]+@", "oauth2:***@", repo)

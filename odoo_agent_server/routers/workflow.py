@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, status
 
 from ..auth import AuthDependency
-from ..config import settings
+from ..config import settings, get_client, get_client_names, make_authenticated_repo_url, mask_repo_url
 from ..schemas import (
     CapabilityCheckResult,
     CodingTaskPlanRequest,
@@ -142,12 +143,42 @@ def capability_check() -> CapabilityCheckResult:
 
 @router.post("/start-session", response_model=WorkflowReport)
 def start_session(payload: StartSessionRequest) -> WorkflowReport:
-    """One-call bootstrap for every ChatGPT session.
+    """V15 Multi-Client bootstrap for every ChatGPT/Claude session.
 
-    It confirms runtime capability, prepares the repo so Render sleep/wipe is
-    handled, reads git status, lists custom modules, and checks Odoo/Odoo.sh
-    connectivity when configured.
+    Pass client_name to auto-resolve repo, branch, path, token, and Odoo creds
+    from ODOO_CLIENTS env var. Falls back to TARGET_GIT_* env vars if no client_name.
+
+    Also confirms runtime capability, prepares the repo, reads git status,
+    lists custom modules, and checks Odoo/Odoo.sh connectivity.
     """
+    # ── V15: Multi-Client Resolution ─────────────────────────────────────
+    if payload.client_name:
+        try:
+            client = get_client(payload.client_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _token = client.get("token")
+        # Build authenticated repo URL
+        _repo_url = make_authenticated_repo_url(client["repo"], _token)
+        # Override payload fields from client config (only if not already set)
+        _branch = payload.branch or client.get("branch")
+        _client_path = client.get("path", "")
+        _repo_name = payload.repo_name or (_client_path.rstrip("/").rsplit("/", 1)[-1] if _client_path else None)
+        payload = payload.model_copy(update={
+            "repo_url": payload.repo_url or _repo_url,
+            "branch": _branch,
+            "repo_name": _repo_name,
+        })
+        # Override Odoo creds for this client session
+        if client.get("odoo_url"):
+            os.environ["ODOO_BASE_URL"] = client["odoo_url"]
+        if client.get("odoo_db"):
+            os.environ["ODOO_DB_NAME"] = client["odoo_db"]
+        if client.get("odoo_login"):
+            os.environ["ODOO_LOGIN"] = client["odoo_login"]
+        if client.get("odoo_password"):
+            os.environ["ODOO_PASSWORD"] = client["odoo_password"]
+
     store = JsonStore()
     job = store.create_job(JobRecord(job_type="start_session", status=JobStatus.running, request=payload.model_dump(mode="json")))
 
@@ -203,6 +234,8 @@ def start_session(payload: StartSessionRequest) -> WorkflowReport:
         "project_path": prepared.project_path if prepared else None,
         "branch": prepared.branch if prepared else None,
         "start_session_status": final,
+        "client_name": payload.client_name or None,
+        "repo_url_safe": mask_repo_url(payload.repo_url or "") if payload.repo_url else None,
     })
     return WorkflowReport(status=final, job_id=job.id, steps=finished.steps, summary={"status": final, "project_path": prepared.project_path if prepared else None, "sha": prepared.sha if prepared else None})
 

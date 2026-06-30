@@ -44,15 +44,16 @@ def agent_instructions() -> dict:
     ChatGPT Custom Instructions should contain ONLY:
     'Before any task, call workflow.agent_instructions first and follow exactly.'
     """
-    from .config import settings
+    from .config import settings, get_client_names
     repo = settings.target_git_repo or "<repo_url>"
     branch = settings.target_git_branch or "<branch>"
     path = settings.target_project_path or "/workspace/repos/<repo>"
+    client_names = get_client_names()
 
     return {
         "version": "v14+",
         "instructions": {
-            "role": "You are an Odoo 18 developer agent. Use MCP tools to code and deploy autonomously. You are a Self-Learning Agent — you ALWAYS read real Odoo core source AND custom module source before writing any code. No static skill. No hallucination. No push without verify.",
+            "role": "You are an Odoo developer agent (supports Odoo 16/17/18/19). Use MCP tools to code and deploy autonomously. You are a Self-Learning Agent — you ALWAYS read real Odoo core source AND custom module source before writing any code. No static skill. No hallucination. No push without verify.",
             "rules": [
                 "Always start with repo.prepare",
                 "Write COMPLETE files only — never partial or placeholder",
@@ -174,6 +175,26 @@ def agent_instructions() -> dict:
                 "workflow.list_module_files": "Browse all files in a module dir when keyword unknown. Use subdir to narrow (models/views/static/src).",
                 "workflow.scope_advice": "NEW V14+: Adaptive mandatory read plan — call after reading custom files, before writing code.",
                 "workflow.verify_against_core": "NEW V14+: Pre-push cross-check — call before every git.push. Blocks push on CRITICAL findings.",
+            },
+            "multi_client": {
+                "rule": (
+                    "At the start of EVERY session: ask user which client to work on. "
+                    "Show available_clients list. Call workflow.start_session(client_name='...'). "
+                    "Repo URL, branch, path, token, and Odoo creds resolve automatically. "
+                    "NEVER ask user for token or password. NEVER log or expose token."
+                ),
+                "available_clients": client_names if client_names else ["(no clients — using TARGET_GIT_* env vars)"],
+                "switch_client": "Call workflow.start_session(client_name='...') anytime to switch.",
+            },
+            "version_compatibility": {
+                "supported_versions": ["Odoo 16", "Odoo 17", "Odoo 18", "Odoo 19"],
+                "rule": (
+                    "Version is auto-detected from /home/odoo/src/odoo — it already contains "
+                    "the exact Odoo version running on this server. "
+                    "ALWAYS read core source first. NEVER assume syntax. "
+                    "tree vs list, attrs= vs invisible=, old domain vs py expression "
+                    "— all differ by version. Confirm from source before writing."
+                ),
             },
             "config": {
                 "repo_url": repo,
