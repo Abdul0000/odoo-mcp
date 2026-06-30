@@ -20,12 +20,21 @@ def _rpc_response(request_id: Any, result: Any = None, error: dict[str, Any] | N
     return payload
 
 
+def _humanize_tool_name(name: str) -> str:
+    """Fallback: convert 'git.push' -> 'Git Push' if no explicit title is set."""
+    tail = name.split(".", 1)[-1]
+    return tail.replace("_", " ").title()
+
+
 def _tool_to_mcp(tool) -> dict[str, Any]:
+    title = getattr(tool, "title", None) or _humanize_tool_name(tool.name)
     return {
         "name": tool.name,
+        "title": title,
         "description": tool.description,
         "inputSchema": tool_input_schema(tool.name),
         "annotations": {
+            "title": title,
             "readOnlyHint": bool(tool.read_only),
             "destructiveHint": bool(tool.requires_approval),
         },

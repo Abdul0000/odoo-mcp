@@ -32,6 +32,8 @@ from ..schemas import (
     FindCoreFileResult,
     FindSimilarViewRequest,
     FindSimilarViewResult,
+    ListModuleFilesRequest,
+    ListModuleFilesResult,
     # V14+: Pillar 2 — Adaptive Scope Advisor
     ScopeAdviceRequest,
     ScopeAdviceResult,
@@ -605,6 +607,27 @@ def find_similar_view(payload: FindSimilarViewRequest) -> FindSimilarViewResult:
     return CoreFinderService().find_similar_view(
         model=payload.model,
         view_type=payload.view_type,
+        search_roots=payload.search_roots or None,
+    )
+
+
+@router.post("/list-module-files", response_model=ListModuleFilesResult)
+def list_module_files(payload: ListModuleFilesRequest) -> ListModuleFilesResult:
+    """V14+ gap-fix: List all files inside a core or custom module directory.
+
+    Use when you don't know the exact filename/keyword to search for yet —
+    browse what exists first, then call find_core_file with a keyword, or
+    repo.read directly on a file you spot here.
+
+    Search priority: user → enterprise → odoo (same as find_core_file).
+
+    Example:
+        module_name="sale", subdir="models"
+        → lists every file under sale/models/ in whichever root has it first.
+    """
+    return CoreFinderService().list_module_files(
+        module_name=payload.module_name,
+        subdir=payload.subdir,
         search_roots=payload.search_roots or None,
     )
 

@@ -53,6 +53,7 @@ from ..schemas import (
     # V14: Self-Learning Agent — Core Discovery
     FindCoreFileRequest,
     FindSimilarViewRequest,
+    ListModuleFilesRequest,
     # V14+: Pillar 2 — Adaptive Scope Advisor
     ScopeAdviceRequest,
     # V14+: Pillar 3 — Pre-Push Syntax Verifier
@@ -68,16 +69,18 @@ from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_apply_pa
 from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
-from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, scope_advice, verify_against_core
+from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
 _TOOL_DESCRIPTORS = [
-    ToolDescriptor(name="connector.health", description="Check connector service health", read_only=True),
+    ToolDescriptor(name="connector.health",
+        title="Check connector health", description="Check connector service health", read_only=True),
     ToolDescriptor(
         name="workflow.agent_instructions",
+        title="Load agent instructions",
         description=(
             "CALL THIS FIRST in every session before any other tool. "
             "Returns full agent rules, flow, error guide, and repo config from the connector. "
@@ -85,21 +88,35 @@ _TOOL_DESCRIPTORS = [
         ),
         read_only=True,
     ),
-    ToolDescriptor(name="workflow.capability_check", description="Check local connector capabilities and missing runtime configuration", read_only=True),
-    ToolDescriptor(name="workflow.coding_task_plan", description="Return the repo-first coding workflow guidance for ChatGPT MCP clients", read_only=True),
-    ToolDescriptor(name="workflow.full_verify", description="Run the full self-verification workflow for an Odoo module", read_only=True),
-    ToolDescriptor(name="workflow.safe_deploy_module", description="Safely commit, push, wait for Odoo.sh deployment, verify manifest, and upgrade an Odoo module", requires_approval=True),
-    ToolDescriptor(name="workflow.start_session", description="Bootstrap a coding session: capability check, repo.prepare, git status, module discovery, Odoo/Odoo.sh health", requires_approval=True),
-    ToolDescriptor(name="workflow.registry_smoke_test", description="Verify live Odoo registry models/menus after install or upgrade", read_only=True),
-    ToolDescriptor(name="workflow.restore_last_good_commit", description="Emergency restore by reverting a bad commit and optionally pushing the revert", requires_approval=True),
-    ToolDescriptor(name="workflow.browser_menu_crawl", description="Open multiple Odoo paths and capture screenshot/console/network errors", read_only=True),
-    ToolDescriptor(name="qa.self_run", description="Run Odoo custom module static QA and optional pytest/git status", read_only=True),
-    ToolDescriptor(name="repo.prepare", description="Clone or refresh target repo and checkout/pull the target branch before coding", requires_approval=True),
-    ToolDescriptor(name="repo.list_custom_modules", description="Discover custom Odoo modules from repo __manifest__.py files", read_only=True),
-    ToolDescriptor(name="repo.list", description="List files inside an allowed project path", read_only=True),
-    ToolDescriptor(name="repo.read", description="Read a UTF-8 file. Default max 300KB. For large files pass max_bytes=500000. Returns file content and line count.", read_only=True),
+    ToolDescriptor(name="workflow.capability_check",
+        title="Check connector capabilities", description="Check local connector capabilities and missing runtime configuration", read_only=True),
+    ToolDescriptor(name="workflow.coding_task_plan",
+        title="Get coding workflow plan", description="Return the repo-first coding workflow guidance for ChatGPT MCP clients", read_only=True),
+    ToolDescriptor(name="workflow.full_verify",
+        title="Run full verification", description="Run the full self-verification workflow for an Odoo module", read_only=True),
+    ToolDescriptor(name="workflow.safe_deploy_module",
+        title="Deploy module (full pipeline)", description="Safely commit, push, wait for Odoo.sh deployment, verify manifest, and upgrade an Odoo module", requires_approval=True),
+    ToolDescriptor(name="workflow.start_session",
+        title="Start coding session", description="Bootstrap a coding session: capability check, repo.prepare, git status, module discovery, Odoo/Odoo.sh health", requires_approval=True),
+    ToolDescriptor(name="workflow.registry_smoke_test",
+        title="Test Odoo registry", description="Verify live Odoo registry models/menus after install or upgrade", read_only=True),
+    ToolDescriptor(name="workflow.restore_last_good_commit",
+        title="Restore last working commit", description="Emergency restore by reverting a bad commit and optionally pushing the revert", requires_approval=True),
+    ToolDescriptor(name="workflow.browser_menu_crawl",
+        title="Crawl Odoo menus in browser", description="Open multiple Odoo paths and capture screenshot/console/network errors", read_only=True),
+    ToolDescriptor(name="qa.self_run",
+        title="Run code quality checks", description="Run Odoo custom module static QA and optional pytest/git status", read_only=True),
+    ToolDescriptor(name="repo.prepare",
+        title="Clone or update repository", description="Clone or refresh target repo and checkout/pull the target branch before coding", requires_approval=True),
+    ToolDescriptor(name="repo.list_custom_modules",
+        title="List custom Odoo modules", description="Discover custom Odoo modules from repo __manifest__.py files", read_only=True),
+    ToolDescriptor(name="repo.list",
+        title="List repository files", description="List files inside an allowed project path", read_only=True),
+    ToolDescriptor(name="repo.read",
+        title="Read file contents", description="Read a UTF-8 file. Default max 300KB. For large files pass max_bytes=500000. Returns file content and line count.", read_only=True),
     ToolDescriptor(
         name="repo.write",
+        title="Write file contents",
         description=(
             "Write a complete file. For files >250 lines, use CHUNKED MODE to avoid token limits: "
             "Split file into chunks of ~200 lines. "
@@ -110,28 +127,42 @@ _TOOL_DESCRIPTORS = [
         ),
         requires_approval=True,
     ),
-    ToolDescriptor(name="repo.write_many_atomic", description="Write many files as one atomic temp-worktree transaction", requires_approval=True),
-    ToolDescriptor(name="repo.delete", description="Delete a file inside an allowed project path", requires_approval=True),
-    ToolDescriptor(name="repo.apply_patch", description="Check/apply a unified diff patch", requires_approval=True),
-    ToolDescriptor(name="repo.apply_patch_atomic", description="Apply a patch through an isolated temp worktree/branch before touching the real checkout", requires_approval=True),
-    ToolDescriptor(name="repo.clean_pyc", description="Remove .pyc and __pycache__ from a project", requires_approval=True),
-    ToolDescriptor(name="git.status", description="Read git status", read_only=True),
-    ToolDescriptor(name="git.current_branch", description="Read current git branch", read_only=True),
-    ToolDescriptor(name="git.diff", description="Read git diff", read_only=True),
-    ToolDescriptor(name="git.commit", description="Create a git commit", requires_approval=True),
-    ToolDescriptor(name="git.push", description="Push current branch to remote", requires_approval=True),
+    ToolDescriptor(name="repo.write_many_atomic",
+        title="Write multiple files safely", description="Write many files as one atomic temp-worktree transaction", requires_approval=True),
+    ToolDescriptor(name="repo.delete",
+        title="Delete file from repo", description="Delete a file inside an allowed project path", requires_approval=True),
+    ToolDescriptor(name="repo.apply_patch",
+        title="Apply code patch", description="[LEGACY — use repo.apply_patch_atomic instead] Check/apply a unified diff patch", requires_approval=True, deprecated=True),
+    ToolDescriptor(name="repo.apply_patch_atomic",
+        title="Apply patch safely (atomic)", description="Apply a patch through an isolated temp worktree/branch before touching the real checkout", requires_approval=True),
+    ToolDescriptor(name="repo.clean_pyc",
+        title="Clean compiled Python files", description="Remove .pyc and __pycache__ from a project", requires_approval=True),
+    ToolDescriptor(name="git.status",
+        title="Check Git status", description="Read git status", read_only=True),
+    ToolDescriptor(name="git.current_branch",
+        title="Check current Git branch", description="Read current git branch", read_only=True),
+    ToolDescriptor(name="git.diff",
+        title="Review code changes (diff)", description="Read git diff", read_only=True),
+    ToolDescriptor(name="git.commit",
+        title="Commit code changes", description="Create a git commit", requires_approval=True),
+    ToolDescriptor(name="git.push",
+        title="Push code to GitHub", description="Push current branch to remote", requires_approval=True),
     ToolDescriptor(
         name="odoosh.module_install_ssh",
+        title="Install module via SSH",
         description=(
-            "Install a NEW module via Odoo.sh SSH using odoo-bin -i flag. "
-            "Use this when odoo.module_deploy fails with Access Denied. "
-            "Only for first-time installs — for upgrades use odoosh.module_update."
+            "[LEGACY — odoo.module_deploy auto-falls-back to SSH on Access Denied, no need to call this directly] "
+            "Install a NEW module via Odoo.sh SSH using odoo-bin -i flag."
         ),
+        deprecated=True,
     ),
-    ToolDescriptor(name="odoosh.health", description="Check Odoo.sh SSH health", read_only=True),
-    ToolDescriptor(name="odoosh.git_status", description="Read Odoo.sh deployed git status", read_only=True),
+    ToolDescriptor(name="odoosh.health",
+        title="Check Odoo.sh connection", description="Check Odoo.sh SSH health", read_only=True),
+    ToolDescriptor(name="odoosh.git_status",
+        title="Check Odoo.sh Git status", description="Read Odoo.sh deployed git status", read_only=True),
     ToolDescriptor(
         name="odoosh.check_commit",
+        title="Check Odoo.sh deployment status",
         description=(
             "NON-BLOCKING single check: returns immediately with deployed=true/false. "
             "Use this in a polling loop after git.push: call once, read the 'deployed' field. "
@@ -140,17 +171,27 @@ _TOOL_DESCRIPTORS = [
         ),
         read_only=True,
     ),
-    ToolDescriptor(name="odoosh.wait_for_commit", description="[DEPRECATED - use odoosh.check_commit in a polling loop] Blocking wait for Odoo.sh deploy", read_only=True),
-    ToolDescriptor(name="odoosh.verify_module_manifest", description="Verify a module manifest exists and is installable on Odoo.sh", read_only=True),
-    ToolDescriptor(name="odoosh.log", description="Tail an Odoo.sh log", read_only=True),
-    ToolDescriptor(name="odoosh.grep_errors", description="Search Odoo.sh logs for errors", read_only=True),
-    ToolDescriptor(name="odoosh.error_pack", description="Return Odoo.sh tracebacks plus root-cause hints/files/XML/model names", read_only=True),
-    ToolDescriptor(name="odoosh.module_deploy_ssh", description="SSH smart install/upgrade via Odoo.sh. Background job. Use only when you explicitly need SSH; odoo.module_deploy falls back to this automatically.", requires_approval=True),
-    ToolDescriptor(name="odoosh.module_update", description="Run Odoo module update through Odoo.sh SSH", requires_approval=True),
-    ToolDescriptor(name="odoo.health", description="Check Odoo XML-RPC health", read_only=True),
-    ToolDescriptor(name="odoo.module_status", description="Read Odoo module state (installed/uninstalled/not found)", read_only=True),
+    ToolDescriptor(name="odoosh.wait_for_commit",
+        title="Wait for Odoo.sh deployment", description="[DEPRECATED - use odoosh.check_commit in a polling loop] Blocking wait for Odoo.sh deploy", read_only=True),
+    ToolDescriptor(name="odoosh.verify_module_manifest",
+        title="Verify module manifest", description="Verify a module manifest exists and is installable on Odoo.sh", read_only=True),
+    ToolDescriptor(name="odoosh.log",
+        title="Read Odoo.sh server log", description="Tail an Odoo.sh log", read_only=True),
+    ToolDescriptor(name="odoosh.grep_errors",
+        title="Search Odoo.sh error logs", description="Search Odoo.sh logs for errors", read_only=True),
+    ToolDescriptor(name="odoosh.error_pack",
+        title="Collect Odoo.sh error details", description="Return Odoo.sh tracebacks plus root-cause hints/files/XML/model names", read_only=True),
+    ToolDescriptor(name="odoosh.module_deploy_ssh",
+        title="Deploy module via SSH", description="SSH smart install/upgrade via Odoo.sh. Background job. Use only when you explicitly need SSH; odoo.module_deploy falls back to this automatically.", requires_approval=True),
+    ToolDescriptor(name="odoosh.module_update",
+        title="Update module on Odoo.sh", description="Run Odoo module update through Odoo.sh SSH", requires_approval=True),
+    ToolDescriptor(name="odoo.health",
+        title="Check Odoo server health", description="Check Odoo XML-RPC health", read_only=True),
+    ToolDescriptor(name="odoo.module_status",
+        title="Check module install status", description="Read Odoo module state (installed/uninstalled/not found)", read_only=True),
     ToolDescriptor(
         name="odoo.module_deploy",
+        title="Install or upgrade module",
         description=(
             "SMART INSTALL/UPGRADE — always use this for ALL first-time installs and upgrades. "
             "Runs XML-RPC when allowed; if update_list/buttons fail with Access Denied, "
@@ -159,20 +200,32 @@ _TOOL_DESCRIPTORS = [
         ),
         requires_approval=True,
     ),
-    ToolDescriptor(name="odoo.module_install", description="[LEGACY] Direct button_immediate_install — use odoo.module_deploy instead", requires_approval=True),
-    ToolDescriptor(name="odoo.module_update", description="[LEGACY] Direct button_immediate_upgrade — use odoo.module_deploy instead", requires_approval=True),
-    ToolDescriptor(name="odoo.search_read", description="Run Odoo search_read via XML-RPC", read_only=True),
-    ToolDescriptor(name="browser.screenshot", description="Capture Odoo page screenshot with console/network errors", read_only=True),
-    ToolDescriptor(name="approvals.list", description="List pending/recent approval records", read_only=True),
-    ToolDescriptor(name="approvals.request", description="Create an approval request", requires_approval=False),
-    ToolDescriptor(name="approvals.approve", description="Approve an approval request", requires_approval=True),
-    ToolDescriptor(name="approvals.reject", description="Reject an approval request", requires_approval=True),
-    ToolDescriptor(name="jobs.list", description="List recent connector jobs", read_only=True),
-    ToolDescriptor(name="jobs.get", description="Read one connector job by id; waits server-side by default until done or timeout to avoid fragile client polling", read_only=True),
-    ToolDescriptor(name="audit.list", description="List recent audit events", read_only=True),
+    ToolDescriptor(name="odoo.module_install",
+        title="Install Odoo module", description="[LEGACY] Direct button_immediate_install — use odoo.module_deploy instead", requires_approval=True, deprecated=True),
+    ToolDescriptor(name="odoo.module_update",
+        title="Upgrade Odoo module", description="[LEGACY] Direct button_immediate_upgrade — use odoo.module_deploy instead", requires_approval=True, deprecated=True),
+    ToolDescriptor(name="odoo.search_read",
+        title="Query Odoo records", description="Run Odoo search_read via XML-RPC", read_only=True),
+    ToolDescriptor(name="browser.screenshot",
+        title="Take browser screenshot", description="Capture Odoo page screenshot with console/network errors", read_only=True),
+    ToolDescriptor(name="approvals.list",
+        title="List pending approvals", description="List pending/recent approval records", read_only=True),
+    ToolDescriptor(name="approvals.request",
+        title="Request approval", description="Create an approval request", requires_approval=False),
+    ToolDescriptor(name="approvals.approve",
+        title="Approve pending action", description="Approve an approval request", requires_approval=True),
+    ToolDescriptor(name="approvals.reject",
+        title="Reject pending action", description="Reject an approval request", requires_approval=True),
+    ToolDescriptor(name="jobs.list",
+        title="List background jobs", description="List recent connector jobs", read_only=True),
+    ToolDescriptor(name="jobs.get",
+        title="Check background job status", description="Read one connector job by id; waits server-side by default until done or timeout to avoid fragile client polling", read_only=True),
+    ToolDescriptor(name="audit.list",
+        title="View audit log", description="List recent audit events", read_only=True),
     # Fix 3: Resume failed pipeline from last successful step
     ToolDescriptor(
         name="workflow.resume_job",
+        title="Resume interrupted job",
         description=(
             "Fix 3 — Resume a failed safe_deploy_module or start_session pipeline from its last "
             "successful step. Pass the job_id from the failed run. Instead of starting over from "
@@ -184,6 +237,7 @@ _TOOL_DESCRIPTORS = [
     # Fix 7: Session state persistence
     ToolDescriptor(
         name="session.save_state",
+        title="Save session state",
         description=(
             "Fix 7 — Persist session context (last_sha, module_name, step_history, etc.) so a new "
             "ChatGPT session after a Render restart can reload it with session.load_state instead "
@@ -192,12 +246,14 @@ _TOOL_DESCRIPTORS = [
     ),
     ToolDescriptor(
         name="session.load_state",
+        title="Load saved session state",
         description="Fix 7 — Load the last persisted session state (sha, module, steps, etc.).",
         read_only=True,
     ),
     # Fix 10: Explicit ensure-dependencies
     ToolDescriptor(
         name="odoo.ensure_dependencies",
+        title="Install missing dependencies",
         description=(
             "Fix 10 — Auto-install any missing/uninstalled Odoo module dependencies before "
             "installing or upgrading the target module. Call this when odoo.module_deploy fails "
@@ -210,6 +266,7 @@ _TOOL_DESCRIPTORS = [
     # ---------------------------------------------------------------------------
     ToolDescriptor(
         name="workflow.find_core_file",
+        title="Find Odoo core source file",
         description=(
             "V14 SELF-LEARNING: Locate an Odoo core source file by module + type + keyword. "
             "CALL THIS before any _inherit or depends addition to read the real field/method definitions. "
@@ -222,6 +279,7 @@ _TOOL_DESCRIPTORS = [
     ),
     ToolDescriptor(
         name="workflow.find_similar_view",
+        title="Find similar Odoo view",
         description=(
             "V14 SELF-LEARNING: Locate an Odoo core view XML file by model + view_type. "
             "CALL THIS before writing any <xpath expr='...'> to read the exact node structure. "
@@ -232,11 +290,24 @@ _TOOL_DESCRIPTORS = [
         ),
         read_only=True,
     ),
+    ToolDescriptor(
+        name="workflow.list_module_files",
+        title="Browse module files",
+        description=(
+            "Browse all files in a core or custom module directory when you don't know the "
+            "exact filename/keyword yet. Use subdir='models'|'views'|'static/src' to narrow. "
+            "Search priority: user → enterprise → odoo. "
+            "Use this BEFORE find_core_file when unsure what files exist, or find_core_file "
+            "directly when you already know module+type+keyword."
+        ),
+        read_only=True,
+    ),
     # ---------------------------------------------------------------------------
     # V14+ — Pillar 2: Adaptive Scope Advisor
     # ---------------------------------------------------------------------------
     ToolDescriptor(
         name="workflow.scope_advice",
+        title="Get code-reading scope advice",
         description=(
             "V14+ MANDATORY DUAL READ: Analyse custom module files and return adaptive read plan. "
             "Call AFTER repo.read on custom files and BEFORE writing any code. "
@@ -251,6 +322,7 @@ _TOOL_DESCRIPTORS = [
     # ---------------------------------------------------------------------------
     ToolDescriptor(
         name="workflow.verify_against_core",
+        title="Verify code against core",
         description=(
             "V14+ PRE-PUSH MANDATORY: Cross-check written files against Odoo core source before git.push. "
             "CALL THIS before every git.push. If push_blocked=True, fix CRITICAL findings and call again (max 3 cycles). "
@@ -323,6 +395,7 @@ _TOOL_INPUT_MODELS = {
     # V14: Self-Learning Agent
     "workflow.find_core_file": FindCoreFileRequest,
     "workflow.find_similar_view": FindSimilarViewRequest,
+    "workflow.list_module_files": ListModuleFilesRequest,
     "workflow.scope_advice": ScopeAdviceRequest,
     "workflow.verify_against_core": SyntaxVerifyRequest,
 }
@@ -337,11 +410,12 @@ def tool_input_schema(name: str) -> dict:
 
 
 @router.get("/list", response_model=list[ToolDescriptor])
-def list_tools() -> list[ToolDescriptor]:
+def list_tools(include_deprecated: bool = False) -> list[ToolDescriptor]:
     # If global approval is disabled, do not advertise approval as required even
     # when an old ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS value is still present.
     required = settings.approval_required_actions if settings.require_approval else set()
-    return [item.model_copy(update={"requires_approval": item.name in required}) for item in _TOOL_DESCRIPTORS]
+    visible = _TOOL_DESCRIPTORS if include_deprecated else [t for t in _TOOL_DESCRIPTORS if not t.deprecated]
+    return [item.model_copy(update={"requires_approval": item.name in required}) for item in visible]
 
 
 @router.post("/call", response_model=ToolCallResult)
@@ -520,6 +594,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return find_core_file(FindCoreFileRequest.model_validate(args))
     if name == "workflow.find_similar_view":
         return find_similar_view(FindSimilarViewRequest.model_validate(args))
+    if name == "workflow.list_module_files":
+        return list_module_files(ListModuleFilesRequest.model_validate(args))
     if name == "workflow.scope_advice":
         return scope_advice(ScopeAdviceRequest.model_validate(args))
     if name == "workflow.verify_against_core":

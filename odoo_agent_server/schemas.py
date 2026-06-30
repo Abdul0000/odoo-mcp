@@ -402,6 +402,23 @@ class ToolDescriptor(BaseModel):
     description: str
     read_only: bool = False
     requires_approval: bool = False
+    deprecated: bool = Field(
+        default=False,
+        description=(
+            "If True, this tool is hidden from tools/list to reduce clutter and "
+            "prevent the agent from choosing the wrong (legacy) tool. The underlying "
+            "function still works if called directly — kept for backward compatibility "
+            "and as an internal fallback target."
+        ),
+    )
+    title: str | None = Field(
+        default=None,
+        description=(
+            "Human-readable action label shown in ChatGPT's tool-call UI "
+            "(e.g. 'Push code to GitHub' instead of raw name 'git.push'). "
+            "Falls back to a humanized version of `name` if not set."
+        ),
+    )
 
 
 class ToolCallRequest(BaseModel):
@@ -630,6 +647,47 @@ class FindSimilarViewResult(BaseModel):
     best_match: str | None = Field(default=None, description="Absolute path of best match — read with repo.read before writing xpath")
     searched_roots: list[str] = Field(default_factory=list)
     total_found: int = 0
+
+
+class ListModuleFilesRequest(BaseModel):
+    """V14+ gap-fix: List all files inside a core or custom module directory.
+
+    Use when you don't know the exact filename/keyword to search for and
+    need to browse what exists first (e.g. before find_core_file).
+    """
+    module_name: str = Field(..., description="Odoo module technical name")
+    subdir: str = Field(
+        default="",
+        description="Optional subdirectory to narrow listing, e.g. 'models', 'views', 'static/src'. Empty = whole module.",
+    )
+    search_roots: list[str] = Field(
+        default_factory=list,
+        description="Override search roots. Defaults to user → enterprise → odoo.",
+    )
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        return validate_safe_name(value, "module_name")
+
+
+class ModuleFileEntry(BaseModel):
+    path: str
+    relative_path: str
+    size: int
+    ext: str
+
+
+class ListModuleFilesResult(BaseModel):
+    module_name: str
+    subdir: str
+    found: bool
+    module_path: str | None = None
+    root: str | None = None
+    priority: int | None = None
+    files: list[ModuleFileEntry] = Field(default_factory=list)
+    total_found: int = 0
+    message: str | None = None
 
 
 # ---------------------------------------------------------------------------

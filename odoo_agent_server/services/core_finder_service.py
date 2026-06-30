@@ -410,6 +410,85 @@ class CoreFinderService:
         )
 
     # ------------------------------------------------------------------
+    # Public API -- list_module_files (gap-fix)
+    # ------------------------------------------------------------------
+
+    def list_module_files(
+        self,
+        module_name: str,
+        subdir: str = "",
+        search_roots: Sequence[str] | None = None,
+    ) -> "ListModuleFilesResult":
+        """List all files in a module directory (or subdir) across priority roots.
+
+        Use this when you don't know the exact filename/keyword yet and need
+        to browse what exists before calling find_core_file with a keyword.
+        """
+        from ..schemas import ListModuleFilesResult, ModuleFileEntry
+
+        roots = self._resolve_roots(search_roots)
+        for priority, root in roots:
+            root_path = Path(root)
+            if not root_path.exists():
+                continue
+            module_dir = root_path / module_name
+            if not module_dir.exists() or not module_dir.is_dir():
+                continue
+
+            search_path = module_dir / subdir if subdir else module_dir
+            if not search_path.exists():
+                continue
+
+            entries: list[ModuleFileEntry] = []
+            if search_path.is_file():
+                entries.append(ModuleFileEntry(
+                    path=str(search_path),
+                    relative_path=str(search_path.relative_to(module_dir)),
+                    size=search_path.stat().st_size,
+                    ext=search_path.suffix,
+                ))
+            else:
+                for current, dirs, files in os.walk(search_path):
+                    dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"__pycache__", ".git"}]
+                    for fname in sorted(files):
+                        fpath = Path(current) / fname
+                        try:
+                            entries.append(ModuleFileEntry(
+                                path=str(fpath),
+                                relative_path=str(fpath.relative_to(module_dir)),
+                                size=fpath.stat().st_size,
+                                ext=fpath.suffix,
+                            ))
+                        except OSError:
+                            continue
+
+            entries.sort(key=lambda e: e.relative_path)
+            return ListModuleFilesResult(
+                module_name=module_name,
+                subdir=subdir or "(root)",
+                found=True,
+                module_path=str(module_dir),
+                root=root,
+                priority=priority,
+                files=entries[:100],
+                total_found=len(entries),
+            )
+
+        # Not found in any root
+        return ListModuleFilesResult(
+            module_name=module_name,
+            subdir=subdir or "(root)",
+            found=False,
+            files=[],
+            total_found=0,
+            message=(
+                f"Module '{module_name}' not found in any search root "
+                f"(checked: {', '.join(r for _, r in roots)}). "
+                f"Check module name spelling or pass search_roots explicitly."
+            ),
+        )
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
