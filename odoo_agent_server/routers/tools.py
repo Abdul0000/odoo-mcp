@@ -696,21 +696,22 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                     return resume_results
 
             elif step_name == "wait_odoosh":
-                import time
-                # Best-effort: poll odoosh for up to 300s
+                # NON-BLOCKING single check — mirrors odoosh.check_commit behaviour.
+                # Resuming a job must return fast; the event loop must never block here.
+                # If not yet deployed, the agent should call workflow.resume_job again
+                # after a short wait, exactly like polling odoosh.check_commit directly.
                 odoosh = OdooShService()
-                deployed = False
-                for _ in range(20):
-                    check = odoosh.check_commit_deployed(
-                        original_request.get("last_sha", "HEAD")
-                    )
-                    if check.exit_code == 0 and "true" in check.stdout.lower():
-                        deployed = True
-                        break
-                    time.sleep(15)
+                check = odoosh.check_commit_deployed(
+                    original_request.get("last_sha", "HEAD")
+                )
+                deployed = check.exit_code == 0 and "true" in check.stdout.lower()
                 resume_results["steps_run"]["wait_odoosh"] = {"deployed": deployed}
                 if not deployed:
-                    resume_results["error"] = "Timed out waiting for Odoo.sh to deploy commit"
+                    resume_results["error"] = (
+                        "Not deployed yet. This is not a failure — wait ~15s and call "
+                        "workflow.resume_job again with the same job_id to re-check."
+                    )
+                    resume_results["status"] = "retry_later"
                     return resume_results
 
             elif step_name == "upgrade":

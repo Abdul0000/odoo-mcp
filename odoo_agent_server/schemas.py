@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 
 class Severity(str, Enum):
@@ -396,16 +396,12 @@ class JobStep(BaseModel):
     result: Any = None
     error: str | None = None
 
+    @computed_field  # type: ignore[misc]
     @property
     def label(self) -> str:
         """Icon-prefixed display label, e.g. '✅ git.push' — ready to show directly to the user."""
         icon = _STEP_STATUS_ICON.get(self.status.lower(), "\u2022")
         return f"{icon} {self.name}"
-
-    def model_dump(self, *args, **kwargs):  # noqa: D401 — include computed label in JSON output
-        data = super().model_dump(*args, **kwargs)
-        data["label"] = self.label
-        return data
 
 
 class JobRecord(BaseModel):
@@ -534,22 +530,22 @@ class WorkflowReport(BaseModel):
     steps: list[JobStep]
     summary: dict[str, Any]
 
+    @computed_field  # type: ignore[misc]
     @property
     def status_label(self) -> str:
         """Icon-prefixed overall status, e.g. '✅ passed' — ready to show directly to the user."""
         icon = _STEP_STATUS_ICON.get(self.status.lower(), "\u2022")
         return f"{icon} {self.status}"
 
+    @computed_field  # type: ignore[misc]
     @property
     def steps_summary(self) -> str:
-        """One-line icon summary of all steps, e.g. '✅ repo.prepare ✅ git.push ⏳ odoosh.check_commit'."""
-        return " ".join(step.label for step in self.steps)
-
-    def model_dump(self, *args, **kwargs):  # noqa: D401 — include computed labels in JSON output
-        data = super().model_dump(*args, **kwargs)
-        data["status_label"] = self.status_label
-        data["steps_summary"] = self.steps_summary
-        return data
+        """One-line icon summary of all steps, capped at last 12 to avoid context bloat
+        in long-running multi-step pipelines (e.g. '... ✅ git.push ⏳ odoosh.check_commit')."""
+        labels = [step.label for step in self.steps]
+        if len(labels) > 12:
+            labels = ["…"] + labels[-12:]
+        return " ".join(labels)
 
 
 def validate_safe_name(value: str, field_name: str) -> str:

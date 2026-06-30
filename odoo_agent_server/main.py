@@ -153,6 +153,7 @@ def agent_instructions() -> dict:
                 "14. odoo.module_status = installed ✅",
             ],
             "error_guide": {
+                "workflow.resume_job status=retry_later": "Odoo.sh not deployed yet — wait ~15s, call workflow.resume_job again with the same job_id. Non-blocking, safe to repeat up to 20x.",
                 "path not found": "Call repo.prepare first",
                 "module not found": "Call odoo.ensure_dependencies then odoo.module_deploy",
                 "Access Denied": "SSH fallback auto-triggered — check jobs.get for result",
