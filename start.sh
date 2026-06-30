@@ -2,6 +2,7 @@
 set -eu
 
 mkdir -p /tmp/keys /workspace/repos /tmp/odoo_agent_state /tmp/odoo_agent_screenshots /root/.ssh
+mkdir -p /home/odoo/src/user /home/odoo/src/enterprise /home/odoo/src/odoo
 chmod 700 /root/.ssh
 
 write_b64_key() {

@@ -119,7 +119,12 @@ def capability_check() -> CapabilityCheckResult:
     checks["allowed_roots"] = {"ok": bool(settings.allowed_roots), "value": [str(p) for p in settings.allowed_roots]}
     checks["git"] = {"ok": shutil.which("git") is not None, "path": shutil.which("git")}
     checks["ssh"] = {"ok": shutil.which("ssh") is not None, "path": shutil.which("ssh")}
-    checks["odoo_rpc_config"] = {"ok": all([settings.odoo_base_url, settings.odoo_db_name, settings.odoo_login, settings.odoo_password])}
+    checks["odoo_rpc_config"] = {"ok": all([
+        os.environ.get("ODOO_BASE_URL") or settings.odoo_base_url,
+        os.environ.get("ODOO_DB_NAME") or settings.odoo_db_name,
+        os.environ.get("ODOO_LOGIN") or settings.odoo_login,
+        os.environ.get("ODOO_PASSWORD") or settings.odoo_password,
+    ])}
     checks["odoosh_config"] = {"ok": bool(settings.odoosh_ssh_host), "host_configured": bool(settings.odoosh_ssh_host)}
     checks["state_dir"] = {"ok": settings.state_path.exists(), "path": str(settings.state_path)}
     checks["screenshots"] = {"ok": Path(settings.screenshot_dir).expanduser().resolve().parent.exists(), "path": settings.screenshot_dir}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from urllib.parse import urljoin
@@ -28,9 +29,9 @@ class PlaywrightService:
         except Exception as exc:  # noqa: BLE001
             return BrowserCheckResult(status="failed", error=f"Playwright is not installed or browsers are missing: {exc}")
 
-        url_base = (base_url or settings.odoo_base_url or "").rstrip("/")
-        user = login or settings.odoo_login
-        secret = password or settings.odoo_password
+        url_base = (base_url or os.environ.get("ODOO_BASE_URL") or settings.odoo_base_url or "").rstrip("/")
+        user = login or os.environ.get("ODOO_LOGIN") or settings.odoo_login
+        secret = password or os.environ.get("ODOO_PASSWORD") or settings.odoo_password
         if not url_base:
             return BrowserCheckResult(status="failed", error="base_url or ODOO_BASE_URL is required")
 

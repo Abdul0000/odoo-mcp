@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     odoosh_wait_timeout_seconds: int = Field(default=600, alias="ODOOSH_WAIT_TIMEOUT_SECONDS")
     odoosh_wait_interval_seconds: int = Field(default=10, alias="ODOOSH_WAIT_INTERVAL_SECONDS")
 
+    # Phase 1 — lazy on-demand core source sync (find_core_file / verify_against_core).
+    core_sync_enabled: bool = Field(default=True, alias="CORE_SYNC_ENABLED")
+    core_sync_max_age_seconds: int = Field(default=3600, alias="CORE_SYNC_MAX_AGE_SECONDS")
+
     @property
     def allowed_roots(self) -> List[Path]:
         roots: list[Path] = []

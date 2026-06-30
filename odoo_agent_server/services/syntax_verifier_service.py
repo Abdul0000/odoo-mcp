@@ -28,6 +28,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from . import core_sync_service
 from ..schemas import (
     SyntaxVerifyRequest,
     SyntaxVerifyResult,
@@ -74,6 +75,8 @@ def _find_core_model_content(model_name: str) -> str:
     for root in _SRC_ROOTS:
         models_dir = root / module / "models"
         if not models_dir.exists():
+            core_sync_service.ensure_module_synced(str(root), module)
+        if not models_dir.exists():
             continue
         for py_file in models_dir.rglob("*.py"):
             content = _read_file(str(py_file))
@@ -95,6 +98,8 @@ def _find_core_view_content(model_name: str) -> str:
     for root in _SRC_ROOTS:
         views_dir = root / module / "views"
         if not views_dir.exists():
+            core_sync_service.ensure_module_synced(str(root), module)
+        if not views_dir.exists():
             continue
         for xml_file in views_dir.rglob("*.xml"):
             fname_lower = xml_file.name.lower()
@@ -107,6 +112,8 @@ def _module_exists_in_src(module_name: str) -> bool:
     """Check whether a module directory exists anywhere in src roots."""
     for root in _SRC_ROOTS:
         if (root / module_name).is_dir():
+            return True
+        if core_sync_service.ensure_module_synced(str(root), module_name) and (root / module_name).is_dir():
             return True
     return False
 

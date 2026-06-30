@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import ssl
 import time
@@ -40,22 +41,33 @@ class OdooRpcService:
     _auth_ttl_seconds = 600.0
 
     def _config(self) -> OdooRpcConfig:
+        # Phase 2: workflow.start_session(client_name=...) mutates os.environ
+        # for the active client, but `settings` is a pydantic object cached
+        # once at process boot and never re-reads env vars. Reading
+        # os.environ here first (falling back to the boot-time settings when
+        # unset, which is the exact previous behavior) makes multi-client
+        # switching actually take effect.
+        base_url = os.environ.get("ODOO_BASE_URL") or settings.odoo_base_url
+        db_name = os.environ.get("ODOO_DB_NAME") or settings.odoo_db_name
+        login = os.environ.get("ODOO_LOGIN") or settings.odoo_login
+        password = os.environ.get("ODOO_PASSWORD") or settings.odoo_password
+
         missing = []
-        if not settings.odoo_base_url:
+        if not base_url:
             missing.append("ODOO_BASE_URL")
-        if not settings.odoo_db_name:
+        if not db_name:
             missing.append("ODOO_DB_NAME")
-        if not settings.odoo_login:
+        if not login:
             missing.append("ODOO_LOGIN")
-        if not settings.odoo_password:
+        if not password:
             missing.append("ODOO_PASSWORD")
         if missing:
             raise ValueError("Missing Odoo RPC settings: " + ", ".join(missing))
         return OdooRpcConfig(
-            base_url=settings.odoo_base_url.rstrip("/"),
-            database=settings.odoo_db_name,
-            login=settings.odoo_login,
-            password=settings.odoo_password,
+            base_url=base_url.rstrip("/"),
+            database=db_name,
+            login=login,
+            password=password,
         )
 
     def _common_proxy(self, cfg: OdooRpcConfig) -> xmlrpc.client.ServerProxy:

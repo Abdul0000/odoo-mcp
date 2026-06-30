@@ -212,10 +212,12 @@ _TOOL_DESCRIPTORS = [
         title="List pending approvals", description="List pending/recent approval records", read_only=True),
     ToolDescriptor(name="approvals.request",
         title="Request approval", description="Create an approval request", requires_approval=False),
-    ToolDescriptor(name="approvals.approve",
-        title="Approve pending action", description="Approve an approval request", requires_approval=True),
-    ToolDescriptor(name="approvals.reject",
-        title="Reject pending action", description="Reject an approval request", requires_approval=True),
+    # Phase 4: approvals.approve/reject are intentionally NOT exposed as MCP
+    # tools. Protected-branch git.push creates an approval record that must
+    # be approved by a human via the REST API (POST /approvals/approve) with
+    # the connector's own API token — not by the agent itself. Exposing
+    # these here would let the agent self-approve the exact gate meant to
+    # require human review.
     ToolDescriptor(name="jobs.list",
         title="List background jobs", description="List recent connector jobs", read_only=True),
     ToolDescriptor(name="jobs.get",
@@ -382,8 +384,6 @@ _TOOL_INPUT_MODELS = {
     "browser.screenshot": BrowserCheckRequest,
     "approvals.list": LimitRequest,
     "approvals.request": ApprovalCreateRequest,
-    "approvals.approve": ApprovalDecisionRequest,
-    "approvals.reject": ApprovalDecisionRequest,
     "jobs.list": LimitRequest,
     "jobs.get": JobGetRequest,
     "audit.list": AuditListRequest,
@@ -555,12 +555,6 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "approvals.request":
         req = ApprovalCreateRequest.model_validate(args)
         return JsonStore().create_approval(ApprovalRecord(action=req.action, summary=req.summary, payload_preview=req.payload_preview))
-    if name == "approvals.approve":
-        req = ApprovalDecisionRequest.model_validate(args)
-        return JsonStore().set_approval_status(req.approval_id, ApprovalStatus.approved, req.reason)
-    if name == "approvals.reject":
-        req = ApprovalDecisionRequest.model_validate(args)
-        return JsonStore().set_approval_status(req.approval_id, ApprovalStatus.rejected, req.reason)
     if name == "jobs.list":
         req = LimitRequest.model_validate(args)
         return JsonStore().list_jobs(limit=req.limit)
@@ -579,10 +573,10 @@ async def _dispatch(name: str, args: dict) -> object:
     # Fix 7: Session state persistence
     if name == "session.save_state":
         req = SessionStateSaveRequest.model_validate(args)
-        return JsonStore().save_session_state(req.state)
+        return JsonStore().save_session_state(req.state, client_name=req.client_name)
     if name == "session.load_state":
-        SessionStateLoadRequest.model_validate(args)
-        return JsonStore().load_session_state()
+        req = SessionStateLoadRequest.model_validate(args)
+        return JsonStore().load_session_state(client_name=req.client_name)
     # Fix 10: Auto-install dependencies
     if name == "odoo.ensure_dependencies":
         req = EnsureDependenciesRequest.model_validate(args)

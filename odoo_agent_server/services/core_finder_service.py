@@ -24,6 +24,7 @@ import re
 from pathlib import Path
 from typing import Sequence
 
+from . import core_sync_service
 from ..schemas import (
     CoreFileMatch,
     FindCoreFileResult,
@@ -136,6 +137,8 @@ class CoreFinderService:
                 continue
             module_dir = root_path / module_name
             if not module_dir.exists() or not module_dir.is_dir():
+                core_sync_service.ensure_module_synced(root, module_name)
+            if not module_dir.exists() or not module_dir.is_dir():
                 continue
 
             candidates = self._walk_module(module_dir, subdirs)
@@ -194,6 +197,8 @@ class CoreFinderService:
             if not root_path.exists():
                 continue
             module_dir = root_path / module_candidate
+            if not module_dir.exists():
+                core_sync_service.ensure_module_synced(root, module_candidate)
             search_dirs: list[Path] = []
             if module_dir.exists():
                 search_dirs.append(module_dir)
@@ -370,6 +375,8 @@ class CoreFinderService:
             for _, root in roots:
                 root_path = Path(root)
                 models_dir = root_path / target_module / "models"
+                if not models_dir.exists():
+                    core_sync_service.ensure_module_synced(root, target_module)
                 if models_dir.exists():
                     instructions.append(ScopeReadInstruction(
                         level=ScopeLevel.L3,
@@ -432,6 +439,8 @@ class CoreFinderService:
             if not root_path.exists():
                 continue
             module_dir = root_path / module_name
+            if not module_dir.exists() or not module_dir.is_dir():
+                core_sync_service.ensure_module_synced(root, module_name)
             if not module_dir.exists() or not module_dir.is_dir():
                 continue
 

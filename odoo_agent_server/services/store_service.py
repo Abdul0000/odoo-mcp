@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -180,41 +181,74 @@ class JsonStore:
     # Fix 7: Session state persistence — survives Render/Koyeb restarts.
     # The agent can save and reload: last_sha, module_name, step_history, and
     # any arbitrary context across sessions.
+    #
+    # Phase 3: multi-client isolation. The legacy unsuffixed session_state.json
+    # keeps being written exactly as before (so session.load_state() with no
+    # args behaves identically to today — nothing breaks for the no-client or
+    # single-client case). When a client_name is known (passed explicitly, or
+    # present inside the saved state dict — workflow.start_session already
+    # includes it), an additional per-client file is written/read so two
+    # different clients' sessions never silently bleed into each other.
     # ---------------------------------------------------------------------------
 
     @property
     def _session_file(self) -> Path:
         return self.root / "session_state.json"
 
-    def save_session_state(self, state: dict) -> dict:
+    def _session_file_for_client(self, client_name: str) -> Path:
+        safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", client_name)
+        return self.root / f"session_state__{safe}.json"
+
+    def save_session_state(self, state: dict, client_name: str | None = None) -> dict:
         """Persist arbitrary session state (sha, module, step history, etc.).
 
         Called by workflow.start_session after success and by safe_deploy on
         each milestone so the agent can resume without repeating step 1.
         state dict is shallow-merged into the existing persisted state.
-        """
-        current: dict = {}
-        if self._session_file.exists():
-            try:
-                current = json.loads(self._session_file.read_text(encoding="utf-8"))
-            except Exception:
-                current = {}
-        from datetime import datetime, timezone
-        current.update(state)
-        current["updated_at"] = datetime.now(timezone.utc).isoformat()
-        with self._file_lock(self._session_file):
-            self._session_file.write_text(json.dumps(current, indent=2), encoding="utf-8")
-        return current
 
-    def load_session_state(self) -> dict:
-        """Return last persisted session state, or empty dict if none."""
-        if not self._session_file.exists():
+        Always updates the legacy global file (unchanged behavior). Also
+        updates a per-client file when client_name is known, either passed
+        explicitly or found inside `state["client_name"]`.
+        """
+        effective_client = client_name or state.get("client_name") or None
+        from datetime import datetime, timezone
+
+        def _write(path: Path) -> dict:
+            current: dict = {}
+            if path.exists():
+                try:
+                    current = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    current = {}
+            current.update(state)
+            current["updated_at"] = datetime.now(timezone.utc).isoformat()
+            with self._file_lock(path):
+                path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+            return current
+
+        merged = _write(self._session_file)
+        if effective_client:
+            _write(self._session_file_for_client(effective_client))
+        return merged
+
+    def load_session_state(self, client_name: str | None = None) -> dict:
+        """Return last persisted session state, or empty dict if none.
+
+        With no client_name, reads the legacy global file (same as before
+        this feature existed). With client_name, reads that client's
+        isolated state file — recommended once you have more than one client
+        configured, so a resumed session can never pick up another client's
+        project_path/sha by accident.
+        """
+        path = self._session_file_for_client(client_name) if client_name else self._session_file
+        if not path.exists():
             return {}
         try:
-            return json.loads(self._session_file.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return {}
 
-    def clear_session_state(self) -> None:
+    def clear_session_state(self, client_name: str | None = None) -> None:
         """Wipe the session state file (e.g. after a successful full deploy)."""
-        self._session_file.unlink(missing_ok=True)
+        path = self._session_file_for_client(client_name) if client_name else self._session_file
+        path.unlink(missing_ok=True)

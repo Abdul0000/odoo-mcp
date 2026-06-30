@@ -761,11 +761,12 @@ class ResumeJobRequest(BaseModel):
 class SessionStateSaveRequest(BaseModel):
     """Fix 7: Save arbitrary key/value pairs to the session state store."""
     state: dict[str, Any] = Field(..., description="Key/value pairs to merge into the session state")
+    client_name: str | None = Field(default=None, description="Phase 3: isolate this save to a specific client's session file. Omit for legacy global behavior.")
 
 
 class SessionStateLoadRequest(BaseModel):
     """Fix 7: Load the last persisted session state."""
-    pass  # no input needed
+    client_name: str | None = Field(default=None, description="Phase 3: load this client's isolated session state instead of the legacy global one. Recommended once more than one client is configured.")
 
 
 # ---------------------------------------------------------------------------
