@@ -20,6 +20,38 @@ def _rpc_response(request_id: Any, result: Any = None, error: dict[str, Any] | N
     return payload
 
 
+def _dump_any(value: Any) -> Any:
+    """Recursively convert Pydantic models (and lists/dicts of them) into
+    plain JSON-safe values using model_dump(mode="json")."""
+    if hasattr(value, "model_dump"):
+        return value.model_dump(mode="json")
+    if isinstance(value, list):
+        return [_dump_any(item) for item in value]
+    if isinstance(value, dict):
+        return {k: _dump_any(v) for k, v in value.items()}
+    return value
+
+
+def _to_structured_content(result: Any, tool_name: str) -> dict[str, Any]:
+    """MCP's CallToolResult.structuredContent MUST be a JSON object (dict).
+
+    Several tools (repo.list, repo.list_custom_modules, jobs.list,
+    approvals.list, audit.list, workflow tools returning matches, etc.)
+    naturally return a bare list of Pydantic models. A raw list at the top
+    level fails MCP schema validation with:
+        "Input should be a valid dictionary [type=dict_type]"
+    Wrap any non-dict result in {"items": [...], "count": N} so every tool
+    call is schema-valid regardless of what the underlying function returns.
+    """
+    dumped = _dump_any(result)
+    if isinstance(dumped, dict):
+        return dumped
+    if isinstance(dumped, list):
+        return {"items": dumped, "count": len(dumped)}
+    # Scalars (str/int/bool/None) — still must be a dict per spec.
+    return {"result": dumped}
+
+
 def _cap_text(text: str, max_chars: int = 24000) -> str:
     """Truncate an oversized tool-result text payload to keep ChatGPT's context
     lean across long sessions. Keeps the head and tail (most relevant parts for
@@ -100,7 +132,7 @@ async def _handle_rpc(payload: dict[str, Any]) -> dict[str, Any] | None:
             return _rpc_response(request_id, error={"code": -32602, "message": "tools/call requires params.name"})
         try:
             result = await _dispatch(name, arguments)
-            structured = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+            structured = _to_structured_content(result, tool_name=name)
             text = json.dumps(structured, ensure_ascii=False, default=str)
             # Context-bloat guard: in long sessions, oversized tool outputs (large diffs,
             # logs, file reads) compound across many calls and slow down/derail the model.

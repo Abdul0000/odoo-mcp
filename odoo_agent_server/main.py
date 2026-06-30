@@ -64,6 +64,7 @@ def agent_instructions() -> dict:
                 "Before install/upgrade: repo.read each file and verify imports against core modules",
                 "Long operations return job_id — poll jobs.get every 10s until passed/failed",
                 "Job/workflow responses include status_label and steps_summary fields (e.g. '✅ git.push') — show these directly to the user instead of writing your own status text",
+                "Tools that return a list (repo.list, repo.list_custom_modules, jobs.list, approvals.list, audit.list) come wrapped as {items: [...], count: N} — read result.items, not result directly",
                 "On error: diagnose first, fix, retry max 3x — never blind retry",
                 "Binary files (.png/.jpg/.ico/.woff/.ttf) cannot be read via repo.read — skip them (415 error expected)",
                 "For files >300KB pass max_bytes=500000 to repo.read",
