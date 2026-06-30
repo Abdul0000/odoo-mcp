@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, status
 
 from ..auth import AuthDependency
-from ..config import settings, get_client, get_client_names, make_authenticated_repo_url, mask_repo_url
+from ..config import settings, get_client_names, mask_repo_url
 from ..schemas import (
     CapabilityCheckResult,
     CodingTaskPlanRequest,
@@ -43,6 +43,7 @@ from ..schemas import (
     SyntaxVerifyResult,
 )
 from ..services.approval_service import ApprovalService
+from ..services.client_resolver_service import ClientResolverService
 from ..services.git_service import GitService
 from ..services.odoo_rpc_service import OdooRpcService
 from ..services.odoosh_service import OdooShService
@@ -61,9 +62,14 @@ router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDepe
 @router.post("/coding-task-plan", response_model=CodingTaskPlanResult)
 def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
     """Return the canonical repo-first coding workflow for ChatGPT/MCP clients."""
-    repo_url = payload.repo_url or settings.target_git_repo or "<repo_url>"
-    branch = payload.branch or settings.target_git_branch or "<target_branch>"
-    project_path = payload.project_path or settings.target_project_path or f"{settings.workspace_root.rstrip('/')}/<repo_name>"
+    client = ClientResolverService().resolve_client(
+        client_name=payload.client_name,
+        project_path=payload.project_path or settings.target_project_path,
+        require_complete=False,
+    )
+    repo_url = payload.repo_url or (client.repo if client else None) or settings.target_git_repo or "<repo_url>"
+    branch = payload.branch or (client.branch if client else None) or settings.target_git_branch or "<target_branch>"
+    project_path = payload.project_path or (client.path if client else None) or settings.target_project_path or f"{settings.workspace_root.rstrip('/')}/<repo_name>"
     module_name = payload.module_name or "<custom_module>"
     steps = [
         "Call repo.prepare with the target repo and branch. This clones if missing, otherwise fetches, checks out, and pulls the branch with --ff-only.",
@@ -107,6 +113,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "repo_url": repo_url,
             "branch": branch,
             "project_path": project_path,
+            "client_name": client.name if client else payload.client_name,
             "module_name": module_name,
             "task": payload.task,
         },
@@ -156,33 +163,22 @@ def start_session(payload: StartSessionRequest) -> WorkflowReport:
     Also confirms runtime capability, prepares the repo, reads git status,
     lists custom modules, and checks Odoo/Odoo.sh connectivity.
     """
-    # ── V15: Multi-Client Resolution ─────────────────────────────────────
-    if payload.client_name:
-        try:
-            client = get_client(payload.client_name)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        _token = client.get("token")
-        # Build authenticated repo URL
-        _repo_url = make_authenticated_repo_url(client["repo"], _token)
-        # Override payload fields from client config (only if not already set)
-        _branch = payload.branch or client.get("branch")
-        _client_path = client.get("path", "")
-        _repo_name = payload.repo_name or (_client_path.rstrip("/").rsplit("/", 1)[-1] if _client_path else None)
+    # ── Multi-Client Resolution ──────────────────────────────────────────
+    resolver = ClientResolverService()
+    client = resolver.resolve_client(
+        client_name=payload.client_name,
+        project_path=settings.target_project_path,
+        require_complete=False,
+    )
+    resolver.apply_odoo_env(client)
+    if client:
         payload = payload.model_copy(update={
-            "repo_url": payload.repo_url or _repo_url,
-            "branch": _branch,
-            "repo_name": _repo_name,
+            "client_name": client.name,
+            "repo_url": payload.repo_url or client.repo,
+            "branch": payload.branch or client.branch,
+            "repo_name": payload.repo_name or Path(client.path).name,
+            "workspace_root": payload.workspace_root or str(Path(client.path).parent),
         })
-        # Override Odoo creds for this client session
-        if client.get("odoo_url"):
-            os.environ["ODOO_BASE_URL"] = client["odoo_url"]
-        if client.get("odoo_db"):
-            os.environ["ODOO_DB_NAME"] = client["odoo_db"]
-        if client.get("odoo_login"):
-            os.environ["ODOO_LOGIN"] = client["odoo_login"]
-        if client.get("odoo_password"):
-            os.environ["ODOO_PASSWORD"] = client["odoo_password"]
 
     store = JsonStore()
     job = store.create_job(JobRecord(job_type="start_session", status=JobStatus.running, request=payload.model_dump(mode="json")))
@@ -199,7 +195,16 @@ def start_session(payload: StartSessionRequest) -> WorkflowReport:
 
     prepared = None
     try:
-        prepared = RepoService().prepare_repo(payload.repo_url, payload.branch, payload.repo_name, payload.workspace_root, payload.remote, payload.timeout_seconds)
+        prepared = RepoService().prepare_repo(
+            payload.repo_url,
+            payload.branch,
+            payload.repo_name,
+            payload.workspace_root,
+            payload.remote,
+            payload.timeout_seconds,
+            client.path if client else settings.target_project_path,
+            client.name if client else payload.client_name,
+        )
         step("repo_prepare", "passed", prepared)
         status_result = GitService().status(prepared.project_path)
         step("git_status", "passed" if status_result.exit_code == 0 else "warning", status_result)
@@ -239,9 +244,12 @@ def start_session(payload: StartSessionRequest) -> WorkflowReport:
         "project_path": prepared.project_path if prepared else None,
         "branch": prepared.branch if prepared else None,
         "start_session_status": final,
-        "client_name": payload.client_name or None,
+        "client_name": client.name if client else payload.client_name or None,
+        "client": client.public if client else None,
         "repo_url_safe": mask_repo_url(payload.repo_url or "") if payload.repo_url else None,
-    })
+        "odoo_url": client.odoo_url if client else os.environ.get("ODOO_BASE_URL") or settings.odoo_base_url,
+        "odoo_db": client.odoo_db if client else os.environ.get("ODOO_DB_NAME") or settings.odoo_db_name,
+    }, client_name=client.name if client else payload.client_name or None)
     return WorkflowReport(status=final, job_id=job.id, steps=finished.steps, summary={"status": final, "project_path": prepared.project_path if prepared else None, "sha": prepared.sha if prepared else None})
 
 
@@ -490,7 +498,14 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         approval.mark_failed(payload.approval_id, f"workflow.safe_deploy_module failed at {name}")
 
     try:
-        project_path = resolve_allowed_path(payload.project_path)
+        resolver = ClientResolverService()
+        client = resolver.resolve_client(
+            client_name=payload.client_name,
+            project_path=payload.project_path,
+            require_complete=False,
+        )
+        resolver.apply_odoo_env(client)
+        project_path = resolve_allowed_path(client.path if client else payload.project_path)
     except Exception as exc:
         _fail("resolve_project", error=str(exc))
         return
@@ -532,7 +547,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         return
     _step("git_configure_identity", "passed", identity_result)
 
-    branch = payload.branch or settings.target_git_branch
+    branch = payload.branch or (client.branch if client else None) or settings.target_git_branch
     target_result = git.validate_target(str(project_path), branch, payload.remote)
     if target_result.exit_code != 0:
         _fail("git_validate_target", target_result)
@@ -594,9 +609,12 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         "last_safe_deploy_job_id": job_id,
         "last_sha": pushed_sha,
         "module_name": payload.module_name,
-        "project_path": payload.project_path,
+        "project_path": str(project_path),
+        "branch": branch,
+        "client_name": client.name if client else payload.client_name,
+        "client": client.public if client else None,
         "safe_deploy_status": "passed",
-    })
+    }, client_name=client.name if client else payload.client_name or None)
 
 
 # ---------------------------------------------------------------------------

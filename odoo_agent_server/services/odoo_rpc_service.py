@@ -13,6 +13,7 @@ from urllib.parse import urljoin
 
 from ..config import settings
 from ..schemas import OdooRpcResult
+from .client_resolver_service import ClientResolverService
 
 _LOGGER = logging.getLogger(__name__)
 socket.setdefaulttimeout(30)  # Prevent infinite blocking on hung Odoo server
@@ -47,10 +48,17 @@ class OdooRpcService:
         # os.environ here first (falling back to the boot-time settings when
         # unset, which is the exact previous behavior) makes multi-client
         # switching actually take effect.
-        base_url = os.environ.get("ODOO_BASE_URL") or settings.odoo_base_url
-        db_name = os.environ.get("ODOO_DB_NAME") or settings.odoo_db_name
-        login = os.environ.get("ODOO_LOGIN") or settings.odoo_login
-        password = os.environ.get("ODOO_PASSWORD") or settings.odoo_password
+        resolver = ClientResolverService()
+        client = resolver.resolve_client(
+            odoo_url=os.environ.get("ODOO_BASE_URL") or settings.odoo_base_url,
+            odoo_db=os.environ.get("ODOO_DB_NAME") or settings.odoo_db_name,
+            require_complete=False,
+        )
+        resolver.apply_odoo_env(client)
+        base_url = (client.odoo_url if client else None) or os.environ.get("ODOO_BASE_URL") or settings.odoo_base_url
+        db_name = (client.odoo_db if client else None) or os.environ.get("ODOO_DB_NAME") or settings.odoo_db_name
+        login = (client.odoo_login if client else None) or os.environ.get("ODOO_LOGIN") or settings.odoo_login
+        password = (client.odoo_password if client else None) or os.environ.get("ODOO_PASSWORD") or settings.odoo_password
 
         missing = []
         if not base_url:

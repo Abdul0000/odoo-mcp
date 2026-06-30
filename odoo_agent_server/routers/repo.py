@@ -60,6 +60,8 @@ def repo_prepare(payload: RepoPrepareRequest) -> RepoPrepareResult:
             payload.workspace_root,
             payload.remote,
             payload.timeout_seconds,
+            payload.project_path,
+            payload.client_name,
         )
     except Exception:
         approval.mark_failed(payload.approval_id, "repo.prepare failed")

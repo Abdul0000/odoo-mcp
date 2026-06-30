@@ -45,9 +45,14 @@ def agent_instructions() -> dict:
     'Before any task, call workflow.agent_instructions first and follow exactly.'
     """
     from .config import settings, get_client_names
-    repo = settings.target_git_repo or "<repo_url>"
-    branch = settings.target_git_branch or "<branch>"
-    path = settings.target_project_path or "/workspace/repos/<repo>"
+    from .services.client_resolver_service import ClientResolverService
+    try:
+        active_client = ClientResolverService().resolve_client(require_complete=False)
+    except Exception:
+        active_client = None
+    repo = (active_client.repo if active_client else None) or settings.target_git_repo or "<repo_url>"
+    branch = (active_client.branch if active_client else None) or settings.target_git_branch or "<branch>"
+    path = (active_client.path if active_client else None) or settings.target_project_path or "/workspace/repos/<repo>"
     client_names = get_client_names()
 
     return {
@@ -178,13 +183,14 @@ def agent_instructions() -> dict:
             },
             "multi_client": {
                 "rule": (
-                    "At the start of EVERY session: ask user which client to work on. "
-                    "Show available_clients list. Call workflow.start_session(client_name='...'). "
-                    "Repo URL, branch, path, token, and Odoo creds resolve automatically. "
+                    "ODOO_CLIENTS is authoritative. At the start of every session call "
+                    "workflow.start_session; pass client_name only when the user names one "
+                    "or multiple clients match. Repo URL, branch, path, token, and Odoo creds resolve automatically. "
+                    "Do not ask for separate repo config when the selected client has repo/branch/path. "
                     "NEVER ask user for token or password. NEVER log or expose token."
                 ),
                 "available_clients": client_names if client_names else ["(no clients — using TARGET_GIT_* env vars)"],
-                "switch_client": "Call workflow.start_session(client_name='...') anytime to switch.",
+                "switch_client": "Call workflow.start_session(client_name='...') anytime to switch. If one client exists, client_name is optional.",
             },
             "version_compatibility": {
                 "supported_versions": ["Odoo 16", "Odoo 17", "Odoo 18", "Odoo 19"],

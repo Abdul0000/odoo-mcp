@@ -102,8 +102,10 @@ class SelfRunReport(BaseModel):
 
 
 class RepoPrepareRequest(ApprovalMixin):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. When omitted, the active client is auto-resolved when possible.")
     repo_url: str | None = Field(default=None, description="Git repository URL. Defaults to TARGET_GIT_REPO.")
     branch: str | None = Field(default=None, description="Target branch. Defaults to TARGET_GIT_BRANCH.")
+    project_path: str | None = Field(default=None, description="Exact checkout path. Defaults to selected ODOO_CLIENTS path or TARGET_PROJECT_PATH.")
     repo_name: str | None = Field(default=None, description="Folder name under workspace_root. Defaults to repo URL name or TARGET_PROJECT_PATH name.")
     workspace_root: str | None = Field(default=None, description="Workspace root for clones. Defaults to WORKSPACE_ROOT.")
     remote: str = Field(default="origin")
@@ -137,6 +139,7 @@ class CustomModuleItem(BaseModel):
 
 
 class CodingTaskPlanRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. When omitted, the active client is auto-resolved when possible.")
     repo_url: str | None = Field(default=None, description="Git repository URL. Defaults to TARGET_GIT_REPO.")
     branch: str | None = Field(default=None, description="Target branch. Defaults to TARGET_GIT_BRANCH.")
     module_name: str | None = Field(default=None, description="Target custom module folder name, if known.")
@@ -457,6 +460,7 @@ class CapabilityCheckResult(BaseModel):
 
 
 class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. When omitted, resolves from project_path when possible.")
     module_name: str = Field(..., description="Technical module folder/name to deploy and update")
     commit_message: str = Field(..., min_length=3, max_length=300)
     paths: list[str] = Field(default_factory=list, description="Relative paths to add before commit. Empty means git add -A.")

@@ -5,10 +5,15 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-import fcntl
 from contextlib import contextmanager
 from threading import Lock
 from typing import Any
+
+try:  # pragma: no cover - platform-specific import
+    import fcntl  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+    import msvcrt
 
 from fastapi import HTTPException, status
 
@@ -28,15 +33,22 @@ class JsonStore:
 
     @contextmanager
     def _file_lock(self, path: Path):
-        """Cross-process file lock using fcntl to prevent JSON corruption."""
+        """Cross-process file lock to prevent JSON corruption."""
         lock_path = path.with_suffix(".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with open(lock_path, "w") as lf:
             try:
-                fcntl.flock(lf, fcntl.LOCK_EX)
+                if fcntl is not None:
+                    fcntl.flock(lf, fcntl.LOCK_EX)
+                else:
+                    msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
                 yield
             finally:
-                fcntl.flock(lf, fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(lf, fcntl.LOCK_UN)
+                else:
+                    lf.seek(0)
+                    msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
 
     def __init__(self) -> None:
         self.root = settings.state_path

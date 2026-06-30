@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Sequence
 
 from . import core_sync_service
+from .client_resolver_service import ClientResolverService
 from ..schemas import (
     CoreFileMatch,
     FindCoreFileResult,
@@ -41,8 +42,8 @@ from ..schemas import (
 # ---------------------------------------------------------------------------
 _DEFAULT_ROOTS: list[tuple[int, str]] = [
     (1, "/home/odoo/src/user"),
-    (2, "/home/odoo/src/enterprise"),
-    (3, "/home/odoo/src/odoo"),
+    (2, "/home/odoo/src/odoo"),
+    (3, "/home/odoo/src/enterprise"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -505,6 +506,9 @@ class CoreFinderService:
     def _resolve_roots(search_roots: Sequence[str] | None) -> list[tuple[int, str]]:
         if search_roots:
             return [(i + 1, r) for i, r in enumerate(search_roots)]
+        client = ClientResolverService().resolve_client(require_complete=False)
+        if client:
+            return [(i + 1, root) for i, root in enumerate(ClientResolverService().search_roots(client))]
         return _DEFAULT_ROOTS
 
     @staticmethod

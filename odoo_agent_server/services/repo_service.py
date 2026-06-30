@@ -13,8 +13,9 @@ from uuid import uuid4
 
 from fastapi import HTTPException, status
 
-from ..config import settings
+from ..config import mask_repo_url, settings
 from ..schemas import CommandResult, CustomModuleItem, FileContent, FileListItem, RepoCleanPycResult, RepoPrepareResult
+from .client_resolver_service import ClientResolverService
 from .path_service import resolve_allowed_path
 from .lock_service import RepoLockService
 
@@ -47,14 +48,25 @@ class RepoService:
         workspace_root: str | None = None,
         remote: str = "origin",
         timeout_seconds: int = 180,
+        project_path: str | None = None,
+        client_name: str | None = None,
     ) -> RepoPrepareResult:
         """Clone or refresh the target repository before any coding task.
 
         This is the repo-first entry point ChatGPT should use for coding work:
         clone if missing; otherwise fetch, checkout, and pull the requested branch.
         """
-        resolved_repo_url = repo_url or settings.target_git_repo
-        resolved_branch = branch or settings.target_git_branch
+        resolver = ClientResolverService()
+        client = resolver.resolve_client(
+            client_name=client_name,
+            project_path=project_path or settings.target_project_path,
+            require_complete=False,
+        )
+        use_client_repo = bool(client and (not repo_url or repo_url == client.repo))
+        resolved_repo_url = (client.authenticated_repo if use_client_repo and client else None) or repo_url or settings.target_git_repo
+        plain_repo_url = repo_url or (client.repo if client else None) or settings.target_git_repo
+        resolved_branch = branch or (client.branch if client else None) or settings.target_git_branch
+        resolved_project_path = project_path or (client.path if client else None) or settings.target_project_path
         if not resolved_repo_url:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="repo_url is required or TARGET_GIT_REPO must be configured")
         if not resolved_branch:
@@ -64,19 +76,21 @@ class RepoService:
         if not self._safe_remote_name(remote):
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsafe remote name: {remote}")
 
-        workspace = resolve_allowed_path(workspace_root or str(settings.workspace_path))
-        workspace.mkdir(parents=True, exist_ok=True)
-        if not repo_name:
-            if settings.target_project_path:
-                repo_name = Path(settings.target_project_path).name
-            else:
+        if resolved_project_path:
+            project = resolve_allowed_path(resolved_project_path)
+            workspace = project.parent
+            workspace.mkdir(parents=True, exist_ok=True)
+            repo_name = project.name
+        else:
+            workspace = resolve_allowed_path(workspace_root or str(settings.workspace_path))
+            workspace.mkdir(parents=True, exist_ok=True)
+            if not repo_name:
                 repo_name = self._repo_name_from_url(resolved_repo_url)
-        if not self._safe_repo_folder_name(repo_name):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsafe repo_name: {repo_name}")
-
-        project = (workspace / repo_name).resolve()
-        if not (project == workspace or workspace in project.parents):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Resolved project path escapes workspace root")
+            if not self._safe_repo_folder_name(repo_name):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsafe repo_name: {repo_name}")
+            project = (workspace / repo_name).resolve()
+            if not (project == workspace or workspace in project.parents):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Resolved project path escapes workspace root")
 
         env = self._git_env()
         steps: list[CommandResult] = []
@@ -84,14 +98,26 @@ class RepoService:
 
         if already_cloned:
             if not (project / ".git").exists():
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Path exists but is not a git repository: {project}")
+                if any(project.iterdir()):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=(
+                            f"Selected client path exists but is not a git repository and is not empty: {project}. "
+                            "Refusing to clone over existing files."
+                        ),
+                    )
+                clone = self._run(["git", "clone", "--branch", resolved_branch, "--single-branch", resolved_repo_url, str(project)], workspace, timeout_seconds, env=env)
+                steps.append(clone)
+                if clone.exit_code != 0:
+                    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=clone.stderr or clone.stdout or "git clone failed")
             remote_result = self._run(["git", "remote", "get-url", remote], project, 30, env=env)
             steps.append(remote_result)
             if remote_result.exit_code != 0:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=remote_result.stderr or remote_result.stdout or "Unable to read git remote")
             configured_remote = remote_result.stdout.strip()
-            if settings.target_git_repo and configured_remote != settings.target_git_repo:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Configured remote mismatch: {configured_remote} != {settings.target_git_repo}")
+            expected_remote = plain_repo_url
+            if expected_remote and not self._remote_matches(configured_remote, expected_remote):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Configured remote mismatch: {configured_remote} != {expected_remote}")
             # Speed: dry-run fetch first — skip full fetch if nothing changed
             dry = self._run(["git", "fetch", "--dry-run", remote], project, 10, env=env)
             if dry.stdout.strip() or dry.stderr.strip():
@@ -114,6 +140,7 @@ class RepoService:
             if pull.exit_code != 0:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=pull.stderr or pull.stdout or "git pull --ff-only failed")
         else:
+            project.parent.mkdir(parents=True, exist_ok=True)
             clone = self._run(["git", "clone", "--branch", resolved_branch, "--single-branch", resolved_repo_url, str(project)], workspace, timeout_seconds, env=env)
             steps.append(clone)
             if clone.exit_code != 0:
@@ -128,7 +155,7 @@ class RepoService:
 
         return RepoPrepareResult(
             project_path=str(project),
-            repo_url=resolved_repo_url,
+            repo_url=plain_repo_url or resolved_repo_url,
             branch=resolved_branch,
             sha=sha.stdout.strip(),
             status=git_status.stdout,
@@ -600,6 +627,11 @@ class RepoService:
             name = name[:-4]
         return name or "repo"
 
+    def _remote_matches(self, configured: str, expected: str) -> bool:
+        if configured == expected:
+            return True
+        return self._repo_name_from_url(configured) == self._repo_name_from_url(expected)
+
     def _safe_repo_folder_name(self, value: str) -> bool:
         return bool(re.fullmatch(r"[A-Za-z0-9._-]+", value)) and value not in {".", ".."}
 
@@ -674,6 +706,21 @@ class RepoService:
     def _run(self, command: list[str], cwd: Path, timeout_seconds: int, env: dict[str, str] | None = None) -> CommandResult:
         try:
             completed = subprocess.run(command, cwd=str(cwd), capture_output=True, text=True, timeout=timeout_seconds, check=False, env=env)
-            return CommandResult(command=command, cwd=str(cwd), exit_code=completed.returncode, stdout=completed.stdout[-20000:], stderr=completed.stderr[-20000:])
+            return CommandResult(
+                command=[mask_repo_url(part) for part in command],
+                cwd=str(cwd),
+                exit_code=completed.returncode,
+                stdout=mask_repo_url(completed.stdout[-20000:]),
+                stderr=mask_repo_url(completed.stderr[-20000:]),
+            )
         except subprocess.TimeoutExpired as exc:
-            return CommandResult(command=command, cwd=str(cwd), exit_code=124, stdout=(exc.stdout or "")[-20000:] if isinstance(exc.stdout, str) else "", stderr=(exc.stderr or "")[-20000:] if isinstance(exc.stderr, str) else "", timed_out=True)
+            stdout = (exc.stdout or "")[-20000:] if isinstance(exc.stdout, str) else ""
+            stderr = (exc.stderr or "")[-20000:] if isinstance(exc.stderr, str) else ""
+            return CommandResult(
+                command=[mask_repo_url(part) for part in command],
+                cwd=str(cwd),
+                exit_code=124,
+                stdout=mask_repo_url(stdout),
+                stderr=mask_repo_url(stderr),
+                timed_out=True,
+            )

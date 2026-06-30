@@ -110,6 +110,7 @@ settings = Settings()
 import json as _json
 import os as _os
 import re as _re
+import codecs as _codecs
 
 
 def get_odoo_clients() -> list[dict]:
@@ -120,25 +121,85 @@ def get_odoo_clients() -> list[dict]:
       odoo_url, odoo_db, odoo_login, odoo_password
     """
     raw = _os.getenv("ODOO_CLIENTS", "[]")
-    try:
-        clients = _json.loads(raw)
-        if isinstance(clients, list):
-            return clients
-    except Exception:
-        pass
+    for candidate in _odoo_client_json_candidates(raw):
+        try:
+            parsed = _json.loads(candidate)
+            if isinstance(parsed, str):
+                parsed = _json.loads(parsed)
+            if isinstance(parsed, list):
+                return [item for item in parsed if isinstance(item, dict)]
+        except Exception:
+            pass
     return []
+
+
+def _odoo_client_json_candidates(raw: str) -> list[str]:
+    value = raw.strip()
+    candidates = [value]
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        candidates.append(value[1:-1])
+    for item in list(candidates):
+        if "\\\"" in item or "\\'" in item:
+            candidates.append(item.replace('\\"', '"').replace("\\'", "'"))
+        try:
+            decoded = _codecs.decode(item, "unicode_escape")
+            if decoded != item:
+                candidates.append(decoded)
+        except Exception:
+            pass
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in candidates:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique
+
+
+def normalise_client(client: dict) -> dict:
+    """Return a string-normalized client dict without changing secret values."""
+    normalized: dict[str, str] = {}
+    for key in (
+        "name",
+        "repo",
+        "branch",
+        "path",
+        "token",
+        "odoo_url",
+        "odoo_db",
+        "odoo_login",
+        "odoo_password",
+    ):
+        value = client.get(key)
+        if value is not None:
+            normalized[key] = str(value).strip()
+    return normalized
+
+
+def safe_client_public(client: dict) -> dict:
+    """Expose non-secret client metadata for errors, jobs, and session state."""
+    normalized = normalise_client(client)
+    return {
+        "name": normalized.get("name"),
+        "repo": mask_repo_url(normalized.get("repo", "")) if normalized.get("repo") else None,
+        "branch": normalized.get("branch"),
+        "path": normalized.get("path"),
+        "odoo_url": normalized.get("odoo_url"),
+        "odoo_db": normalized.get("odoo_db"),
+    }
 
 
 def get_client_names() -> list[str]:
     """Return just the client display names — safe to expose to agent."""
-    return [c.get("name", "") for c in get_odoo_clients() if c.get("name")]
+    return [normalise_client(c).get("name", "") for c in get_odoo_clients() if normalise_client(c).get("name")]
 
 
 def get_client(name: str) -> dict:
     """Lookup a client by name (case-insensitive). Raises ValueError if not found."""
     for c in get_odoo_clients():
-        if c.get("name", "").lower() == name.lower():
-            return c
+        normalized = normalise_client(c)
+        if normalized.get("name", "").lower() == name.lower():
+            return normalized
     available = get_client_names()
     raise ValueError(
         f"Client '{name}' not found in ODOO_CLIENTS. "

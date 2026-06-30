@@ -6,8 +6,9 @@ from pathlib import Path
 
 from fastapi import HTTPException, status
 
-from ..config import settings
+from ..config import mask_repo_url, settings
 from ..schemas import CommandResult
+from .client_resolver_service import ClientResolverService
 from .path_service import resolve_allowed_path
 from .repo_service import RepoService
 from .lock_service import RepoLockService
@@ -59,37 +60,40 @@ class GitService:
 
     def validate_target(self, project_path: str, branch: str | None = None, remote: str = "origin") -> CommandResult:
         project = self._project(project_path)
+        client = ClientResolverService().resolve_client(project_path=str(project), require_complete=False)
         current = self.current_branch(project_path)
         if current.exit_code != 0:
             return current
         current_branch = current.stdout.strip()
-        target_branch = branch or settings.target_git_branch or current_branch
+        expected_branch = (client.branch if client else None) or settings.target_git_branch
+        expected_repo = (client.repo if client else None) or settings.target_git_repo
+        target_branch = branch or expected_branch or current_branch
 
-        if settings.target_git_branch and target_branch != settings.target_git_branch:
+        if expected_branch and target_branch != expected_branch:
             return CommandResult(
                 command=["git", "validate-target"],
                 cwd=str(project),
                 exit_code=2,
-                stderr=f"Refusing push to {target_branch}; expected {settings.target_git_branch}",
+                stderr=f"Refusing push to {target_branch}; expected {expected_branch}",
             )
-        if settings.target_git_branch and current_branch not in {settings.target_git_branch, "HEAD"}:
+        if expected_branch and current_branch not in {expected_branch, "HEAD"}:
             return CommandResult(
                 command=["git", "validate-target"],
                 cwd=str(project),
                 exit_code=2,
-                stderr=f"Refusing push from branch {current_branch}; expected {settings.target_git_branch}",
+                stderr=f"Refusing push from branch {current_branch}; expected {expected_branch}",
             )
 
         remote_result = self._run(["git", "remote", "get-url", remote], project, 20)
         if remote_result.exit_code != 0:
             return remote_result
         remote_url = remote_result.stdout.strip()
-        if settings.target_git_repo and remote_url != settings.target_git_repo:
+        if expected_repo and not self._remote_matches(remote_url, expected_repo):
             return CommandResult(
                 command=["git", "validate-target"],
                 cwd=str(project),
                 exit_code=2,
-                stderr=f"Refusing push to remote {remote_url}; expected {settings.target_git_repo}",
+                stderr=f"Refusing push to remote {remote_url}; expected {expected_repo}",
             )
         return CommandResult(command=["git", "validate-target"], cwd=str(project), exit_code=0, stdout="Target git remote/branch validated.\n")
 
@@ -157,8 +161,9 @@ class GitService:
             if branch_result.exit_code != 0:
                 return branch_result
             branch = branch_result.stdout.strip()
-        if settings.target_git_branch and not branch:
-            branch = settings.target_git_branch
+        client = ClientResolverService().resolve_client(project_path=str(project), require_complete=False)
+        if not branch:
+            branch = (client.branch if client else None) or settings.target_git_branch
         if branch in {"", "HEAD"}:
             return CommandResult(command=["git", "push"], cwd=str(project), exit_code=2, stderr="Cannot push detached HEAD without explicit branch.")
 
@@ -195,18 +200,23 @@ class GitService:
                 env=self._ssh_env(),
             )
             return CommandResult(
-                command=command,
+                command=[mask_repo_url(part) for part in command],
                 cwd=str(cwd),
                 exit_code=completed.returncode,
-                stdout=completed.stdout[-20000:],
-                stderr=completed.stderr[-20000:],
+                stdout=mask_repo_url(completed.stdout[-20000:]),
+                stderr=mask_repo_url(completed.stderr[-20000:]),
             )
         except subprocess.TimeoutExpired as exc:
             return CommandResult(
-                command=command,
+                command=[mask_repo_url(part) for part in command],
                 cwd=str(cwd),
                 exit_code=124,
-                stdout=(exc.stdout or "")[-20000:] if isinstance(exc.stdout, str) else "",
-                stderr=(exc.stderr or "")[-20000:] if isinstance(exc.stderr, str) else "",
+                stdout=mask_repo_url((exc.stdout or "")[-20000:] if isinstance(exc.stdout, str) else ""),
+                stderr=mask_repo_url((exc.stderr or "")[-20000:] if isinstance(exc.stderr, str) else ""),
                 timed_out=True,
             )
+
+    def _remote_matches(self, configured: str, expected: str) -> bool:
+        if configured == expected:
+            return True
+        return self.repo._repo_name_from_url(configured) == self.repo._repo_name_from_url(expected)
