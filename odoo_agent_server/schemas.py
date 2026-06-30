@@ -377,6 +377,17 @@ class JobStatus(str, Enum):
     failed = "failed"
 
 
+_STEP_STATUS_ICON = {
+    "passed": "\u2705",   # ✅
+    "ok": "\u2705",
+    "running": "\u23f3",  # ⏳
+    "queued": "\u23f3",
+    "warning": "\u26a0\ufe0f",  # ⚠️
+    "failed": "\u274c",   # ❌
+    "skipped": "\u23ed\ufe0f",  # ⏭️
+}
+
+
 class JobStep(BaseModel):
     name: str
     status: str
@@ -384,6 +395,17 @@ class JobStep(BaseModel):
     finished_at: str | None = None
     result: Any = None
     error: str | None = None
+
+    @property
+    def label(self) -> str:
+        """Icon-prefixed display label, e.g. '✅ git.push' — ready to show directly to the user."""
+        icon = _STEP_STATUS_ICON.get(self.status.lower(), "\u2022")
+        return f"{icon} {self.name}"
+
+    def model_dump(self, *args, **kwargs):  # noqa: D401 — include computed label in JSON output
+        data = super().model_dump(*args, **kwargs)
+        data["label"] = self.label
+        return data
 
 
 class JobRecord(BaseModel):
@@ -511,6 +533,23 @@ class WorkflowReport(BaseModel):
     job_id: str
     steps: list[JobStep]
     summary: dict[str, Any]
+
+    @property
+    def status_label(self) -> str:
+        """Icon-prefixed overall status, e.g. '✅ passed' — ready to show directly to the user."""
+        icon = _STEP_STATUS_ICON.get(self.status.lower(), "\u2022")
+        return f"{icon} {self.status}"
+
+    @property
+    def steps_summary(self) -> str:
+        """One-line icon summary of all steps, e.g. '✅ repo.prepare ✅ git.push ⏳ odoosh.check_commit'."""
+        return " ".join(step.label for step in self.steps)
+
+    def model_dump(self, *args, **kwargs):  # noqa: D401 — include computed labels in JSON output
+        data = super().model_dump(*args, **kwargs)
+        data["status_label"] = self.status_label
+        data["steps_summary"] = self.steps_summary
+        return data
 
 
 def validate_safe_name(value: str, field_name: str) -> str:
