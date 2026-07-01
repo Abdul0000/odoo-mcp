@@ -75,6 +75,7 @@ def agent_instructions() -> dict:
                 "Binary files (.png/.jpg/.ico/.woff/.ttf) cannot be read via repo.read — skip them (415 error expected)",
                 "For files >300KB pass max_bytes=500000 to repo.read",
                 "For simple field/view/notebook edits, use the small_patch_fast_path: reuse session state, read only targeted files, skip broad discovery/health/screenshots unless needed.",
+                "For hard UI/POS/website/view tasks, include exact post-upgrade Odoo paths in workflow.safe_deploy_module.verify_ui_paths so the deploy job opens each page and records screenshots, console/network errors, and Odoo UI breakage.",
             ],
             "small_patch_fast_path": {
                 "when": "Use for small tasks like adding one field, one xpath, one notebook page, or a tiny label/view change in a known module.",
@@ -88,7 +89,7 @@ def agent_instructions() -> dict:
                     "6. Run git.diff and qa.self_run(run_pytest=false) unless tests/shared logic are touched.",
                     "7. workflow.verify_against_core only for changed files, then git.commit and git.push.",
                     "8. Poll odoosh.check_commit for the pushed SHA, then odoo.module_deploy(wait_timeout_seconds=5).",
-                    "9. Verify exact field/model with odoo.search_read or registry_smoke_test; skip browser.screenshot unless UI proof was requested.",
+                    "9. Verify exact field/model with odoo.search_read or registry_smoke_test; if UI proof was requested, pass exact paths in verify_ui_paths or call workflow.browser_menu_crawl once.",
                 ],
                 "do_not": [
                     "Do not repeatedly look up the tool list after the first successful tool call.",
@@ -178,7 +179,8 @@ def agent_instructions() -> dict:
                 "12. odoo.ensure_dependencies → odoo.module_deploy → poll jobs.get every 10s",
                 "    If Access Denied → SSH fallback auto-triggered inside module_deploy",
                 "13. If failed → odoosh.grep_errors → read traceback → fix → back to step 6 (max 3x)",
-                "14. odoo.module_status = installed ✅",
+                "14. For UI/POS/website/view tasks, open exact affected paths with verify_ui_paths or workflow.browser_menu_crawl; failed page load, Odoo error dialog, RPC_ERROR, traceback, console error, or 4xx/5xx network response means breakage.",
+                "15. odoo.module_status = installed ✅",
             ],
             "error_guide": {
                 "workflow.resume_job status=retry_later": "Odoo.sh not deployed yet — wait ~15s, call workflow.resume_job again with the same job_id. Non-blocking, safe to repeat up to 20x.",

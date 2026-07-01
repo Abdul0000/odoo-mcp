@@ -7,8 +7,10 @@ from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
+from odoo_agent_server.routers import workflow
 from odoo_agent_server.services.lock_service import RepoLockService
 from odoo_agent_server.services.odoosh_service import OdooShService
+from odoo_agent_server.schemas import BrowserCheckResult, SafeDeployModuleRequest
 from odoo_agent_server.services.validator_service import OdooModuleValidator
 from odoo_agent_server.schemas import Severity
 
@@ -35,6 +37,43 @@ def test_new_v8_tools_are_exposed():
     assert "workflow.restore_last_good_commit" in names
     assert "workflow.browser_menu_crawl" in names
     assert "odoosh.error_pack" in names
+
+
+def test_safe_deploy_request_accepts_ui_paths(tmp_path):
+    payload = SafeDeployModuleRequest(
+        project_path=str(tmp_path),
+        module_name="x_module",
+        commit_message="Deploy x module",
+        verify_ui_paths=["/web#action=1&model=sale.order&view_type=form", "/web#menu_id=2"],
+    )
+    assert payload.verify_ui_paths[0].startswith("/web#action=")
+    assert payload.verify_ui_timeout_seconds == 45
+
+
+def test_browser_menu_crawl_fails_on_odoo_ui_breakage(monkeypatch):
+    class FakePlaywrightService:
+        async def screenshot_odoo_page(self, *args, **kwargs):
+            return BrowserCheckResult(
+                status="failed",
+                url="https://example.test/web#action=1",
+                title="Odoo",
+                screenshot_path="/tmp/odoo.png",
+                console_errors=["odoo_ui_error_text:RPC_ERROR"],
+                network_errors=[],
+                error="odoo_ui_error_text:RPC_ERROR",
+            )
+
+    monkeypatch.setattr(workflow, "PlaywrightService", FakePlaywrightService)
+    client = TestClient(app)
+    response = client.post(
+        "/workflow/browser-menu-crawl",
+        headers=_auth(),
+        json={"paths": ["/web#action=1"], "timeout_seconds": 10},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "failed"
+    assert payload["steps"][0]["status"] == "failed"
 
 
 def test_repo_lock_blocks_second_owner(tmp_path, monkeypatch):

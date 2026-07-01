@@ -470,6 +470,16 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     run_qa: bool = Field(default=True)
     wait_for_odoosh: bool = Field(default=True)
     upgrade_module: bool = Field(default=True)
+    verify_ui_paths: list[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description=(
+            "Optional Odoo web paths to open after upgrade for live UI breakage checks, "
+            "for example /web#action=123&model=sale.order&view_type=form."
+        ),
+    )
+    verify_ui_screenshot_prefix: str = Field(default="safe_deploy_ui", description="Screenshot filename prefix for verify_ui_paths")
+    verify_ui_timeout_seconds: int = Field(default=45, ge=10, le=180, description="Per-page browser timeout for verify_ui_paths")
     timeout_seconds: int = Field(default=900, ge=60, le=2400)
 
     @field_validator("module_name")

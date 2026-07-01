@@ -68,15 +68,18 @@ class PlaywrightService:
                 await page.goto(target_url, wait_until="networkidle")
                 final_url = page.url
                 title = await page.title()
+                page_markers = await self._detect_odoo_breakage(page)
+                console_errors.extend(page_markers)
                 await page.screenshot(path=str(output_path), full_page=full_page)
                 await browser.close()
             return BrowserCheckResult(
-                status="ok",
+                status="failed" if page_markers else "ok",
                 url=final_url,
                 title=title,
                 screenshot_path=str(output_path),
                 console_errors=console_errors[-50:],
                 network_errors=network_errors[-50:],
+                error="; ".join(page_markers) if page_markers else None,
             )
         except Exception as exc:  # noqa: BLE001
             return BrowserCheckResult(
@@ -88,6 +91,32 @@ class PlaywrightService:
                 network_errors=network_errors[-50:],
                 error=str(exc),
             )
+
+    async def _detect_odoo_breakage(self, page) -> list[str]:
+        markers: list[str] = []
+        selectors = [
+            ".o_error_dialog",
+            ".o_dialog_error",
+            ".o_technical_modal",
+            ".o_notification_manager .border-danger",
+            ".o_notification_manager .text-danger",
+        ]
+        for selector in selectors:
+            try:
+                count = await page.locator(selector).count()
+            except Exception:
+                count = 0
+            if count:
+                markers.append(f"odoo_ui_error_selector:{selector}")
+
+        try:
+            body_text = (await page.locator("body").inner_text(timeout=2000))[:5000]
+        except Exception:
+            body_text = ""
+        for token in ("Odoo Client Error", "RPC_ERROR", "UncaughtPromiseError", "Traceback", "Internal Server Error"):
+            if token in body_text:
+                markers.append(f"odoo_ui_error_text:{token}")
+        return markers
 
     async def screenshot_login_page(self, base_url: str, output_path: Path) -> Path:
         from playwright.async_api import async_playwright

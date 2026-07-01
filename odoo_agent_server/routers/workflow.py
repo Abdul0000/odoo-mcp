@@ -88,7 +88,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Run git.diff and qa.self_run with run_pytest=false unless Python tests are present or the patch touches shared logic.",
             "Run workflow.verify_against_core only for the changed .py/.xml/__manifest__.py files, then git.commit and git.push.",
             "After push, poll odoosh.check_commit for the pushed SHA, then call odoo.module_deploy with wait_timeout_seconds=5; use jobs.get only if it returns a running job.",
-            "Verify the exact field with odoo.search_read or workflow.registry_smoke_test; skip browser.screenshot unless the user specifically asks for UI proof.",
+            "Verify the exact field with odoo.search_read or workflow.registry_smoke_test; if the user asks for visible UI proof, pass the exact Odoo web path in verify_ui_paths during deploy or call workflow.browser_menu_crawl once.",
         ]
         required_tools = [
             "session.load_state",
@@ -117,7 +117,8 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Push to the exact target branch with git.push; branch must match TARGET_GIT_BRANCH when configured. Note the 'sha' in the push response.",
             "Poll Odoo.sh deploy using odoosh.check_commit with the pushed sha. It returns immediately with deployed=true/false. If false, wait 15 seconds and call again. Max 20 retries.",
             "When odoosh.check_commit returns deployed=true, call odoosh.verify_module_manifest then odoosh.module_update.",
-            "Finish with odoo.module_status, odoosh.grep_errors, and browser.screenshot for UI tasks.",
+            "For UI/POS/website/view tasks, pass exact post-upgrade paths in workflow.safe_deploy_module.verify_ui_paths or call workflow.browser_menu_crawl after upgrade; treat failed page loads, Odoo error dialogs, console errors, and network errors as breakage.",
+            "Finish with odoo.module_status, odoosh.grep_errors, registry smoke checks, and browser UI path verification for UI tasks.",
         ]
         required_tools = [
             "repo.prepare",
@@ -147,6 +148,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Only patch the requested module and related files.",
             "Do not upgrade Odoo.sh until the expected pushed SHA is deployed.",
             "For small patches, avoid repeated tool discovery, broad source reads, full health checks, and screenshots unless they are needed to prove the requested change.",
+            "For hard UI/POS/website/accounting view tasks, verify exact affected views in a browser after upgrade using verify_ui_paths or workflow.browser_menu_crawl.",
         ],
         defaults={
             "repo_url": repo_url,
@@ -340,14 +342,18 @@ async def browser_menu_crawl(payload: MenuCrawlerRequest) -> WorkflowReport:
     store = JsonStore()
     job = store.create_job(JobRecord(job_type="browser_menu_crawl", status=JobStatus.running, request=payload.model_dump(mode="json")))
     flags: list[str] = []
+    failed = False
     for index, path in enumerate(payload.paths, start=1):
         result = await PlaywrightService().screenshot_odoo_page(payload.base_url, payload.login, payload.password, path, f"{payload.screenshot_prefix}_{index}.png", payload.timeout_seconds, full_page=True)
-        status_ = "passed" if result.status == "ok" and not result.console_errors and not result.network_errors else "warning"
-        if status_ != "passed":
+        status_ = "passed" if result.status == "ok" and not result.console_errors and not result.network_errors else "failed" if result.status == "failed" else "warning"
+        if status_ == "failed":
+            failed = True
+        elif status_ != "passed":
             flags.append("warning")
         store.add_step(store.get_job(job.id), JobStep(name=f"browser_path:{path}", status=status_, finished_at=datetime.now(timezone.utc).isoformat(), result=result.model_dump(mode="json")))
-    final = "warning" if flags else "passed"
-    finished = store.finish_job(store.get_job(job.id), JobStatus.warning if flags else JobStatus.passed, {"status": final, "paths": payload.paths})
+    final = "failed" if failed else "warning" if flags else "passed"
+    job_status = JobStatus.failed if failed else JobStatus.warning if flags else JobStatus.passed
+    finished = store.finish_job(store.get_job(job.id), job_status, {"status": final, "paths": payload.paths})
     return WorkflowReport(status=final, job_id=job.id, steps=finished.steps, summary={"status": final, "paths": payload.paths})
 
 
@@ -531,7 +537,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
 
     def _fail(name: str, result=None, error: str | None = None) -> None:
         _step(name, "failed", result, error)
-        if name in {"odoosh_wait_for_commit", "odoosh_verify_module_manifest", "odoosh_module_update", "odoo_module_status"}:
+        if name in {"odoosh_wait_for_commit", "odoosh_verify_module_manifest", "odoosh_module_update", "odoo_module_status", "browser_ui_verify"}:
             _rollback_after_failure(name)
         job = store.get_job(job_id)
         store.finish_job(job, JobStatus.failed, {"failed_step": name, "module_name": payload.module_name, "rollback_attempted": rollback_attempted})
@@ -641,8 +647,31 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     smoke = OdooRpcService().registry_smoke_test(payload.module_name, [], [], strict=False)
     _step("registry_smoke_test", "passed" if smoke.status == "ok" else "warning", smoke)
 
+    if payload.verify_ui_paths:
+        ui_results = []
+        for index, path in enumerate(payload.verify_ui_paths, start=1):
+            result = asyncio.run(PlaywrightService().screenshot_odoo_page(
+                None,
+                None,
+                None,
+                path,
+                f"{payload.verify_ui_screenshot_prefix}_{index}.png",
+                payload.verify_ui_timeout_seconds,
+                full_page=True,
+            ))
+            ui_results.append({"path": path, "result": result.model_dump(mode="json")})
+            status_ = "passed" if result.status == "ok" and not result.console_errors and not result.network_errors else "failed" if result.status == "failed" else "warning"
+            _step(f"browser_ui_path:{path}", status_, result)
+            if status_ == "failed":
+                _fail("browser_ui_verify", {"failed_path": path, "result": result.model_dump(mode="json")})
+                return
+        if any(item["result"]["console_errors"] or item["result"]["network_errors"] for item in ui_results):
+            _step("browser_ui_verify", "warning", {"paths": payload.verify_ui_paths, "results": ui_results})
+        else:
+            _step("browser_ui_verify", "passed", {"paths": payload.verify_ui_paths, "results": ui_results})
+
     fresh_job = store.get_job(job_id)
-    store.finish_job(fresh_job, JobStatus.passed, {"module_name": payload.module_name, "sha": pushed_sha})
+    store.finish_job(fresh_job, JobStatus.passed, {"module_name": payload.module_name, "sha": pushed_sha, "verify_ui_paths": payload.verify_ui_paths})
     approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module succeeded")
     # Fix 7: persist milestone so resume_job and future sessions know where we are
     store.save_session_state({
