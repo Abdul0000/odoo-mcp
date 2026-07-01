@@ -35,19 +35,19 @@ def test_list_custom_modules_discovers_manifest(tmp_path: Path, monkeypatch):
     assert modules[0].name == "My Custom Module"
 
 
-def test_repo_write_single_pass_threshold_is_500_lines(tmp_path: Path, monkeypatch):
+def test_repo_write_single_pass_threshold_is_1000_lines(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     project = tmp_path / "repo"
     project.mkdir()
     service = RepoService()
 
-    exactly_500 = service.write_file(str(project), "exactly_500.txt", "x\n" * 500)
-    over_500 = service.write_file(str(project), "over_500.txt", "x\n" * 501)
+    exactly_1000 = service.write_file(str(project), "exactly_1000.txt", "x\n" * 1000)
+    over_1000 = service.write_file(str(project), "over_1000.txt", "x\n" * 1001)
     chunk_start = service.write_file(str(project), "chunked.txt", "x\n" * 600, chunk_index=0, total_chunks=2)
     chunk_next = service.write_file(str(project), "chunked.txt", "x\n" * 600, chunk_index=1, total_chunks=2)
 
-    assert "large_file_warning" not in exactly_500.extra
-    assert "large_file_warning" in over_500.extra
-    assert "500 lines" in over_500.extra["large_file_warning"]
+    assert "large_file_warning" not in exactly_1000.extra
+    assert "large_file_warning" in over_1000.extra
+    assert "1000 lines" in over_1000.extra["large_file_warning"]
     assert "large_file_warning" not in chunk_start.extra
     assert "large_file_warning" not in chunk_next.extra

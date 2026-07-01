@@ -118,8 +118,8 @@ _TOOL_DESCRIPTORS = [
         name="repo.write",
         title="Write file contents",
         description=(
-            "Write a complete file. Single-pass writes are supported up to 500 lines. "
-            "For files >500 lines, use CHUNKED MODE to avoid token limits: "
+            "Write a complete file. Single-pass writes are supported up to 1000 lines. "
+            "For files >1000 lines, use CHUNKED MODE to avoid token limits: "
             "Split file into chunks; follow-up chunks have no single-pass warning limit. "
             "First call: chunk_index=0, total_chunks=N. "
             "Next calls: chunk_index=1,2...N-1 with total_chunks=N. "

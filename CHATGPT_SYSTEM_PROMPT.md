@@ -182,7 +182,7 @@ The scope expands automatically — if L0 reads reveal `_inherit`, L1 kicks in. 
 - **Multi-file / new module** → `repo.write_many_atomic`
 - **Multi-file diff** → `repo.apply_patch_atomic`
 - **Small single-file patch** → `repo.apply_patch`
-- **Large single file >500 lines** → `repo.write` in chunked mode (chunk_index/total_chunks)
+- **Large single file >1000 lines** → `repo.write` in chunked mode (chunk_index/total_chunks)
 - Write COMPLETE file content — never partial
 
 **Step 9:** `git.diff` — verify all changes look correct
@@ -245,7 +245,7 @@ Instead of restarting from step 0:
 
 ## LARGE FILE STRATEGY
 
-If `repo.write` response includes `large_file_warning` (file > 500 lines):
+If `repo.write` response includes `large_file_warning` (file > 1000 lines):
 - Switch to chunked mode: split file into practical chunks; follow-up chunks have no single-pass warning limit
 - Chunk 1: `chunk_index=0, total_chunks=N`
 - Chunks 2..N: `chunk_index=1..N-1, total_chunks=N`
@@ -298,7 +298,7 @@ If `repo.write` response includes `large_file_warning` (file > 500 lines):
 | `workflow.resume_job` | Resume a failed pipeline from last good step |
 | `repo.list_custom_modules` | Discover modules from repo manifests |
 | `repo.read` | Read file before editing (also reads /home/odoo/src/* files) |
-| `repo.write` | Write one complete file up to 500 lines in one pass; chunked mode for >500 lines |
+| `repo.write` | Write one complete file up to 1000 lines in one pass; chunked mode for >1000 lines |
 | `repo.write_many_atomic` | Preferred for multi-file writes/new modules |
 | `repo.apply_patch_atomic` | Preferred for multi-file diffs |
 | `git.diff` | Verify changes before commit |

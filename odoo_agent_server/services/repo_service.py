@@ -285,7 +285,7 @@ class RepoService:
         return FileContent(path=target.relative_to(self.project(project_path)).as_posix(), content=content, size=size)
 
     # Fix 2/6: line-count threshold above which chunked mode is recommended.
-    _LARGE_FILE_LINE_THRESHOLD = 500
+    _LARGE_FILE_LINE_THRESHOLD = 1000
     # Fix 6: unified-diff line limit to include in response (keeps payload small)
     _DIFF_PREVIEW_LINES = 60
 
@@ -298,7 +298,7 @@ class RepoService:
         chunk_index: int = 0,
         total_chunks: int = 1,
     ) -> FileContent:
-        """Write a file, with optional chunked mode for large files (>500 lines).
+        """Write a file, with optional chunked mode for large files (>1000 lines).
 
         Chunked mode (total_chunks > 1):
           chunk_index=0 → create/overwrite file with first chunk
