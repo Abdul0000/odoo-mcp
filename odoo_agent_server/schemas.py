@@ -36,6 +36,7 @@ class FileContent(BaseModel):
     path: str
     content: str
     size: int
+    extra: dict[str, Any] = Field(default_factory=dict)
 
 
 class FileListItem(BaseModel):
@@ -170,7 +171,7 @@ class RepoWriteRequest(BaseProjectRequest, ApprovalMixin):
     relative_path: str
     content: str
     create_dirs: bool = True
-    # Chunked write support for large files (>300 lines)
+    # Chunked write support for large files (>500 lines)
     # chunk_index: 0-based index of this chunk
     # total_chunks: total number of chunks to expect
     # When total_chunks > 1, content is appended to existing file chunks

@@ -2,6 +2,7 @@ from pathlib import Path
 
 from odoo_agent_server.schemas import CodingTaskPlanRequest, RepoPrepareRequest
 from odoo_agent_server.routers.tools import _TOOL_DESCRIPTORS, tool_input_schema
+from odoo_agent_server.config import settings
 from odoo_agent_server.services.repo_service import RepoService
 
 
@@ -24,10 +25,29 @@ def test_coding_task_plan_schema_requires_task():
     assert model.task == "Add field test_mcp"
 
 
-def test_list_custom_modules_discovers_manifest(tmp_path: Path):
+def test_list_custom_modules_discovers_manifest(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     module = tmp_path / "my_custom_module"
     module.mkdir()
     (module / "__manifest__.py").write_text("{'name': 'My Custom Module', 'version': '18.0.1.0.0', 'installable': True, 'author': 'Tester'}", encoding="utf-8")
     modules = RepoService().list_custom_modules(str(tmp_path))
     assert [item.module_name for item in modules] == ["my_custom_module"]
     assert modules[0].name == "My Custom Module"
+
+
+def test_repo_write_single_pass_threshold_is_500_lines(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    project.mkdir()
+    service = RepoService()
+
+    exactly_500 = service.write_file(str(project), "exactly_500.txt", "x\n" * 500)
+    over_500 = service.write_file(str(project), "over_500.txt", "x\n" * 501)
+    chunk_start = service.write_file(str(project), "chunked.txt", "x\n" * 600, chunk_index=0, total_chunks=2)
+    chunk_next = service.write_file(str(project), "chunked.txt", "x\n" * 600, chunk_index=1, total_chunks=2)
+
+    assert "large_file_warning" not in exactly_500.extra
+    assert "large_file_warning" in over_500.extra
+    assert "500 lines" in over_500.extra["large_file_warning"]
+    assert "large_file_warning" not in chunk_start.extra
+    assert "large_file_warning" not in chunk_next.extra

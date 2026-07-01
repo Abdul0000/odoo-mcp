@@ -284,8 +284,8 @@ class RepoService:
             raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Only UTF-8 text files are supported") from exc
         return FileContent(path=target.relative_to(self.project(project_path)).as_posix(), content=content, size=size)
 
-    # Fix 2/6: line-count threshold above which chunked mode is mandatory
-    _LARGE_FILE_LINE_THRESHOLD = 300
+    # Fix 2/6: line-count threshold above which chunked mode is recommended.
+    _LARGE_FILE_LINE_THRESHOLD = 500
     # Fix 6: unified-diff line limit to include in response (keeps payload small)
     _DIFF_PREVIEW_LINES = 60
 
@@ -298,7 +298,7 @@ class RepoService:
         chunk_index: int = 0,
         total_chunks: int = 1,
     ) -> FileContent:
-        """Write a file, with optional chunked mode for large files (>300 lines).
+        """Write a file, with optional chunked mode for large files (>500 lines).
 
         Chunked mode (total_chunks > 1):
           chunk_index=0 → create/overwrite file with first chunk
@@ -375,8 +375,10 @@ class RepoService:
                 # Fix 2: large file warning
                 if lines > self._LARGE_FILE_LINE_THRESHOLD:
                     extra["large_file_warning"] = (
-                        f"File has {lines} lines. For files >250 lines use chunked mode "
-                        f"(total_chunks>1) to avoid token-limit partial writes."
+                        f"File has {lines} lines. Single-pass repo.write is supported up to "
+                        f"{self._LARGE_FILE_LINE_THRESHOLD} lines. For larger files use chunked "
+                        f"mode (total_chunks>1); follow-up chunks are append-only and do not have "
+                        f"this single-pass warning limit."
                     )
                 # Fix 6: diff preview on overwrite
                 if old_content is not None:

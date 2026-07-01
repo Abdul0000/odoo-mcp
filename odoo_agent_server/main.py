@@ -149,8 +149,8 @@ def agent_instructions() -> dict:
                 },
             },
             "large_file_writing": {
-                "threshold": "Files >250 lines must use chunked mode",
-                "chunk_size": "~200 lines per chunk",
+                "threshold": "Single-pass repo.write is supported up to 500 lines; files >500 lines should use chunked mode",
+                "chunk_size": "Choose practical chunks; follow-up chunks have no single-pass warning limit",
                 "how": [
                     "chunk_index=0, total_chunks=N → create file with first chunk",
                     "chunk_index=1..N-1, total_chunks=N → append next chunks",
