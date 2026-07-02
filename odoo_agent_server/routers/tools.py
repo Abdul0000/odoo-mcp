@@ -58,6 +58,8 @@ from ..schemas import (
     ScopeAdviceRequest,
     # V14+: Pillar 3 — Pre-Push Syntax Verifier
     SyntaxVerifyRequest,
+    # V15: Strict Odoo frontend/OWL/JS/XML preflight
+    FrontendPatternPreflightRequest,
 )
 from ..services.git_service import GitService
 from ..services.odoo_rpc_service import OdooRpcService
@@ -69,7 +71,7 @@ from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_apply_pa
 from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
-from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core
+from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, frontend_pattern_preflight
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
@@ -104,6 +106,15 @@ _TOOL_DESCRIPTORS = [
         title="Restore last working commit", description="Emergency restore by reverting a bad commit and optionally pushing the revert", requires_approval=True),
     ToolDescriptor(name="workflow.browser_menu_crawl",
         title="Crawl Odoo menus in browser", description="Open multiple Odoo paths and capture screenshot/console/network/Odoo UI errors", read_only=True),
+    ToolDescriptor(
+        name="workflow.frontend_pattern_preflight",
+        title="Strict frontend/OWL preflight",
+        description=(
+            "MANDATORY before writing any Odoo JS, OWL, POS, website, payment, QWeb/XML template, "
+            "SCSS, or asset code. Returns source files/areas to read first and strict syntax/bundle rules."
+        ),
+        read_only=True,
+    ),
     ToolDescriptor(name="qa.self_run",
         title="Run code quality checks", description="Run Odoo custom module static QA and optional pytest/git status", read_only=True),
     ToolDescriptor(name="repo.prepare",
@@ -349,6 +360,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.registry_smoke_test": RegistrySmokeTestRequest,
     "workflow.restore_last_good_commit": RestoreLastGoodCommitRequest,
     "workflow.browser_menu_crawl": MenuCrawlerRequest,
+    "workflow.frontend_pattern_preflight": FrontendPatternPreflightRequest,
     "qa.self_run": SelfRunRequest,
     "repo.prepare": RepoPrepareRequest,
     "repo.list_custom_modules": RepoCustomModulesRequest,
@@ -462,6 +474,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return restore_last_good_commit(RestoreLastGoodCommitRequest.model_validate(args))
     if name == "workflow.browser_menu_crawl":
         return await browser_menu_crawl(MenuCrawlerRequest.model_validate(args))
+    if name == "workflow.frontend_pattern_preflight":
+        return frontend_pattern_preflight(FrontendPatternPreflightRequest.model_validate(args))
     if name == "qa.self_run":
         return self_run(SelfRunRequest.model_validate(args))
     if name == "repo.prepare":

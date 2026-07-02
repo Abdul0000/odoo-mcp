@@ -42,8 +42,8 @@ from ..schemas import (
 # ---------------------------------------------------------------------------
 _DEFAULT_ROOTS: list[tuple[int, str]] = [
     (1, "/home/odoo/src/user"),
-    (2, "/home/odoo/src/odoo"),
-    (3, "/home/odoo/src/enterprise"),
+    (2, "/home/odoo/src/enterprise"),
+    (3, "/home/odoo/src/odoo"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -136,10 +136,11 @@ class CoreFinderService:
             root_path = Path(root)
             if not root_path.exists():
                 continue
-            module_dir = root_path / module_name
-            if not module_dir.exists() or not module_dir.is_dir():
+            module_dir = self._find_module_dir(root_path, module_name)
+            if not module_dir:
                 core_sync_service.ensure_module_synced(root, module_name)
-            if not module_dir.exists() or not module_dir.is_dir():
+                module_dir = self._find_module_dir(root_path, module_name)
+            if not module_dir:
                 continue
 
             candidates = self._walk_module(module_dir, subdirs)
@@ -197,11 +198,12 @@ class CoreFinderService:
             root_path = Path(root)
             if not root_path.exists():
                 continue
-            module_dir = root_path / module_candidate
-            if not module_dir.exists():
+            module_dir = self._find_module_dir(root_path, module_candidate)
+            if not module_dir:
                 core_sync_service.ensure_module_synced(root, module_candidate)
+                module_dir = self._find_module_dir(root_path, module_candidate)
             search_dirs: list[Path] = []
-            if module_dir.exists():
+            if module_dir:
                 search_dirs.append(module_dir)
             else:
                 search_dirs.append(root_path)
@@ -375,9 +377,11 @@ class CoreFinderService:
             target_module = inherit_models[0].split(".")[0] if inherit_models else custom_module_name
             for _, root in roots:
                 root_path = Path(root)
-                models_dir = root_path / target_module / "models"
-                if not models_dir.exists():
+                module_dir = self._find_module_dir(root_path, target_module)
+                if not module_dir:
                     core_sync_service.ensure_module_synced(root, target_module)
+                    module_dir = self._find_module_dir(root_path, target_module)
+                models_dir = module_dir / "models" if module_dir else root_path / target_module / "models"
                 if models_dir.exists():
                     instructions.append(ScopeReadInstruction(
                         level=ScopeLevel.L3,
@@ -439,10 +443,11 @@ class CoreFinderService:
             root_path = Path(root)
             if not root_path.exists():
                 continue
-            module_dir = root_path / module_name
-            if not module_dir.exists() or not module_dir.is_dir():
+            module_dir = self._find_module_dir(root_path, module_name)
+            if not module_dir:
                 core_sync_service.ensure_module_synced(root, module_name)
-            if not module_dir.exists() or not module_dir.is_dir():
+                module_dir = self._find_module_dir(root_path, module_name)
+            if not module_dir:
                 continue
 
             search_path = module_dir / subdir if subdir else module_dir

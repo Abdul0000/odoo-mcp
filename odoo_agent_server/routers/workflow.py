@@ -41,6 +41,9 @@ from ..schemas import (
     # V14+: Pillar 3 — Pre-Push Syntax Verifier
     SyntaxVerifyRequest,
     SyntaxVerifyResult,
+    # V15: Strict Odoo frontend/OWL/JS/XML preflight
+    FrontendPatternPreflightRequest,
+    FrontendPatternPreflightResult,
 )
 from ..services.approval_service import ApprovalService
 from ..services.client_resolver_service import ClientResolverService
@@ -54,6 +57,7 @@ from ..services.store_service import JsonStore
 from ..services.background_executor import submit_background
 from ..services.core_finder_service import CoreFinderService          # V14
 from ..services.syntax_verifier_service import SyntaxVerifierService  # V14+
+from ..services.frontend_pattern_service import FrontendPatternService  # V15
 from .qa import self_run
 
 router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDependency])
@@ -64,6 +68,16 @@ def _looks_like_small_patch(task: str) -> bool:
     small_terms = ("add field", "new field", "simple field", "notebook", "tab", "page", "xpath", "label")
     broad_terms = ("new module", "report", "dashboard", "integration", "migration", "workflow", "portal", "api")
     return any(term in value for term in small_terms) and not any(term in value for term in broad_terms)
+
+
+def _looks_like_frontend_task(task: str) -> bool:
+    value = task.lower().replace("-", "_")
+    frontend_terms = (
+        "js", "javascript", "owl", "component", "qweb", "xml template", "scss", "asset",
+        "pos", "point_of_sale", "website", "snippet", "frontend", "editor",
+        "payment", "checkout", "provider", "dashboard", "screen", "patch", "registry",
+    )
+    return any(term in value for term in frontend_terms)
 
 
 @router.post("/coding-task-plan", response_model=CodingTaskPlanResult)
@@ -83,6 +97,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
         steps = [
             "Use the small-patch path: if session.load_state already has project_path/client_name, skip workflow.start_session; otherwise call workflow.start_session with include_odoo=false and include_odoosh=false.",
             "Call repo.prepare once, then read only the target module manifest plus the specific model/view files needed for the requested field or notebook change.",
+            "If the patch touches JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, call workflow.frontend_pattern_preflight after reading custom files and read every mandatory source pattern before coding.",
             "For a field on an existing inherited model, read the matching core model/view once with workflow.find_core_file or workflow.find_similar_view only when the existing custom file does not already prove the pattern.",
             "Patch the smallest file set with repo.apply_patch_atomic or repo.write_many_atomic; do not run broad module discovery again after the target module is known.",
             "Run git.diff and qa.self_run with run_pytest=false unless Python tests are present or the patch touches shared logic.",
@@ -99,6 +114,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "git.diff",
             "qa.self_run",
             "workflow.verify_against_core",
+            "workflow.frontend_pattern_preflight",
             "git.commit",
             "git.push",
             "odoosh.check_commit",
@@ -111,6 +127,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Call repo.prepare with the target repo and branch. This clones if missing, otherwise fetches, checks out, and pulls the branch with --ff-only.",
             "Call repo.list_custom_modules on the returned project_path; choose the target custom module from __manifest__.py files, not from Odoo's installed module list only.",
             f"Read the target module files first: {module_name}/__manifest__.py, models, views, security, and relevant static files.",
+            "For JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, call workflow.frontend_pattern_preflight with task_description, target_module_name, custom_file_paths, and planned_file_paths; then repo.read all mandatory pattern files returned before implementation.",
             "Apply edits atomically: use repo.apply_patch_atomic for multi-file diffs or repo.write_many_atomic for multi-file/new-module writes. Use repo.apply_patch/repo.write only for small single-file changes. Do not edit Odoo core, enterprise, .git, or unrelated modules.",
             "Run git.diff and qa.self_run. Treat pytest environment failures separately from real module errors.",
             "Commit only related paths with git.commit using a clear message.",
@@ -124,6 +141,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "repo.prepare",
             "repo.list_custom_modules",
             "repo.read",
+            "workflow.frontend_pattern_preflight",
             "repo.apply_patch_atomic",
             "repo.write_many_atomic",
             "repo.apply_patch",
@@ -149,6 +167,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Do not upgrade Odoo.sh until the expected pushed SHA is deployed.",
             "For small patches, avoid repeated tool discovery, broad source reads, full health checks, and screenshots unless they are needed to prove the requested change.",
             "For hard UI/POS/website/accounting view tasks, verify exact affected views in a browser after upgrade using verify_ui_paths or workflow.browser_menu_crawl.",
+            "For JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, frontend_pattern_preflight is blocking: do not write code until real framework source patterns are read.",
         ],
         defaults={
             "repo_url": repo_url,
@@ -843,3 +862,19 @@ def verify_against_core(payload: SyntaxVerifyRequest) -> SyntaxVerifyResult:
         fix_cycle=0
     """
     return SyntaxVerifierService().verify(payload)
+
+
+# ===========================================================================
+# V15 — Strict Odoo Frontend / OWL / JS / XML Preflight
+# ===========================================================================
+
+@router.post("/frontend-pattern-preflight", response_model=FrontendPatternPreflightResult)
+def frontend_pattern_preflight(payload: FrontendPatternPreflightRequest) -> FrontendPatternPreflightResult:
+    """V15: Blocking source exploration plan for Odoo frontend work.
+
+    MANDATORY for any POS, OWL, JS, website, payment, QWeb/XML template,
+    frontend SCSS, or asset-bundle task before writing code.  It returns the
+    exact source areas/files the agent must read so the implementation matches
+    the installed Odoo framework pattern instead of guessing.
+    """
+    return FrontendPatternService().preflight(payload)

@@ -1,29 +1,14 @@
-"""V14+ — Pre-Push Syntax Verifier: cross-check written files against Odoo core.
+"""Strict Odoo pre-push verifier.
 
-Pillar 3 of the Mandatory Dual Read system:
-  Before every git.push the agent MUST call workflow.verify_against_core.
-  This service reads the written custom files, compares them against core
-  source files already on disk, and blocks push if mismatches are found.
-
-What is verified:
-  Python model files (.py):
-    - _inherit model names exist in core
-    - Field names used in depends=[], comodel_name=, related= match core fields
-    - No hallucinated field names (fields not present in core model)
-
-  XML view files (.xml):
-    - xpath expr= attributes reference real node IDs found in core view
-    - field name= attributes reference real field names from core model
-    - inherit_id ref= references a real view ID in core
-
-  Manifest files (__manifest__.py):
-    - module names in depends=[] exist in /home/odoo/src/{user,enterprise,odoo}
-
-Push is BLOCKED if any CRITICAL mismatches are found.
-Max 3 fix cycles are tracked; after that the service reports and halts.
+V14 verified Python/XML/manifest code against Odoo source.  V15 extends that
+same guard to Odoo frontend assets: JS/OWL/POS/website/payment XML templates,
+asset bundles, and import/template consistency.  The goal is not to replace a
+browser test; it blocks the most common framework-pattern mistakes before push.
 """
 from __future__ import annotations
 
+import ast
+import glob
 import re
 from pathlib import Path
 from typing import Any
@@ -39,24 +24,51 @@ from ..schemas import (
 # ---------------------------------------------------------------------------
 # Regex helpers
 # ---------------------------------------------------------------------------
-_FIELD_NAME_RE    = re.compile(r'^\s{4,}(\w+)\s*=\s*fields\.', re.MULTILINE)
-_INHERIT_RE       = re.compile(r'_inherit\s*=\s*["\']([^"\']+)["\']')
-_DEPENDS_PY_RE    = re.compile(r'depends\(\[([^\]]+)\]\)')
-_COMODEL_RE       = re.compile(r'comodel_name\s*=\s*["\']([^"\']+)["\']')
-_RELATED_RE       = re.compile(r'related\s*=\s*["\']([^"\']+)["\']')
-_COMPUTE_RE       = re.compile(r'compute\s*=\s*["\']([^"\']+)["\']')
-_XPATH_EXPR_RE    = re.compile(r'expr=["\']([^"\']+)["\']')
-_FIELD_NAME_XML_RE= re.compile(r'<field\s+name=["\'](\w+)["\']')
-_INHERIT_ID_RE    = re.compile(r'inherit_id\s+ref=["\']([^"\']+)["\']')
-_MANIFEST_DEPS_RE = re.compile(r"'depends'\s*:\s*\[([^\]]+)\]", re.DOTALL)
-_MODULE_NAME_RE   = re.compile(r"'(\w+)'")
+_FIELD_NAME_RE     = re.compile(r'^\s{4,}(\w+)\s*=\s*fields\.', re.MULTILINE)
+_INHERIT_RE        = re.compile(r'_inherit\s*=\s*["\']([^"\']+)["\']')
+_DEPENDS_PY_RE     = re.compile(r'depends\(\[([^\]]+)\]\)')
+_COMODEL_RE        = re.compile(r'comodel_name\s*=\s*["\']([^"\']+)["\']')
+_RELATED_RE        = re.compile(r'related\s*=\s*["\']([^"\']+)["\']')
+_COMPUTE_RE        = re.compile(r'compute\s*=\s*["\']([^"\']+)["\']')
+_XPATH_EXPR_RE     = re.compile(r'expr=["\']([^"\']+)["\']')
+_FIELD_NAME_XML_RE = re.compile(r'<field\s+name=["\'](\w+)["\']')
+_INHERIT_ID_RE     = re.compile(r'inherit_id\s+ref=["\']([^"\']+)["\']')
+_MANIFEST_DEPS_RE  = re.compile(r"['\"]depends['\"]\s*:\s*\[([^\]]+)\]", re.DOTALL)
+_MODULE_NAME_RE    = re.compile(r"['\"]([A-Za-z0-9_]+)['\"]")
 
-# Search roots (same as CoreFinderService)
+_JS_IMPORT_RE      = re.compile(r'(?:from\s+["\']([^"\']+)["\']|import\s*\(\s*["\']([^"\']+)["\']\s*\))')
+_JS_TEMPLATE_RE    = re.compile(r'(?:static\s+template\s*=|\.template\s*=)\s*["\']([^"\']+)["\']')
+_T_NAME_RE         = re.compile(r't-name=["\']([^"\']+)["\']')
+_T_INHERIT_RE      = re.compile(r't-inherit=["\']([^"\']+)["\']')
+_T_CALL_RE         = re.compile(r't-call=["\']([^"\']+)["\']')
+_T_XPATH_RE        = re.compile(r'<xpath\b[^>]*expr=["\']([^"\']+)["\']', re.DOTALL)
+_CLASS_IN_EXPR_RE  = re.compile(r'contains\(@class,\s*["\']([^"\']+)["\']\)|hasclass\(["\']([^"\']+)["\']\)')
+
+# Search roots (same as CoreFinderService): custom/user, enterprise, community.
 _SRC_ROOTS = [
     Path("/home/odoo/src/user"),
     Path("/home/odoo/src/enterprise"),
     Path("/home/odoo/src/odoo"),
 ]
+
+_ALIAS_MODULES = {
+    "@web/": "web",
+    "@point_of_sale/": "point_of_sale",
+    "@pos/": "point_of_sale",
+    "@website/": "website",
+    "@website_sale/": "website_sale",
+    "@website_payment/": "website_payment",
+    "@payment/": "payment",
+    "@mail/": "mail",
+    "@portal/": "portal",
+    "@spreadsheet/": "spreadsheet",
+    "@hr/": "hr",
+    "@account/": "account",
+    "@sale/": "sale",
+    "@stock/": "stock",
+}
+
+_EXTERNAL_IMPORTS = {"@odoo/owl", "luxon"}
 
 
 def _read_file(path: str, max_bytes: int = 524288) -> str:
@@ -67,15 +79,32 @@ def _read_file(path: str, max_bytes: int = 524288) -> str:
         return ""
 
 
+def _module_dir(root: Path, module_name: str) -> Path | None:
+    """Resolve direct and community addons layouts."""
+    for candidate in (root / module_name, root / "addons" / module_name, root / "odoo" / "addons" / module_name):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _iter_module_dirs(module_name: str) -> list[Path]:
+    dirs: list[Path] = []
+    for root in _SRC_ROOTS:
+        found = _module_dir(root, module_name)
+        if not found:
+            core_sync_service.ensure_module_synced(str(root), module_name)
+            found = _module_dir(root, module_name)
+        if found:
+            dirs.append(found)
+    return dirs
+
+
 def _find_core_model_content(model_name: str) -> str:
     """Return concatenated content of core model files for a given model."""
     module = model_name.split(".")[0]
-    keyword = model_name.replace(".", "_")
     contents: list[str] = []
-    for root in _SRC_ROOTS:
-        models_dir = root / module / "models"
-        if not models_dir.exists():
-            core_sync_service.ensure_module_synced(str(root), module)
+    for module_dir in _iter_module_dirs(module):
+        models_dir = module_dir / "models"
         if not models_dir.exists():
             continue
         for py_file in models_dir.rglob("*.py"):
@@ -92,13 +121,13 @@ def _extract_core_field_names(core_content: str) -> set[str]:
 
 def _find_core_view_content(model_name: str) -> str:
     """Return concatenated content of core view XML files for a model."""
+    if not model_name:
+        return ""
     module = model_name.split(".")[0]
     hints = [model_name.replace(".", "_"), model_name.split(".")[-1]]
     contents: list[str] = []
-    for root in _SRC_ROOTS:
-        views_dir = root / module / "views"
-        if not views_dir.exists():
-            core_sync_service.ensure_module_synced(str(root), module)
+    for module_dir in _iter_module_dirs(module):
+        views_dir = module_dir / "views"
         if not views_dir.exists():
             continue
         for xml_file in views_dir.rglob("*.xml"):
@@ -110,28 +139,90 @@ def _find_core_view_content(model_name: str) -> str:
 
 def _module_exists_in_src(module_name: str) -> bool:
     """Check whether a module directory exists anywhere in src roots."""
-    for root in _SRC_ROOTS:
-        if (root / module_name).is_dir():
-            return True
-        if core_sync_service.ensure_module_synced(str(root), module_name) and (root / module_name).is_dir():
-            return True
+    return bool(_iter_module_dirs(module_name))
+
+
+def _extract_all_template_names(xml_contents: dict[str, str]) -> set[str]:
+    names: set[str] = set()
+    for content in xml_contents.values():
+        names.update(m.group(1) for m in _T_NAME_RE.finditer(content))
+    return names
+
+
+def _find_template_content(template_name: str, local_xml_contents: dict[str, str] | None = None) -> str:
+    """Find QWeb template source in written XML files or Odoo source roots."""
+    if local_xml_contents:
+        for content in local_xml_contents.values():
+            if f't-name="{template_name}"' in content or f"t-name='{template_name}'" in content:
+                return content
+    # Try module prefix first for speed: web.SomeTemplate -> module web.
+    module_hint = template_name.split(".", 1)[0] if "." in template_name else None
+    module_dirs = _iter_module_dirs(module_hint) if module_hint else []
+    search_dirs = module_dirs or [root for root in _SRC_ROOTS if root.exists()]
+    for search_dir in search_dirs:
+        for xml_file in search_dir.rglob("*.xml"):
+            content = _read_file(str(xml_file), max_bytes=1048576)
+            if f't-name="{template_name}"' in content or f"t-name='{template_name}'" in content:
+                return content
+    return ""
+
+
+def _resolve_odoo_alias(import_path: str) -> list[Path]:
+    """Map @web/foo/bar imports to possible source files."""
+    for alias, module in _ALIAS_MODULES.items():
+        if not import_path.startswith(alias):
+            continue
+        tail = import_path[len(alias):]
+        candidates: list[Path] = []
+        for module_dir in _iter_module_dirs(module):
+            base = module_dir / "static" / "src" / tail
+            candidates.extend([base, base.with_suffix(".js"), base.with_suffix(".xml"), base / "index.js"])
+        return candidates
+    return []
+
+
+def _asset_path_exists(module_root: Path, asset: str) -> bool:
+    """Return True if a manifest asset string resolves to at least one file."""
+    if not isinstance(asset, str):
+        return True
+    if asset.startswith(("http://", "https://", "//")):
+        return True
+    # Odoo assets commonly start with module_name/static/src/...
+    parent = module_root.parent
+    raw_candidates = [parent / asset, module_root / asset]
+    if any(candidate.exists() for candidate in raw_candidates):
+        return True
+    if "*" in asset:
+        return bool(glob.glob(str(parent / asset)) or glob.glob(str(module_root / asset)))
     return False
 
 
+def _flatten_asset_entries(entries: Any) -> list[str]:
+    assets: list[str] = []
+    if isinstance(entries, str):
+        return [entries]
+    if not isinstance(entries, (list, tuple)):
+        return assets
+    for item in entries:
+        if isinstance(item, str):
+            assets.append(item)
+        elif isinstance(item, (list, tuple)):
+            # Examples: ('include', 'web._assets_helpers'), ('replace', old, new)
+            assets.extend(value for value in item if isinstance(value, str) and "/" in value)
+    return assets
+
+
 class SyntaxVerifierService:
-    """Pre-push cross-checker: verify written files against Odoo core source.
-
-    Usage (workflow.verify_against_core):
-      Pass the list of absolute paths of files the agent wrote.
-      Returns SyntaxVerifyResult with findings and push_blocked flag.
-
-    Push is BLOCKED when any finding has severity=CRITICAL.
-    """
+    """Pre-push cross-checker for Odoo Python/XML/manifest/JS asset files."""
 
     def verify(self, request: SyntaxVerifyRequest) -> SyntaxVerifyResult:
         findings: list[VerifyFinding] = []
         files_checked: list[str] = []
+        xml_contents: dict[str, str] = {}
+        js_contents: dict[str, str] = {}
 
+        # First pass: read files and collect XML/JS context for template matching.
+        file_contents: dict[str, str] = {}
         for file_path in request.written_files:
             path = Path(file_path)
             if not path.exists():
@@ -143,21 +234,35 @@ class SyntaxVerifierService:
                     fix_hint="Re-run repo.write or repo.write_many_atomic for this file.",
                 ))
                 continue
-
             files_checked.append(file_path)
             content = _read_file(file_path)
+            file_contents[file_path] = content
+            if path.suffix == ".xml":
+                xml_contents[file_path] = content
+            elif path.suffix == ".js":
+                js_contents[file_path] = content
 
+        template_names = _extract_all_template_names(xml_contents)
+        findings.extend(self._verify_duplicate_template_names(xml_contents))
+
+        for file_path, content in file_contents.items():
+            path = Path(file_path)
             if path.name == "__manifest__.py":
                 findings.extend(self._verify_manifest(file_path, content))
             elif path.suffix == ".py":
                 findings.extend(self._verify_python_model(file_path, content))
             elif path.suffix == ".xml":
                 findings.extend(self._verify_xml_view(file_path, content))
+                findings.extend(self._verify_qweb_template(file_path, content, xml_contents))
+            elif path.suffix == ".js":
+                findings.extend(self._verify_js_owl(file_path, content, template_names))
+            elif path.suffix == ".scss":
+                findings.extend(self._verify_scss_asset(file_path, content))
 
         push_blocked = any(f.severity == VerifySeverity.CRITICAL for f in findings)
         critical_count = sum(1 for f in findings if f.severity == VerifySeverity.CRITICAL)
-        warning_count  = sum(1 for f in findings if f.severity == VerifySeverity.WARNING)
-        info_count     = sum(1 for f in findings if f.severity == VerifySeverity.INFO)
+        warning_count = sum(1 for f in findings if f.severity == VerifySeverity.WARNING)
+        info_count = sum(1 for f in findings if f.severity == VerifySeverity.INFO)
 
         fix_cycle = request.fix_cycle or 0
         if push_blocked and fix_cycle >= 3:
@@ -194,33 +299,73 @@ class SyntaxVerifierService:
     def _verify_manifest(self, file_path: str, content: str) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
         m = _MANIFEST_DEPS_RE.search(content)
-        if not m:
+        if m:
+            deps_block = m.group(1)
+            dep_names = [n.group(1) for n in _MODULE_NAME_RE.finditer(deps_block)]
+            for dep in dep_names:
+                if dep in {"base", "web", "mail", "sale", "purchase", "account", "stock", "hr"}:
+                    continue
+                if not _module_exists_in_src(dep):
+                    findings.append(VerifyFinding(
+                        file=file_path,
+                        severity=VerifySeverity.CRITICAL,
+                        check="manifest_depends",
+                        message=f"depends[] contains '{dep}' but module directory not found in any /home/odoo/src/* root.",
+                        fix_hint=(
+                            f"Run workflow.find_core_file('{dep}', 'manifest', '{dep}') to verify the exact module name. "
+                            "Then correct the depends[] entry."
+                        ),
+                    ))
+                else:
+                    findings.append(VerifyFinding(
+                        file=file_path,
+                        severity=VerifySeverity.INFO,
+                        check="manifest_depends",
+                        message=f"depends[] '{dep}' — verified exists in src roots.",
+                        fix_hint="",
+                    ))
+        findings.extend(self._verify_manifest_assets(file_path, content))
+        return findings
+
+    def _verify_manifest_assets(self, file_path: str, content: str) -> list[VerifyFinding]:
+        findings: list[VerifyFinding] = []
+        try:
+            manifest = ast.literal_eval(content)
+        except Exception:
             return findings
-        deps_block = m.group(1)
-        dep_names = [n.group(1) for n in _MODULE_NAME_RE.finditer(deps_block)]
-        for dep in dep_names:
-            if dep in {"base", "web", "mail", "sale", "purchase", "account", "stock", "hr"}:
-                # common well-known modules — always pass without disk check
-                continue
-            if not _module_exists_in_src(dep):
-                findings.append(VerifyFinding(
-                    file=file_path,
-                    severity=VerifySeverity.CRITICAL,
-                    check="manifest_depends",
-                    message=f"depends[] contains '{dep}' but module directory not found in any /home/odoo/src/* root.",
-                    fix_hint=(
-                        f"Run: workflow.find_core_file('{dep}', 'manifest', '{dep}') to verify the exact module name. "
-                        "Then correct the depends[] entry."
-                    ),
-                ))
-            else:
-                findings.append(VerifyFinding(
-                    file=file_path,
-                    severity=VerifySeverity.INFO,
-                    check="manifest_depends",
-                    message=f"depends[] '{dep}' — verified exists in src roots.",
-                    fix_hint="",
-                ))
+        if not isinstance(manifest, dict):
+            return findings
+        assets = manifest.get("assets") or {}
+        if not isinstance(assets, dict):
+            return findings
+        module_root = Path(file_path).parent
+        for bundle, entries in assets.items():
+            for asset in _flatten_asset_entries(entries):
+                if not _asset_path_exists(module_root, asset):
+                    findings.append(VerifyFinding(
+                        file=file_path,
+                        severity=VerifySeverity.CRITICAL,
+                        check="manifest_asset_exists",
+                        message=f"Asset '{asset}' in bundle '{bundle}' does not resolve to a file/glob from this module.",
+                        fix_hint="Fix the asset path or remove it from __manifest__.py before pushing.",
+                    ))
+                lower_asset = asset.lower()
+                if ("point_of_sale" in lower_asset or "/pos" in lower_asset or "pos_" in lower_asset) and bundle != "point_of_sale._assets_pos":
+                    findings.append(VerifyFinding(
+                        file=file_path,
+                        severity=VerifySeverity.CRITICAL,
+                        check="manifest_pos_asset_bundle",
+                        message=f"POS-looking asset '{asset}' is in '{bundle}', not point_of_sale._assets_pos.",
+                        fix_hint="Move POS JS/XML/SCSS assets to point_of_sale._assets_pos unless real Odoo source proves another bundle.",
+                    ))
+                if ("website" in lower_asset or "snippet" in lower_asset or "editor" in lower_asset) and bundle == "web.assets_backend":
+                    findings.append(VerifyFinding(
+                        file=file_path,
+                        severity=VerifySeverity.WARNING,
+                        check="manifest_website_asset_bundle",
+                        message=f"Website/editor-looking asset '{asset}' is in backend bundle '{bundle}'.",
+                        fix_hint="Verify from website source whether this belongs in web.assets_frontend or website.assets_editor.",
+                    ))
         return findings
 
     # ------------------------------------------------------------------
@@ -229,8 +374,6 @@ class SyntaxVerifierService:
 
     def _verify_python_model(self, file_path: str, content: str) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
-
-        # Find all _inherit models
         inherit_models = [m.group(1) for m in _INHERIT_RE.finditer(content)]
 
         for model_name in inherit_models:
@@ -246,8 +389,6 @@ class SyntaxVerifierService:
                 continue
 
             core_fields = _extract_core_field_names(core_content)
-
-            # Check depends=[] field chains
             for dep_m in _DEPENDS_PY_RE.finditer(content):
                 raw = dep_m.group(1)
                 field_refs = [s.strip().strip("'\"") for s in raw.split(",")]
@@ -261,11 +402,10 @@ class SyntaxVerifierService:
                             message=f"depends(['{ref}']) — field '{first_field}' not found in core model '{model_name}'.",
                             fix_hint=(
                                 f"Core fields available: {sorted(list(core_fields))[:20]}... "
-                                f"Re-read core model with repo.read and use only real field names."
+                                "Re-read core model with repo.read and use only real field names."
                             ),
                         ))
 
-            # Check comodel_name references
             for cm_m in _COMODEL_RE.finditer(content):
                 comodel = cm_m.group(1)
                 if "." in comodel:
@@ -279,7 +419,6 @@ class SyntaxVerifierService:
                             fix_hint=f"Run workflow.find_core_file('{comodel_module}', 'model', '{comodel.split('.')[-1]}') to verify.",
                         ))
 
-            # Check related= field chains
             for rel_m in _RELATED_RE.finditer(content):
                 chain = rel_m.group(1)
                 first_field = chain.split(".")[0]
@@ -292,7 +431,6 @@ class SyntaxVerifierService:
                         fix_hint=f"Valid starting fields in '{model_name}': {sorted(list(core_fields))[:15]}",
                     ))
 
-            # Check compute= method exists in file itself
             compute_methods_used = {m.group(1) for m in _COMPUTE_RE.finditer(content)}
             for method_name in compute_methods_used:
                 if method_name and f"def {method_name}" not in content:
@@ -312,25 +450,20 @@ class SyntaxVerifierService:
                 message="No _inherit detected — new model, skipping core field cross-check.",
                 fix_hint="",
             ))
-
         return findings
 
     # ------------------------------------------------------------------
-    # XML view verification
+    # XML / QWeb verification
     # ------------------------------------------------------------------
 
     def _verify_xml_view(self, file_path: str, content: str) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
-
-        # Find inherit_id ref to get the base model context
         inherit_refs = [m.group(1) for m in _INHERIT_ID_RE.finditer(content)]
 
-        # Get model name from the first inherit ref (e.g. 'sale.order.form.view' -> 'sale.order')
         model_name: str | None = None
         for ref in inherit_refs:
             parts = ref.split(".")
             if len(parts) >= 2:
-                # Heuristic: first two parts are likely module.model_ish
                 candidate = f"{parts[0]}.{parts[1]}"
                 core_content_test = _find_core_view_content(candidate)
                 if core_content_test:
@@ -338,10 +471,11 @@ class SyntaxVerifierService:
                     break
 
         core_view_content = _find_core_view_content(model_name) if model_name else ""
-
-        # Check xpath expr= references
         for xpath_m in _XPATH_EXPR_RE.finditer(content):
             expr = xpath_m.group(1)
+            # QWeb template xpaths are verified by _verify_qweb_template.
+            if "t-inherit" in content and not inherit_refs:
+                continue
             if not core_view_content:
                 findings.append(VerifyFinding(
                     file=file_path,
@@ -352,7 +486,6 @@ class SyntaxVerifierService:
                 ))
                 continue
 
-            # Extract node identifier from xpath (last @name or last element name)
             name_in_expr = re.search(r'@name\s*=\s*["\']([^"\']+)["\']', expr)
             if name_in_expr:
                 node_name = name_in_expr.group(1)
@@ -362,10 +495,7 @@ class SyntaxVerifierService:
                         severity=VerifySeverity.CRITICAL,
                         check="xpath_node_exists",
                         message=f"xpath expr='{expr}' — node with name='{node_name}' not found in core view source.",
-                        fix_hint=(
-                            f"Re-read the core view with workflow.find_similar_view + repo.read "
-                            f"to find the correct node name. The node '{node_name}' does not exist."
-                        ),
+                        fix_hint="Re-read the core view with workflow.find_similar_view + repo.read to find the correct node name.",
                     ))
                 else:
                     findings.append(VerifyFinding(
@@ -376,7 +506,6 @@ class SyntaxVerifierService:
                         fix_hint="",
                     ))
 
-        # Check <field name="..."> references against core model fields
         if model_name and core_view_content:
             field_names_in_xml = {m.group(1) for m in _FIELD_NAME_XML_RE.finditer(content)}
             core_model_content = _find_core_model_content(model_name)
@@ -384,7 +513,6 @@ class SyntaxVerifierService:
                 core_fields = _extract_core_field_names(core_model_content)
                 for field_name in field_names_in_xml:
                     if field_name not in core_fields:
-                        # Could be a custom field — warn but not block (it might be defined in the same module)
                         findings.append(VerifyFinding(
                             file=file_path,
                             severity=VerifySeverity.WARNING,
@@ -393,10 +521,187 @@ class SyntaxVerifierService:
                                 f"<field name='{field_name}'> not found in core model '{model_name}'. "
                                 "If this is a custom field added by your module, this is expected."
                             ),
-                            fix_hint=(
-                                f"Verify '{field_name}' is defined in your custom module's model file. "
-                                "If it should be a core field, check the spelling."
-                            ),
+                            fix_hint=f"Verify '{field_name}' is defined in your custom module's model file.",
                         ))
+        return findings
 
+    def _verify_qweb_template(self, file_path: str, content: str, xml_contents: dict[str, str]) -> list[VerifyFinding]:
+        findings: list[VerifyFinding] = []
+        template_names = [m.group(1) for m in _T_NAME_RE.finditer(content)]
+        inherit_names = [m.group(1) for m in _T_INHERIT_RE.finditer(content)]
+        call_names = [m.group(1) for m in _T_CALL_RE.finditer(content)]
+
+        if (template_names or inherit_names) and 'owl="1"' not in content and "owl='1'" not in content:
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.WARNING,
+                check="qweb_owl_marker",
+                message="QWeb/OWL template has t-name or t-inherit but no owl='1' marker.",
+                fix_hint="Verify from installed Odoo source whether this template should use owl='1' for this version/bundle.",
+            ))
+
+        for template in inherit_names + call_names:
+            source = _find_template_content(template, xml_contents)
+            if not source:
+                findings.append(VerifyFinding(
+                    file=file_path,
+                    severity=VerifySeverity.CRITICAL,
+                    check="qweb_template_source_exists",
+                    message=f"Template reference '{template}' not found in written XML or Odoo source roots.",
+                    fix_hint="Run workflow.frontend_pattern_preflight and repo.read the source template before using t-inherit/t-call.",
+                ))
+                continue
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.INFO,
+                check="qweb_template_source_exists",
+                message=f"Template reference '{template}' — source found.",
+                fix_hint="",
+            ))
+            for expr in _T_XPATH_RE.findall(content):
+                name_in_expr = re.search(r'@name\s*=\s*["\']([^"\']+)["\']', expr)
+                if name_in_expr and name_in_expr.group(1) not in source:
+                    findings.append(VerifyFinding(
+                        file=file_path,
+                        severity=VerifySeverity.CRITICAL,
+                        check="qweb_xpath_name_exists",
+                        message=f"QWeb xpath expr='{expr}' targets name='{name_in_expr.group(1)}' not found in inherited template '{template}'.",
+                        fix_hint="Re-read inherited template and target a confirmed node.",
+                    ))
+                for class_match in _CLASS_IN_EXPR_RE.findall(expr):
+                    class_name = class_match[0] or class_match[1]
+                    if class_name and class_name not in source:
+                        findings.append(VerifyFinding(
+                            file=file_path,
+                            severity=VerifySeverity.WARNING,
+                            check="qweb_xpath_class_exists",
+                            message=f"QWeb xpath expr='{expr}' targets class '{class_name}' not found in inherited template '{template}'.",
+                            fix_hint="Verify the class from source before using this xpath.",
+                        ))
+        return findings
+
+    @staticmethod
+    def _verify_duplicate_template_names(xml_contents: dict[str, str]) -> list[VerifyFinding]:
+        findings: list[VerifyFinding] = []
+        seen: dict[str, str] = {}
+        for file_path, content in xml_contents.items():
+            for name in _T_NAME_RE.findall(content):
+                if name in seen:
+                    findings.append(VerifyFinding(
+                        file=file_path,
+                        severity=VerifySeverity.CRITICAL,
+                        check="qweb_duplicate_t_name",
+                        message=f"Duplicate t-name '{name}' also appears in {seen[name]}.",
+                        fix_hint="Use a unique template name per XML asset.",
+                    ))
+                else:
+                    seen[name] = file_path
+        return findings
+
+    # ------------------------------------------------------------------
+    # JS/OWL/SCSS verification
+    # ------------------------------------------------------------------
+
+    def _verify_js_owl(self, file_path: str, content: str, template_names: set[str]) -> list[VerifyFinding]:
+        findings: list[VerifyFinding] = []
+        modern_signals = ("from \"@" in content or "from '@" in content or "import " in content or "registry.category" in content or "Component" in content)
+
+        if modern_signals and "/** @odoo-module **/" not in content:
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.CRITICAL,
+                check="js_odoo_module_header",
+                message="Modern Odoo JS/OWL file is missing /** @odoo-module **/ header.",
+                fix_hint="Add the Odoo module header at the top, matching installed Odoo source style.",
+            ))
+        if "odoo.define(" in content and modern_signals:
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.CRITICAL,
+                check="js_no_mixed_legacy_modern",
+                message="File mixes legacy odoo.define/require with modern ES module/OWL syntax.",
+                fix_hint="Use one pattern only. Read the installed Odoo source and match its style for this component.",
+            ))
+
+        for import_match in _JS_IMPORT_RE.finditer(content):
+            import_path = import_match.group(1) or import_match.group(2) or ""
+            if not import_path or import_path in _EXTERNAL_IMPORTS or import_path.startswith((".", "/")):
+                continue
+            if import_path.startswith("@"):
+                candidates = _resolve_odoo_alias(import_path)
+                if not candidates:
+                    findings.append(VerifyFinding(
+                        file=file_path,
+                        severity=VerifySeverity.WARNING,
+                        check="js_import_alias_known",
+                        message=f"Import alias '{import_path}' is not in the verifier's known Odoo aliases.",
+                        fix_hint="Read real Odoo source and verify this alias exists before pushing.",
+                    ))
+                elif not any(candidate.exists() for candidate in candidates):
+                    findings.append(VerifyFinding(
+                        file=file_path,
+                        severity=VerifySeverity.CRITICAL,
+                        check="js_import_resolves",
+                        message=f"Import '{import_path}' did not resolve to any source file in /home/odoo/src roots.",
+                        fix_hint="Correct the import path after reading the installed Odoo source file that exports it.",
+                    ))
+                else:
+                    findings.append(VerifyFinding(
+                        file=file_path,
+                        severity=VerifySeverity.INFO,
+                        check="js_import_resolves",
+                        message=f"Import '{import_path}' resolved in source roots.",
+                        fix_hint="",
+                    ))
+
+        used_templates = {m.group(1) for m in _JS_TEMPLATE_RE.finditer(content)}
+        for template in used_templates:
+            if template not in template_names and not _find_template_content(template):
+                findings.append(VerifyFinding(
+                    file=file_path,
+                    severity=VerifySeverity.WARNING,
+                    check="js_template_exists",
+                    message=f"Component template '{template}' not found in changed XML files or Odoo source roots.",
+                    fix_hint="Add/read the matching XML template and ensure t-name equals Component.template/static template.",
+                ))
+
+        if "useService(" in content and "setup(" not in content:
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.WARNING,
+                check="js_use_service_setup",
+                message="useService() appears but no setup() method/function was detected in this file.",
+                fix_hint="Confirm hook usage from source; hooks normally run inside setup().",
+            ))
+        if "useState(" in content and "setup(" not in content:
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.WARNING,
+                check="js_use_state_setup",
+                message="useState() appears but no setup() method/function was detected in this file.",
+                fix_hint="Confirm hook usage from source; hooks normally run inside setup().",
+            ))
+
+        lower_path = file_path.lower()
+        if ("point_of_sale" in lower_path or "/pos" in lower_path) and "@point_of_sale/" not in content and "odoo.define(" not in content:
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.WARNING,
+                check="js_pos_pattern_source",
+                message="POS JS file does not import from @point_of_sale and is not legacy odoo.define.",
+                fix_hint="Verify this exact POS pattern from point_of_sale/static/src before pushing.",
+            ))
+        return findings
+
+    @staticmethod
+    def _verify_scss_asset(file_path: str, content: str) -> list[VerifyFinding]:
+        findings: list[VerifyFinding] = []
+        if "var(--" in content and "min(" in content:
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.WARNING,
+                check="scss_css_min_with_vars",
+                message="SCSS contains min() with CSS variables; Odoo sass compilation may treat min as a Sass function.",
+                fix_hint="Use calc(), clamp(), or plain CSS values; avoid Sass min/max with var() in Odoo assets.",
+            ))
         return findings

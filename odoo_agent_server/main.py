@@ -76,6 +76,7 @@ def agent_instructions() -> dict:
                 "For files >300KB pass max_bytes=500000 to repo.read",
                 "For simple field/view/notebook edits, use the small_patch_fast_path: reuse session state, read only targeted files, skip broad discovery/health/screenshots unless needed.",
                 "For hard UI/POS/website/view tasks, include exact post-upgrade Odoo paths in workflow.safe_deploy_module.verify_ui_paths so the deploy job opens each page and records screenshots, console/network errors, and Odoo UI breakage.",
+                "STRICT FRONTEND: before writing any Odoo JS/OWL/POS/website/payment/QWeb/XML/SCSS asset code, call workflow.frontend_pattern_preflight and read the mandatory pattern files it returns. Do not guess framework syntax.",
             ],
             "small_patch_fast_path": {
                 "when": "Use for small tasks like adding one field, one xpath, one notebook page, or a tiny label/view change in a known module.",
@@ -131,6 +132,35 @@ def agent_instructions() -> dict:
                     "3rd: /home/odoo/src/odoo",
                 ],
             },
+            "strict_frontend_owl_js_xml_preflight": {
+                "rule": "MANDATORY before any JS, OWL, POS, website, payment, QWeb/XML template, SCSS, or asset-bundle implementation.",
+                "tool": "workflow.frontend_pattern_preflight(task_description, target_area='auto', target_module_name, custom_file_paths, planned_file_paths)",
+                "sequence": [
+                    "1. Read existing custom module files first: manifest, views, static/src JS/XML/SCSS related to the task.",
+                    "2. Call workflow.frontend_pattern_preflight with those custom file paths and planned files.",
+                    "3. Execute every mandatory instruction returned: repo.read each concrete source path; for NOT_FOUND hints call workflow.list_module_files to browse manually.",
+                    "4. Confirm exact import aliases, registry category, service names, hooks, patch syntax, Component.template/t-name, t-inherit/xpath, and asset bundle from real source.",
+                    "5. Only then write code; keep syntax/style matching the installed Odoo framework source.",
+                    "6. After coding, call workflow.verify_against_core with changed .py, .xml, .js, .scss, and __manifest__.py files.",
+                    "7. For POS/website/payment UI changes, deploy with exact verify_ui_paths or call workflow.browser_menu_crawl after upgrade.",
+                ],
+                "areas": {
+                    "pos": "Read point_of_sale/static/src/app + views and use point_of_sale._assets_pos unless source proves otherwise.",
+                    "website": "Decide frontend vs editor assets from website/website_form/website_sale source before coding.",
+                    "payment": "Read payment + website_payment source before provider/checkout/frontend code.",
+                    "web": "Read web/static/src/core/views/webclient before backend OWL/action/dashboard code.",
+                },
+                "blocked_mistakes": [
+                    "Missing /** @odoo-module **/ in modern JS",
+                    "Mixed odoo.define/require with ES imports",
+                    "Wrong @web/@point_of_sale import path",
+                    "Wrong registry category/service/hook usage",
+                    "Component.template not matching t-name",
+                    "t-inherit/xpath target not read from source",
+                    "POS assets outside point_of_sale._assets_pos",
+                    "Website editor code loaded only in frontend assets or frontend code loaded only in editor assets",
+                ],
+            },
             "adaptive_scope_levels": {
                 "L0": "Always: custom manifest (baseline)",
                 "L1": "_inherit detected → read parent core model file(s)",
@@ -168,7 +198,8 @@ def agent_instructions() -> dict:
                 "   L3: IF computed/relational → repo.read full models/ dir scan result",
                 "   L4: IF cross-module → repo.read dep module manifest",
                 "5. IF view inherit: workflow.find_similar_view → repo.read core view XML",
-                "6. Write code using ONLY verified field/method/xpath names from steps 2-5",
+                "5a. IF JS/OWL/POS/website/payment/QWeb/SCSS/assets: workflow.frontend_pattern_preflight → repo.read every mandatory pattern source before coding",
+                "6. Write code using ONLY verified field/method/xpath/template/import/registry/service names from steps 2-5a",
                 "7. repo.write_many_atomic (multi-file) OR repo.write chunks (single large file)",
                 "8. git.diff → qa.self_run (fix errors before continuing)",
                 "9. workflow.verify_against_core(written_files, fix_cycle=0)",
@@ -196,6 +227,7 @@ def agent_instructions() -> dict:
                 "not sure what files exist in a module": "Call workflow.list_module_files(module_name, subdir) to browse before find_core_file",
                 "verify_against_core push_blocked=True": "Fix ALL CRITICAL findings shown in findings[] then call verify_against_core again with fix_cycle incremented",
                 "scope_advice mandatory_count>0": "Execute ALL mandatory ScopeReadInstructions before writing any code — do not skip",
+                "frontend_pattern_preflight push_blocked_until_done=true": "Read all mandatory frontend pattern instructions before writing JS/OWL/XML/assets — no guessing.",
             },
             "new_tools_v14plus": {
                 "workflow.find_core_file": "Find exact core source file before _inherit. Returns best_match absolute path.",
@@ -203,6 +235,7 @@ def agent_instructions() -> dict:
                 "workflow.list_module_files": "Browse all files in a module dir when keyword unknown. Use subdir to narrow (models/views/static/src).",
                 "workflow.scope_advice": "NEW V14+: Adaptive mandatory read plan — call after reading custom files, before writing code.",
                 "workflow.verify_against_core": "NEW V14+: Pre-push cross-check — call before every git.push. Blocks push on CRITICAL findings.",
+                "workflow.frontend_pattern_preflight": "NEW V15: Mandatory preflight for Odoo JS/OWL/POS/website/payment/QWeb/XML/SCSS asset work. Returns source patterns to read first.",
             },
             "multi_client": {
                 "rule": (

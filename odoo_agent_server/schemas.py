@@ -915,12 +915,18 @@ class SyntaxVerifyRequest(BaseModel):
 
       Manifest (__manifest__.py):
         - depends[] module names exist in /home/odoo/src/* roots
+        - asset paths exist and are in the right Odoo bundle
+
+      Frontend assets (.js/.scss/.xml QWeb):
+        - JS/OWL module header, import aliases, legacy/modern mixing, template names
+        - QWeb t-name/t-inherit/t-call/xpath source existence
+        - SCSS patterns that often break Odoo sass compilation
     """
     written_files: list[str] = Field(
         ...,
         description=(
             "Absolute paths of files written by the agent that need pre-push verification. "
-            "Include ALL .py, .xml, and __manifest__.py files changed in this task."
+            "Include ALL .py, .xml, .js, .scss, and __manifest__.py files changed in this task."
         ),
     )
     fix_cycle: int | None = Field(
@@ -942,3 +948,63 @@ class SyntaxVerifyResult(BaseModel):
     warning_count: int = 0
     info_count: int = 0
     fix_cycle: int = 0
+
+# ===========================================================================
+# V15 — Strict Odoo Frontend / OWL / JS / XML Preflight
+# ===========================================================================
+
+class FrontendReadInstruction(BaseModel):
+    """One source file or module area that must be explored before frontend coding."""
+    source: str = Field(..., description="custom | odoo_source")
+    module: str = Field(..., description="Odoo module technical name, or '(custom)'")
+    subdir: str = Field("", description="Module subdirectory to inspect, e.g. static/src/app")
+    reason: str = Field(..., description="Why this pattern source must be read")
+    path: str = Field(..., description="Absolute path to read, or NOT_FOUND hint if the source was not found")
+    mandatory: bool = Field(True, description="True means the agent must read this before writing code")
+
+
+class FrontendPatternPreflightRequest(BaseModel):
+    """Blocking preflight for Odoo JS/OWL/POS/website/payment/XML asset work.
+
+    Call this after reading the target custom files and before writing any JS,
+    OWL component, QWeb/XML template, SCSS asset, POS screen/store patch,
+    website snippet/editor code, or payment frontend code.
+    """
+    task_description: str = Field(..., description="User task or short implementation description")
+    target_area: str = Field(
+        default="auto",
+        description="auto | pos | website | web | payment. Use auto unless the area is known.",
+    )
+    target_module_name: str | None = Field(
+        default=None,
+        description="Custom or core module being edited, if known. Used to inspect local static/src and views first.",
+    )
+    custom_file_paths: list[str] = Field(
+        default_factory=list,
+        description="Absolute paths of existing custom files already identified/read for the task.",
+    )
+    planned_file_paths: list[str] = Field(
+        default_factory=list,
+        description="Planned changed/new file paths, useful for area auto-detection.",
+    )
+    search_roots: list[str] = Field(
+        default_factory=list,
+        description="Override source roots. Defaults to user → enterprise → odoo.",
+    )
+
+
+class FrontendPatternPreflightResult(BaseModel):
+    """Strict frontend preflight result consumed by the agent before writing."""
+    target_area: str = Field(..., description="Detected target area: pos | website | web | payment | none")
+    is_frontend_task: bool = Field(..., description="True when strict JS/OWL/XML preflight applies")
+    push_blocked_until_done: bool = Field(..., description="True means do not write/push until mandatory reads are completed")
+    mandatory_read_count: int = Field(0, description="Number of mandatory read instructions")
+    instructions: list[FrontendReadInstruction] = Field(default_factory=list)
+    explorer_calls: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="Suggested workflow.list_module_files calls used/needed for source exploration",
+    )
+    required_asset_bundles: list[str] = Field(default_factory=list, description="Allowed/expected asset bundles for this area")
+    strict_rules: list[str] = Field(default_factory=list, description="Rules the agent must follow while implementing")
+    validation_steps: list[str] = Field(default_factory=list, description="Checks to run after implementation")
+    message: str = Field(..., description="Human-readable preflight summary")
