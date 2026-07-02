@@ -949,6 +949,18 @@ class SyntaxVerifyRequest(BaseModel):
         default=0,
         description="Current fix cycle number (0-indexed). After 3 cycles, the service reports and stops.",
     )
+    project_path: str | None = Field(
+        default=None,
+        description="Optional repo root. When provided, impact-aware validation can include only directly related companion files.",
+    )
+    impact_aware: bool | None = Field(
+        default=None,
+        description="Default true via env. Adds only related companion files for template/assets checks; does not scan the full repo.",
+    )
+    max_related_files: int = Field(
+        default=20, ge=0, le=100,
+        description="Maximum related files to add during impact-aware validation.",
+    )
 
 
 class SyntaxVerifyResult(BaseModel):
@@ -1024,3 +1036,69 @@ class FrontendPatternPreflightResult(BaseModel):
     strict_rules: list[str] = Field(default_factory=list, description="Rules the agent must follow while implementing")
     validation_steps: list[str] = Field(default_factory=list, description="Checks to run after implementation")
     message: str = Field(..., description="Human-readable preflight summary")
+
+
+# ===========================================================================
+# V16 — Fast/correct router, repo index, impact-aware validation
+# ===========================================================================
+
+class SmartToolRouteRequest(BaseModel):
+    """Return the fastest safe MCP workflow for the current task."""
+    task_description: str = Field(..., description="User task or implementation summary")
+    project_path: str | None = Field(default=None, description="Repo path if already known")
+    planned_file_paths: list[str] = Field(default_factory=list, description="Files likely to be read/written")
+    changed_file_count: int | None = Field(default=None, ge=0, description="Expected number of files to change")
+    risk_level: Literal["auto", "low", "medium", "high"] = Field(default="auto")
+
+
+class SmartToolRouteStep(BaseModel):
+    order: int
+    tool: str
+    reason: str
+    required: bool = True
+
+
+class SmartToolRouteResult(BaseModel):
+    task_type: str
+    frontend_required: bool
+    recommended_write_tool: str
+    validation_scope: str
+    browser_check: str
+    steps: list[SmartToolRouteStep] = Field(default_factory=list)
+    fast_reason: str = ""
+
+
+class RepoIndexRequest(BaseProjectRequest):
+    force_refresh: bool = Field(default=False, description="Rebuild even if a fresh cached index exists")
+    max_files: int = Field(default=5000, ge=100, le=50000, description="Safety cap for indexed files")
+
+
+class RepoIndexModule(BaseModel):
+    name: str
+    path: str
+    manifest_path: str
+    depends: list[str] = Field(default_factory=list)
+    assets: dict[str, list[str]] = Field(default_factory=dict)
+
+
+class RepoIndexResult(BaseModel):
+    project_path: str
+    cached: bool
+    generated_at: str
+    total_files: int = 0
+    modules: list[RepoIndexModule] = Field(default_factory=list)
+    python_files: list[str] = Field(default_factory=list)
+    xml_files: list[str] = Field(default_factory=list)
+    js_files: list[str] = Field(default_factory=list)
+    scss_files: list[str] = Field(default_factory=list)
+    manifest_files: list[str] = Field(default_factory=list)
+    template_names: dict[str, str] = Field(default_factory=dict, description="template name -> file path")
+    notes: list[str] = Field(default_factory=list)
+
+
+class QwenShortTokenResult(BaseModel):
+    token: str
+    expires_at: str
+    ttl_seconds: int
+    qwen_mcp_url: str
+    note: str

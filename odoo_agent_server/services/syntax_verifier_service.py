@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from . import core_sync_service
+from ..config import settings
+from .repo_index_service import RepoIndexService
 from ..schemas import (
     SyntaxVerifyRequest,
     SyntaxVerifyResult,
@@ -221,9 +223,11 @@ class SyntaxVerifierService:
         xml_contents: dict[str, str] = {}
         js_contents: dict[str, str] = {}
 
+        written_files = self._impact_aware_files(request)
+
         # First pass: read files and collect XML/JS context for template matching.
         file_contents: dict[str, str] = {}
-        for file_path in request.written_files:
+        for file_path in written_files:
             path = Path(file_path)
             if not path.exists():
                 findings.append(VerifyFinding(
@@ -291,6 +295,21 @@ class SyntaxVerifierService:
             info_count=info_count,
             fix_cycle=fix_cycle,
         )
+
+    def _impact_aware_files(self, request: SyntaxVerifyRequest) -> list[str]:
+        enabled = settings.verify_impact_aware_default if request.impact_aware is None else bool(request.impact_aware)
+        if not enabled or not request.project_path or request.max_related_files <= 0:
+            return list(request.written_files)
+        try:
+            return RepoIndexService().related_files(
+                request.written_files,
+                project_path=request.project_path,
+                max_related=request.max_related_files,
+            )
+        except Exception:
+            # Verification must never fail just because the optimiser could not
+            # locate related files. Fall back to exact changed files.
+            return list(request.written_files)
 
     # ------------------------------------------------------------------
     # Manifest verification

@@ -62,6 +62,9 @@ from ..schemas import (
     SyntaxVerifyRequest,
     # V15: Strict Odoo frontend/OWL/JS/XML preflight
     FrontendPatternPreflightRequest,
+    # V16: fast/correct router and repo index
+    SmartToolRouteRequest,
+    RepoIndexRequest,
 )
 from ..services.git_service import GitService
 from ..services.odoo_rpc_service import OdooRpcService
@@ -73,7 +76,7 @@ from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_write_ma
 from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
-from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, frontend_pattern_preflight
+from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, frontend_pattern_preflight, smart_tool_router, repo_index
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
@@ -96,6 +99,21 @@ _TOOL_DESCRIPTORS = [
         title="Check connector capabilities", description="Check local connector capabilities and missing runtime configuration", read_only=True),
     ToolDescriptor(name="workflow.coding_task_plan",
         title="Get coding workflow plan", description="Return the repo-first coding workflow guidance for ChatGPT MCP clients", read_only=True),
+    ToolDescriptor(
+        name="workflow.smart_tool_router",
+        title="Choose fastest safe workflow",
+        description=(
+            "V16: lightweight planner that chooses the fastest correct tool sequence: direct Odoo query, "
+            "targeted read/preflight, repo.write_many_smart, changed-files validation, and browser smoke test only when needed."
+        ),
+        read_only=True,
+    ),
+    ToolDescriptor(
+        name="workflow.repo_index",
+        title="Build/read repo index",
+        description="V16: cached lightweight index of modules, manifests, assets, JS/XML templates, and source files to avoid full repo scans.",
+        read_only=True,
+    ),
     ToolDescriptor(name="workflow.full_verify",
         title="Run full verification", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module",
@@ -375,6 +393,8 @@ _TOOL_INPUT_MODELS = {
     "workflow.agent_instructions": EmptyRequest,
     "workflow.capability_check": EmptyRequest,
     "workflow.coding_task_plan": CodingTaskPlanRequest,
+    "workflow.smart_tool_router": SmartToolRouteRequest,
+    "workflow.repo_index": RepoIndexRequest,
     "workflow.full_verify": FullVerifyRequest,
     "workflow.safe_deploy_module": SafeDeployModuleRequest,
     "workflow.start_session": StartSessionRequest,
@@ -485,6 +505,10 @@ async def _dispatch(name: str, args: dict) -> object:
         return capability_check()
     if name == "workflow.coding_task_plan":
         return coding_task_plan(CodingTaskPlanRequest.model_validate(args))
+    if name == "workflow.smart_tool_router":
+        return smart_tool_router(SmartToolRouteRequest.model_validate(args))
+    if name == "workflow.repo_index":
+        return repo_index(RepoIndexRequest.model_validate(args))
     if name == "workflow.full_verify":
         return await full_verify(FullVerifyRequest.model_validate(args))
     if name == "workflow.safe_deploy_module":

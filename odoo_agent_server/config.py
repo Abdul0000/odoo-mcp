@@ -62,6 +62,19 @@ class Settings(BaseSettings):
     fast_write_max_bytes_each: int = Field(default=300_000, alias="ODOO_AGENT_FAST_WRITE_MAX_BYTES_EACH")
     fast_write_max_total_bytes: int = Field(default=750_000, alias="ODOO_AGENT_FAST_WRITE_MAX_TOTAL_BYTES")
 
+    # Fast/correct agent optimisations. These keep strict validation while avoiding
+    # repeated full-source scans on every OWL/POS/website task.
+    pattern_cache_enabled: bool = Field(default=True, alias="ODOO_AGENT_PATTERN_CACHE_ENABLED")
+    pattern_cache_seconds: int = Field(default=3600, alias="ODOO_AGENT_PATTERN_CACHE_SECONDS")
+    pattern_cache_dir: str | None = Field(default=None, alias="ODOO_AGENT_PATTERN_CACHE_DIR")
+    repo_index_enabled: bool = Field(default=True, alias="ODOO_AGENT_REPO_INDEX_ENABLED")
+    repo_index_cache_seconds: int = Field(default=3600, alias="ODOO_AGENT_REPO_INDEX_CACHE_SECONDS")
+    verify_impact_aware_default: bool = Field(default=True, alias="ODOO_AGENT_VERIFY_IMPACT_AWARE_DEFAULT")
+
+    # Qwen URL-token fallback hardening. Qwen app may not pass headers, so the
+    # server can mint a short-lived URL token that maps to the real API/OAuth token.
+    qwen_short_token_ttl_seconds: int = Field(default=3600, alias="ODOO_AGENT_QWEN_SHORT_TOKEN_TTL_SECONDS")
+
     # Odoo RPC defaults.
     odoo_base_url: str | None = Field(default=None, alias="ODOO_BASE_URL")
     odoo_db_name: str | None = Field(default=None, alias="ODOO_DB_NAME")
@@ -114,6 +127,13 @@ class Settings(BaseSettings):
     @property
     def state_path(self) -> Path:
         path = Path(self.state_dir).expanduser().resolve()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    @property
+    def cache_path(self) -> Path:
+        raw = self.pattern_cache_dir or str(self.state_path / "cache")
+        path = Path(raw).expanduser().resolve()
         path.mkdir(parents=True, exist_ok=True)
         return path
 

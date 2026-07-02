@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from ..auth import AuthDependency
 from ..config import settings
 from ..services.oauth_service import OAuthStore
+from ..services.qwen_token_service import QwenTokenService
 from .tools import _dispatch, list_tools, tool_input_schema
 
 router = APIRouter(prefix="/mcp", tags=["mcp"], dependencies=[AuthDependency])
@@ -178,11 +179,23 @@ def _validate_qwen_url_token(token: str | None) -> None:
     import secrets
 
     value = (token or "").strip()
+    if value and QwenTokenService().validate(value):
+        return
     if value and secrets.compare_digest(value, settings.api_token):
         return
     if value and OAuthStore().validate_access_token(value):
         return
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid Qwen MCP access token")
+
+
+@qwen_router.post("/token", dependencies=[AuthDependency])
+def qwen_short_token() -> dict[str, Any]:
+    """Mint a short-lived Qwen URL token after normal bearer/OAuth auth.
+
+    Use this instead of putting the permanent ODOO_AGENT_API_TOKEN in Qwen app
+    URLs. Configure Qwen with the returned qwen_mcp_url and Auth=None.
+    """
+    return QwenTokenService().mint()
 
 
 @qwen_router.get("/mcp/{access_token}")

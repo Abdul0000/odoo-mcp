@@ -44,6 +44,12 @@ from ..schemas import (
     # V15: Strict Odoo frontend/OWL/JS/XML preflight
     FrontendPatternPreflightRequest,
     FrontendPatternPreflightResult,
+    # V16: fast/correct routing and repo index
+    SmartToolRouteRequest,
+    SmartToolRouteResult,
+    SmartToolRouteStep,
+    RepoIndexRequest,
+    RepoIndexResult,
 )
 from ..services.approval_service import ApprovalService
 from ..services.client_resolver_service import ClientResolverService
@@ -58,6 +64,7 @@ from ..services.background_executor import submit_background
 from ..services.core_finder_service import CoreFinderService          # V14
 from ..services.syntax_verifier_service import SyntaxVerifierService  # V14+
 from ..services.frontend_pattern_service import FrontendPatternService  # V15
+from ..services.repo_index_service import RepoIndexService  # V16
 from .qa import self_run
 
 router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDependency])
@@ -878,3 +885,81 @@ def frontend_pattern_preflight(payload: FrontendPatternPreflightRequest) -> Fron
     the installed Odoo framework pattern instead of guessing.
     """
     return FrontendPatternService().preflight(payload)
+
+
+# ===========================================================================
+# V16 — Smart router + repo index
+# ===========================================================================
+
+@router.post("/smart-tool-router", response_model=SmartToolRouteResult)
+def smart_tool_router(payload: SmartToolRouteRequest) -> SmartToolRouteResult:
+    """Return a fast but strict tool plan for the current task.
+
+    This is a planner only; it does not mutate code. It prevents the agent from
+    calling heavy tools for simple Odoo queries while still enforcing frontend
+    preflight, smart writes, changed-file verification, and browser checks when
+    needed.
+    """
+    text = (payload.task_description or "").lower()
+    planned = [p.lower() for p in payload.planned_file_paths]
+    frontend = _looks_like_frontend_task(payload.task_description) or any(
+        any(token in p for token in ("static/src", ".js", ".scss", "qweb", "website", "point_of_sale", "pos"))
+        for p in planned
+    )
+    data_query = any(term in text for term in ("list ", "show ", "find ", "search ", "count ", "invoices", "employees")) and not any(
+        term in text for term in ("fix", "implement", "module", "code", "js", "xml", "view", "write")
+    )
+    high_risk = payload.risk_level == "high" or any(term in text for term in (
+        "new module", "migration", "large refactor", "rewrite", "multi module", "security", "access rights", "accounting", "payment provider"
+    ))
+    file_count = payload.changed_file_count if payload.changed_file_count is not None else len(payload.planned_file_paths)
+
+    steps: list[SmartToolRouteStep] = []
+    order = 1
+    def add(tool: str, reason: str, required: bool = True) -> None:
+        nonlocal order
+        steps.append(SmartToolRouteStep(order=order, tool=tool, reason=reason, required=required))
+        order += 1
+
+    if data_query:
+        add("odoo.search_read", "Direct live-data query; no repo or frontend preflight needed.")
+        return SmartToolRouteResult(
+            task_type="odoo_data_query",
+            frontend_required=False,
+            recommended_write_tool="none",
+            validation_scope="none",
+            browser_check="none",
+            steps=steps,
+            fast_reason="Fastest path: no code write requested.",
+        )
+
+    add("repo.prepare", "Ensure the correct target repo/branch is available before coding.")
+    add("workflow.repo_index", "Use cached repo index to find manifests/assets/templates without full filesystem scans.", required=False)
+    add("repo.read", "Read the exact custom files involved before changing them.")
+    if frontend:
+        add("workflow.frontend_pattern_preflight", "Mandatory targeted OWL/POS/website/payment pattern read before JS/XML/SCSS writes.")
+    else:
+        add("workflow.scope_advice", "Mandatory backend/model/view source-scope advice before Python/XML writes.")
+
+    write_tool = "repo.write_many_atomic" if high_risk or file_count > settings.fast_write_max_files else "repo.write_many_smart"
+    add(write_tool, "Use atomic only for high-risk/large changes; otherwise smart writer keeps lock+backup+rollback without worktree overhead.")
+    add("git.diff", "Review exact changes before validation.")
+    add("workflow.verify_against_core", "Validate changed files with impact-aware related companions only.")
+    if frontend:
+        add("browser.screenshot", "Smoke-test affected POS/website/backend page and inspect console/network errors after deploy.", required=False)
+
+    return SmartToolRouteResult(
+        task_type="frontend_code" if frontend else "backend_code",
+        frontend_required=frontend,
+        recommended_write_tool=write_tool,
+        validation_scope="impact-aware changed files",
+        browser_check="required for frontend changes" if frontend else "only if views/UI changed",
+        steps=steps,
+        fast_reason="Strict validation remains; speed comes from repo index cache, pattern cache, smart writes, and changed-files-only checks.",
+    )
+
+
+@router.post("/repo-index", response_model=RepoIndexResult)
+def repo_index(payload: RepoIndexRequest) -> RepoIndexResult:
+    """Build or return a cached lightweight Odoo repo index."""
+    return RepoIndexService().index(payload.project_path, force_refresh=payload.force_refresh, max_files=payload.max_files)

@@ -7,6 +7,9 @@ agent must inspect real Odoo source first, then code with the same pattern.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import time
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -15,6 +18,7 @@ from ..schemas import (
     FrontendPatternPreflightResult,
     FrontendReadInstruction,
 )
+from ..config import settings
 from .core_finder_service import CoreFinderService
 
 
@@ -118,6 +122,10 @@ class FrontendPatternService:
     """Return mandatory preflight read plan for Odoo frontend work."""
 
     def preflight(self, request: FrontendPatternPreflightRequest) -> FrontendPatternPreflightResult:
+        cached = self._load_cache(request)
+        if cached is not None:
+            return cached
+
         area = self._detect_area(request)
         is_frontend_task = area != "none"
         instructions: list[FrontendReadInstruction] = []
@@ -179,7 +187,7 @@ class FrontendPatternService:
             "After upgrade, verify exact affected Odoo web/POS/website paths in browser with console/network capture.",
         ]
 
-        return FrontendPatternPreflightResult(
+        result = FrontendPatternPreflightResult(
             target_area=area,
             is_frontend_task=is_frontend_task,
             push_blocked_until_done=is_frontend_task,
@@ -190,11 +198,50 @@ class FrontendPatternService:
             strict_rules=_COMMON_RULES + _AREA_RULES.get(area, []),
             validation_steps=validation_steps,
             message=(
-                "FRONTEND PREFLIGHT REQUIRED: execute mandatory reads before writing code."
+                "FRONTEND PREFLIGHT REQUIRED: execute mandatory reads before writing code. Result is cached for repeated similar tasks."
                 if is_frontend_task else
                 "No Odoo frontend/OWL/POS/website keywords detected. Use normal scope_advice + verify_against_core."
             ),
         )
+        self._save_cache(request, result)
+        return result
+
+    def _cache_key(self, request: FrontendPatternPreflightRequest) -> str:
+        payload = json.dumps(request.model_dump(mode="json"), sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+    def _cache_path(self, request: FrontendPatternPreflightRequest) -> Path:
+        return settings.cache_path / "frontend_patterns" / f"{self._cache_key(request)}.json"
+
+    def _load_cache(self, request: FrontendPatternPreflightRequest) -> FrontendPatternPreflightResult | None:
+        if not settings.pattern_cache_enabled:
+            return None
+        path = self._cache_path(request)
+        if not path.exists():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8") or "{}")
+            saved_at = float(raw.get("_saved_at", 0))
+            if time.time() - saved_at > max(1, settings.pattern_cache_seconds):
+                return None
+            result = FrontendPatternPreflightResult.model_validate(raw.get("result") or {})
+            result.message += " (served from pattern cache)"
+            return result
+        except Exception:
+            return None
+
+    def _save_cache(self, request: FrontendPatternPreflightRequest, result: FrontendPatternPreflightResult) -> None:
+        if not settings.pattern_cache_enabled:
+            return
+        try:
+            path = self._cache_path(request)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps({"_saved_at": time.time(), "result": result.model_dump(mode="json")}, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _detect_area(request: FrontendPatternPreflightRequest) -> str:
