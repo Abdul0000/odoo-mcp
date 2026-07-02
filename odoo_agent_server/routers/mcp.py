@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -79,12 +80,45 @@ def _humanize_tool_name(name: str) -> str:
     return tail.replace("_", " ").title()
 
 
+def _mcp_safe_tool_name(name: str) -> str:
+    """Return a ChatGPT/Qwen-safe MCP tool name.
+
+    Some MCP clients validate tool names with:
+        ^[a-zA-Z0-9_-]{1,64}$
+    Odoo-agent internal REST tool names historically use namespaces like
+    ``repo.write`` and ``workflow.find_core_file``. Dots are valid for our
+    internal router, but not for those MCP frontends. Expose sanitized names
+    over MCP while keeping the internal dotted names for REST/backward
+    compatibility.
+    """
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name).strip("_")
+    return (safe or "tool")[:64]
+
+
+def _mcp_name_to_internal(name: str) -> str:
+    """Map an MCP-safe name back to the internal dotted tool name.
+
+    Backward-compatible: existing clients that still call dotted tool names are
+    accepted. New strict MCP frontends receive and call sanitized names.
+    """
+    known = [tool.name for tool in list_tools(include_deprecated=True)]
+    if name in known:
+        return name
+    for actual in known:
+        if _mcp_safe_tool_name(actual) == name:
+            return actual
+    return name
+
+
 def _tool_to_mcp(tool) -> dict[str, Any]:
     title = getattr(tool, "title", None) or _humanize_tool_name(tool.name)
     return {
-        "name": tool.name,
+        "name": _mcp_safe_tool_name(tool.name),
         "title": title,
-        "description": tool.description,
+        "description": (
+            f"Internal tool: {tool.name}. "
+            f"{tool.description}"
+        ),
         "inputSchema": tool_input_schema(tool.name),
         "annotations": {
             "title": title,
@@ -134,9 +168,10 @@ async def _handle_rpc(payload: dict[str, Any]) -> dict[str, Any] | None:
         arguments = params.get("arguments") or {}
         if not name:
             return _rpc_response(request_id, error={"code": -32602, "message": "tools/call requires params.name"})
+        internal_name = _mcp_name_to_internal(name)
         try:
-            result = await _dispatch(name, arguments)
-            structured = _to_structured_content(result, tool_name=name)
+            result = await _dispatch(internal_name, arguments)
+            structured = _to_structured_content(result, tool_name=internal_name)
             text = json.dumps(structured, ensure_ascii=False, default=str)
             # Context-bloat guard: in long sessions, oversized tool outputs (large diffs,
             # logs, file reads) compound across many calls and slow down/derail the model.
