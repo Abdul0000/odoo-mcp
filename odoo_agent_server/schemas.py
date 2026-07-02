@@ -321,11 +321,6 @@ class OdooSearchReadRequest(BaseModel):
     context: dict[str, Any] | None = Field(default=None, description="Optional Odoo context passed to search_read")
 
 
-class OdooFunctionalQueryRequest(BaseModel):
-    query: str = Field(..., min_length=1, description="Natural-language Odoo functional read query, e.g. list users, draft invoices, unpaid invoices, top customers")
-    limit: int = Field(default=10, ge=1, le=100, description="Maximum records to return")
-
-
 class OdooRpcResult(BaseModel):
     status: Literal["ok", "failed"]
     base_url: str | None = None
