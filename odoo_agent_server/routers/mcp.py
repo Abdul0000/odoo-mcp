@@ -3,12 +3,15 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query, status
 
 from ..auth import AuthDependency
+from ..config import settings
+from ..services.oauth_service import OAuthStore
 from .tools import _dispatch, list_tools, tool_input_schema
 
 router = APIRouter(prefix="/mcp", tags=["mcp"], dependencies=[AuthDependency])
+qwen_router = APIRouter(prefix="/qwen", tags=["mcp-qwen"] )
 
 
 def _rpc_response(request_id: Any, result: Any = None, error: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -156,3 +159,65 @@ async def _handle_rpc(payload: dict[str, Any]) -> dict[str, Any] | None:
                 },
             )
     return _rpc_response(request_id, error={"code": -32601, "message": f"Unknown method: {method}"})
+
+
+def _validate_qwen_url_token(token: str | None) -> None:
+    """Validate a token embedded in the Qwen-specific URL fallback.
+
+    Some Qwen app builds POST to the MCP endpoint without forwarding custom
+    Authorization headers. The normal /mcp endpoint remains the preferred,
+    standards-aligned endpoint. This fallback lets a private HTTPS deployment
+    place the existing ODOO_AGENT_API_TOKEN in the URL path or query string:
+
+        /qwen/mcp/<ODOO_AGENT_API_TOKEN>
+        /qwen/mcp?access_token=<ODOO_AGENT_API_TOKEN>
+
+    The token is still checked with constant-time comparison and OAuth access
+    tokens are also accepted for compatibility.
+    """
+    import secrets
+
+    value = (token or "").strip()
+    if value and secrets.compare_digest(value, settings.api_token):
+        return
+    if value and OAuthStore().validate_access_token(value):
+        return
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid Qwen MCP access token")
+
+
+@qwen_router.get("/mcp/{access_token}")
+def qwen_mcp_path_health(access_token: str) -> dict[str, Any]:
+    _validate_qwen_url_token(access_token)
+    return {"status": "ok", "endpoint": "qwen-url-token-mcp", "transport": "http-post-json-rpc"}
+
+
+@qwen_router.get("/mcp")
+def qwen_mcp_query_health(access_token: str = Query(default="")) -> dict[str, Any]:
+    _validate_qwen_url_token(access_token)
+    return {"status": "ok", "endpoint": "qwen-url-token-mcp", "transport": "http-post-json-rpc"}
+
+
+@qwen_router.post("/mcp/{access_token}")
+async def qwen_mcp_path_rpc(access_token: str, payload: dict[str, Any]) -> dict[str, Any] | list[dict[str, Any]] | None:
+    _validate_qwen_url_token(access_token)
+    if isinstance(payload, list):
+        responses = []
+        for item in payload:
+            response = await _handle_rpc(item)
+            if response is not None:
+                responses.append(response)
+        return responses
+    return await _handle_rpc(payload)
+
+
+@qwen_router.post("/mcp")
+async def qwen_mcp_query_rpc(payload: dict[str, Any], access_token: str = Query(default="")) -> dict[str, Any] | list[dict[str, Any]] | None:
+    _validate_qwen_url_token(access_token)
+    if isinstance(payload, list):
+        responses = []
+        for item in payload:
+            response = await _handle_rpc(item)
+            if response is not None:
+                responses.append(response)
+        return responses
+    return await _handle_rpc(payload)

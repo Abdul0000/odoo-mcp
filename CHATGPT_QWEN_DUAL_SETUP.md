@@ -146,3 +146,20 @@ Invoke-RestMethod `
   -ContentType "application/json" `
   -Body $BODY
 ```
+
+
+## Qwen hard fallback when headers are not forwarded
+
+If ChatGPT works but Qwen still returns `HTTP 401 Missing or invalid bearer token`, Qwen is reaching the server but is not forwarding the `Authorization` header. Use the Qwen-only URL-token endpoint:
+
+```text
+https://odoo-mcp-1-jh8m.onrender.com/qwen/mcp/YOUR_ODOO_AGENT_API_TOKEN
+```
+
+Use transport/type `streamable-http` or HTTP POST JSON-RPC. Do not add OAuth for this Qwen endpoint. Keep the normal ChatGPT endpoint unchanged:
+
+```text
+https://odoo-mcp-1-jh8m.onrender.com/mcp
+```
+
+Security note: putting a token in the URL is less ideal than an Authorization header because URLs can appear in service logs. Use this only for a private HTTPS connector and rotate the token if exposed.
