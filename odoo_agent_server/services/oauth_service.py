@@ -155,6 +155,19 @@ class OAuthStore:
         state = self._read()
         record = state["clients"].get(client_id)
         if not record:
+            # ChatGPT can reuse a dynamically registered dcr_* client_id after a
+            # Render/Koyeb redeploy. If the OAuth state directory is ephemeral,
+            # that client registration is gone even though the connector is the
+            # same service. This recovery path keeps ChatGPT working while still
+            # validating the redirect URI later in _validate_redirect_for_client.
+            if settings.oauth_accept_unknown_dcr_clients and client_id.startswith("dcr_"):
+                return OAuthClient(
+                    client_id=client_id,
+                    redirect_uris=[],
+                    client_name="Recovered ChatGPT Dynamic MCP Client",
+                    client_secret=None,
+                    token_endpoint_auth_method="none",
+                )
             raise HTTPException(status_code=400, detail="Unknown OAuth client_id")
         return OAuthClient(
             client_id=record["client_id"],

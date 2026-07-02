@@ -43,6 +43,16 @@ class Settings(BaseSettings):
     oauth_authorization_code_ttl_seconds: int = Field(default=600, alias="ODOO_AGENT_OAUTH_AUTH_CODE_TTL_SECONDS")
     oauth_access_token_ttl_seconds: int = Field(default=3600, alias="ODOO_AGENT_OAUTH_ACCESS_TOKEN_TTL_SECONDS")
     oauth_refresh_token_ttl_seconds: int = Field(default=2592000, alias="ODOO_AGENT_OAUTH_REFRESH_TOKEN_TTL_SECONDS")
+    # Recover ChatGPT dynamic OAuth clients after ephemeral-state redeploys.
+    # When enabled, unknown dcr_* client IDs are accepted only with normal
+    # redirect validation, which permits ChatGPT/OpenAI redirect hosts for
+    # static/recovered clients.
+    oauth_accept_unknown_dcr_clients: bool = Field(default=False, alias="ODOO_AGENT_OAUTH_ACCEPT_UNKNOWN_DCR_CLIENTS")
+
+    # Optional compatibility for MCP clients that cannot send Authorization
+    # headers from their app UI. Prefer Authorization: Bearer <token>. Enable
+    # query-token auth only for private HTTPS deployments.
+    query_token_auth_enabled: bool = Field(default=False, alias="ODOO_AGENT_QUERY_TOKEN_AUTH_ENABLED")
 
     # Odoo RPC defaults.
     odoo_base_url: str | None = Field(default=None, alias="ODOO_BASE_URL")
