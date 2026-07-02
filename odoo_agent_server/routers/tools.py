@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, HTTPException
 
 from ..auth import AuthDependency
@@ -25,6 +27,7 @@ from ..schemas import (
     LimitRequest,
     OdooRpcModuleRequest,
     OdooSearchReadRequest,
+    OdooFunctionalQueryRequest,
     OdooShCheckCommitRequest,
     OdooShCommandRequest,
     OdooShLogRequest,
@@ -81,6 +84,74 @@ from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
+
+_STRICT_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def strict_safe_tool_name(name: str) -> str:
+    """Return a strict MCP/Claude/ChatGPT/Qwen-safe tool name.
+
+    Some frontends validate tool names with ^[a-zA-Z0-9_-]{1,64}$.
+    Internal Odoo-agent tool names use dotted namespaces such as
+    ``odoo.search_read`` and ``workflow.smart_tool_router``. Externally expose
+    underscored names while accepting both formats on calls.
+    """
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name).strip("_")
+    safe = (safe or "tool")[:64]
+    if _STRICT_TOOL_NAME_RE.match(safe):
+        return safe
+    return "tool"
+
+
+def internal_tool_name(name: str) -> str:
+    """Map an external strict tool name back to the internal dotted name."""
+    if name in _TOOL_INPUT_MODELS:
+        return name
+    for actual in _TOOL_INPUT_MODELS:
+        if strict_safe_tool_name(actual) == name:
+            return actual
+    return name
+
+
+def _agent_priority(name: str) -> tuple[int, str]:
+    """Put functional Odoo query tools early so Claude/Qwen choose them first.
+
+    Functional questions like "list draft invoices" should call odoo_search_read
+    directly and not enter the coding workflow.
+    """
+    order = {
+        "connector.health": 0,
+        "odoo.query": 1,
+        "odoo.search_read": 2,
+        "odoo.health": 3,
+        "odoo.module_status": 3,
+        "workflow.smart_tool_router": 4,
+        "workflow.agent_instructions": 5,
+        "workflow.capability_check": 6,
+    }
+    if name in order:
+        return (order[name], name)
+    if name.startswith("workflow."):
+        return (20, name)
+    if name.startswith("repo."):
+        return (30, name)
+    if name.startswith("git."):
+        return (40, name)
+    if name.startswith("odoosh."):
+        return (50, name)
+    if name.startswith("odoo."):
+        return (60, name)
+    return (70, name)
+
+
+def _external_tool_descriptor(item: ToolDescriptor) -> ToolDescriptor:
+    """Descriptor form safe for strict remote tool frontends and REST clients."""
+    safe_name = strict_safe_tool_name(item.name)
+    description = item.description
+    if safe_name != item.name:
+        description = f"External tool name: {safe_name}. Internal route: {item.name}. {description}"
+    return item.model_copy(update={"name": safe_name, "description": description})
+
 
 _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="connector.health",
@@ -238,6 +309,16 @@ _TOOL_DESCRIPTORS = [
         title="Update module on Odoo.sh", description="Run Odoo module update through Odoo.sh SSH", requires_approval=True),
     ToolDescriptor(name="odoo.health",
         title="Check Odoo server health", description="Check Odoo XML-RPC health", read_only=True),
+    ToolDescriptor(
+        name="odoo.query",
+        title="Smart Odoo functional query",
+        description=(
+            "Best tool for simple functional Odoo questions in Claude/Qwen/ChatGPT: list users, employees, "
+            "draft invoices, unpaid invoices, customers, vendors, products, sale orders, purchase orders, or modules. "
+            "Takes a natural-language query and returns parsed model/domain/fields plus live Odoo records."
+        ),
+        read_only=True,
+    ),
     ToolDescriptor(name="odoo.module_status",
         title="Check module install status", description="Read Odoo module state (installed/uninstalled/not found)", read_only=True),
     ToolDescriptor(
@@ -432,6 +513,7 @@ _TOOL_INPUT_MODELS = {
     "odoosh.module_deploy_ssh": OdooShModuleUpdateRequest,
     "odoosh.module_update": OdooShModuleUpdateRequest,
     "odoo.health": EmptyRequest,
+    "odoo.query": OdooFunctionalQueryRequest,
     "odoo.module_status": OdooRpcModuleRequest,
     "odoo.module_deploy": OdooRpcModuleRequest,
     "odoo.module_install": OdooRpcModuleRequest,
@@ -458,7 +540,8 @@ _TOOL_INPUT_MODELS = {
 
 
 def tool_input_schema(name: str) -> dict:
-    model = _TOOL_INPUT_MODELS.get(name, EmptyRequest)
+    internal_name = internal_tool_name(name)
+    model = _TOOL_INPUT_MODELS.get(internal_name, EmptyRequest)
     schema = model.model_json_schema()
     schema.setdefault("type", "object")
     schema.setdefault("additionalProperties", False)
@@ -466,26 +549,157 @@ def tool_input_schema(name: str) -> dict:
 
 
 @router.get("/list", response_model=list[ToolDescriptor])
-def list_tools(include_deprecated: bool = False) -> list[ToolDescriptor]:
+def list_tools(include_deprecated: bool = False, strict_names: bool = True) -> list[ToolDescriptor]:
     # If global approval is disabled, do not advertise approval as required even
     # when an old ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS value is still present.
     required = settings.approval_required_actions if settings.require_approval else set()
     visible = _TOOL_DESCRIPTORS if include_deprecated else [t for t in _TOOL_DESCRIPTORS if not t.deprecated]
-    return [item.model_copy(update={"requires_approval": item.name in required}) for item in visible]
+    ordered = sorted(visible, key=lambda item: _agent_priority(item.name))
+    result = [item.model_copy(update={"requires_approval": item.name in required}) for item in ordered]
+    if strict_names:
+        return [_external_tool_descriptor(item) for item in result]
+    return result
 
 
 @router.post("/call", response_model=ToolCallResult)
 async def call_tool(payload: ToolCallRequest) -> ToolCallResult:
+    external_name = payload.name
+    name = internal_tool_name(payload.name)
     try:
-        result = await _dispatch(payload.name, payload.arguments)
+        result = await _dispatch(name, payload.arguments)
         if hasattr(result, "model_dump"):
             result = result.model_dump(mode="json")
-        return ToolCallResult(name=payload.name, status="ok", result=result)
+        return ToolCallResult(name=external_name, status="ok", result=result)
     except HTTPException as exc:
-        return ToolCallResult(name=payload.name, status="failed", error=str(exc.detail))
+        return ToolCallResult(name=external_name, status="failed", error=str(exc.detail))
     except Exception as exc:  # noqa: BLE001
-        return ToolCallResult(name=payload.name, status="failed", error=str(exc))
+        return ToolCallResult(name=external_name, status="failed", error=str(exc))
 
+
+
+
+def _odoo_functional_query(req: OdooFunctionalQueryRequest) -> object:
+    """Map common functional Odoo questions to safe search_read calls.
+
+    This is intentionally read-only and conservative. It gives Claude/Qwen a
+    tiny, reliable functional tool so prompts like "List users" do not need to
+    inspect the larger coding toolset or manually construct a model/domain.
+    """
+    text = (req.query or "").strip().lower()
+    limit = req.limit
+
+    model = "res.partner"
+    domain: list = []
+    fields = ["name", "email", "phone", "active"]
+    order = "id desc"
+    intent = "partners"
+
+    if any(word in text for word in ["user", "users", "login"]):
+        model = "res.users"
+        domain = []
+        if "inactive" in text or "archived" in text:
+            domain = [("active", "=", False)]
+        elif "all" not in text:
+            domain = [("active", "=", True)]
+        fields = ["name", "login", "active", "partner_id", "company_ids"]
+        order = "id asc"
+        intent = "users"
+    elif "employee" in text or "employees" in text or "staff" in text:
+        model = "hr.employee"
+        domain = []
+        if "inactive" in text or "archived" in text:
+            domain = [("active", "=", False)]
+        elif "all" not in text:
+            domain = [("active", "=", True)]
+        fields = ["name", "work_email", "work_phone", "department_id", "job_id", "active"]
+        order = "id asc"
+        intent = "employees"
+    elif "invoice" in text or "invoices" in text:
+        model = "account.move"
+        move_type = "in_invoice" if any(w in text for w in ["vendor", "bill", "bills", "supplier"]) else "out_invoice"
+        domain = [("move_type", "=", move_type)]
+        if "draft" in text:
+            domain.append(("state", "=", "draft"))
+        elif "posted" in text or "confirmed" in text:
+            domain.append(("state", "=", "posted"))
+        if "unpaid" in text or "not paid" in text or "open" in text:
+            domain.append(("payment_state", "in", ["not_paid", "partial"]))
+        elif "paid" in text and "unpaid" not in text and "not paid" not in text:
+            domain.append(("payment_state", "=", "paid"))
+        if "cancel" in text:
+            domain.append(("state", "=", "cancel"))
+        fields = ["name", "partner_id", "invoice_date", "invoice_date_due", "amount_total", "amount_residual", "currency_id", "state", "payment_state"]
+        order = "invoice_date desc, id desc"
+        intent = "vendor_bills" if move_type == "in_invoice" else "customer_invoices"
+    elif any(w in text for w in ["customer", "customers", "client", "clients"]):
+        model = "res.partner"
+        domain = [("customer_rank", ">", 0)]
+        fields = ["name", "email", "phone", "customer_rank", "active"]
+        order = "customer_rank desc, name asc"
+        intent = "customers"
+    elif any(w in text for w in ["vendor", "vendors", "supplier", "suppliers"]):
+        model = "res.partner"
+        domain = [("supplier_rank", ">", 0)]
+        fields = ["name", "email", "phone", "supplier_rank", "active"]
+        order = "supplier_rank desc, name asc"
+        intent = "vendors"
+    elif "product" in text or "products" in text:
+        model = "product.product"
+        domain = []
+        if "can be sold" in text or "sale" in text or "sell" in text:
+            domain.append(("sale_ok", "=", True))
+        if "can be purchased" in text or "purchase" in text or "buy" in text:
+            domain.append(("purchase_ok", "=", True))
+        fields = ["display_name", "default_code", "list_price", "standard_price", "qty_available", "uom_id", "active"]
+        order = "id desc"
+        intent = "products"
+    elif "sale order" in text or "sales order" in text or "quotation" in text or "quotations" in text:
+        model = "sale.order"
+        domain = []
+        if "draft" in text or "quotation" in text:
+            domain.append(("state", "in", ["draft", "sent"]))
+        elif "done" in text:
+            domain.append(("state", "=", "done"))
+        elif "cancel" in text:
+            domain.append(("state", "=", "cancel"))
+        elif "confirmed" in text or "sale" in text:
+            domain.append(("state", "=", "sale"))
+        fields = ["name", "partner_id", "date_order", "amount_total", "currency_id", "state", "invoice_status"]
+        order = "date_order desc, id desc"
+        intent = "sale_orders"
+    elif "purchase order" in text or "rfq" in text or "purchase" in text:
+        model = "purchase.order"
+        domain = []
+        if "draft" in text or "rfq" in text:
+            domain.append(("state", "in", ["draft", "sent"]))
+        elif "done" in text:
+            domain.append(("state", "=", "done"))
+        elif "cancel" in text:
+            domain.append(("state", "=", "cancel"))
+        elif "confirmed" in text or "purchase" in text:
+            domain.append(("state", "=", "purchase"))
+        fields = ["name", "partner_id", "date_order", "amount_total", "currency_id", "state", "invoice_status"]
+        order = "date_order desc, id desc"
+        intent = "purchase_orders"
+    elif "module" in text or "modules" in text or "apps" in text:
+        model = "ir.module.module"
+        domain = []
+        if "installed" in text:
+            domain.append(("state", "=", "installed"))
+        elif "uninstalled" in text:
+            domain.append(("state", "=", "uninstalled"))
+        fields = ["name", "shortdesc", "state", "latest_version", "installed_version"]
+        order = "name asc"
+        intent = "modules"
+
+    result = OdooRpcService().search_read(model, domain, fields, limit, 0, order, None)
+    dumped = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+    return {
+        "status": dumped.get("status") if isinstance(dumped, dict) else "ok",
+        "intent": intent,
+        "parsed": {"model": model, "domain": domain, "fields": fields, "limit": limit, "order": order},
+        "odoo": dumped,
+    }
 
 async def _dispatch(name: str, args: dict) -> object:
     if name == "connector.health":
@@ -592,6 +806,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return odoosh_module_update(OdooShModuleUpdateRequest.model_validate(args))
     if name == "odoo.health":
         return OdooRpcService().health()
+    if name == "odoo.query":
+        return _odoo_functional_query(OdooFunctionalQueryRequest.model_validate(args))
     if name == "odoo.module_deploy":
         return odoo_module_deploy(OdooRpcModuleRequest.model_validate(args))
     if name == "odoo.module_status":

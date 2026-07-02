@@ -4,16 +4,18 @@ import json
 import re
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 
 from ..auth import AuthDependency
 from ..config import settings
 from ..services.oauth_service import OAuthStore
 from ..services.qwen_token_service import QwenTokenService
-from .tools import _dispatch, list_tools, tool_input_schema
+from .tools import _dispatch, internal_tool_name, list_tools, strict_safe_tool_name, tool_input_schema
 
 router = APIRouter(prefix="/mcp", tags=["mcp"], dependencies=[AuthDependency])
 qwen_router = APIRouter(prefix="/qwen", tags=["mcp-qwen"] )
+claude_router = APIRouter(prefix="/claude", tags=["mcp-claude"], dependencies=[AuthDependency])
+chatgpt_router = APIRouter(prefix="/chatgpt", tags=["mcp-chatgpt"], dependencies=[AuthDependency])
 
 
 def _rpc_response(request_id: Any, result: Any = None, error: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -81,37 +83,135 @@ def _humanize_tool_name(name: str) -> str:
 
 
 def _mcp_safe_tool_name(name: str) -> str:
-    """Return a ChatGPT/Qwen-safe MCP tool name.
-
-    Some MCP clients validate tool names with:
-        ^[a-zA-Z0-9_-]{1,64}$
-    Odoo-agent internal REST tool names historically use namespaces like
-    ``repo.write`` and ``workflow.find_core_file``. Dots are valid for our
-    internal router, but not for those MCP frontends. Expose sanitized names
-    over MCP while keeping the internal dotted names for REST/backward
-    compatibility.
-    """
-    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name).strip("_")
-    return (safe or "tool")[:64]
+    return strict_safe_tool_name(name)
 
 
 def _mcp_name_to_internal(name: str) -> str:
-    """Map an MCP-safe name back to the internal dotted tool name.
+    return internal_tool_name(name)
 
-    Backward-compatible: existing clients that still call dotted tool names are
-    accepted. New strict MCP frontends receive and call sanitized names.
+
+_CLAUDE_TOOL_NAMES = {
+    "connector.health",
+    "odoo.query",
+    "odoo.search_read",
+    "odoo.health",
+    "odoo.module_status",
+}
+
+_REMOTE_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+
+
+def _force_remote_tool_name(name: Any, fallback_index: int = 0) -> str:
+    """Final guard for ChatGPT/Claude/Qwen strict remote-MCP name validation.
+
+    Some clients reject the whole connection when even one returned tool name
+    contains a dot or other punctuation. This function is intentionally used at
+    the final serialization boundary, not only in descriptors, so no future code
+    path can accidentally leak dotted internal names.
     """
-    known = [tool.name for tool in list_tools(include_deprecated=True)]
-    if name in known:
-        return name
-    for actual in known:
-        if _mcp_safe_tool_name(actual) == name:
-            return actual
-    return name
+    value = strict_safe_tool_name(str(name or f"tool_{fallback_index}"))
+    value = re.sub(r"[^a-zA-Z0-9_-]", "_", value).strip("_") or f"tool_{fallback_index}"
+    value = value[:64]
+    if _REMOTE_TOOL_NAME_RE.match(value):
+        return value
+    return f"tool_{fallback_index}"[:64]
 
 
-def _tool_to_mcp(tool) -> dict[str, Any]:
+def _force_remote_tool_list(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Hard-sanitize every tools/list item right before returning to clients."""
+    sanitized: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for idx, tool in enumerate(tools):
+        item = dict(tool)
+        name = _force_remote_tool_name(item.get("name"), idx)
+        if name in seen:
+            suffix = f"_{idx}"
+            name = f"{name[:64-len(suffix)]}{suffix}"
+        seen.add(name)
+        item["name"] = name
+        schema = item.get("inputSchema")
+        if not isinstance(schema, dict):
+            item["inputSchema"] = {"type": "object", "properties": {}}
+        item.setdefault("description", "Odoo MCP tool")
+        sanitized.append(item)
+    return sanitized
+
+
+def _is_claude_request(request: Request | None) -> bool:
+    if request is None:
+        return False
+    headers = request.headers
+    joined = " ".join(
+        str(headers.get(name, ""))
+        for name in ("user-agent", "x-client-name", "anthropic-version", "mcp-client")
+    ).lower()
+    return "claude" in joined or "anthropic" in joined
+
+
+def _tools_for_profile(profile: str | None = None) -> list[Any]:
+    tools = list_tools(strict_names=False)
+    if profile == "claude":
+        # Claude currently fails more easily on very large remote MCP tool lists
+        # and complex coding schemas. Keep the Claude profile tiny and functional
+        # by default; ChatGPT/Qwen still use the full tool list on /mcp and /qwen.
+        return [tool for tool in tools if tool.name in _CLAUDE_TOOL_NAMES]
+    return tools
+
+
+def _claude_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return a small Claude-safe JSON schema.
+
+    Claude's remote-MCP frontend can fail the message stream while loading tools
+    when schemas contain lots of generated Pydantic metadata or nested $defs. This
+    removes non-essential metadata and simplifies nullable anyOf values.
+    """
+    def clean(value: Any) -> Any:
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+
+        if "$ref" in value:
+            return {"type": "object"}
+        if "anyOf" in value:
+            non_null = [item for item in value.get("anyOf", []) if not (isinstance(item, dict) and item.get("type") == "null")]
+            if len(non_null) == 1:
+                base = clean(non_null[0])
+                if "description" in value and isinstance(base, dict):
+                    base.setdefault("description", value["description"])
+                return base
+            return {"type": "string", "description": value.get("description", "JSON value")}
+
+        out: dict[str, Any] = {}
+        for key, child in value.items():
+            if key in {"$defs", "title", "default", "examples", "computed_fields"}:
+                continue
+            if key == "additionalProperties":
+                # Keep strict false, but drop complex schemas under additionalProperties.
+                out[key] = child if isinstance(child, bool) else True
+                continue
+            out[key] = clean(child)
+        return out
+
+    cleaned = clean(schema)
+    if not isinstance(cleaned, dict):
+        cleaned = {"type": "object"}
+    cleaned.setdefault("type", "object")
+    cleaned.setdefault("properties", {})
+    return cleaned
+
+
+def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
     title = getattr(tool, "title", None) or _humanize_tool_name(tool.name)
+    if profile in {"claude", "chatgpt"}:
+        # Claude and some ChatGPT remote-MCP builds are strict and can fail while
+        # validating the initial tool list. Use the minimal MCP tool shape for
+        # these compatibility profiles: strict-safe name, description, schema only.
+        return {
+            "name": _mcp_safe_tool_name(tool.name),
+            "description": str(tool.description)[:900],
+            "inputSchema": _claude_schema(tool_input_schema(tool.name)),
+        }
     return {
         "name": _mcp_safe_tool_name(tool.name),
         "title": title,
@@ -129,7 +229,7 @@ def _tool_to_mcp(tool) -> dict[str, Any]:
 
 
 @router.post("")
-async def mcp_rpc(payload: dict[str, Any]) -> dict[str, Any] | list[dict[str, Any]] | None:
+async def mcp_rpc(payload: dict[str, Any], request: Request) -> dict[str, Any] | list[dict[str, Any]] | None:
     """Lightweight JSON-RPC MCP-compatible endpoint.
 
     It exposes initialize, tools/list, and tools/call over one HTTPS POST route.
@@ -138,14 +238,14 @@ async def mcp_rpc(payload: dict[str, Any]) -> dict[str, Any] | list[dict[str, An
     if isinstance(payload, list):
         responses = []
         for item in payload:
-            response = await _handle_rpc(item)
+            response = await _handle_rpc(item, profile="claude" if _is_claude_request(request) else None)
             if response is not None:
                 responses.append(response)
         return responses
-    return await _handle_rpc(payload)
+    return await _handle_rpc(payload, profile="claude" if _is_claude_request(request) else None)
 
 
-async def _handle_rpc(payload: dict[str, Any]) -> dict[str, Any] | None:
+async def _handle_rpc(payload: dict[str, Any], profile: str | None = None) -> dict[str, Any] | None:
     method = payload.get("method")
     request_id = payload.get("id")
     params = payload.get("params") or {}
@@ -162,7 +262,8 @@ async def _handle_rpc(payload: dict[str, Any]) -> dict[str, Any] | None:
             },
         )
     if method == "tools/list":
-        return _rpc_response(request_id, {"tools": [_tool_to_mcp(tool) for tool in list_tools()]})
+        tools_payload = [_tool_to_mcp(tool, profile=profile) for tool in _tools_for_profile(profile)]
+        return _rpc_response(request_id, {"tools": _force_remote_tool_list(tools_payload)})
     if method == "tools/call":
         name = params.get("name")
         arguments = params.get("arguments") or {}
@@ -195,6 +296,57 @@ async def _handle_rpc(payload: dict[str, Any]) -> dict[str, Any] | None:
                 },
             )
     return _rpc_response(request_id, error={"code": -32601, "message": f"Unknown method: {method}"})
+
+
+@claude_router.get("/mcp")
+def claude_mcp_health() -> dict[str, Any]:
+    return {"status": "ok", "endpoint": "claude-slim-mcp", "transport": "http-post-json-rpc", "tools_profile": "functional"}
+
+
+@claude_router.post("/mcp")
+async def claude_mcp_rpc(payload: dict[str, Any]) -> dict[str, Any] | list[dict[str, Any]] | None:
+    if isinstance(payload, list):
+        responses = []
+        for item in payload:
+            response = await _handle_rpc(item, profile="claude")
+            if response is not None:
+                responses.append(response)
+        return responses
+    return await _handle_rpc(payload, profile="claude")
+
+
+@chatgpt_router.get("/mcp")
+def chatgpt_mcp_health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "endpoint": "chatgpt-strict-mcp",
+        "transport": "http-post-json-rpc",
+        "tool_names": "strict_regex_safe",
+    }
+
+
+@chatgpt_router.get("/tools-debug")
+def chatgpt_tools_debug() -> dict[str, Any]:
+    tools_payload = _force_remote_tool_list([_tool_to_mcp(tool, profile="chatgpt") for tool in _tools_for_profile(None)])
+    bad = [tool.get("name") for tool in tools_payload if not _REMOTE_TOOL_NAME_RE.match(str(tool.get("name", "")))]
+    return {
+        "status": "ok" if not bad else "bad_names",
+        "count": len(tools_payload),
+        "bad_names": bad,
+        "first_names": [tool.get("name") for tool in tools_payload[:20]],
+    }
+
+
+@chatgpt_router.post("/mcp")
+async def chatgpt_mcp_rpc(payload: dict[str, Any]) -> dict[str, Any] | list[dict[str, Any]] | None:
+    if isinstance(payload, list):
+        responses = []
+        for item in payload:
+            response = await _handle_rpc(item, profile="chatgpt")
+            if response is not None:
+                responses.append(response)
+        return responses
+    return await _handle_rpc(payload, profile="chatgpt")
 
 
 def _validate_qwen_url_token(token: str | None) -> None:

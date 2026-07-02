@@ -10,7 +10,7 @@ from .routers.approvals import router as approvals_router
 from .routers.browser import router as browser_router
 from .routers.git import router as git_router
 from .routers.jobs import router as jobs_router
-from .routers.mcp import router as mcp_router, qwen_router as qwen_mcp_router
+from .routers.mcp import router as mcp_router, qwen_router as qwen_mcp_router, claude_router as claude_mcp_router, chatgpt_router as chatgpt_mcp_router
 from .routers.odoo import router as odoo_router
 from .routers.odoosh import router as odoosh_router
 from .routers.oauth import router as oauth_router
@@ -284,6 +284,7 @@ def root() -> dict[str, object]:
         "openapi": "/openapi.json",
         "tools": "/tools/list",
         "mcp": "/mcp",
+        "chatgpt_mcp": "/chatgpt/mcp",
         "workflow": ["/workflow/capability-check", "/workflow/full-verify", "/workflow/safe-deploy-module"],
     }
 
@@ -312,4 +313,6 @@ async def request_id_middleware(request: Request, call_next):
 
 app.include_router(mcp_router)
 app.include_router(qwen_mcp_router)
+app.include_router(claude_mcp_router)
+app.include_router(chatgpt_mcp_router)
 app.include_router(workflow_router)
