@@ -36,6 +36,8 @@ No Codex, no CLI agent, no backend AI model, and no frontend UI are required. Ch
 - `POST /repo/list`
 - `POST /repo/read`
 - `POST /repo/write`
+- `POST /repo/write-many-smart`
+- `POST /repo/write-many-fast-safe`
 - `POST /repo/write-many-atomic`
 - `POST /repo/apply-patch-atomic`
 - `POST /repo/delete`
@@ -468,14 +470,16 @@ ODOOSH_WAIT_INTERVAL_SECONDS=10
 For every coding task, ChatGPT should start with the repository tools, not with Odoo database reads:
 
 ```text
-repo.prepare → repo.list_custom_modules → repo.read → repo.apply_patch_atomic or repo.write_many_atomic → git.diff → qa.self_run → git.commit → git.push → odoosh.check_commit polling → odoosh.module_update
+repo.prepare → repo.list_custom_modules → repo.read → repo.apply_patch_atomic or repo.write_many_smart → git.diff → qa.self_run → workflow.verify_against_core(changed files only) → git.commit → git.push → odoosh.check_commit polling → odoosh.module_update
 ```
 
 New MCP/REST tools:
 
 - `repo.prepare`: clones the target repo if missing, otherwise runs `git fetch`, `git checkout <branch>`, and `git pull --ff-only origin <branch>`. Defaults come from `TARGET_GIT_REPO`, `TARGET_GIT_BRANCH`, `TARGET_PROJECT_PATH`, and `WORKSPACE_ROOT`.
 - `repo.list_custom_modules`: scans the checkout for Odoo custom modules using `__manifest__.py`, instead of relying only on installed modules in Odoo.
-- `repo.write_many_atomic`: writes many files as one all-or-none temp worktree transaction; the real checkout is touched only after the full generated diff validates.
+- `repo.write_many_smart`: preferred multi-file writer; auto-selects fast-safe for small edits and atomic worktree for larger/riskier edits.
+- `repo.write_many_fast_safe`: small multi-file writer with path validation, repo lock, backups, temporary replacement, and rollback; no git worktree overhead.
+- `repo.write_many_atomic`: large/risky multi-file writer; writes many files as one all-or-none temp worktree transaction; the real checkout is touched only after the full generated diff validates.
 - `repo.apply_patch_atomic`: validates and applies a multi-file patch in a temporary worktree/branch, then validates the resulting diff against the real checkout before applying it.
 - `workflow.coding_task_plan`: returns the canonical ordered tool plan and guardrails for ChatGPT before patching code.
 

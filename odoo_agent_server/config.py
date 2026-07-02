@@ -54,6 +54,14 @@ class Settings(BaseSettings):
     # query-token auth only for private HTTPS deployments.
     query_token_auth_enabled: bool = Field(default=False, alias="ODOO_AGENT_QUERY_TOKEN_AUTH_ENABLED")
 
+    # Fast-safe write tuning.  The smart writer uses this path for normal small
+    # multi-file edits and keeps the slower git-worktree transaction for larger
+    # or riskier changes.  Validation is still handled by the normal verifier
+    # on the exact files changed by the task.
+    fast_write_max_files: int = Field(default=8, alias="ODOO_AGENT_FAST_WRITE_MAX_FILES")
+    fast_write_max_bytes_each: int = Field(default=300_000, alias="ODOO_AGENT_FAST_WRITE_MAX_BYTES_EACH")
+    fast_write_max_total_bytes: int = Field(default=750_000, alias="ODOO_AGENT_FAST_WRITE_MAX_TOTAL_BYTES")
+
     # Odoo RPC defaults.
     odoo_base_url: str | None = Field(default=None, alias="ODOO_BASE_URL")
     odoo_db_name: str | None = Field(default=None, alias="ODOO_DB_NAME")

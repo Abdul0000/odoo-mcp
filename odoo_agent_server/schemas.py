@@ -191,6 +191,22 @@ class RepoWriteManyAtomicRequest(BaseProjectRequest, ApprovalMixin):
     timeout_seconds: int = Field(default=60, ge=5, le=300)
 
 
+class RepoWriteManyFastSafeRequest(BaseProjectRequest, ApprovalMixin):
+    files: list[RepoWriteItem] = Field(..., min_length=1, max_length=50, description="Small related files to write using lock + backup + rollback, without git worktree overhead")
+    check_only: bool = Field(default=False, description="Validate paths, limits, and parent directories without changing the checkout")
+    timeout_seconds: int = Field(default=30, ge=5, le=180, description="Lock timeout for the fast-safe write")
+
+
+class RepoWriteManySmartRequest(RepoWriteManyAtomicRequest):
+    strategy: Literal["auto", "fast_safe", "atomic"] = Field(
+        default="auto",
+        description=(
+            "auto selects fast_safe for small safe writes and atomic for large/risky writes; "
+            "fast_safe forces lock+backup+rollback; atomic forces temp git-worktree transaction"
+        ),
+    )
+
+
 class RepoDeleteRequest(BaseProjectRequest, ApprovalMixin):
     relative_path: str
 

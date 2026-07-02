@@ -40,6 +40,8 @@ from ..schemas import (
     RepoPrepareRequest,
     RepoReadRequest,
     RepoWriteManyAtomicRequest,
+    RepoWriteManyFastSafeRequest,
+    RepoWriteManySmartRequest,
     RepoWriteRequest,
     SelfRunRequest,
     ToolCallRequest,
@@ -67,7 +69,7 @@ from ..services.odoosh_service import OdooShService
 from ..services.playwright_service import PlaywrightService
 from ..services.repo_service import RepoService
 from .qa import self_run
-from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_apply_patch, repo_apply_patch_atomic, repo_clean_pyc, repo_prepare, repo_custom_modules
+from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_write_many_fast_safe, repo_write_many_smart, repo_apply_patch, repo_apply_patch_atomic, repo_clean_pyc, repo_prepare, repo_custom_modules
 from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
@@ -139,8 +141,27 @@ _TOOL_DESCRIPTORS = [
         ),
         requires_approval=True,
     ),
+    ToolDescriptor(
+        name="repo.write_many_smart",
+        title="Write multiple files smartly",
+        description=(
+            "PREFERRED for multi-file writes. Auto-selects fast-safe lock+backup+rollback for small related edits "
+            "and falls back to git temp-worktree atomic for large/risky writes. Keeps quality high while avoiding "
+            "slow repo.write_many_atomic for normal OWL/POS/website/XML changes."
+        ),
+        requires_approval=True,
+    ),
+    ToolDescriptor(
+        name="repo.write_many_fast_safe",
+        title="Write small multi-file change fast",
+        description=(
+            "Fast-safe small multi-file writer: validates paths, locks repo, backs up original files, writes through "
+            "temporary files, and rolls back on failure. Use for <= configured limits; still run git.diff and changed-files verification after."
+        ),
+        requires_approval=True,
+    ),
     ToolDescriptor(name="repo.write_many_atomic",
-        title="Write multiple files safely", description="Write many files as one atomic temp-worktree transaction", requires_approval=True),
+        title="Write multiple files safely", description="Slowest/premium safety path: write many files as one isolated git temp-worktree transaction. Use for large/risky refactors only.", requires_approval=True),
     ToolDescriptor(name="repo.delete",
         title="Delete file from repo", description="Delete a file inside an allowed project path", requires_approval=True),
     ToolDescriptor(name="repo.apply_patch",
@@ -367,6 +388,8 @@ _TOOL_INPUT_MODELS = {
     "repo.list": RepoListRequest,
     "repo.read": RepoReadRequest,
     "repo.write": RepoWriteRequest,
+    "repo.write_many_smart": RepoWriteManySmartRequest,
+    "repo.write_many_fast_safe": RepoWriteManyFastSafeRequest,
     "repo.write_many_atomic": RepoWriteManyAtomicRequest,
     "repo.delete": RepoDeleteRequest,
     "repo.apply_patch": RepoPatchRequest,
@@ -490,6 +513,10 @@ async def _dispatch(name: str, args: dict) -> object:
         return RepoService().read_file(req.project_path, req.relative_path, req.max_bytes)
     if name == "repo.write":
         return repo_write(RepoWriteRequest.model_validate(args))
+    if name == "repo.write_many_smart":
+        return repo_write_many_smart(RepoWriteManySmartRequest.model_validate(args))
+    if name == "repo.write_many_fast_safe":
+        return repo_write_many_fast_safe(RepoWriteManyFastSafeRequest.model_validate(args))
     if name == "repo.write_many_atomic":
         return repo_write_many_atomic(RepoWriteManyAtomicRequest.model_validate(args))
     if name == "repo.delete":

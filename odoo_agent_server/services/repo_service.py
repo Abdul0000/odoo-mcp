@@ -470,22 +470,7 @@ class RepoService:
     def write_many_atomic(self, project_path: str, files: list[object], check_only: bool = False, timeout_seconds: int = 60) -> CommandResult:
         """Write many files as one atomic transaction via temp worktree/branch."""
         project = self.project(project_path)
-        seen: set[str] = set()
-        normalized_files: list[dict[str, object]] = []
-        for item in files:
-            raw_path = str(getattr(item, "relative_path", ""))
-            content = str(getattr(item, "content", ""))
-            create_dirs = bool(getattr(item, "create_dirs", True))
-            self._reject_git_internal_path(raw_path)
-            # Validate against the real project root first.
-            resolved = self._safe_join(project, raw_path)
-            rel = resolved.relative_to(project).as_posix()
-            if rel in seen:
-                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Duplicate file in atomic write: {rel}")
-            seen.add(rel)
-            normalized_files.append({"relative_path": rel, "content": content, "create_dirs": create_dirs})
-        if not normalized_files:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="files must not be empty")
+        normalized_files = self._normalise_write_many_files(project, files, action="repo.write_many_atomic")
 
         return self._run_atomic_worktree_transaction(
             project=project,
@@ -494,6 +479,175 @@ class RepoService:
             check_only=check_only,
             mutate_worktree=lambda worktree: self._write_many_inside_worktree(worktree, normalized_files),
         )
+
+    def write_many_fast_safe(self, project_path: str, files: list[object], check_only: bool = False, timeout_seconds: int = 30) -> CommandResult:
+        """Write small related files without the heavy git-worktree transaction.
+
+        This path is intentionally still safe: it validates every path, takes the
+        repository lock, backs up original file bytes, writes through temporary
+        files, and rolls back every touched file if any write fails.  It is the
+        right default for small JS/XML/SCSS/Python edits where full git worktree
+        isolation adds latency but not meaningful extra quality.
+        """
+        project = self.project(project_path)
+        normalized_files = self._normalise_write_many_files(project, files, action="repo.write_many_fast_safe")
+        allowed, reason = self._fast_safe_write_allowed(normalized_files)
+        if not allowed:
+            return CommandResult(
+                command=["repo", "write_many_fast_safe"],
+                cwd=str(project),
+                exit_code=2,
+                stderr=f"Fast-safe limits exceeded: {reason}. Use repo.write_many_smart or repo.write_many_atomic.",
+            )
+
+        parent_error = self._precheck_write_many_parents(project, normalized_files)
+        if parent_error:
+            return CommandResult(command=["repo", "write_many_fast_safe", "--check"], cwd=str(project), exit_code=1, stderr=parent_error)
+
+        total_bytes = sum(len(str(item["content"]).encode("utf-8")) for item in normalized_files)
+        if check_only:
+            return CommandResult(
+                command=["repo", "write_many_fast_safe", "--check"],
+                cwd=str(project),
+                exit_code=0,
+                stdout=(
+                    f"Fast-safe check-only passed for {len(normalized_files)} file(s), "
+                    f"{total_bytes} bytes total. Real checkout unchanged.\n"
+                    f"files={', '.join(str(item['relative_path']) for item in normalized_files)}"
+                ),
+            )
+
+        backups: dict[str, bytes | None] = {}
+        changed: list[str] = []
+        unchanged: list[str] = []
+        write_started = time.monotonic()
+
+        with RepoLockService().locked(str(project), owner="repo.write_many_fast_safe", timeout_seconds=timeout_seconds):
+            try:
+                for item in normalized_files:
+                    rel = str(item["relative_path"])
+                    target = self._safe_join(project, rel)
+                    if bool(item.get("create_dirs", True)):
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                    elif not target.parent.exists():
+                        raise RuntimeError(f"Parent directory not found: {target.parent}")
+                    if target.exists() and not target.is_file():
+                        raise RuntimeError(f"Target exists but is not a file: {target}")
+                    backups[rel] = target.read_bytes() if target.exists() else None
+
+                for item in normalized_files:
+                    rel = str(item["relative_path"])
+                    target = self._safe_join(project, rel)
+                    content = str(item["content"])
+                    new_bytes = content.encode("utf-8")
+                    if backups.get(rel) == new_bytes:
+                        unchanged.append(rel)
+                        continue
+                    tmp = target.with_name(f".{target.name}.tmp.{uuid4().hex[:8]}")
+                    tmp.write_bytes(new_bytes)
+                    tmp.replace(target)
+                    changed.append(rel)
+            except Exception as exc:  # noqa: BLE001
+                rollback_errors: list[str] = []
+                for rel, old_bytes in backups.items():
+                    target = self._safe_join(project, rel)
+                    try:
+                        if old_bytes is None:
+                            target.unlink(missing_ok=True)
+                        else:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            tmp = target.with_name(f".{target.name}.rollback.{uuid4().hex[:8]}")
+                            tmp.write_bytes(old_bytes)
+                            tmp.replace(target)
+                    except Exception as rollback_exc:  # noqa: BLE001
+                        rollback_errors.append(f"{rel}: {rollback_exc}")
+                stderr = f"Fast-safe write failed and rollback was attempted: {exc}"
+                if rollback_errors:
+                    stderr += "\nRollback errors:\n" + "\n".join(rollback_errors)
+                return CommandResult(command=["repo", "write_many_fast_safe"], cwd=str(project), exit_code=1, stderr=stderr[-20000:])
+
+        elapsed_ms = int((time.monotonic() - write_started) * 1000)
+        return CommandResult(
+            command=["repo", "write_many_fast_safe"],
+            cwd=str(project),
+            exit_code=0,
+            stdout=(
+                "Fast-safe write applied with repo lock + backups + rollback protection.\n"
+                f"changed={changed}\n"
+                f"unchanged={unchanged}\n"
+                f"files={len(normalized_files)} total_bytes={total_bytes} elapsed_ms={elapsed_ms}\n"
+                "Next: run git.diff and workflow.verify_against_core on these changed files only."
+            ),
+        )
+
+    def write_many_smart(self, project_path: str, files: list[object], check_only: bool = False, timeout_seconds: int = 60, strategy: str = "auto") -> CommandResult:
+        """Choose the fastest safe writer without weakening validation quality."""
+        project = self.project(project_path)
+        normalized_files = self._normalise_write_many_files(project, files, action="repo.write_many_smart")
+        strategy = (strategy or "auto").strip().lower()
+        if strategy not in {"auto", "fast_safe", "atomic"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="strategy must be one of: auto, fast_safe, atomic")
+
+        if strategy == "atomic":
+            return self.write_many_atomic(project_path, files, check_only=check_only, timeout_seconds=timeout_seconds)
+
+        allowed, reason = self._fast_safe_write_allowed(normalized_files)
+        if strategy == "fast_safe":
+            return self.write_many_fast_safe(project_path, files, check_only=check_only, timeout_seconds=min(timeout_seconds, 180))
+
+        if allowed:
+            result = self.write_many_fast_safe(project_path, files, check_only=check_only, timeout_seconds=min(timeout_seconds, 180))
+            result.stdout = "SMART_STRATEGY=fast_safe\n" + result.stdout
+            return result
+
+        result = self.write_many_atomic(project_path, files, check_only=check_only, timeout_seconds=timeout_seconds)
+        result.stdout = f"SMART_STRATEGY=atomic reason={reason}\n" + result.stdout
+        return result
+
+    def _normalise_write_many_files(self, project: Path, files: list[object], action: str) -> list[dict[str, object]]:
+        seen: set[str] = set()
+        normalized_files: list[dict[str, object]] = []
+        for item in files:
+            raw_path = str(getattr(item, "relative_path", ""))
+            content = str(getattr(item, "content", ""))
+            create_dirs = bool(getattr(item, "create_dirs", True))
+            self._reject_git_internal_path(raw_path)
+            resolved = self._safe_join(project, raw_path)
+            rel = resolved.relative_to(project).as_posix()
+            if rel in seen:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Duplicate file in {action}: {rel}")
+            seen.add(rel)
+            normalized_files.append({"relative_path": rel, "content": content, "create_dirs": create_dirs})
+        if not normalized_files:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="files must not be empty")
+        return normalized_files
+
+    def _fast_safe_write_allowed(self, files: list[dict[str, object]]) -> tuple[bool, str]:
+        max_files = max(1, int(getattr(settings, "fast_write_max_files", 8)))
+        max_each = max(1, int(getattr(settings, "fast_write_max_bytes_each", 300_000)))
+        max_total = max(1, int(getattr(settings, "fast_write_max_total_bytes", 750_000)))
+        if len(files) > max_files:
+            return False, f"file count {len(files)} > max {max_files}"
+        total = 0
+        for item in files:
+            rel = str(item["relative_path"])
+            size = len(str(item["content"]).encode("utf-8"))
+            if size > max_each:
+                return False, f"{rel} size {size} bytes > max_each {max_each}"
+            total += size
+        if total > max_total:
+            return False, f"total size {total} bytes > max_total {max_total}"
+        return True, "within fast-safe limits"
+
+    def _precheck_write_many_parents(self, project: Path, files: list[dict[str, object]]) -> str:
+        for item in files:
+            rel = str(item["relative_path"])
+            target = self._safe_join(project, rel)
+            if not bool(item.get("create_dirs", True)) and not target.parent.exists():
+                return f"Parent directory not found: {target.parent}"
+            if target.exists() and not target.is_file():
+                return f"Target exists but is not a file: {target}"
+        return ""
 
     def _apply_patch_inside_worktree(self, worktree: Path, patch_path: Path, timeout_seconds: int) -> CommandResult:
         check = self._run(["git", "apply", "--check", str(patch_path)], worktree, timeout_seconds)

@@ -179,7 +179,9 @@ The scope expands automatically — if L0 reads reveal `_inherit`, L1 kicks in. 
 - `__init__.py`, `models/__init__.py` + model files, `views/` XML, `security/ir.model.access.csv`
 
 **Step 8:** Use atomic editing tools
-- **Multi-file / new module** → `repo.write_many_atomic`
+- **Multi-file normal edit** → `repo.write_many_smart`
+- **Small multi-file edit when explicitly forcing fast path** → `repo.write_many_fast_safe`
+- **Large/risky multi-file refactor/new module** → `repo.write_many_atomic`
 - **Multi-file diff** → `repo.apply_patch_atomic`
 - **Small single-file patch** → `repo.apply_patch`
 - **Large single file >1000 lines** → `repo.write` in chunked mode (chunk_index/total_chunks)
@@ -299,7 +301,9 @@ If `repo.write` response includes `large_file_warning` (file > 1000 lines):
 | `repo.list_custom_modules` | Discover modules from repo manifests |
 | `repo.read` | Read file before editing (also reads /home/odoo/src/* files) |
 | `repo.write` | Write one complete file up to 1000 lines in one pass; chunked mode for >1000 lines |
-| `repo.write_many_atomic` | Preferred for multi-file writes/new modules |
+| `repo.write_many_smart` | Preferred for multi-file writes; auto fast-safe for small edits, atomic for large/risky edits |
+| `repo.write_many_fast_safe` | Small multi-file writer using repo lock + backups + rollback, no git worktree overhead |
+| `repo.write_many_atomic` | Premium safety for large/risky multi-file writes/new modules |
 | `repo.apply_patch_atomic` | Preferred for multi-file diffs |
 | `git.diff` | Verify changes before commit |
 | `qa.self_run` | Syntax + Odoo import validation |

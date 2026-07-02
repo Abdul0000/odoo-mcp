@@ -19,6 +19,8 @@ from ..schemas import (
     RepoPrepareResult,
     RepoReadRequest,
     RepoWriteManyAtomicRequest,
+    RepoWriteManyFastSafeRequest,
+    RepoWriteManySmartRequest,
     RepoWriteRequest,
 )
 from ..services.approval_service import ApprovalService
@@ -129,6 +131,32 @@ def repo_apply_patch(payload: RepoPatchRequest) -> CommandResult:
     return result
 
 
+
+
+
+
+@router.post("/write-many-fast-safe", response_model=CommandResult)
+def repo_write_many_fast_safe(payload: RepoWriteManyFastSafeRequest) -> CommandResult:
+    approval = ApprovalService()
+    if not payload.check_only:
+        approval.ensure_allowed("repo.write_many_fast_safe", payload.approval_id, _preview(payload))
+    result = RepoService().write_many_fast_safe(payload.project_path, payload.files, payload.check_only, payload.timeout_seconds)
+    if not payload.check_only:
+        approval.finalize_command(payload.approval_id, result.exit_code, "repo.write_many_fast_safe succeeded", "repo.write_many_fast_safe failed")
+    JsonStore().log_audit("repo.write_many_fast_safe", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
+    return result
+
+
+@router.post("/write-many-smart", response_model=CommandResult)
+def repo_write_many_smart(payload: RepoWriteManySmartRequest) -> CommandResult:
+    approval = ApprovalService()
+    if not payload.check_only:
+        approval.ensure_allowed("repo.write_many_smart", payload.approval_id, _preview(payload))
+    result = RepoService().write_many_smart(payload.project_path, payload.files, payload.check_only, payload.timeout_seconds, payload.strategy)
+    if not payload.check_only:
+        approval.finalize_command(payload.approval_id, result.exit_code, "repo.write_many_smart succeeded", "repo.write_many_smart failed")
+    JsonStore().log_audit("repo.write_many_smart", "ok" if result.exit_code == 0 else "failed", payload.strategy, _preview(payload))
+    return result
 
 
 @router.post("/write-many-atomic", response_model=CommandResult)
