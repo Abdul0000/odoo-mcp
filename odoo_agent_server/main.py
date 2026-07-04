@@ -78,6 +78,7 @@ def agent_instructions() -> dict:
                 "For hard UI/POS/website/view tasks, include exact post-upgrade Odoo paths in workflow.safe_deploy_module.verify_ui_paths so the deploy job opens each page through CDP and records console/network errors plus Odoo UI breakage.",
                 "SMART ROUTER: for coding tasks, call workflow.smart_tool_router early to choose the fastest correct path. For pure data queries, use direct odoo.search_read and skip repo tools.",
                 "STRICT FRONTEND: before writing any Odoo JS/OWL/POS/website/payment/QWeb/XML/SCSS asset code, call workflow.frontend_pattern_preflight and read the mandatory pattern files it returns. Results are cached; do not guess framework syntax.",
+                "POS CONFIG RULE: never use legacy load_fields('pos.config', ...) / models.load_fields for pos.config. Read installed point_of_sale source and use the version's real loader/backend pattern.",
                 "FAST WRITE RULE: for multi-file edits use repo.write_many_smart first. It keeps lock+backup+rollback for small changes and automatically uses repo.write_many_atomic only when size/risk requires it. Never skip git.diff or impact-aware changed-files verification.",
                 "CACHE RULE: use workflow.repo_index for module/assets/template discovery instead of full repo scans. Reuse cache unless files changed or force_refresh is required.",
             ],

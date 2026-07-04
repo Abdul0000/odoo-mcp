@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import os
 from pathlib import Path
 from typing import List
 
@@ -87,6 +89,7 @@ class Settings(BaseSettings):
     odoosh_ssh_user: str = Field(default="odoo", alias="ODOOSH_SSH_USER")
     odoosh_ssh_port: int = Field(default=22, alias="ODOOSH_SSH_PORT")
     odoosh_ssh_key_path: str | None = Field(default=None, alias="ODOOSH_SSH_KEY_PATH")
+    odoosh_ssh_private_key_b64: str | None = Field(default=None, alias="ODOOSH_SSH_PRIVATE_KEY_B64")
     odoosh_db_name: str | None = Field(default=None, alias="ODOOSH_DB_NAME")
     odoosh_odoo_path: str = Field(default="/home/odoo/src/odoo", alias="ODOOSH_ODOO_PATH")
     odoosh_user_addons_path: str = Field(default="/home/odoo/src/user", alias="ODOOSH_USER_ADDONS_PATH")
@@ -137,6 +140,24 @@ class Settings(BaseSettings):
         path = Path(raw).expanduser().resolve()
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    @property
+    def effective_odoosh_ssh_key_path(self) -> Path | None:
+        if self.odoosh_ssh_key_path:
+            return Path(self.odoosh_ssh_key_path).expanduser().resolve()
+        if not self.odoosh_ssh_private_key_b64:
+            return None
+        key_dir = self.state_path / "keys"
+        key_dir.mkdir(parents=True, exist_ok=True)
+        key_path = key_dir / "odoosh_key"
+        if not key_path.exists():
+            raw = base64.b64decode(self.odoosh_ssh_private_key_b64.encode("ascii"))
+            key_path.write_bytes(raw)
+            try:
+                os.chmod(key_path, 0o600)
+            except OSError:
+                pass
+        return key_path
 
 
 settings = Settings()

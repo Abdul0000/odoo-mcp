@@ -125,9 +125,7 @@ class OdooShService:
             host=settings.odoosh_ssh_host,
             user=settings.odoosh_ssh_user or "odoo",
             port=settings.odoosh_ssh_port,
-            key_path=Path(settings.odoosh_ssh_key_path).expanduser().resolve()
-            if settings.odoosh_ssh_key_path
-            else None,
+            key_path=settings.effective_odoosh_ssh_key_path,
         )
 
     def _base_ssh_command(self, target: SshTarget) -> list[str]:

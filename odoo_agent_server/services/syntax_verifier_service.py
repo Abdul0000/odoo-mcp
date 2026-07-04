@@ -40,6 +40,7 @@ _MODULE_NAME_RE    = re.compile(r"['\"]([A-Za-z0-9_]+)['\"]")
 
 _JS_IMPORT_RE      = re.compile(r'(?:from\s+["\']([^"\']+)["\']|import\s*\(\s*["\']([^"\']+)["\']\s*\))')
 _JS_TEMPLATE_RE    = re.compile(r'(?:static\s+template\s*=|\.template\s*=)\s*["\']([^"\']+)["\']')
+_POS_CONFIG_LOAD_FIELDS_RE = re.compile(r'load_fields\s*\(\s*["\']pos\.config["\']', re.IGNORECASE)
 _T_NAME_RE         = re.compile(r't-name=["\']([^"\']+)["\']')
 _T_INHERIT_RE      = re.compile(r't-inherit=["\']([^"\']+)["\']')
 _T_CALL_RE         = re.compile(r't-call=["\']([^"\']+)["\']')
@@ -676,6 +677,18 @@ class SyntaxVerifierService:
     def _verify_js_owl(self, file_path: str, content: str, template_names: set[str]) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
         modern_signals = ("from \"@" in content or "from '@" in content or "import " in content or "registry.category" in content or "Component" in content)
+
+        if _POS_CONFIG_LOAD_FIELDS_RE.search(content):
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.CRITICAL,
+                check="pos_config_no_load_fields",
+                message="POS code must not use load_fields('pos.config', ...).",
+                fix_hint=(
+                    "Read the installed point_of_sale source first and extend the correct loader/backend pattern. "
+                    "For pos.config data, use the Odoo version's real loader params/model-loading mechanism instead of legacy load_fields."
+                ),
+            ))
 
         if modern_signals and "/** @odoo-module **/" not in content:
             findings.append(VerifyFinding(
