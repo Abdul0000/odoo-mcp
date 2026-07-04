@@ -362,9 +362,9 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="odoo.search_read",
         title="Query Odoo records", description="Run Odoo search_read via XML-RPC", read_only=True),
     ToolDescriptor(name="browser.screenshot",
-        title="Check browser page", description="Navigate an Odoo page through external CDP browser and capture console/network errors; screenshot_path is optional", read_only=True),
+        title="Take browser screenshot", description="Capture Odoo page screenshot with console/network errors", read_only=True),
     ToolDescriptor(name="browser.pos_flow",
-        title="Run POS end-to-end flow", description="Login, open POS, click product, pay, validate order in one CDP browser session with console/network capture at every step. Use for any POS OWL change.", read_only=True),
+        title="Run POS end-to-end flow", description="Login, open POS, click product, pay, validate order in one session — screenshot + console/network capture at every step. Use for any POS OWL change; a single screenshot never exercises click/payment bugs.", read_only=True),
     ToolDescriptor(name="approvals.list",
         title="List pending approvals", description="List pending/recent approval records", read_only=True),
     ToolDescriptor(name="approvals.request",
@@ -873,7 +873,7 @@ async def _dispatch(name: str, args: dict) -> object:
         return OdooRpcService().search_read(req.model, req.domain, req.fields, req.limit, req.offset, req.order, req.context)
     if name == "browser.pos_flow":
         req = PosFlowCheckRequest.model_validate(args)
-        return await CdpBrowserService().run_pos_flow(req)
+        return await PlaywrightService().run_pos_flow(req)
     if name == "browser.screenshot":
         req = BrowserCheckRequest.model_validate(args)
         return await CdpBrowserService().screenshot_odoo_page(

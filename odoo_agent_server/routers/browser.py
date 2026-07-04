@@ -4,7 +4,7 @@ from fastapi import APIRouter
 
 from ..auth import AuthDependency
 from ..schemas import BrowserCheckRequest, BrowserCheckResult, PosFlowCheckRequest, PosFlowCheckResult
-from ..services.browser_cdp_service import CdpBrowserService
+from ..services.playwright_service import PlaywrightService
 
 router = APIRouter(prefix="/browser", tags=["browser"], dependencies=[AuthDependency])
 
@@ -26,9 +26,9 @@ async def browser_screenshot(payload: BrowserCheckRequest) -> BrowserCheckResult
 async def browser_pos_flow(payload: PosFlowCheckRequest) -> PosFlowCheckResult:
     """Run a real end-to-end POS interaction (login -> open POS -> click
     product -> payment -> validate) in one persistent session, with a
-    console/network capture at every step. Use this instead of
+    screenshot and console/network capture at every step. Use this instead of
     /browser/screenshot whenever the change under test touches POS OWL code —
     a single cold-load screenshot never exercises the click/payment surface
     where POS component bugs actually throw.
     """
-    return await CdpBrowserService().run_pos_flow(payload)
+    return await PlaywrightService().run_pos_flow(payload)

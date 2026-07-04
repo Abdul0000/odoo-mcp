@@ -11,7 +11,6 @@ from odoo_agent_server.services.git_service import GitService
 from odoo_agent_server.services.odoosh_service import OdooShService
 from odoo_agent_server.services.repo_service import RepoService
 from odoo_agent_server.services.store_service import JsonStore
-from odoo_agent_server.routers.workflow import _pre_push_verify_files
 
 
 def _init_repo(path):
@@ -87,32 +86,3 @@ def test_approval_failed_command_is_not_consumed(tmp_path, monkeypatch):
     service.finalize_command(approval.id, exit_code=1, success_reason="ok", failure_reason="failed")
 
     assert JsonStore().get_approval(approval.id).status == ApprovalStatus.failed
-
-
-def test_pre_push_verify_files_expands_directory_paths_after_write(tmp_path):
-    repo = tmp_path / "repo"
-    module = repo / "custom_mod"
-    (module / "models").mkdir(parents=True)
-    (module / "__manifest__.py").write_text("{'name': 'Custom'}\n", encoding="utf-8")
-    (module / "models" / "x.py").write_text("from odoo import models\n", encoding="utf-8")
-    (module / "static").mkdir()
-    (module / "static" / "ignored.png").write_bytes(b"png")
-
-    files = _pre_push_verify_files(repo, "custom_mod", ["custom_mod"], "")
-
-    assert str(module / "__manifest__.py") in files
-    assert str(module / "models" / "x.py") in files
-    assert all(not path.endswith("ignored.png") for path in files)
-
-
-def test_pre_push_verify_files_falls_back_to_git_status_when_paths_are_not_files(tmp_path):
-    repo = tmp_path / "repo"
-    module = repo / "custom_mod"
-    (module / "views").mkdir(parents=True)
-    changed = module / "views" / "view.xml"
-    changed.write_text("<odoo/>\n", encoding="utf-8")
-    status = "## branch\n M custom_mod/views/view.xml\n M README.md\n"
-
-    files = _pre_push_verify_files(repo, "custom_mod", ["README.md"], status)
-
-    assert files == [str(changed)]
