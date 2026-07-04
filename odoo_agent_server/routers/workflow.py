@@ -800,10 +800,10 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
 def find_core_file(payload: FindCoreFileRequest) -> FindCoreFileResult:
     """V14: Locate an Odoo core source file by module + type + keyword.
 
-    Search priority (mirrors Odoo.sh module load order):
-      1. /home/odoo/src/user       — custom addons
-      2. /home/odoo/src/enterprise — Odoo enterprise
-      3. /home/odoo/src/odoo       — Odoo community
+    Search priority for installed-source reads:
+      1. /home/odoo/src/enterprise — Odoo enterprise
+      2. /home/odoo/src/odoo       — Odoo community
+      3. /home/odoo/src/user       — fallback for other related custom dependencies
 
     Use before any ``_inherit`` so the agent reads the exact field
     definitions, method signatures, and model structure from source
@@ -829,7 +829,7 @@ def find_similar_view(payload: FindSimilarViewRequest) -> FindSimilarViewResult:
     reads the exact attribute names, field references, and node structure
     from the real source file rather than guessing.
 
-    Search priority: user → enterprise → odoo (same as find_core_file).
+    Search priority: enterprise → odoo → user fallback (same as find_core_file).
 
     Example:
         model="sale.order", view_type="form"
@@ -850,7 +850,7 @@ def list_module_files(payload: ListModuleFilesRequest) -> ListModuleFilesResult:
     browse what exists first, then call find_core_file with a keyword, or
     repo.read directly on a file you spot here.
 
-    Search priority: user → enterprise → odoo (same as find_core_file).
+    Search priority: enterprise → odoo → user fallback (same as find_core_file).
 
     Example:
         module_name="sale", subdir="models"

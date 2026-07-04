@@ -7,10 +7,10 @@ Mandatory dual source read:
   levels), but it does not duplicate the current custom module from
   /home/odoo/src/user.
 
-Search priority (matches Odoo.sh module load order):
-  1. /home/odoo/src/user       (priority 1 — other related custom addons on this server)
-  2. /home/odoo/src/enterprise (priority 2)
-  3. /home/odoo/src/odoo       (priority 3)
+Search priority for installed-source reads:
+  1. /home/odoo/src/enterprise (priority 1)
+  2. /home/odoo/src/odoo       (priority 2)
+  3. /home/odoo/src/user       (priority 3 — fallback for other related custom addons)
 
 Adaptive scope levels:
   L0 (base)     — Custom module already read from checkout; no extra source read
@@ -43,9 +43,9 @@ from ..schemas import (
 # Default search roots ordered by priority
 # ---------------------------------------------------------------------------
 _DEFAULT_ROOTS: list[tuple[int, str]] = [
-    (1, "/home/odoo/src/user"),
-    (2, "/home/odoo/src/enterprise"),
-    (3, "/home/odoo/src/odoo"),
+    (1, "/home/odoo/src/enterprise"),
+    (2, "/home/odoo/src/odoo"),
+    (3, "/home/odoo/src/user"),
 ]
 
 # ---------------------------------------------------------------------------

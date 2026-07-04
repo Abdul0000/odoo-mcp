@@ -703,9 +703,9 @@ class FindCoreFileRequest(BaseModel):
     """V14: Locate an Odoo core source file by module + type + keyword.
 
     Search priority:
-      1. /home/odoo/src/user       (custom, already installed)
-      2. /home/odoo/src/enterprise
-      3. /home/odoo/src/odoo
+      1. /home/odoo/src/enterprise
+      2. /home/odoo/src/odoo
+      3. /home/odoo/src/user       (fallback for other related custom dependencies)
 
     Use before any _inherit, view inherit, or depends to read exact
     fields/methods/xpath structure directly from source.
@@ -730,7 +730,7 @@ class FindCoreFileRequest(BaseModel):
         default_factory=list,
         description=(
             "Override search roots (absolute paths). Defaults to "
-            "['/home/odoo/src/user', '/home/odoo/src/enterprise', '/home/odoo/src/odoo']"
+            "['/home/odoo/src/enterprise', '/home/odoo/src/odoo', '/home/odoo/src/user']"
         ),
     )
 
@@ -753,7 +753,7 @@ class CoreFileMatch(BaseModel):
     path: str = Field(..., description="Absolute path to the found file")
     relative_path: str = Field(..., description="Path relative to its search root")
     root: str = Field(..., description="Which search root this file was found in")
-    priority: int = Field(..., description="1=user, 2=enterprise, 3=odoo — lower is higher priority")
+    priority: int = Field(..., description="1=enterprise, 2=odoo, 3=user fallback — lower is higher priority")
     size: int = Field(..., description="File size in bytes")
 
 
@@ -775,7 +775,7 @@ class FindSimilarViewRequest(BaseModel):
     exact xpath structure, field names, and string attributes before
     writing a <xpath expr="..."> element.
 
-    Search priority: user → enterprise → odoo (same as find_core_file).
+    Search priority: enterprise → odoo → user fallback (same as find_core_file).
     """
     model: str = Field(
         ...,
@@ -787,7 +787,7 @@ class FindSimilarViewRequest(BaseModel):
     )
     search_roots: list[str] = Field(
         default_factory=list,
-        description="Override search roots. Defaults to user → enterprise → odoo.",
+        description="Override search roots. Defaults to enterprise → odoo → user fallback.",
     )
 
     @field_validator("view_type")
@@ -804,7 +804,7 @@ class SimilarViewMatch(BaseModel):
     path: str = Field(..., description="Absolute path to the view XML file")
     relative_path: str = Field(..., description="Relative path within its search root")
     root: str = Field(..., description="Which search root this was found in")
-    priority: int = Field(..., description="1=user, 2=enterprise, 3=odoo")
+    priority: int = Field(..., description="1=enterprise, 2=odoo, 3=user fallback")
     model_hint: str = Field(..., description="Model name extracted from file/path heuristic")
     size: int
 
@@ -832,7 +832,7 @@ class ListModuleFilesRequest(BaseModel):
     )
     search_roots: list[str] = Field(
         default_factory=list,
-        description="Override search roots. Defaults to user → enterprise → odoo.",
+        description="Override search roots. Defaults to enterprise → odoo → user fallback.",
     )
 
     @field_validator("module_name")
@@ -965,7 +965,7 @@ class ScopeAdviceRequest(BaseModel):
     )
     search_roots: list[str] = Field(
         default_factory=list,
-        description="Override search roots. Defaults to user → enterprise → odoo.",
+        description="Override search roots. Defaults to enterprise → odoo → user fallback.",
     )
 
 
@@ -1140,7 +1140,7 @@ class FrontendPatternPreflightRequest(BaseModel):
     )
     search_roots: list[str] = Field(
         default_factory=list,
-        description="Override source roots. Defaults to user → enterprise → odoo.",
+        description="Override source roots. Defaults to enterprise → odoo → user fallback.",
     )
 
 

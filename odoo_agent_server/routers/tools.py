@@ -429,7 +429,8 @@ _TOOL_DESCRIPTORS = [
         description=(
             "V14 SELF-LEARNING: Locate an Odoo core source file by module + type + keyword. "
             "CALL THIS before any _inherit or depends addition to read the real field/method definitions. "
-            "Search priority: /home/odoo/src/user → /home/odoo/src/enterprise → /home/odoo/src/odoo. "
+            "Search priority: /home/odoo/src/enterprise → /home/odoo/src/odoo → /home/odoo/src/user fallback for other related custom dependencies. "
+            "Do not use this to read the current custom module; read that from the active checkout with repo.read. "
             "Returns best_match path — then call repo.read(best_match) to read the actual source. "
             "Example: module_name='sale', file_type='model', keyword='order' "
             "→ /home/odoo/src/odoo/addons/sale/models/sale_order.py"
@@ -442,7 +443,7 @@ _TOOL_DESCRIPTORS = [
         description=(
             "V14 SELF-LEARNING: Locate an Odoo core view XML file by model + view_type. "
             "CALL THIS before writing any <xpath expr='...'> to read the exact node structure. "
-            "Search priority: user → enterprise → odoo. "
+            "Search priority: enterprise → odoo → user fallback for other related custom dependencies. "
             "Returns best_match path — then call repo.read(best_match) to inspect real xpath/attrs. "
             "Example: model='sale.order', view_type='form' "
             "→ /home/odoo/src/enterprise/sale/views/sale_order_views.xml"
@@ -455,7 +456,7 @@ _TOOL_DESCRIPTORS = [
         description=(
             "Browse all files in a core or custom module directory when you don't know the "
             "exact filename/keyword yet. Use subdir='models'|'views'|'static/src' to narrow. "
-            "Search priority: user → enterprise → odoo. "
+            "Search priority: enterprise → odoo → user fallback for other related custom dependencies. "
             "Use this BEFORE find_core_file when unsure what files exist, or find_core_file "
             "directly when you already know module+type+keyword."
         ),

@@ -66,7 +66,7 @@ def agent_instructions() -> dict:
                 "Never edit src/odoo or src/enterprise core files — READ them only",
                 "Dummy data requests → add data.xml",
                 "Coding patterns: github.com/fhidalgodev/odoo-development-skill",
-                "Module reference priority for installed-source reads: /home/odoo/src/user for other related custom dependencies only, then /home/odoo/src/enterprise, then /home/odoo/src/odoo. The current custom module must be read from the active checkout, not duplicated from /home/odoo/src/user.",
+                "Module reference priority for installed-source reads: /home/odoo/src/enterprise, then /home/odoo/src/odoo, then /home/odoo/src/user only as fallback for other related custom dependencies. The current custom module must be read from the active checkout, not duplicated from /home/odoo/src/user.",
                 "Before install/upgrade: repo.read each file and verify imports against core modules",
                 "Long operations return job_id — poll jobs.get every 10s until passed/failed",
                 "Job/workflow responses include status_label and steps_summary fields (e.g. '✅ git.push') — show these directly to the user instead of writing your own status text",
@@ -131,9 +131,9 @@ def agent_instructions() -> dict:
                     "3. Add to depends[] only verified module names",
                 ],
                 "search_priority": [
-                    "1st: /home/odoo/src/user      (custom addons — highest priority)",
-                    "2nd: /home/odoo/src/enterprise",
-                    "3rd: /home/odoo/src/odoo",
+                    "1st: /home/odoo/src/enterprise",
+                    "2nd: /home/odoo/src/odoo",
+                    "3rd: /home/odoo/src/user      (fallback for other related custom dependencies only)",
                 ],
             },
             "strict_frontend_owl_js_xml_preflight": {
@@ -267,9 +267,9 @@ def agent_instructions() -> dict:
                 "branch": branch,
                 "project_path": path,
                 "odoo_src_roots": [
-                    "/home/odoo/src/user",
                     "/home/odoo/src/enterprise",
                     "/home/odoo/src/odoo",
+                    "/home/odoo/src/user (fallback for other related custom dependencies only)",
                 ],
             },
         },
