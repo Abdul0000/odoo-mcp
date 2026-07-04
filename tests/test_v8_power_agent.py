@@ -32,11 +32,11 @@ def test_new_v8_tools_are_exposed():
     client = TestClient(app)
     response = client.get("/tools/list", headers=_auth())
     names = {item["name"] for item in response.json()}
-    assert "workflow.start_session" in names
-    assert "workflow.registry_smoke_test" in names
-    assert "workflow.restore_last_good_commit" in names
-    assert "workflow.browser_menu_crawl" in names
-    assert "odoosh.error_pack" in names
+    assert "workflow_start_session" in names
+    assert "workflow_registry_smoke_test" in names
+    assert "workflow_restore_last_good_commit" in names
+    assert "workflow_browser_menu_crawl" in names
+    assert "odoosh_error_pack" in names
 
 
 def test_safe_deploy_request_accepts_ui_paths(tmp_path):
@@ -51,11 +51,7 @@ def test_safe_deploy_request_accepts_ui_paths(tmp_path):
 
 
 def test_browser_menu_crawl_fails_on_odoo_ui_breakage(monkeypatch):
-<<<<<<< HEAD
     class FakeCdpBrowserService:
-=======
-    class FakePlaywrightService:
->>>>>>> dbbb38fa6fedfe4f22b33bbac26fe212f24abfe6
         async def screenshot_odoo_page(self, *args, **kwargs):
             return BrowserCheckResult(
                 status="failed",
@@ -67,11 +63,7 @@ def test_browser_menu_crawl_fails_on_odoo_ui_breakage(monkeypatch):
                 error="odoo_ui_error_text:RPC_ERROR",
             )
 
-<<<<<<< HEAD
     monkeypatch.setattr(workflow, "CdpBrowserService", FakeCdpBrowserService)
-=======
-    monkeypatch.setattr(workflow, "PlaywrightService", FakePlaywrightService)
->>>>>>> dbbb38fa6fedfe4f22b33bbac26fe212f24abfe6
     client = TestClient(app)
     response = client.post(
         "/workflow/browser-menu-crawl",
@@ -86,6 +78,7 @@ def test_browser_menu_crawl_fails_on_odoo_ui_breakage(monkeypatch):
 
 def test_repo_lock_blocks_second_owner(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_git_repo(repo)

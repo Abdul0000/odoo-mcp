@@ -1,24 +1,23 @@
-"""Real (non-mocked) Playwright integration test for PlaywrightService.run_pos_flow.
+"""Real (non-mocked) CDP integration test for CdpBrowserService.run_pos_flow.
 
-Every other test that touches PlaywrightService (see test_v8_power_agent.py's
-FakePlaywrightService) stubs it out entirely, which means the actual browser
+Most tests stub the browser service, which means the actual CDP browser
 automation code — selectors, click sequence, session persistence, screenshot
 capture, console/network accumulation — has never been exercised by CI.
 
 This test serves a tiny local fixture site that mimics the DOM shape of a
 real POS OWL flow (login -> config select -> new session -> product tile ->
 payment button -> payment method -> validate -> receipt) and points
-run_pos_flow's base_url at it via monkeypatched login route, so the exact
-Playwright API calls in playwright_service.py run for real.
+run_pos_flow's base_url at it, so the exact CDP calls in
+browser_cdp_service.py run for real.
 
-It is skipped automatically if Playwright's Chromium browser isn't installed
-in the current environment (e.g. a minimal CI image that hasn't run
-`playwright install chromium`), rather than failing the whole suite.
+It is skipped automatically unless ODOO_AGENT_CDP_URL points at an already
+running browser that exposes the Chrome DevTools Protocol.
 """
 from __future__ import annotations
 
 import asyncio
 import http.server
+import os
 import threading
 from pathlib import Path
 
@@ -27,15 +26,8 @@ import pytest
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "fake_pos_site"
 
 
-def _chromium_available() -> bool:
-    try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            browser.close()
-        return True
-    except Exception:
-        return False
+def _cdp_available() -> bool:
+    return bool(os.environ.get("ODOO_AGENT_CDP_URL"))
 
 
 @pytest.fixture(scope="module")
@@ -55,13 +47,13 @@ def fake_pos_server():
         thread.join(timeout=5)
 
 
-@pytest.mark.skipif(not _chromium_available(), reason="Playwright Chromium browser is not installed in this environment")
+@pytest.mark.skipif(not _cdp_available(), reason="ODOO_AGENT_CDP_URL is not configured")
 def test_run_pos_flow_happy_path_real_browser(fake_pos_server):
     """Drives the real run_pos_flow against a fixture site that mimics an
     Odoo POS OWL session end-to-end. Fails if any selector/click in
-    playwright_service.py stops matching the DOM shape it expects.
+    browser_cdp_service.py stops matching the DOM shape it expects.
     """
-    from odoo_agent_server.services.playwright_service import PlaywrightService
+    from odoo_agent_server.services.browser_cdp_service import CdpBrowserService
     from odoo_agent_server.schemas import PosFlowCheckRequest
 
     # The fixture's login form redirects straight to pos_backend.html rather
@@ -75,7 +67,7 @@ def test_run_pos_flow_happy_path_real_browser(fake_pos_server):
         screenshot_prefix="test_pos_flow_happy",
     )
 
-    result = asyncio.run(PlaywrightService().run_pos_flow(request))
+    result = asyncio.run(CdpBrowserService().run_pos_flow(request))
 
     step_names = [s.step for s in result.steps]
     assert "login" in step_names
@@ -97,13 +89,13 @@ def test_run_pos_flow_happy_path_real_browser(fake_pos_server):
     assert result.status == "ok"
 
 
-@pytest.mark.skipif(not _chromium_available(), reason="Playwright Chromium browser is not installed in this environment")
+@pytest.mark.skipif(not _cdp_available(), reason="ODOO_AGENT_CDP_URL is not configured")
 def test_run_pos_flow_reports_failure_when_product_tile_missing(fake_pos_server):
     """When the POS catalog fails to render (simulating a real OWL crash),
     run_pos_flow must report click_product as failed with a clear error —
     not raise, and not silently report 'ok'.
     """
-    from odoo_agent_server.services.playwright_service import PlaywrightService
+    from odoo_agent_server.services.browser_cdp_service import CdpBrowserService
     from odoo_agent_server.schemas import PosFlowCheckRequest
 
     # Point pos_config_name so the flow lands on the SAME config click, but we
@@ -120,7 +112,7 @@ def test_run_pos_flow_reports_failure_when_product_tile_missing(fake_pos_server)
         screenshot_prefix="test_pos_flow_broken",
     )
 
-    result = asyncio.run(PlaywrightService().run_pos_flow(request))
+    result = asyncio.run(CdpBrowserService().run_pos_flow(request))
 
     click_product_step = next(s for s in result.steps if s.step == "click_product")
     assert click_product_step.status == "failed"

@@ -991,11 +991,7 @@ async def verify_pos_change(payload: PosChangeVerifyRequest) -> PosChangeVerifyR
     # CRITICAL issues — fix those first, they're cheaper and faster to loop on.
     if payload.run_pos_flow and is_pos and static_result.critical_count == 0:
         flow_req = payload.pos_flow_request or PosFlowCheckRequest()
-<<<<<<< HEAD
         pos_flow_result = await CdpBrowserService().run_pos_flow(flow_req)
-=======
-        pos_flow_result = await PlaywrightService().run_pos_flow(flow_req)
->>>>>>> dbbb38fa6fedfe4f22b33bbac26fe212f24abfe6
 
     push_blocked = static_result.push_blocked or (pos_flow_result is not None and pos_flow_result.status == "failed")
 
@@ -1012,11 +1008,7 @@ async def verify_pos_change(payload: PosChangeVerifyRequest) -> PosChangeVerifyR
         message = "POS flow check was skipped (run_pos_flow=False)."
     elif pos_flow_result.status == "failed":
         failed_steps = [s.step for s in pos_flow_result.steps if s.status == "failed"]
-<<<<<<< HEAD
         message = f"Live POS flow FAILED at step(s): {', '.join(failed_steps) or 'unknown'}. Review console_errors/console_all for that step, fix, and call again with fix_cycle+1."
-=======
-        message = f"Live POS flow FAILED at step(s): {', '.join(failed_steps) or 'unknown'}. Review console_errors/screenshots for that step, fix, and call again with fix_cycle+1."
->>>>>>> dbbb38fa6fedfe4f22b33bbac26fe212f24abfe6
     else:
         message = "Static checks and live POS flow both passed. Safe to git.push."
 
