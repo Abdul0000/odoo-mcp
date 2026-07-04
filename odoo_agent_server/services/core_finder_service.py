@@ -1,17 +1,19 @@
 """V14+ — Self-Learning Agent: Core File Discovery + Adaptive Scope Advisor.
 
-Mandatory Dual Read:
-  Every coding task MUST read both the custom module AND the relevant Odoo core
-  source files. The ScopeAdvisorService decides how deeply to read based on what
-  is found (L0 → L4 adaptive levels).
+Mandatory dual source read:
+  Every coding task MUST read the custom module from the active checkout first,
+  then read only the relevant installed Odoo/Odoo.sh source files. The scope
+  advisor decides how deeply to read based on what is found (L0 → L4 adaptive
+  levels), but it does not duplicate the current custom module from
+  /home/odoo/src/user.
 
 Search priority (matches Odoo.sh module load order):
-  1. /home/odoo/src/user       (priority 1 — custom addons already on this server)
+  1. /home/odoo/src/user       (priority 1 — other related custom addons on this server)
   2. /home/odoo/src/enterprise (priority 2)
   3. /home/odoo/src/odoo       (priority 3)
 
 Adaptive scope levels:
-  L0 (base)     — Always: custom module + core direct files
+  L0 (base)     — Custom module already read from checkout; no extra source read
   L1 (inherit)  — _inherit chain detected → also read parent model
   L2 (mixin)    — Abstract model / mixin detected → read all mixins (mail.thread etc.)
   L3 (computed) — ir.model / computed fields → full module models/ dir scan
@@ -288,15 +290,6 @@ class CoreFinderService:
         instructions: list[ScopeReadInstruction] = []
         reached_level = ScopeLevel.L0
         cross_modules: set[str] = set()
-
-        # L0 baseline: always read custom module manifest
-        instructions.append(ScopeReadInstruction(
-            level=ScopeLevel.L0,
-            reason="Mandatory baseline: always read custom module manifest",
-            read_type="custom_manifest",
-            path=f"{custom_module_name}/__manifest__.py",
-            mandatory=True,
-        ))
 
         # Scan provided custom Python files for patterns
         inherit_models: list[str] = []

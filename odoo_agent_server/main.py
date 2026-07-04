@@ -66,7 +66,7 @@ def agent_instructions() -> dict:
                 "Never edit src/odoo or src/enterprise core files — READ them only",
                 "Dummy data requests → add data.xml",
                 "Coding patterns: github.com/fhidalgodev/odoo-development-skill",
-                "Module reference priority: /home/odoo/src/user → /home/odoo/src/enterprise → /home/odoo/src/odoo",
+                "Module reference priority for installed-source reads: /home/odoo/src/user for other related custom dependencies only, then /home/odoo/src/enterprise, then /home/odoo/src/odoo. The current custom module must be read from the active checkout, not duplicated from /home/odoo/src/user.",
                 "Before install/upgrade: repo.read each file and verify imports against core modules",
                 "Long operations return job_id — poll jobs.get every 10s until passed/failed",
                 "Job/workflow responses include status_label and steps_summary fields (e.g. '✅ git.push') — show these directly to the user instead of writing your own status text",

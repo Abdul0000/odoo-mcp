@@ -916,7 +916,7 @@ class EnsureDependenciesRequest(ApprovalMixin):
 
 class ScopeLevel(str, Enum):
     """Adaptive scope level reached during analysis."""
-    L0 = "L0"  # Baseline: custom + core direct files
+    L0 = "L0"  # Baseline: custom module already read from checkout
     L1 = "L1"  # _inherit chain: read parent model
     L2 = "L2"  # Mixin/abstract: read all mixins
     L3 = "L3"  # Computed fields / ir.model: scan full models/ dir
@@ -930,7 +930,7 @@ class ScopeReadInstruction(BaseModel):
     read_type: str = Field(
         ...,
         description=(
-            "Instruction type: custom_manifest | core_model | core_model_missing | "
+            "Instruction type: core_model | core_model_missing | "
             "core_mixin | core_models_dir_scan | cross_module_manifest"
         ),
     )
@@ -941,10 +941,11 @@ class ScopeReadInstruction(BaseModel):
 class ScopeAdviceRequest(BaseModel):
     """V14+: Request adaptive scope analysis for a coding task.
 
-    Call this AFTER reading custom module files (repo.read) and BEFORE
-    writing any code. The service scans the custom files for _inherit,
-    mixins, computed fields, and cross-module refs, then returns an
-    ordered list of mandatory reads.
+    Call this AFTER reading custom module files from the active repo checkout
+    and BEFORE writing any code. The service scans those custom files for
+    _inherit, mixins, computed fields, and cross-module refs, then returns an
+    ordered list of additional installed-source reads. It should not duplicate
+    the current custom module from /home/odoo/src/user.
     """
     custom_module_name: str = Field(
         ...,
