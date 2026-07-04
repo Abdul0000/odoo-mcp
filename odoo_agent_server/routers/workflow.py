@@ -41,6 +41,10 @@ from ..schemas import (
     # V14+: Pillar 3 — Pre-Push Syntax Verifier
     SyntaxVerifyRequest,
     SyntaxVerifyResult,
+    # V17: Combined static + live POS browser verification with bounded fix-cycle
+    PosChangeVerifyRequest,
+    PosChangeVerifyResult,
+    PosFlowCheckRequest,
     # V15: Strict Odoo frontend/OWL/JS/XML preflight
     FrontendPatternPreflightRequest,
     FrontendPatternPreflightResult,
@@ -869,6 +873,79 @@ def verify_against_core(payload: SyntaxVerifyRequest) -> SyntaxVerifyResult:
         fix_cycle=0
     """
     return SyntaxVerifierService().verify(payload)
+
+
+_POS_FILE_MARKERS = ("point_of_sale", "/pos/", "pos_", "_pos.")
+
+
+def _looks_pos_related(written_files: list[str]) -> bool:
+    lowered = [f.lower() for f in written_files]
+    return any(any(marker in f for marker in _POS_FILE_MARKERS) for f in lowered)
+
+
+@router.post("/verify-pos-change", response_model=PosChangeVerifyResult)
+async def verify_pos_change(payload: PosChangeVerifyRequest) -> PosChangeVerifyResult:
+    """V17: Bounded fix-loop for POS changes — static check AND live browser check.
+
+    verify_against_core alone (even with the real node --check parse added in
+    V17) only proves the JS/XML/manifest are syntactically and pattern-wise
+    sound. It cannot prove the POS screen actually renders, that clicking a
+    product still works, or that the payment/validate flow doesn't throw at
+    runtime. This endpoint runs BOTH under one fix_cycle counter, exactly
+    mirroring the existing verify_against_core contract:
+
+      push_blocked=True, fix_cycle < 3  → fix CRITICAL/failed findings, call
+                                            again with fix_cycle+1
+      push_blocked=True, fix_cycle >= 3 → STOP retrying, report to user
+      push_blocked=False                → safe to git.push
+
+    The live POS flow only runs if written_files look POS-related (or
+    run_pos_flow is forced True) — non-POS changes skip straight to the
+    static-only result to avoid unnecessary browser cost.
+    """
+    static_request = SyntaxVerifyRequest(
+        written_files=payload.written_files,
+        fix_cycle=payload.fix_cycle,
+        project_path=payload.project_path,
+    )
+    static_result = SyntaxVerifierService().verify(static_request)
+
+    pos_flow_result = None
+    is_pos = _looks_pos_related(payload.written_files)
+
+    # Never bother driving a real browser if static checks already found
+    # CRITICAL issues — fix those first, they're cheaper and faster to loop on.
+    if payload.run_pos_flow and is_pos and static_result.critical_count == 0:
+        flow_req = payload.pos_flow_request or PosFlowCheckRequest()
+        pos_flow_result = await PlaywrightService().run_pos_flow(flow_req)
+
+    push_blocked = static_result.push_blocked or (pos_flow_result is not None and pos_flow_result.status == "failed")
+
+    if payload.fix_cycle >= 3 and push_blocked:
+        message = (
+            f"STOP: fix_cycle={payload.fix_cycle} reached the max of 3 with issues still unresolved. "
+            "Report the remaining findings/console errors to the user instead of retrying again."
+        )
+    elif not is_pos:
+        message = "No POS-related files detected in written_files — static verification only was run."
+    elif static_result.critical_count > 0:
+        message = "Static CRITICAL findings exist — fix those first, then call verify_pos_change again to run the live POS flow."
+    elif pos_flow_result is None:
+        message = "POS flow check was skipped (run_pos_flow=False)."
+    elif pos_flow_result.status == "failed":
+        failed_steps = [s.step for s in pos_flow_result.steps if s.status == "failed"]
+        message = f"Live POS flow FAILED at step(s): {', '.join(failed_steps) or 'unknown'}. Review console_errors/screenshots for that step, fix, and call again with fix_cycle+1."
+    else:
+        message = "Static checks and live POS flow both passed. Safe to git.push."
+
+    return PosChangeVerifyResult(
+        push_blocked=push_blocked,
+        status="failed" if push_blocked else "passed",
+        static_result=static_result,
+        pos_flow_result=pos_flow_result,
+        fix_cycle=payload.fix_cycle,
+        message=message,
+    )
 
 
 # ===========================================================================

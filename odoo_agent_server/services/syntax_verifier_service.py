@@ -259,6 +259,7 @@ class SyntaxVerifierService:
                 findings.extend(self._verify_xml_view(file_path, content))
                 findings.extend(self._verify_qweb_template(file_path, content, xml_contents))
             elif path.suffix == ".js":
+                findings.extend(self._verify_js_syntax_real(file_path, content))
                 findings.extend(self._verify_js_owl(file_path, content, template_names))
             elif path.suffix == ".scss":
                 findings.extend(self._verify_scss_asset(file_path, content))
@@ -710,6 +711,91 @@ class SyntaxVerifierService:
                 message="POS JS file does not import from @point_of_sale and is not legacy odoo.define.",
                 fix_hint="Verify this exact POS pattern from point_of_sale/static/src before pushing.",
             ))
+        return findings
+
+    @staticmethod
+    def _verify_js_syntax_real(file_path: str, content: str) -> list[VerifyFinding]:
+        """Actually parse the JS file with Node instead of regex heuristics.
+
+        Regex checks (js_odoo_module_header, js_no_mixed_legacy_modern, etc.)
+        can never catch a plain broken-syntax file (unmatched brace, stray
+        token, bad destructuring) because they only look for known substrings.
+        This runs `node --check` against the real file content, which is a
+        full parse and will fail on any genuine syntax error, with an exact
+        line number. Odoo OWL/JS files are ES modules, so the temp file is
+        written with a .mjs extension — Node infers module parsing from the
+        extension without needing --input-type (which only works on stdin).
+
+        If Node is not installed in this environment, this degrades to a
+        single INFO finding rather than crashing verify_against_core.
+        """
+        import shutil
+        import subprocess
+        import tempfile
+
+        findings: list[VerifyFinding] = []
+        node_path = shutil.which("node")
+        if not node_path:
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.INFO,
+                check="js_real_syntax_check_skipped",
+                message="Node.js not found in this environment; falling back to regex-only JS checks.",
+                fix_hint="Install Node.js in the container so `node --check` can catch real JS syntax errors.",
+            ))
+            return findings
+
+        tmp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False, encoding="utf-8") as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+            completed = subprocess.run(
+                [node_path, "--check", tmp_path],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if completed.returncode != 0:
+                stderr = completed.stderr or ""
+                line_no = None
+                line_match = re.search(re.escape(tmp_path) + r":(\d+)", stderr)
+                if line_match:
+                    line_no = int(line_match.group(1))
+                error_line = next(
+                    (ln for ln in stderr.splitlines() if "Error" in ln or "SyntaxError" in ln),
+                    stderr.strip().splitlines()[-1] if stderr.strip() else "Unknown syntax error",
+                )
+                findings.append(VerifyFinding(
+                    file=file_path,
+                    severity=VerifySeverity.CRITICAL,
+                    check="js_real_syntax_error",
+                    message=f"Node failed to parse this JS file: {error_line.strip()}",
+                    line=line_no,
+                    fix_hint="This is a genuine JS syntax error (not a style/pattern warning) — fix the exact line before anything else.",
+                ))
+        except subprocess.TimeoutExpired:
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.WARNING,
+                check="js_real_syntax_check_timeout",
+                message="Node syntax check timed out after 10s.",
+                fix_hint="File may be unusually large or Node startup is slow in this environment; re-run if this persists.",
+            ))
+        except Exception as exc:  # noqa: BLE001 - this check must never crash verify_against_core
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.INFO,
+                check="js_real_syntax_check_error",
+                message=f"Could not run real JS syntax check: {exc}",
+            ))
+        finally:
+            if tmp_path:
+                try:
+                    Path(tmp_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
         return findings
 
     @staticmethod

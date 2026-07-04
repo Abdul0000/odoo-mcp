@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head><title>POS</title></head>
+<body>
+  <div id="app">
+    <article class="product-card" onclick="document.getElementById('order').innerText='1x Coca-Cola'; document.getElementById('pay-area').style.display='block';">
+      Coca-Cola
+    </article>
+    <div id="order"></div>
+    <div id="pay-area" style="display:none;">
+      <button class="o_pos_payment_button" onclick="document.getElementById('payment-screen').style.display='block'; document.getElementById('pay-area').style.display='none';">Payment</button>
+    </div>
+    <div id="payment-screen" style="display:none;">
+      <button class="paymentmethod" onclick="document.getElementById('validate-area').style.display='block';">Cash</button>
+      <div id="validate-area" style="display:none;">
+        <button onclick="window.location.href='receipt.html'">Validate</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

@@ -354,6 +354,40 @@ class BrowserCheckResult(BaseModel):
     error: str | None = None
 
 
+class PosFlowCheckRequest(BaseModel):
+    """Run a real multi-step POS interaction inside one persistent session,
+    instead of a single cold-load screenshot. Steps are fixed (open POS ->
+    open session if needed -> click first product -> open payment screen ->
+    validate order -> receipt screen) because POS component/state bugs only
+    surface once you actually interact with the app, not on initial mount.
+    """
+    base_url: str | None = Field(default=None)
+    login: str | None = Field(default=None)
+    password: str | None = Field(default=None)
+    pos_config_name: str | None = Field(default=None, description="Optional POS config display name to open; if omitted, opens the first available POS.")
+    product_name: str | None = Field(default=None, description="Optional exact/partial product name to click; if omitted, clicks the first product tile found.")
+    payment_method_name: str | None = Field(default=None, description="Optional payment method button label; if omitted, clicks the first payment method tile found.")
+    screenshot_prefix: str = Field(default="pos_flow")
+    timeout_seconds: int = Field(default=60, ge=15, le=180)
+
+
+class PosFlowStepResult(BaseModel):
+    step: str
+    status: Literal["ok", "failed", "skipped"]
+    screenshot_path: str | None = None
+    console_errors: list[str] = Field(default_factory=list)
+    network_errors: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
+class PosFlowCheckResult(BaseModel):
+    status: Literal["ok", "failed"]
+    steps: list[PosFlowStepResult] = Field(default_factory=list)
+    console_errors: list[str] = Field(default_factory=list, description="All console errors across the whole session, deduplicated.")
+    network_errors: list[str] = Field(default_factory=list, description="All network errors across the whole session, deduplicated.")
+    error: str | None = None
+
+
 class ApprovalStatus(str, Enum):
     pending = "pending"
     approved = "approved"
@@ -914,6 +948,7 @@ class VerifyFinding(BaseModel):
     check: str = Field(..., description="Name of the check that fired")
     message: str = Field(..., description="Human-readable description of the mismatch")
     fix_hint: str = Field("", description="What to do to fix this issue")
+    line: int | None = Field(default=None, description="Line number in `file` where the issue was found, when known (e.g. real JS parse errors).")
 
 
 class SyntaxVerifyRequest(BaseModel):
@@ -981,6 +1016,31 @@ class SyntaxVerifyResult(BaseModel):
     warning_count: int = 0
     info_count: int = 0
     fix_cycle: int = 0
+
+
+class PosChangeVerifyRequest(BaseModel):
+    """Combined static + live-browser verification for a POS-touching change.
+
+    This exists because verify_against_core alone only catches static
+    pattern mistakes (regex + now real JS parse errors); it never proves the
+    POS UI actually still works. This wraps verify_against_core AND
+    browser.pos_flow behind one bounded fix-cycle counter, mirroring the
+    existing verify_against_core contract (push_blocked / fix_cycle / max 3).
+    """
+    written_files: list[str] = Field(..., description="Absolute paths of files changed in this task (.py/.xml/.js/.scss/__manifest__.py).")
+    fix_cycle: int = Field(default=0, description="Current fix cycle number (0-indexed). After 3 cycles, stop and report to the user.")
+    project_path: str | None = Field(default=None)
+    run_pos_flow: bool = Field(default=True, description="If true and any written_files look POS-related, also run a live browser.pos_flow check.")
+    pos_flow_request: "PosFlowCheckRequest | None" = Field(default=None, description="Optional overrides (base_url/login/product_name/etc.) for the POS flow step.")
+
+
+class PosChangeVerifyResult(BaseModel):
+    push_blocked: bool
+    status: str
+    static_result: SyntaxVerifyResult
+    pos_flow_result: "PosFlowCheckResult | None" = None
+    fix_cycle: int = 0
+    message: str
 
 # ===========================================================================
 # V15 — Strict Odoo Frontend / OWL / JS / XML Preflight

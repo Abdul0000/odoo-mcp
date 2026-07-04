@@ -12,6 +12,7 @@ from ..schemas import (
     AuditListRequest,
     BaseProjectRequest,
     BrowserCheckRequest,
+    PosFlowCheckRequest,
     StartSessionRequest,
     RegistrySmokeTestRequest,
     RestoreLastGoodCommitRequest,
@@ -63,6 +64,7 @@ from ..schemas import (
     ScopeAdviceRequest,
     # V14+: Pillar 3 — Pre-Push Syntax Verifier
     SyntaxVerifyRequest,
+    PosChangeVerifyRequest,
     # V15: Strict Odoo frontend/OWL/JS/XML preflight
     FrontendPatternPreflightRequest,
     # V16: fast/correct router and repo index
@@ -79,7 +81,7 @@ from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_write_ma
 from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
-from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, frontend_pattern_preflight, smart_tool_router, repo_index
+from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
@@ -340,6 +342,8 @@ _TOOL_DESCRIPTORS = [
         title="Query Odoo records", description="Run Odoo search_read via XML-RPC", read_only=True),
     ToolDescriptor(name="browser.screenshot",
         title="Take browser screenshot", description="Capture Odoo page screenshot with console/network errors", read_only=True),
+    ToolDescriptor(name="browser.pos_flow",
+        title="Run POS end-to-end flow", description="Login, open POS, click product, pay, validate order in one session — screenshot + console/network capture at every step. Use for any POS OWL change; a single screenshot never exercises click/payment bugs.", read_only=True),
     ToolDescriptor(name="approvals.list",
         title="List pending approvals", description="List pending/recent approval records", read_only=True),
     ToolDescriptor(name="approvals.request",
@@ -467,6 +471,18 @@ _TOOL_DESCRIPTORS = [
         ),
         read_only=True,
     ),
+    ToolDescriptor(
+        name="workflow.verify_pos_change",
+        title="Verify POS change (static + live browser)",
+        description=(
+            "V17 MANDATORY FOR POS CHANGES: Combines workflow.verify_against_core (static, incl. real node --check JS parse) "
+            "with a live browser.pos_flow run (login -> open POS -> click product -> payment -> validate) under ONE bounded "
+            "fix_cycle counter (max 3, same contract as verify_against_core). Only runs the live browser step if written_files "
+            "look POS-related AND static checks have zero CRITICAL findings. Use this instead of verify_against_core alone "
+            "whenever the task touches point_of_sale JS/XML/OWL — static checks cannot prove the POS UI actually still works."
+        ),
+        read_only=True,
+    ),
 ]
 
 _TOOL_INPUT_MODELS = {
@@ -520,6 +536,7 @@ _TOOL_INPUT_MODELS = {
     "odoo.module_update": OdooRpcModuleRequest,
     "odoo.search_read": OdooSearchReadRequest,
     "browser.screenshot": BrowserCheckRequest,
+    "browser.pos_flow": PosFlowCheckRequest,
     "approvals.list": LimitRequest,
     "approvals.request": ApprovalCreateRequest,
     "jobs.list": LimitRequest,
@@ -536,6 +553,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.list_module_files": ListModuleFilesRequest,
     "workflow.scope_advice": ScopeAdviceRequest,
     "workflow.verify_against_core": SyntaxVerifyRequest,
+    "workflow.verify_pos_change": PosChangeVerifyRequest,
 }
 
 
@@ -820,6 +838,9 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "odoo.search_read":
         req = OdooSearchReadRequest.model_validate(args)
         return OdooRpcService().search_read(req.model, req.domain, req.fields, req.limit, req.offset, req.order, req.context)
+    if name == "browser.pos_flow":
+        req = PosFlowCheckRequest.model_validate(args)
+        return await PlaywrightService().run_pos_flow(req)
     if name == "browser.screenshot":
         req = BrowserCheckRequest.model_validate(args)
         return await PlaywrightService().screenshot_odoo_page(
@@ -876,6 +897,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return scope_advice(ScopeAdviceRequest.model_validate(args))
     if name == "workflow.verify_against_core":
         return verify_against_core(SyntaxVerifyRequest.model_validate(args))
+    if name == "workflow.verify_pos_change":
+        return await verify_pos_change(PosChangeVerifyRequest.model_validate(args))
     raise HTTPException(status_code=404, detail=f"Unknown tool: {name}")
 
 
