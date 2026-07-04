@@ -74,6 +74,12 @@ class JobGetRequest(BaseModel):
     poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
 
 
+class ArtifactReadRequest(BaseModel):
+    artifact_id: str = Field(..., min_length=1, max_length=120, description="Artifact id returned by a previous tool response")
+    offset: int = Field(default=0, ge=0, description="Zero-based character offset for text artifacts")
+    max_chars: int = Field(default=12000, ge=1, le=50000, description="Maximum characters to return")
+
+
 class SelfRunRequest(BaseProjectRequest):
     module_name: str = Field(..., description="Custom module folder name inside the repo")
     run_pytest: bool = Field(default=True)
@@ -165,6 +171,20 @@ class RepoListRequest(BaseProjectRequest):
 class RepoReadRequest(BaseProjectRequest):
     relative_path: str
     max_bytes: int = Field(default=300_000, ge=100, le=2_000_000)
+
+
+class RepoReadRangeRequest(BaseProjectRequest):
+    relative_path: str
+    start_line: int = Field(default=1, ge=1, description="1-based first line to read")
+    max_lines: int = Field(default=200, ge=1, le=2000, description="Maximum number of lines to return")
+
+
+class RepoSearchRequest(BaseProjectRequest):
+    pattern: str = Field(..., min_length=1, max_length=500, description="Literal text or regex pattern to search for")
+    relative_path: str = Field(default=".", description="Directory or file inside project_path to search")
+    max_matches: int = Field(default=100, ge=1, le=1000)
+    context_lines: int = Field(default=2, ge=0, le=10)
+    regex: bool = Field(default=False, description="Treat pattern as a Python regular expression instead of literal text")
 
 
 class RepoWriteRequest(BaseProjectRequest, ApprovalMixin):
@@ -349,7 +369,44 @@ class BrowserCheckResult(BaseModel):
     url: str | None = None
     title: str | None = None
     screenshot_path: str | None = None
-    console_errors: list[str] = Field(default_factory=list)
+    console_errors: list[str] = Field(default_factory=list, description="console.error/warning + pageerror entries.")
+    console_all: list[str] = Field(default_factory=list, description="EVERY console message (log/info/debug/warning/error), in order. Always populated — read this for full console output on every run, not just when something fails.")
+    network_errors: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
+class PosFlowCheckRequest(BaseModel):
+    """Run a real multi-step POS interaction inside one persistent session,
+    instead of a single cold-load screenshot. Steps are fixed (open POS ->
+    open session if needed -> click first product -> open payment screen ->
+    validate order -> receipt screen) because POS component/state bugs only
+    surface once you actually interact with the app, not on initial mount.
+    """
+    base_url: str | None = Field(default=None)
+    login: str | None = Field(default=None)
+    password: str | None = Field(default=None)
+    pos_config_name: str | None = Field(default=None, description="Optional POS config display name to open; if omitted, opens the first available POS.")
+    product_name: str | None = Field(default=None, description="Optional exact/partial product name to click; if omitted, clicks the first product tile found.")
+    payment_method_name: str | None = Field(default=None, description="Optional payment method button label; if omitted, clicks the first payment method tile found.")
+    screenshot_prefix: str = Field(default="pos_flow")
+    timeout_seconds: int = Field(default=60, ge=15, le=180)
+
+
+class PosFlowStepResult(BaseModel):
+    step: str
+    status: Literal["ok", "failed", "skipped"]
+    screenshot_path: str | None = None
+    console_errors: list[str] = Field(default_factory=list, description="console.error/warning + pageerror entries for this step only.")
+    console_all: list[str] = Field(default_factory=list, description="EVERY console message (log/info/debug/warning/error) for this step, in order. Read this whenever you need full console output, not just errors.")
+    network_errors: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
+class PosFlowCheckResult(BaseModel):
+    status: Literal["ok", "failed"]
+    steps: list[PosFlowStepResult] = Field(default_factory=list)
+    console_errors: list[str] = Field(default_factory=list, description="All console errors/warnings across the whole session, deduplicated.")
+    console_all: list[str] = Field(default_factory=list, description="EVERY console message across the whole session (log/info/debug/warning/error), in order. Always populated regardless of pass/fail — read this for full console output on every run.")
     network_errors: list[str] = Field(default_factory=list)
     error: str | None = None
 
@@ -914,6 +971,7 @@ class VerifyFinding(BaseModel):
     check: str = Field(..., description="Name of the check that fired")
     message: str = Field(..., description="Human-readable description of the mismatch")
     fix_hint: str = Field("", description="What to do to fix this issue")
+    line: int | None = Field(default=None, description="Line number in `file` where the issue was found, when known (e.g. real JS parse errors).")
 
 
 class SyntaxVerifyRequest(BaseModel):
@@ -981,6 +1039,31 @@ class SyntaxVerifyResult(BaseModel):
     warning_count: int = 0
     info_count: int = 0
     fix_cycle: int = 0
+
+
+class PosChangeVerifyRequest(BaseModel):
+    """Combined static + live-browser verification for a POS-touching change.
+
+    This exists because verify_against_core alone only catches static
+    pattern mistakes (regex + now real JS parse errors); it never proves the
+    POS UI actually still works. This wraps verify_against_core AND
+    browser.pos_flow behind one bounded fix-cycle counter, mirroring the
+    existing verify_against_core contract (push_blocked / fix_cycle / max 3).
+    """
+    written_files: list[str] = Field(..., description="Absolute paths of files changed in this task (.py/.xml/.js/.scss/__manifest__.py).")
+    fix_cycle: int = Field(default=0, description="Current fix cycle number (0-indexed). After 3 cycles, stop and report to the user.")
+    project_path: str | None = Field(default=None)
+    run_pos_flow: bool = Field(default=True, description="If true and any written_files look POS-related, also run a live browser.pos_flow check.")
+    pos_flow_request: "PosFlowCheckRequest | None" = Field(default=None, description="Optional overrides (base_url/login/product_name/etc.) for the POS flow step.")
+
+
+class PosChangeVerifyResult(BaseModel):
+    push_blocked: bool
+    status: str
+    static_result: SyntaxVerifyResult
+    pos_flow_result: "PosFlowCheckResult | None" = None
+    fix_cycle: int = 0
+    message: str
 
 # ===========================================================================
 # V15 — Strict Odoo Frontend / OWL / JS / XML Preflight

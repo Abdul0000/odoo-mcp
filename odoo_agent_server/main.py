@@ -27,7 +27,7 @@ app = FastAPI(
     description=(
         "V14 Self-Learning Agent connector for ChatGPT Odoo development automation: "
         "core file discovery (find_core_file + find_similar_view), "
-        "repo patching, self QA, Git, Odoo.sh, Odoo RPC, Playwright screenshots, "
+        "repo patching, self QA, Git, Odoo.sh, Odoo RPC, CDP browser diagnostics, "
         "approvals, jobs/audit, full MCP conversion, OAuth 2.1/PKCE MCP auth, and tool-call bridge."
     ),
 )
@@ -74,8 +74,8 @@ def agent_instructions() -> dict:
                 "On error: diagnose first, fix, retry max 3x — never blind retry",
                 "Binary files (.png/.jpg/.ico/.woff/.ttf) cannot be read via repo.read — skip them (415 error expected)",
                 "For files >300KB pass max_bytes=500000 to repo.read",
-                "For simple field/view/notebook edits, use the small_patch_fast_path: reuse session state, read only targeted files, skip broad discovery/health/screenshots unless needed.",
-                "For hard UI/POS/website/view tasks, include exact post-upgrade Odoo paths in workflow.safe_deploy_module.verify_ui_paths so the deploy job opens each page and records screenshots, console/network errors, and Odoo UI breakage.",
+                "For simple field/view/notebook edits, use the small_patch_fast_path: reuse session state, read only targeted files, skip broad discovery/health/browser diagnostics unless needed.",
+                "For hard UI/POS/website/view tasks, include exact post-upgrade Odoo paths in workflow.safe_deploy_module.verify_ui_paths so the deploy job opens each page through CDP and records console/network errors plus Odoo UI breakage.",
                 "SMART ROUTER: for coding tasks, call workflow.smart_tool_router early to choose the fastest correct path. For pure data queries, use direct odoo.search_read and skip repo tools.",
                 "STRICT FRONTEND: before writing any Odoo JS/OWL/POS/website/payment/QWeb/XML/SCSS asset code, call workflow.frontend_pattern_preflight and read the mandatory pattern files it returns. Results are cached; do not guess framework syntax.",
                 "FAST WRITE RULE: for multi-file edits use repo.write_many_smart first. It keeps lock+backup+rollback for small changes and automatically uses repo.write_many_atomic only when size/risk requires it. Never skip git.diff or impact-aware changed-files verification.",
@@ -98,7 +98,7 @@ def agent_instructions() -> dict:
                 "do_not": [
                     "Do not repeatedly look up the tool list after the first successful tool call.",
                     "Do not crawl all custom modules when the target module is already known.",
-                    "Do not run browser screenshots for a backend field unless the user asks for visible UI proof.",
+                    "Do not run browser diagnostics for a backend field unless the user asks for visible UI proof.",
                 ],
             },
             "mandatory_dual_read": {

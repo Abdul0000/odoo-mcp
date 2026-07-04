@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     allowed_roots_raw: str = Field(default="/workspace/repos,/tmp,/home/odoo/src", alias="ODOO_AGENT_ALLOWED_ROOTS")
     state_dir: str = Field(default="/tmp/odoo_agent_state", alias="ODOO_AGENT_STATE_DIR")
     screenshot_dir: str = Field(default="/tmp/odoo_agent_screenshots", alias="ODOO_AGENT_SCREENSHOT_DIR")
+    cdp_url: str | None = Field(default=None, alias="ODOO_AGENT_CDP_URL")
 
     # Approval gating is disabled in this build so ChatGPT MCP tools can write, commit, push, and deploy directly.
     require_approval: bool = Field(default=False, alias="ODOO_AGENT_REQUIRE_APPROVAL")

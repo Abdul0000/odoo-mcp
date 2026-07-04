@@ -41,6 +41,10 @@ from ..schemas import (
     # V14+: Pillar 3 — Pre-Push Syntax Verifier
     SyntaxVerifyRequest,
     SyntaxVerifyResult,
+    # V17: Combined static + live POS browser verification with bounded fix-cycle
+    PosChangeVerifyRequest,
+    PosChangeVerifyResult,
+    PosFlowCheckRequest,
     # V15: Strict Odoo frontend/OWL/JS/XML preflight
     FrontendPatternPreflightRequest,
     FrontendPatternPreflightResult,
@@ -57,7 +61,7 @@ from ..services.git_service import GitService
 from ..services.odoo_rpc_service import OdooRpcService
 from ..services.odoosh_service import OdooShService
 from ..services.path_service import resolve_allowed_path
-from ..services.playwright_service import PlaywrightService
+from ..services.browser_cdp_service import CdpBrowserService
 from ..services.repo_service import RepoService
 from ..services.store_service import JsonStore
 from ..services.background_executor import submit_background
@@ -105,10 +109,10 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Use the small-patch path: if session.load_state already has project_path/client_name, skip workflow.start_session; otherwise call workflow.start_session with include_odoo=false and include_odoosh=false.",
             "Call repo.prepare once, then read only the target module manifest plus the specific model/view files needed for the requested field or notebook change.",
             "If the patch touches JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, call workflow.frontend_pattern_preflight after reading custom files and read every mandatory source pattern before coding.",
-            "For a field on an existing inherited model, read the matching core model/view once with workflow.find_core_file or workflow.find_similar_view only when the existing custom file does not already prove the pattern.",
+            "MANDATORY Odoo.sh source layer before writing: call workflow.scope_advice after reading custom files, then repo.read every mandatory user/enterprise/odoo source path it returns. This verifies Enterprise/core syntax and patterns before any patch.",
             "Patch the smallest file set with repo.apply_patch_atomic or repo.write_many_atomic; do not run broad module discovery again after the target module is known.",
             "Run git.diff and qa.self_run with run_pytest=false unless Python tests are present or the patch touches shared logic.",
-            "Run workflow.verify_against_core only for the changed .py/.xml/__manifest__.py files, then git.commit and git.push.",
+            "MANDATORY before push: run workflow.verify_against_core for changed .py/.xml/.js/__manifest__.py files. If push_blocked=true, fix and re-run; only then git.commit and git.push.",
             "After push, poll odoosh.check_commit for the pushed SHA, then call odoo.module_deploy with wait_timeout_seconds=5; use jobs.get only if it returns a running job.",
             "Verify the exact field with odoo.search_read or workflow.registry_smoke_test; if the user asks for visible UI proof, pass the exact Odoo web path in verify_ui_paths during deploy or call workflow.browser_menu_crawl once.",
         ]
@@ -116,6 +120,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "session.load_state",
             "repo.prepare",
             "repo.read",
+            "workflow.scope_advice",
             "repo.apply_patch_atomic",
             "repo.write_many_atomic",
             "git.diff",
@@ -135,8 +140,10 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Call repo.list_custom_modules on the returned project_path; choose the target custom module from __manifest__.py files, not from Odoo's installed module list only.",
             f"Read the target module files first: {module_name}/__manifest__.py, models, views, security, and relevant static files.",
             "For JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, call workflow.frontend_pattern_preflight with task_description, target_module_name, custom_file_paths, and planned_file_paths; then repo.read all mandatory pattern files returned before implementation.",
+            "MANDATORY Odoo.sh source layer before writing: call workflow.scope_advice after reading custom files, then repo.read every mandatory user/enterprise/odoo source path it returns. This is the Enterprise/core syntax and pattern verification layer.",
             "Apply edits atomically: use repo.apply_patch_atomic for multi-file diffs or repo.write_many_atomic for multi-file/new-module writes. Use repo.apply_patch/repo.write only for small single-file changes. Do not edit Odoo core, enterprise, .git, or unrelated modules.",
             "Run git.diff and qa.self_run. Treat pytest environment failures separately from real module errors.",
+            "MANDATORY before push: run workflow.verify_against_core for changed .py/.xml/.js/__manifest__.py files. If push_blocked=true, fix and re-run; do not push while blocked.",
             "Commit only related paths with git.commit using a clear message.",
             "Push to the exact target branch with git.push; branch must match TARGET_GIT_BRANCH when configured. Note the 'sha' in the push response.",
             "Poll Odoo.sh deploy using odoosh.check_commit with the pushed sha. It returns immediately with deployed=true/false. If false, wait 15 seconds and call again. Max 20 retries.",
@@ -149,11 +156,13 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "repo.list_custom_modules",
             "repo.read",
             "workflow.frontend_pattern_preflight",
+            "workflow.scope_advice",
             "repo.apply_patch_atomic",
             "repo.write_many_atomic",
             "repo.apply_patch",
             "git.diff",
             "qa.self_run",
+            "workflow.verify_against_core",
             "git.commit",
             "git.push",
             "odoosh.check_commit",
@@ -172,7 +181,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Use atomic multi-file tools for broad changes so incomplete states are not left in the checkout.",
             "Only patch the requested module and related files.",
             "Do not upgrade Odoo.sh until the expected pushed SHA is deployed.",
-            "For small patches, avoid repeated tool discovery, broad source reads, full health checks, and screenshots unless they are needed to prove the requested change.",
+            "For small patches, avoid repeated tool discovery, broad source reads, full health checks, and browser diagnostics unless they are needed to prove the requested change.",
             "For hard UI/POS/website/accounting view tasks, verify exact affected views in a browser after upgrade using verify_ui_paths or workflow.browser_menu_crawl.",
             "For JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, frontend_pattern_preflight is blocking: do not write code until real framework source patterns are read.",
         ],
@@ -202,13 +211,13 @@ def capability_check() -> CapabilityCheckResult:
     ])}
     checks["odoosh_config"] = {"ok": bool(settings.odoosh_ssh_host), "host_configured": bool(settings.odoosh_ssh_host)}
     checks["state_dir"] = {"ok": settings.state_path.exists(), "path": str(settings.state_path)}
-    checks["screenshots"] = {"ok": Path(settings.screenshot_dir).expanduser().resolve().parent.exists(), "path": settings.screenshot_dir}
-    try:
-        import playwright  # noqa: F401
-
-        checks["playwright_python"] = {"ok": True}
-    except Exception as exc:  # noqa: BLE001
-        checks["playwright_python"] = {"ok": False, "error": str(exc)}
+    checks["browser_artifact_dir"] = {"ok": Path(settings.screenshot_dir).expanduser().resolve().parent.exists(), "path": settings.screenshot_dir}
+    cdp_url = os.environ.get("ODOO_AGENT_CDP_URL") or settings.cdp_url
+    checks["cdp_browser"] = {
+        "ok": bool(cdp_url),
+        "url_configured": bool(cdp_url),
+        "note": "Set ODOO_AGENT_CDP_URL to a Chrome remote debugging endpoint for UI console diagnostics.",
+    }
     failed = [key for key, item in checks.items() if not item.get("ok")]
     if not failed:
         status = "ready"
@@ -370,7 +379,7 @@ async def browser_menu_crawl(payload: MenuCrawlerRequest) -> WorkflowReport:
     flags: list[str] = []
     failed = False
     for index, path in enumerate(payload.paths, start=1):
-        result = await PlaywrightService().screenshot_odoo_page(payload.base_url, payload.login, payload.password, path, f"{payload.screenshot_prefix}_{index}.png", payload.timeout_seconds, full_page=True)
+        result = await CdpBrowserService().screenshot_odoo_page(payload.base_url, payload.login, payload.password, path, f"{payload.screenshot_prefix}_{index}.png", payload.timeout_seconds, full_page=True)
         status_ = "passed" if result.status == "ok" and not result.console_errors and not result.network_errors else "failed" if result.status == "failed" else "warning"
         if status_ == "failed":
             failed = True
@@ -451,7 +460,7 @@ async def full_verify(payload: FullVerifyRequest) -> WorkflowReport:
             status_flags.append("warning")
 
     if payload.take_browser_screenshot:
-        result = await PlaywrightService().screenshot_odoo_page(
+        result = await CdpBrowserService().screenshot_odoo_page(
             None,
             None,
             None,
@@ -523,6 +532,52 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             "module_name": payload.module_name,
         },
     )
+
+
+def _pre_push_verify_files(project: Path, module_name: str, paths: list[str], status_output: str) -> list[str]:
+    """Return completed written module files that must pass pre-push verification."""
+    allowed_suffixes = (".py", ".xml", ".js", ".scss", "__manifest__.py")
+    module_prefix = f"{module_name}/"
+
+    def status_candidates() -> list[str]:
+        found: list[str] = []
+        for raw_line in status_output.splitlines():
+            if not raw_line or raw_line.startswith("##"):
+                continue
+            path_part = raw_line[3:].strip() if len(raw_line) > 3 else raw_line.strip()
+            if " -> " in path_part:
+                path_part = path_part.rsplit(" -> ", 1)[-1].strip()
+            if path_part:
+                found.append(path_part)
+        return found
+
+    def collect(candidates: list[str]) -> list[str]:
+        written: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            rel = candidate.replace("\\", "/").strip()
+            if not rel or rel.startswith(".git/"):
+                continue
+            target = (project / rel).resolve()
+            if not (target == project or project in target.parents):
+                continue
+            targets = [target] if target.is_file() else sorted(p for p in target.rglob("*") if p.is_file()) if target.is_dir() else []
+            for file_target in targets:
+                rel_posix = file_target.relative_to(project).as_posix()
+                if not (rel_posix == f"{module_name}/__manifest__.py" or rel_posix.startswith(module_prefix)):
+                    continue
+                if not rel_posix.endswith(allowed_suffixes):
+                    continue
+                value = str(file_target)
+                if value not in seen:
+                    seen.add(value)
+                    written.append(value)
+        return written
+
+    written = collect(paths) if paths else []
+    if written:
+        return written
+    return collect(status_candidates())
 
 
 def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
@@ -613,6 +668,29 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             _fail("qa_self_run", qa_report)
             return
 
+    verify_files = _pre_push_verify_files(project_path, payload.module_name, payload.paths, status_result.stdout)
+    if verify_files:
+        verify_result = SyntaxVerifierService().verify(SyntaxVerifyRequest(
+            written_files=verify_files,
+            fix_cycle=0,
+            project_path=str(project_path),
+        ))
+        _step("verify_against_core_pre_push", "failed" if verify_result.push_blocked else "passed", verify_result)
+        if verify_result.push_blocked:
+            _fail("verify_against_core_pre_push", verify_result)
+            return
+    else:
+        _step(
+            "verify_against_core_pre_push",
+            "warning",
+            {
+                "message": (
+                    "No changed module .py/.xml/.js/.scss/__manifest__.py files were detected for pre-push verification. "
+                    "Push gate passed only because there were no verifiable code files in this deploy request."
+                )
+            },
+        )
+
     identity_result = git.configure_identity(str(project_path))
     if identity_result.exit_code != 0:
         _fail("git_configure_identity", identity_result)
@@ -676,7 +754,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     if payload.verify_ui_paths:
         ui_results = []
         for index, path in enumerate(payload.verify_ui_paths, start=1):
-            result = asyncio.run(PlaywrightService().screenshot_odoo_page(
+            result = asyncio.run(CdpBrowserService().screenshot_odoo_page(
                 None,
                 None,
                 None,
@@ -869,6 +947,79 @@ def verify_against_core(payload: SyntaxVerifyRequest) -> SyntaxVerifyResult:
         fix_cycle=0
     """
     return SyntaxVerifierService().verify(payload)
+
+
+_POS_FILE_MARKERS = ("point_of_sale", "/pos/", "pos_", "_pos.")
+
+
+def _looks_pos_related(written_files: list[str]) -> bool:
+    lowered = [f.lower() for f in written_files]
+    return any(any(marker in f for marker in _POS_FILE_MARKERS) for f in lowered)
+
+
+@router.post("/verify-pos-change", response_model=PosChangeVerifyResult)
+async def verify_pos_change(payload: PosChangeVerifyRequest) -> PosChangeVerifyResult:
+    """V17: Bounded fix-loop for POS changes — static check AND live browser check.
+
+    verify_against_core alone (even with the real node --check parse added in
+    V17) only proves the JS/XML/manifest are syntactically and pattern-wise
+    sound. It cannot prove the POS screen actually renders, that clicking a
+    product still works, or that the payment/validate flow doesn't throw at
+    runtime. This endpoint runs BOTH under one fix_cycle counter, exactly
+    mirroring the existing verify_against_core contract:
+
+      push_blocked=True, fix_cycle < 3  → fix CRITICAL/failed findings, call
+                                            again with fix_cycle+1
+      push_blocked=True, fix_cycle >= 3 → STOP retrying, report to user
+      push_blocked=False                → safe to git.push
+
+    The live POS flow only runs if written_files look POS-related (or
+    run_pos_flow is forced True) — non-POS changes skip straight to the
+    static-only result to avoid unnecessary browser cost.
+    """
+    static_request = SyntaxVerifyRequest(
+        written_files=payload.written_files,
+        fix_cycle=payload.fix_cycle,
+        project_path=payload.project_path,
+    )
+    static_result = SyntaxVerifierService().verify(static_request)
+
+    pos_flow_result = None
+    is_pos = _looks_pos_related(payload.written_files)
+
+    # Never bother driving a real browser if static checks already found
+    # CRITICAL issues — fix those first, they're cheaper and faster to loop on.
+    if payload.run_pos_flow and is_pos and static_result.critical_count == 0:
+        flow_req = payload.pos_flow_request or PosFlowCheckRequest()
+        pos_flow_result = await CdpBrowserService().run_pos_flow(flow_req)
+
+    push_blocked = static_result.push_blocked or (pos_flow_result is not None and pos_flow_result.status == "failed")
+
+    if payload.fix_cycle >= 3 and push_blocked:
+        message = (
+            f"STOP: fix_cycle={payload.fix_cycle} reached the max of 3 with issues still unresolved. "
+            "Report the remaining findings/console errors to the user instead of retrying again."
+        )
+    elif not is_pos:
+        message = "No POS-related files detected in written_files — static verification only was run."
+    elif static_result.critical_count > 0:
+        message = "Static CRITICAL findings exist — fix those first, then call verify_pos_change again to run the live POS flow."
+    elif pos_flow_result is None:
+        message = "POS flow check was skipped (run_pos_flow=False)."
+    elif pos_flow_result.status == "failed":
+        failed_steps = [s.step for s in pos_flow_result.steps if s.status == "failed"]
+        message = f"Live POS flow FAILED at step(s): {', '.join(failed_steps) or 'unknown'}. Review console_errors/console_all for that step, fix, and call again with fix_cycle+1."
+    else:
+        message = "Static checks and live POS flow both passed. Safe to git.push."
+
+    return PosChangeVerifyResult(
+        push_blocked=push_blocked,
+        status="failed" if push_blocked else "passed",
+        static_result=static_result,
+        pos_flow_result=pos_flow_result,
+        fix_cycle=payload.fix_cycle,
+        message=message,
+    )
 
 
 # ===========================================================================

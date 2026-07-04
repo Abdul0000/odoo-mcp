@@ -9,7 +9,7 @@ Custom GPT Actions / lightweight MCP JSON-RPC bridge
         ↓
 FastAPI Odoo Agent Server = tools only
         ↓
-GitHub + Odoo.sh + Odoo RPC + Playwright
+GitHub + Odoo.sh + Odoo RPC + optional external CDP browser
 ```
 
 No Codex, no CLI agent, no backend AI model, and no frontend UI are required. ChatGPT writes and reasons about code; this server performs the allowed operations.
@@ -72,11 +72,12 @@ Odoo.sh deployment is normally triggered by GitHub push. The Odoo.sh tools verif
 - `POST /odoo/module-update`
 - `POST /odoo/search-read`
 
-### Browser / Playwright tools
+### Browser / CDP tools
 
 - `POST /browser/screenshot`
+- `POST /browser/pos-flow`
 
-Captures an Odoo page screenshot and returns console/network errors.
+Navigates Odoo pages through an external Chrome DevTools Protocol browser and returns console/network errors. Screenshots are optional compatibility output; Odoo.sh logs remain the primary server-side diagnostic source.
 
 ### Safety and observability
 
@@ -136,18 +137,18 @@ docker compose up --build
 
 Mount your Odoo repo under `./repos` or change the volume and `ODOO_AGENT_ALLOWED_ROOTS`.
 
-## Playwright setup
+## Optional CDP browser setup
 
-For screenshots:
+The connector does not bundle Chromium. For UI console diagnostics, run Chrome/Chromium outside the connector with remote debugging enabled and set `ODOO_AGENT_CDP_URL`:
 
-```bash
-playwright install chromium
+```text
+ODOO_AGENT_CDP_URL=http://chrome-host:9222
 ```
 
-On Linux VPS:
+Example local Chrome launch:
 
 ```bash
-playwright install --with-deps chromium
+chrome --remote-debugging-port=9222 --headless=new --disable-gpu --no-sandbox
 ```
 
 ## Connect to ChatGPT

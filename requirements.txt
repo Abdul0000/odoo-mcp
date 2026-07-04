@@ -3,6 +3,6 @@ uvicorn[standard]==0.34.0
 pydantic==2.10.4
 pydantic-settings==2.7.1
 pytest==8.3.4
-playwright==1.49.1
 slowapi==0.1.9
 httpx>=0.27.0
+websocket-client==1.8.0

@@ -17,7 +17,9 @@ from ..schemas import (
     RepoPatchRequest,
     RepoPrepareRequest,
     RepoPrepareResult,
+    RepoReadRangeRequest,
     RepoReadRequest,
+    RepoSearchRequest,
     RepoWriteManyAtomicRequest,
     RepoWriteManyFastSafeRequest,
     RepoWriteManySmartRequest,
@@ -89,6 +91,18 @@ def repo_list(payload: RepoListRequest) -> list[FileListItem]:
 def repo_read(payload: RepoReadRequest) -> FileContent:
     JsonStore().log_audit("repo.read", "ok", payload.relative_path, _preview(payload))
     return RepoService().read_file(payload.project_path, payload.relative_path, payload.max_bytes)
+
+
+@router.post("/read-range", response_model=dict)
+def repo_read_range(payload: RepoReadRangeRequest) -> dict:
+    JsonStore().log_audit("repo.read_range", "ok", payload.relative_path, _preview(payload))
+    return RepoService().read_range(payload.project_path, payload.relative_path, payload.start_line, payload.max_lines)
+
+
+@router.post("/search", response_model=dict)
+def repo_search(payload: RepoSearchRequest) -> dict:
+    JsonStore().log_audit("repo.search", "ok", payload.pattern, _preview(payload))
+    return RepoService().search(payload.project_path, payload.pattern, payload.relative_path, payload.max_matches, payload.context_lines, payload.regex)
 
 
 @router.post("/write", response_model=FileContent)
