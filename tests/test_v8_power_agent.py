@@ -51,7 +51,11 @@ def test_safe_deploy_request_accepts_ui_paths(tmp_path):
 
 
 def test_browser_menu_crawl_fails_on_odoo_ui_breakage(monkeypatch):
+<<<<<<< HEAD
+    class FakeCdpBrowserService:
+=======
     class FakePlaywrightService:
+>>>>>>> dbbb38fa6fedfe4f22b33bbac26fe212f24abfe6
         async def screenshot_odoo_page(self, *args, **kwargs):
             return BrowserCheckResult(
                 status="failed",
@@ -63,7 +67,11 @@ def test_browser_menu_crawl_fails_on_odoo_ui_breakage(monkeypatch):
                 error="odoo_ui_error_text:RPC_ERROR",
             )
 
+<<<<<<< HEAD
+    monkeypatch.setattr(workflow, "CdpBrowserService", FakeCdpBrowserService)
+=======
     monkeypatch.setattr(workflow, "PlaywrightService", FakePlaywrightService)
+>>>>>>> dbbb38fa6fedfe4f22b33bbac26fe212f24abfe6
     client = TestClient(app)
     response = client.post(
         "/workflow/browser-menu-crawl",
