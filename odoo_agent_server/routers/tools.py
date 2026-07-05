@@ -314,7 +314,10 @@ _TOOL_DESCRIPTORS = [
         title="Install module via SSH",
         description=(
             "[LEGACY — odoo.module_deploy auto-falls-back to SSH on Access Denied, no need to call this directly] "
-            "Install a NEW module via Odoo.sh SSH using odoo-bin -i flag."
+            "Install a NEW module via Odoo.sh SSH using odoo-bin -i flag. "
+            "Do not call this directly after a fresh code change. Use workflow.safe_deploy_module instead, "
+            "which pushes code and verifies the remote HEAD before upgrading. This tool will refuse to run "
+            "if local commits are not yet pushed to the remote branch."
         ),
         deprecated=True,
     ),
@@ -354,10 +357,27 @@ _TOOL_DESCRIPTORS = [
         title="Search Odoo.sh error logs", description="Search Odoo.sh logs for errors", read_only=True),
     ToolDescriptor(name="odoosh.error_pack",
         title="Collect Odoo.sh error details", description="Return Odoo.sh tracebacks plus root-cause hints/files/XML/model names", read_only=True),
-    ToolDescriptor(name="odoosh.module_deploy_ssh",
-        title="Deploy module via SSH", description="SSH smart install/upgrade via Odoo.sh. Background job. Use only when you explicitly need SSH; odoo.module_deploy falls back to this automatically.", requires_approval=True),
-    ToolDescriptor(name="odoosh.module_update",
-        title="Update module on Odoo.sh", description="Run Odoo module update through Odoo.sh SSH", requires_approval=True),
+    ToolDescriptor(
+        name="odoosh.module_deploy_ssh",
+        title="Deploy module via SSH",
+        description=(
+            "SSH smart install/upgrade via Odoo.sh. Background job. Use only when you explicitly need SSH; "
+            "odoo.module_deploy falls back to this automatically. Do not call this directly after a fresh code change. "
+            "Use workflow.safe_deploy_module instead, which pushes code and verifies the remote HEAD before upgrading. "
+            "This tool will refuse to run if local commits are not yet pushed to the remote branch."
+        ),
+        requires_approval=True,
+    ),
+    ToolDescriptor(
+        name="odoosh.module_update",
+        title="Update module on Odoo.sh",
+        description=(
+            "Run Odoo module update through Odoo.sh SSH. Do not call this directly after a fresh code change. "
+            "Use workflow.safe_deploy_module instead, which pushes code and verifies the remote HEAD before upgrading. "
+            "This tool will refuse to run if local commits are not yet pushed to the remote branch."
+        ),
+        requires_approval=True,
+    ),
     ToolDescriptor(name="odoo.health",
         title="Check Odoo server health", description="Check Odoo XML-RPC health", read_only=True),
     ToolDescriptor(

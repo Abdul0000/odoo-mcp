@@ -345,8 +345,11 @@ class OdooShUserFilesListRequest(BaseModel):
 
 class OdooShModuleUpdateRequest(ApprovalMixin):
     module_name: str = Field(..., description="Technical module folder/name to update")
+    project_path: str | None = Field(default=None, description="Optional local checkout path used to prove local HEAD is pushed before manual Odoo.sh update/install. If omitted, session state is used when available.")
+    remote: str = Field(default="origin", description="Git remote used for the local-vs-remote HEAD safety check")
+    branch: str | None = Field(default=None, description="Git branch used for the local-vs-remote HEAD safety check. Defaults to current branch.")
     timeout_seconds: int = Field(default=600, ge=30, le=1800)
-    expected_sha: str | None = Field(default=None, description="Optional pushed Git SHA that must be deployed on Odoo.sh before update")
+    expected_sha: str | None = Field(default=None, description="Pushed Git SHA that must be deployed on Odoo.sh before update. If omitted, manual Odoo.sh tools require local HEAD to match remote branch HEAD before running.")
     wait_for_result: bool = Field(default=True, description="Wait server-side for background SSH job until done or wait timeout")
     wait_timeout_seconds: int = Field(default=20, ge=0, le=25, description="Maximum server-side wait. Kept under Render request timeout.")
     poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
@@ -359,6 +362,10 @@ class OdooShModuleUpdateRequest(ApprovalMixin):
 
 class OdooRpcModuleRequest(ApprovalMixin):
     module_name: str = Field(..., description="Technical module name")
+    project_path: str | None = Field(default=None, description="Optional local checkout path used by manual Odoo.sh SSH install to prove local HEAD is pushed before running. If omitted, session state is used when available.")
+    remote: str = Field(default="origin", description="Git remote used for the local-vs-remote HEAD safety check")
+    branch: str | None = Field(default=None, description="Git branch used for the local-vs-remote HEAD safety check. Defaults to current branch.")
+    expected_sha: str | None = Field(default=None, description="Optional pushed Git SHA that must be deployed on Odoo.sh before manual SSH install/update. If omitted, local HEAD must match remote branch HEAD.")
     wait_for_result: bool = Field(default=True, description="For background install/upgrade/deploy, wait server-side until the job finishes or times out")
     wait_timeout_seconds: int = Field(default=20, ge=0, le=25, description="Maximum server-side wait. Kept under Render request timeout.")
     poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
