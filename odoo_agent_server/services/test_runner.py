@@ -35,19 +35,6 @@ class TestRunner:
                 stderr=(exc.stderr or "")[-12000:] if isinstance(exc.stderr, str) else "",
                 timed_out=True,
             )
-        except OSError as exc:
-            # Keep QA/reporting endpoints deterministic when a stale session
-            # points at a missing checkout.  subprocess.run raises before it
-            # can return a CompletedProcess if cwd does not exist; surface that
-            # as a normal failed command so the agent cannot treat the step as
-            # verified.
-            return CommandResult(
-                command=command,
-                cwd=str(cwd),
-                exit_code=127,
-                stdout="",
-                stderr=f"Command could not start in cwd {cwd}: {exc}",
-            )
 
     def git_status(self, cwd: Path, timeout_seconds: int = 20) -> CommandResult:
         return self.run(["git", "status", "--short", "--branch"], cwd, timeout_seconds)

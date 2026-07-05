@@ -63,9 +63,6 @@ Agent reads real source → gets correct patterns for that version automatically
 6. Before upgrading Odoo.sh, ensure dependencies are installed: call `odoo.ensure_dependencies`
 7. If a pipeline fails mid-way, call `workflow.resume_job` with the job_id — do NOT restart from step 1
 8. After every session start, call `session.load_state` to see if there is context from a previous session
-9. If `session.load_state` returns `project_path_valid=false`, `project_path=null`, or `stale_project_path`, the saved checkout is stale. Do not reuse it and do not run shell commands; call `repo.prepare` or `workflow.start_session` to recover a real checkout first.
-10. Any command/tool with `status=failed` or `exit_code != 0` is a blocker. Never claim success, staged, pushed, deployed, or upgraded after a failed `cd`, `git`, `pytest`, or QA command; fix and rerun the failed step.
-11. Use MCP git/workflow tools for commit/push/deploy. Do not manually run bash like `cd <project_path> && git add/commit/push`; `workflow.safe_deploy_module` owns commit, push, Odoo.sh polling, module upgrade, and verification.
 
 ---
 

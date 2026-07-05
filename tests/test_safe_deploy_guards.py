@@ -784,3 +784,282 @@ def test_resume_job_without_id_uses_saved_job_and_upgrade_alias(tmp_path, monkey
     assert calls == {"deploy": 1}
     assert "git_commit" not in result["steps_run"]
     assert "git_push" not in result["steps_run"]
+
+
+def test_manual_git_commit_blocked_while_safe_deploy_owns_pipeline(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    project.mkdir()
+    store = JsonStore()
+    job = store.create_job(JobRecord(
+        job_type="safe_deploy_module",
+        status=JobStatus.running,
+        request={"project_path": str(project), "module_name": "x_module"},
+    ))
+    store.save_session_state({"last_safe_deploy_job_id": job.id, "project_path": str(project), "module_name": "x_module"})
+
+    from odoo_agent_server.routers.git import git_commit
+    from odoo_agent_server.schemas import GitCommitRequest
+
+    result = git_commit(GitCommitRequest(project_path=str(project), message="manual commit", paths=[]))
+
+    assert result.exit_code == 2
+    assert "workflow.safe_deploy_module already owns" in result.stderr
+    assert "workflow.resume_job" in result.stdout
+
+
+def test_manual_odoosh_update_blocked_while_safe_deploy_owns_pipeline(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    store = JsonStore()
+    job = store.create_job(JobRecord(
+        job_type="safe_deploy_module",
+        status=JobStatus.running,
+        request={"project_path": str(tmp_path / "repo"), "module_name": "x_module"},
+    ))
+    store.save_session_state({"last_safe_deploy_job_id": job.id, "module_name": "x_module"})
+
+    from odoo_agent_server.routers.odoosh import odoosh_module_update
+    from odoo_agent_server.schemas import OdooShModuleUpdateRequest
+
+    result = odoosh_module_update(OdooShModuleUpdateRequest(module_name="x_module"))
+
+    assert result.exit_code == 2
+    assert "Manual odoosh.module_update is blocked" in result.stderr
+    assert "workflow.resume_job" in result.stdout
+
+
+def test_safe_deploy_blocks_success_when_nested_module_update_still_running(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    (project / "x_module").mkdir(parents=True)
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running))
+
+    class FakeGit:
+        def status(self, project_path):
+            return CommandResult(command=["git", "status"], cwd=project_path, exit_code=0, stdout="")
+
+        def diff(self, project_path, staged=False, timeout_seconds=30):
+            return CommandResult(command=["git", "diff"], cwd=project_path, exit_code=0, stdout="")
+
+        def configure_identity(self, project_path):
+            return CommandResult(command=["git", "config"], cwd=project_path, exit_code=0)
+
+        def validate_target(self, project_path, branch=None, remote="origin"):
+            return CommandResult(command=["git", "validate-target"], cwd=project_path, exit_code=0)
+
+        def commit(self, project_path, message, paths, timeout_seconds=60):
+            return CommandResult(command=["git", "commit"], cwd=project_path, exit_code=0)
+
+        def head_sha(self, project_path):
+            return CommandResult(command=["git", "rev-parse", "HEAD"], cwd=project_path, exit_code=0, stdout="abc1234\n")
+
+        def push(self, project_path, remote="origin", branch=None, set_upstream=True, timeout_seconds=120):
+            return CommandResult(command=["git", "push"], cwd=project_path, exit_code=0, stdout="PUSH_OK\nsha=abc1234\n")
+
+    class FakeOdooSh:
+        def check_commit_deployed(self, sha):
+            return CommandResult(command=["odoosh", "check"], cwd="odoosh:ssh", exit_code=0, stdout='{"deployed": true}')
+
+        def verify_module_manifest(self, module_name):
+            return CommandResult(command=["odoosh", "manifest"], cwd="odoosh:ssh", exit_code=0, stdout="ok")
+
+    def fake_deploy(req):
+        nested = JsonStore().create_job(JobRecord(job_type="odoo.module_deploy", status=JobStatus.running, request={"module_name": req.module_name}))
+        return OdooRpcResult(status="ok", result={"job_id": nested.id, "job_status": "running", "finished": False})
+
+    monkeypatch.setattr(workflow, "GitService", lambda: FakeGit())
+    monkeypatch.setattr(workflow, "OdooShService", lambda: FakeOdooSh())
+    monkeypatch.setattr(workflow, "start_odoo_module_deploy_job", fake_deploy)
+
+    workflow._run_safe_deploy(
+        SafeDeployModuleRequest(
+            project_path=str(project),
+            module_name="x_module",
+            commit_message="Deploy x_module",
+            run_qa=False,
+            wait_for_odoosh=True,
+            upgrade_module=True,
+            odoo_module_deploy_timeout_seconds=0,
+        ),
+        job.id,
+    )
+
+    finished = store.get_job(job.id)
+    assert finished.status == JobStatus.failed
+    assert finished.result["status"] == "module_upgrade_running"
+    assert any(step.name == "odoo_module_deploy" and step.status == "failed" for step in finished.steps)
+
+
+def test_safe_deploy_verifies_inferred_python_field_after_upgrade(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    field_file = project / "x_module" / "models" / "purchase_order.py"
+    field_file.parent.mkdir(parents=True)
+    field_file.write_text("from odoo import fields, models\n\nclass PurchaseOrder(models.Model):\n    _inherit = 'purchase.order'\n\n    grok_y = fields.Char(string='Grok Y', tracking=True)\n", encoding="utf-8")
+    calls = {"registry_fields": 0}
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running))
+
+    class FakeGit:
+        def status(self, project_path):
+            return CommandResult(command=["git", "status"], cwd=project_path, exit_code=0, stdout=" M x_module/models/purchase_order.py\n")
+
+        def diff(self, project_path, staged=False, timeout_seconds=30):
+            return CommandResult(command=["git", "diff"], cwd=project_path, exit_code=0, stdout="")
+
+        def configure_identity(self, project_path):
+            return CommandResult(command=["git", "config"], cwd=project_path, exit_code=0)
+
+        def validate_target(self, project_path, branch=None, remote="origin"):
+            return CommandResult(command=["git", "validate-target"], cwd=project_path, exit_code=0)
+
+        def commit(self, project_path, message, paths, timeout_seconds=60):
+            return CommandResult(command=["git", "commit"], cwd=project_path, exit_code=0)
+
+        def head_sha(self, project_path):
+            return CommandResult(command=["git", "rev-parse", "HEAD"], cwd=project_path, exit_code=0, stdout="abc1234\n")
+
+        def push(self, project_path, remote="origin", branch=None, set_upstream=True, timeout_seconds=120):
+            return CommandResult(command=["git", "push"], cwd=project_path, exit_code=0, stdout="PUSH_OK\nsha=abc1234\n")
+
+    class FakeSyntaxVerifier:
+        def verify(self, req):
+            class Result:
+                push_blocked = False
+                def model_dump(self, mode="json"):
+                    return {"push_blocked": False}
+            return Result()
+
+    class FakeOdooSh:
+        def check_commit_deployed(self, sha):
+            return CommandResult(command=["odoosh", "check"], cwd="odoosh:ssh", exit_code=0, stdout='{"deployed": true}')
+
+        def verify_user_file_hashes(self, expected_hashes):
+            return CommandResult(command=["odoosh", "verify_user_file_hashes"], cwd="odoosh:ssh", exit_code=0, stdout="ok")
+
+        def verify_module_manifest(self, module_name):
+            return CommandResult(command=["odoosh", "manifest"], cwd="odoosh:ssh", exit_code=0, stdout="ok")
+
+    def fake_deploy(req):
+        return OdooRpcResult(status="ok", result={"finished": True, "module_name": req.module_name})
+
+    class FakeOdooRpc:
+        def module_status(self, module_name):
+            return OdooRpcResult(status="ok", result=[{"name": module_name, "state": "installed"}])
+
+        def search_read(self, model, domain, fields, limit=20, offset=0, order=None, context=None):
+            calls["registry_fields"] += 1
+            assert model == "ir.model.fields"
+            assert ("model", "=", "purchase.order") in domain
+            assert ("name", "in", ["grok_y"]) in domain
+            return OdooRpcResult(status="ok", result=[{"model": "purchase.order", "name": "grok_y", "ttype": "char"}])
+
+        def registry_smoke_test(self, module_name, model_names=None, menu_names=None, strict=True):
+            return OdooRpcResult(status="ok", result={"module": module_name})
+
+    monkeypatch.setattr(workflow, "GitService", lambda: FakeGit())
+    monkeypatch.setattr(workflow, "SyntaxVerifierService", lambda: FakeSyntaxVerifier())
+    monkeypatch.setattr(workflow, "OdooShService", lambda: FakeOdooSh())
+    monkeypatch.setattr(workflow, "start_odoo_module_deploy_job", fake_deploy)
+    monkeypatch.setattr(workflow, "OdooRpcService", lambda: FakeOdooRpc())
+
+    workflow._run_safe_deploy(
+        SafeDeployModuleRequest(
+            project_path=str(project),
+            module_name="x_module",
+            commit_message="Deploy x_module",
+            paths=["x_module/models/purchase_order.py"],
+            run_qa=False,
+            wait_for_odoosh=True,
+            upgrade_module=True,
+        ),
+        job.id,
+    )
+
+    finished = store.get_job(job.id)
+    assert finished.status == JobStatus.passed
+    assert calls == {"registry_fields": 1}
+    assert finished.result["expected_registry_fields"] == {"purchase.order": ["grok_y"]}
+    assert any(step.name == "registry_field_verify" and step.status == "passed" for step in finished.steps)
+
+
+def test_safe_deploy_fails_when_inferred_field_missing_after_upgrade(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    field_file = project / "x_module" / "models" / "purchase_order.py"
+    field_file.parent.mkdir(parents=True)
+    field_file.write_text("from odoo import fields, models\n\nclass PurchaseOrder(models.Model):\n    _inherit = 'purchase.order'\n\n    grok_y = fields.Char(string='Grok Y')\n", encoding="utf-8")
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running))
+
+    class FakeGit:
+        def status(self, project_path):
+            return CommandResult(command=["git", "status"], cwd=project_path, exit_code=0, stdout=" M x_module/models/purchase_order.py\n")
+        def diff(self, project_path, staged=False, timeout_seconds=30):
+            return CommandResult(command=["git", "diff"], cwd=project_path, exit_code=0, stdout="")
+        def configure_identity(self, project_path):
+            return CommandResult(command=["git", "config"], cwd=project_path, exit_code=0)
+        def validate_target(self, project_path, branch=None, remote="origin"):
+            return CommandResult(command=["git", "validate-target"], cwd=project_path, exit_code=0)
+        def commit(self, project_path, message, paths, timeout_seconds=60):
+            return CommandResult(command=["git", "commit"], cwd=project_path, exit_code=0)
+        def head_sha(self, project_path):
+            return CommandResult(command=["git", "rev-parse", "HEAD"], cwd=project_path, exit_code=0, stdout="abc1234\n")
+        def push(self, project_path, remote="origin", branch=None, set_upstream=True, timeout_seconds=120):
+            return CommandResult(command=["git", "push"], cwd=project_path, exit_code=0, stdout="PUSH_OK\nsha=abc1234\n")
+
+    class FakeSyntaxVerifier:
+        def verify(self, req):
+            class Result:
+                push_blocked = False
+                def model_dump(self, mode="json"):
+                    return {"push_blocked": False}
+            return Result()
+
+    class FakeOdooSh:
+        def check_commit_deployed(self, sha):
+            return CommandResult(command=["odoosh", "check"], cwd="odoosh:ssh", exit_code=0, stdout='{"deployed": true}')
+        def verify_user_file_hashes(self, expected_hashes):
+            return CommandResult(command=["odoosh", "verify_user_file_hashes"], cwd="odoosh:ssh", exit_code=0, stdout="ok")
+        def verify_module_manifest(self, module_name):
+            return CommandResult(command=["odoosh", "manifest"], cwd="odoosh:ssh", exit_code=0, stdout="ok")
+
+    def fake_deploy(req):
+        return OdooRpcResult(status="ok", result={"finished": True, "module_name": req.module_name})
+
+    class FakeOdooRpc:
+        def module_status(self, module_name):
+            return OdooRpcResult(status="ok", result=[{"name": module_name, "state": "installed"}])
+        def search_read(self, model, domain, fields, limit=20, offset=0, order=None, context=None):
+            return OdooRpcResult(status="ok", result=[])
+        def registry_smoke_test(self, module_name, model_names=None, menu_names=None, strict=True):
+            return OdooRpcResult(status="ok", result={"module": module_name})
+
+    monkeypatch.setattr(workflow, "GitService", lambda: FakeGit())
+    monkeypatch.setattr(workflow, "SyntaxVerifierService", lambda: FakeSyntaxVerifier())
+    monkeypatch.setattr(workflow, "OdooShService", lambda: FakeOdooSh())
+    monkeypatch.setattr(workflow, "start_odoo_module_deploy_job", fake_deploy)
+    monkeypatch.setattr(workflow, "OdooRpcService", lambda: FakeOdooRpc())
+
+    workflow._run_safe_deploy(
+        SafeDeployModuleRequest(
+            project_path=str(project),
+            module_name="x_module",
+            commit_message="Deploy x_module",
+            paths=["x_module/models/purchase_order.py"],
+            run_qa=False,
+            wait_for_odoosh=True,
+            upgrade_module=True,
+        ),
+        job.id,
+    )
+
+    finished = store.get_job(job.id)
+    assert finished.status == JobStatus.failed
+    assert finished.result["status"] == "registry_field_missing"
+    assert any(step.name == "registry_field_verify" and step.status == "failed" for step in finished.steps)

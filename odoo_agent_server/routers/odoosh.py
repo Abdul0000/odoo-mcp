@@ -23,6 +23,7 @@ from ..schemas import (
 from ..services.approval_service import ApprovalService
 from ..services.odoosh_service import OdooShService
 from ..services.store_service import JsonStore
+from ..services.workflow_guard_service import safe_deploy_command_block
 from ..services.background_executor import submit_background
 
 router = APIRouter(prefix="/odoosh", tags=["odoosh"], dependencies=[AuthDependency])
@@ -160,6 +161,9 @@ def odoosh_grep_errors(payload: OdooShCommandRequest) -> CommandResult:
 
 @router.post("/module-install-ssh", response_model=CommandResult)
 def odoosh_module_install_ssh(payload: OdooRpcModuleRequest) -> CommandResult:
+    blocked = safe_deploy_command_block("odoosh.module_install_ssh", module_name=payload.module_name, cwd="odoosh:ssh")
+    if blocked:
+        return blocked
     approval = ApprovalService()
     approval.ensure_allowed("odoosh.module_install_ssh", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     service = OdooShService()
@@ -177,6 +181,9 @@ def odoosh_module_install_ssh(payload: OdooRpcModuleRequest) -> CommandResult:
 @router.post("/module-deploy-ssh", response_model=CommandResult)
 def odoosh_module_deploy_ssh(payload: OdooShModuleUpdateRequest) -> CommandResult:
     """SSH smart install/upgrade. Background job: poll jobs.get."""
+    blocked = safe_deploy_command_block("odoosh.module_deploy_ssh", module_name=payload.module_name, cwd="odoosh:ssh")
+    if blocked:
+        return blocked
     approval = ApprovalService()
     approval.ensure_allowed("odoosh.module_deploy_ssh", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     service = OdooShService()
@@ -201,6 +208,9 @@ def odoosh_module_deploy_ssh(payload: OdooShModuleUpdateRequest) -> CommandResul
 
 @router.post("/module-update", response_model=CommandResult)
 def odoosh_module_update(payload: OdooShModuleUpdateRequest) -> CommandResult:
+    blocked = safe_deploy_command_block("odoosh.module_update", module_name=payload.module_name, cwd="odoosh:ssh")
+    if blocked:
+        return blocked
     approval = ApprovalService()
     approval.ensure_allowed("odoosh.module_update", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     service = OdooShService()

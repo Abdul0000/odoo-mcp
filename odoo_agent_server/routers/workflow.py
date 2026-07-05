@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import hashlib
 import json
 import os
@@ -123,7 +124,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Patch the smallest file set with repo.apply_patch_atomic or repo.write_many_smart; use repo.write_many_atomic only for large/risky refactors. Do not run broad module discovery again after the target module is known.",
             "Run git.diff and qa.self_run with run_pytest=false unless Python tests are present or the patch touches shared logic.",
             "MANDATORY before deploy: run workflow.verify_against_core for changed .py/.xml/.js/__manifest__.py files. If push_blocked=true, fix and re-run; only then continue.",
-            "Call workflow.safe_deploy_module with module_name, commit_message, changed paths, run_qa=false if qa.self_run already passed, wait_for_odoosh=true, and upgrade_module=true. Do not manually chain git.commit/git.push/odoosh.check_commit/odoo.module_deploy for the normal path.",
+            "Call workflow.safe_deploy_module with module_name, commit_message, changed paths, run_qa=false if qa.self_run already passed, wait_for_odoosh=true, upgrade_module=true, and expected_registry_fields for new fields when known. Do not manually chain git.commit/git.push/odoosh.check_commit/odoosh.module_update/odoo.module_deploy for the normal path; those lower-level tools are blocked once safe_deploy starts.",
             "If the repo already contains the requested change and no edit is needed, do not say done from repo.read alone; call workflow.verify_deployed_module and continue deploy/resume if /home/odoo/src/user does not match.",
             "If safe deploy returns retry_later, wait briefly and call workflow.resume_job with the job_id. If it returns deploy_running, call jobs.get on the nested job. Do not repeat commit/push.",
             "Verify the exact field with odoo.search_read or workflow.registry_smoke_test; if the user asks for visible UI proof, pass the exact Odoo web path in verify_ui_paths during deploy or call workflow.browser_menu_crawl once.",
@@ -723,6 +724,147 @@ def verify_deployed_module(payload: DeployedModuleVerifyRequest) -> dict:
     }
 
 
+
+def _infer_registry_fields_from_python(project: Path, module_name: str, verify_files: list[str]) -> dict[str, list[str]]:
+    """Infer Odoo model fields from changed Python files for post-upgrade smoke.
+
+    This catches the exact class of false success where a field was committed but
+    the live registry never loaded it.  It intentionally only reads the active
+    checkout and verifies after upgrade through ir.model.fields.
+    """
+    root = project.resolve()
+    inferred: dict[str, set[str]] = {}
+    for raw_path in verify_files:
+        file_path = Path(raw_path).resolve()
+        if file_path.suffix != ".py" or not file_path.is_file() or not (file_path == root or root in file_path.parents):
+            continue
+        rel = file_path.relative_to(root).as_posix()
+        if not rel.startswith(f"{module_name}/"):
+            continue
+        try:
+            tree = ast.parse(file_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            model_name: str | None = None
+            for stmt in node.body:
+                if not isinstance(stmt, ast.Assign):
+                    continue
+                targets = [target.id for target in stmt.targets if isinstance(target, ast.Name)]
+                if not targets:
+                    continue
+                if any(target in {"_inherit", "_name"} for target in targets):
+                    value = stmt.value
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                        model_name = value.value
+                    elif isinstance(value, (ast.List, ast.Tuple)):
+                        names = [elt.value for elt in value.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)]
+                        if names:
+                            model_name = names[0]
+                    continue
+            if not model_name:
+                continue
+            for stmt in node.body:
+                if not isinstance(stmt, ast.Assign):
+                    continue
+                is_odoo_field = isinstance(stmt.value, ast.Call) and isinstance(stmt.value.func, ast.Attribute) and isinstance(stmt.value.func.value, ast.Name) and stmt.value.func.value.id == "fields"
+                if not is_odoo_field:
+                    continue
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name) and not target.id.startswith("_"):
+                        inferred.setdefault(model_name, set()).add(target.id)
+    return {model: sorted(fields) for model, fields in sorted(inferred.items()) if fields}
+
+
+def _normalise_expected_registry_fields(fields_by_model: dict[str, list[str]] | None) -> dict[str, list[str]]:
+    normalised: dict[str, list[str]] = {}
+    for model, names in (fields_by_model or {}).items():
+        if not isinstance(model, str) or not model.strip():
+            continue
+        clean_names = sorted({str(name).strip() for name in names or [] if str(name).strip()})
+        if clean_names:
+            normalised[model.strip()] = clean_names
+    return normalised
+
+
+def _verify_registry_fields(fields_by_model: dict[str, list[str]]) -> OdooRpcResult:
+    rpc = OdooRpcService()
+    missing: dict[str, list[str]] = {}
+    found: dict[str, list[str]] = {}
+    raw_results: dict[str, object] = {}
+    for model, field_names in sorted(fields_by_model.items()):
+        result = rpc.search_read(
+            "ir.model.fields",
+            [("model", "=", model), ("name", "in", field_names)],
+            ["model", "name", "ttype", "field_description"],
+            limit=max(len(field_names) + 5, 20),
+            offset=0,
+            order="name asc",
+            context=None,
+        )
+        raw_results[model] = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+        if result.status != "ok":
+            return OdooRpcResult(status="failed", error=f"Could not verify registry fields for {model}: {result.error}", result={"raw_results": raw_results})
+        records = result.result or []
+        present = sorted({record.get("name") for record in records if isinstance(record, dict) and record.get("name")})
+        found[model] = present
+        absent = sorted(set(field_names) - set(present))
+        if absent:
+            missing[model] = absent
+    if missing:
+        return OdooRpcResult(
+            status="failed",
+            error="Live Odoo registry is missing expected fields after module upgrade.",
+            result={"expected": fields_by_model, "found": found, "missing": missing, "raw_results": raw_results},
+        )
+    return OdooRpcResult(status="ok", result={"expected": fields_by_model, "found": found, "raw_results": raw_results})
+
+
+def _start_and_wait_module_deploy(payload: SafeDeployModuleRequest) -> OdooRpcResult:
+    started = start_odoo_module_deploy_job(OdooRpcModuleRequest(
+        module_name=payload.module_name,
+        wait_for_result=False,
+        wait_timeout_seconds=0,
+        poll_interval_seconds=1.0,
+    ))
+    started_payload = started.model_dump(mode="json") if hasattr(started, "model_dump") else started
+    result_payload = started_payload.get("result") if isinstance(started_payload, dict) and isinstance(started_payload.get("result"), dict) else {}
+    if result_payload.get("finished") or not result_payload.get("job_id"):
+        return started
+
+    nested_job_id = result_payload.get("job_id")
+    waited = JsonStore().wait_job(
+        str(nested_job_id),
+        payload.odoo_module_deploy_timeout_seconds,
+        payload.odoo_module_deploy_poll_interval_seconds,
+    )
+    data = waited.model_dump(mode="json")
+    if waited.status == JobStatus.passed:
+        return OdooRpcResult(status="ok", result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data})
+    if waited.status in {JobStatus.failed, JobStatus.warning}:
+        result_error = waited.result.get("error") if isinstance(waited.result, dict) else None
+        return OdooRpcResult(
+            status="failed" if waited.status == JobStatus.failed else "ok",
+            error=result_error or f"Odoo module deploy job finished with status={waited.status.value}",
+            result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data},
+        )
+    return OdooRpcResult(
+        status="ok",
+        result={
+            "job_id": waited.id,
+            "job_status": waited.status.value,
+            "finished": False,
+            "message": (
+                f"Odoo module deploy is still running after {payload.odoo_module_deploy_timeout_seconds}s. "
+                "Safe deploy is not complete and final success is blocked."
+            ),
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": waited.id, "wait_for_result": True}},
+        },
+    )
+
+
 def _poll_odoosh_deployed(odoosh: OdooShService, pushed_sha: str, timeout_seconds: int, interval_seconds: float) -> CommandResult:
     deadline = time.monotonic() + max(timeout_seconds, 0)
     attempts: list[dict[str, object]] = []
@@ -806,7 +948,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
 
     def _fail(name: str, result=None, error: str | None = None) -> None:
         _step(name, "failed", result, error)
-        if name in {"odoosh_verify_module_manifest", "odoo_module_deploy", "odoo_module_status", "browser_ui_verify"}:
+        if name in {"odoosh_verify_module_manifest", "odoo_module_deploy", "odoo_module_status", "registry_field_verify", "browser_ui_verify"}:
             _rollback_after_failure(name)
         job = store.get_job(job_id)
         store.finish_job(job, JobStatus.failed, {"failed_step": name, "module_name": payload.module_name, "rollback_attempted": rollback_attempted})
@@ -879,6 +1021,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             },
         )
     expected_user_hashes = _expected_user_file_hashes(project_path, verify_files)
+    expected_registry_fields = _normalise_expected_registry_fields(payload.expected_registry_fields) or _infer_registry_fields_from_python(project_path, payload.module_name, verify_files)
 
     identity_result = git.configure_identity(str(project_path))
     if identity_result.exit_code != 0:
@@ -915,6 +1058,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     pushed_job = store.get_job(job_id)
     pushed_job.request["push_started_epoch"] = push_started_epoch
     pushed_job.request["expected_user_file_hashes"] = expected_user_hashes
+    pushed_job.request["expected_registry_fields"] = expected_registry_fields
     store.update_job(pushed_job)
 
     if payload.wait_for_odoosh:
@@ -1007,28 +1151,32 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
 
     if payload.upgrade_module:
         _step("db_rollback_checkpoint", "warning", {"note": "Code rollback is automatic, but database schema/data rollback requires an Odoo.sh backup or duplicate staging before upgrade. Create/confirm backup before destructive migrations."})
-        deploy_result = start_odoo_module_deploy_job(OdooRpcModuleRequest(
-            module_name=payload.module_name,
-            wait_for_result=True,
-            wait_timeout_seconds=5,
-            poll_interval_seconds=1.0,
-        ))
+        deploy_result = _start_and_wait_module_deploy(payload)
         deploy_payload = deploy_result.model_dump(mode="json") if hasattr(deploy_result, "model_dump") else deploy_result
         deploy_finished = bool(isinstance(deploy_payload.get("result"), dict) and deploy_payload["result"].get("finished"))
         deploy_running = deploy_result.status == "ok" and not deploy_finished
-        _step("odoo_module_deploy", "warning" if deploy_running else "passed" if deploy_result.status == "ok" else "failed", deploy_result)
+        _step("odoo_module_deploy", "failed" if deploy_running else "passed" if deploy_result.status == "ok" else "failed", deploy_result)
         if deploy_running:
             job = store.get_job(job_id)
             nested_result = deploy_payload.get("result") if isinstance(deploy_payload.get("result"), dict) else {}
             result = {
-                "status": "deploy_running",
-                "message": "Odoo module deploy is still running in its own job. Poll that job for the final install/upgrade result.",
+                "status": "module_upgrade_running",
+                "message": "Odoo module deploy/update is still running. Safe deploy is not complete; do not claim success. Resume or poll the nested job.",
                 "module_name": payload.module_name,
                 "sha": pushed_sha,
                 "odoo_module_deploy": nested_result,
                 "next_call": nested_result.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": nested_result.get("job_id"), "wait_for_result": True}},
             }
-            store.finish_job(job, JobStatus.warning, result)
+            store.finish_job(job, JobStatus.failed, result)
+            store.save_session_state({
+                "last_safe_deploy_job_id": job_id,
+                "last_sha": pushed_sha,
+                "module_name": payload.module_name,
+                "project_path": str(project_path),
+                "branch": branch,
+                "client_name": client.name if client else payload.client_name,
+                "safe_deploy_status": "module_upgrade_running",
+            }, client_name=client.name if client else payload.client_name or None)
             return
         if deploy_result.status != "ok":
             _fail("odoo_module_deploy", deploy_result)
@@ -1037,6 +1185,34 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     module_status = OdooRpcService().module_status(payload.module_name)
     status_ = "passed" if module_status.status == "ok" else "warning"
     _step("odoo_module_status", status_, module_status)
+
+    if expected_registry_fields:
+        field_verify = _verify_registry_fields(expected_registry_fields)
+        _step("registry_field_verify", "passed" if field_verify.status == "ok" else "failed", field_verify)
+        if field_verify.status != "ok":
+            job = store.get_job(job_id)
+            result = {
+                "status": "registry_field_missing",
+                "message": "Module upgrade finished but the live Odoo registry is missing expected fields. Do not claim success.",
+                "module_name": payload.module_name,
+                "sha": pushed_sha,
+                "expected_registry_fields": expected_registry_fields,
+                "registry_field_verify": field_verify.model_dump(mode="json"),
+                "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+            }
+            store.finish_job(job, JobStatus.failed, result)
+            store.save_session_state({
+                "last_safe_deploy_job_id": job_id,
+                "last_sha": pushed_sha,
+                "module_name": payload.module_name,
+                "project_path": str(project_path),
+                "branch": branch,
+                "client_name": client.name if client else payload.client_name,
+                "safe_deploy_status": "registry_field_missing",
+            }, client_name=client.name if client else payload.client_name or None)
+            return
+    else:
+        _step("registry_field_verify", "skipped", {"message": "No expected Python field additions were inferred or provided."})
 
     smoke = OdooRpcService().registry_smoke_test(payload.module_name, [], [], strict=False)
     _step("registry_smoke_test", "passed" if smoke.status == "ok" else "warning", smoke)
@@ -1065,7 +1241,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             _step("browser_ui_verify", "passed", {"paths": payload.verify_ui_paths, "results": ui_results})
 
     fresh_job = store.get_job(job_id)
-    store.finish_job(fresh_job, JobStatus.passed, {"module_name": payload.module_name, "sha": pushed_sha, "verify_ui_paths": payload.verify_ui_paths})
+    store.finish_job(fresh_job, JobStatus.passed, {"module_name": payload.module_name, "sha": pushed_sha, "verify_ui_paths": payload.verify_ui_paths, "expected_registry_fields": expected_registry_fields})
     approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module succeeded")
     # Fix 7: persist milestone so resume_job and future sessions know where we are
     store.save_session_state({

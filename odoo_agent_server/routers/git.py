@@ -12,6 +12,7 @@ from ..schemas import ApprovalRecord, ApprovalStatus, BaseProjectRequest, Comman
 from ..services.approval_service import ApprovalService
 from ..services.git_service import GitService
 from ..services.store_service import JsonStore
+from ..services.workflow_guard_service import safe_deploy_command_block
 
 router = APIRouter(prefix="/git", tags=["git"], dependencies=[AuthDependency])
 
@@ -101,6 +102,9 @@ def git_diff(payload: GitDiffRequest) -> CommandResult:
 
 @router.post("/commit", response_model=CommandResult)
 def git_commit(payload: GitCommitRequest) -> CommandResult:
+    blocked = safe_deploy_command_block("git.commit", project_path=payload.project_path)
+    if blocked:
+        return blocked
     approval = ApprovalService()
     approval.ensure_allowed("git.commit", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     result = GitService().commit(payload.project_path, payload.message, payload.paths, payload.timeout_seconds)
@@ -111,6 +115,9 @@ def git_commit(payload: GitCommitRequest) -> CommandResult:
 
 @router.post("/push", response_model=CommandResult)
 def git_push(payload: GitPushRequest) -> CommandResult:
+    blocked = safe_deploy_command_block("git.push", project_path=payload.project_path)
+    if blocked:
+        return blocked
     branch = payload.branch
     if branch is None:
         branch_result = GitService().current_branch(payload.project_path)

@@ -11,6 +11,7 @@ from ..services.approval_service import ApprovalService
 from ..services.odoo_rpc_service import OdooRpcService
 from ..services.odoosh_service import OdooShService
 from ..services.store_service import JsonStore
+from ..services.workflow_guard_service import safe_deploy_rpc_block
 from ..services.background_executor import submit_background
 
 router = APIRouter(prefix="/odoo", tags=["odoo"], dependencies=[AuthDependency])
@@ -172,6 +173,9 @@ def odoo_module_status(payload: OdooRpcModuleRequest) -> OdooRpcResult:
 @router.post("/module-install", response_model=OdooRpcResult)
 def odoo_module_install(payload: OdooRpcModuleRequest) -> OdooRpcResult:
     """Background install — returns job_id immediately, poll jobs.get for result."""
+    blocked = safe_deploy_rpc_block("odoo.module_install", module_name=payload.module_name)
+    if blocked:
+        return blocked
     approval = ApprovalService()
     approval.ensure_allowed("odoo.module_install", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     store = JsonStore()
@@ -195,6 +199,9 @@ def odoo_module_install(payload: OdooRpcModuleRequest) -> OdooRpcResult:
 @router.post("/module-update", response_model=OdooRpcResult)
 def odoo_module_update(payload: OdooRpcModuleRequest) -> OdooRpcResult:
     """Background upgrade — returns job_id immediately, poll jobs.get for result."""
+    blocked = safe_deploy_rpc_block("odoo.module_update", module_name=payload.module_name)
+    if blocked:
+        return blocked
     approval = ApprovalService()
     approval.ensure_allowed("odoo.module_update", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     store = JsonStore()
@@ -244,6 +251,9 @@ def start_odoo_module_deploy_job(payload: OdooRpcModuleRequest, approval: Approv
 @router.post("/module-deploy", response_model=OdooRpcResult)
 def odoo_module_deploy(payload: OdooRpcModuleRequest) -> OdooRpcResult:
     """Smart deploy: update_list → check state → install/upgrade. Background job."""
+    blocked = safe_deploy_rpc_block("odoo.module_deploy", module_name=payload.module_name)
+    if blocked:
+        return blocked
     approval = ApprovalService()
     approval.ensure_allowed("odoo.module_deploy", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     return start_odoo_module_deploy_job(payload, approval, enforce_deploy_guard=True)
