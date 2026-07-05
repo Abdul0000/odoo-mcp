@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -638,6 +640,51 @@ def _pre_push_verify_files(project: Path, module_name: str, paths: list[str], st
     return collect(status_candidates())
 
 
+def _poll_odoosh_deployed(odoosh: OdooShService, pushed_sha: str, timeout_seconds: int, interval_seconds: float) -> CommandResult:
+    deadline = time.monotonic() + max(timeout_seconds, 0)
+    attempts: list[dict[str, object]] = []
+    attempt = 0
+
+    while True:
+        attempt += 1
+        check_result = odoosh.check_commit_deployed(pushed_sha)
+        deployed = check_result.exit_code == 0 and '"deployed": true' in (check_result.stdout or "").lower()
+        attempts.append({
+            "attempt": attempt,
+            "exit_code": check_result.exit_code,
+            "stdout": check_result.stdout,
+            "stderr": check_result.stderr,
+        })
+        if deployed:
+            return check_result.model_copy(update={
+                "command": ["odoosh.check_commit_poll", pushed_sha],
+                "stdout": json.dumps({
+                    "deployed": True,
+                    "expected_sha": pushed_sha,
+                    "attempts": attempt,
+                    "poll_interval_seconds": interval_seconds,
+                    "message": "Odoo.sh deployed the pushed commit. Proceeding to module upgrade.",
+                    "last_check": check_result.stdout,
+                }),
+            })
+        if time.monotonic() >= deadline:
+            return CommandResult(
+                command=["odoosh.check_commit_poll", pushed_sha],
+                cwd="odoosh:ssh",
+                exit_code=124,
+                stdout=json.dumps({
+                    "deployed": False,
+                    "expected_sha": pushed_sha,
+                    "attempts": attempt,
+                    "poll_interval_seconds": interval_seconds,
+                    "recent_checks": attempts[-10:],
+                }),
+                stderr=f"Odoo.sh did not deploy pushed commit {pushed_sha} within {timeout_seconds}s.",
+                timed_out=True,
+            )
+        time.sleep(min(interval_seconds, max(deadline - time.monotonic(), 0.0)))
+
+
 def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     """Background worker — runs the full commit→push→wait→upgrade pipeline."""
     store = JsonStore()
@@ -782,19 +829,26 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     _step("git_push", "passed", push_result)
 
     if payload.wait_for_odoosh:
-        check_result = odoosh.check_commit_deployed(pushed_sha)
+        check_result = _poll_odoosh_deployed(
+            odoosh,
+            pushed_sha,
+            payload.odoosh_deploy_timeout_seconds,
+            payload.odoosh_deploy_poll_interval_seconds,
+        )
         deployed = check_result.exit_code == 0 and '"deployed": true' in (check_result.stdout or "").lower()
-        _step("odoosh_check_commit", "passed" if deployed else "warning", check_result)
+        _step("odoosh_check_commit", "passed" if deployed else "failed", check_result)
         if not deployed:
             job = store.get_job(job_id)
             result = {
-                "status": "retry_later",
-                "message": "Odoo.sh has not deployed the pushed commit yet. Resume after a short wait; no commit or push will be repeated.",
+                "status": "deploy_failed_or_timeout",
+                "message": "Odoo.sh did not report the pushed commit as deployed within the polling window. Module upgrade was not attempted.",
                 "module_name": payload.module_name,
                 "sha": pushed_sha,
+                "poll_timeout_seconds": payload.odoosh_deploy_timeout_seconds,
+                "poll_interval_seconds": payload.odoosh_deploy_poll_interval_seconds,
                 "next_call": {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}},
             }
-            store.finish_job(job, JobStatus.warning, result)
+            store.finish_job(job, JobStatus.failed, result)
             store.save_session_state({
                 "last_safe_deploy_job_id": job_id,
                 "last_sha": pushed_sha,
@@ -802,7 +856,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 "project_path": str(project_path),
                 "branch": branch,
                 "client_name": client.name if client else payload.client_name,
-                "safe_deploy_status": "retry_later",
+                "safe_deploy_status": "deploy_failed_or_timeout",
             }, client_name=client.name if client else payload.client_name or None)
             return
 

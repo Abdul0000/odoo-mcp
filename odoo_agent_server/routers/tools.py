@@ -85,7 +85,7 @@ from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_write_ma
 from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy, start_odoo_module_deploy_job
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
-from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index
+from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index, _poll_odoosh_deployed
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
@@ -200,7 +200,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.full_verify",
         title="Run full verification", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module",
-        title="Deploy module (full pipeline)", description="Safely commit, push, wait briefly for Odoo.sh deployment, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths. Defaults to wait_for_result=true; status=running is not success and must be followed via next_call/jobs.get.", requires_approval=True),
+        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 5 minutes for the pushed SHA to deploy, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths. Defaults to wait_for_result=true; status=running is not success and must be followed via next_call/jobs.get.", requires_approval=True),
     ToolDescriptor(name="workflow.start_session",
         title="Start coding session", description="Bootstrap a coding session: capability check, repo.prepare, git status, module discovery, Odoo/Odoo.sh health", requires_approval=True),
     ToolDescriptor(name="workflow.registry_smoke_test",
@@ -1169,12 +1169,17 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
 
             elif step_name == "odoosh_check_commit":
                 pushed_sha = pushed_sha or git.head_sha(project_path).stdout.strip()
-                check = odoosh.check_commit_deployed(pushed_sha)
+                check = _poll_odoosh_deployed(
+                    odoosh,
+                    pushed_sha,
+                    int(original_request.get("odoosh_deploy_timeout_seconds", 300)),
+                    float(original_request.get("odoosh_deploy_poll_interval_seconds", 10.0)),
+                )
                 deployed = check.exit_code == 0 and '"deployed": true' in (check.stdout or "").lower()
                 resume_results["steps_run"][step_name] = {"status": "ok" if deployed else "warning", "sha": pushed_sha, "deployed": deployed, "result": _step_payload(check)}
                 if not deployed:
-                    resume_results["status"] = "retry_later"
-                    resume_results["message"] = "Odoo.sh has not deployed the pushed commit yet. Resume later; completed commit/push steps will not be replayed."
+                    resume_results["status"] = "deploy_failed_or_timeout"
+                    resume_results["message"] = "Odoo.sh did not report the pushed commit as deployed within the polling window. Completed commit/push steps will not be replayed."
                     resume_results["next_call"] = {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}}
                     return resume_results
 

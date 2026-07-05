@@ -218,7 +218,7 @@ def test_pre_push_verify_files_falls_back_to_git_status_when_paths_are_not_files
     assert files == [str(changed)]
 
 
-def test_safe_deploy_returns_retry_later_when_sha_is_not_deployed(tmp_path, monkeypatch):
+def test_safe_deploy_fails_without_upgrade_when_sha_is_not_deployed(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     project = tmp_path / "repo"
@@ -263,16 +263,99 @@ def test_safe_deploy_returns_retry_later_when_sha_is_not_deployed(tmp_path, monk
             run_qa=False,
             wait_for_odoosh=True,
             upgrade_module=False,
+            odoosh_deploy_timeout_seconds=0,
+            odoosh_deploy_poll_interval_seconds=0.25,
         ),
         job.id,
     )
 
     finished = store.get_job(job.id)
-    assert finished.status == JobStatus.warning
-    assert finished.result["status"] == "retry_later"
+    assert finished.status == JobStatus.failed
+    assert finished.result["status"] == "deploy_failed_or_timeout"
     assert finished.result["next_call"] == {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}}
     assert "odoosh_wait_for_commit" not in {step.name for step in finished.steps}
-    assert any(step.name == "odoosh_check_commit" and step.status == "warning" for step in finished.steps)
+    assert any(step.name == "odoosh_check_commit" and step.status == "failed" for step in finished.steps)
+
+
+def test_safe_deploy_polls_odoosh_until_deployed_before_upgrade(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    (project / "x_module").mkdir(parents=True)
+    calls = {"check": 0, "deploy": 0}
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running))
+
+    class FakeGit:
+        def status(self, project_path):
+            return CommandResult(command=["git", "status"], cwd=project_path, exit_code=0, stdout="")
+
+        def diff(self, project_path, staged=False, timeout_seconds=30):
+            return CommandResult(command=["git", "diff"], cwd=project_path, exit_code=0, stdout="")
+
+        def configure_identity(self, project_path):
+            return CommandResult(command=["git", "config"], cwd=project_path, exit_code=0)
+
+        def validate_target(self, project_path, branch=None, remote="origin"):
+            return CommandResult(command=["git", "validate-target"], cwd=project_path, exit_code=0)
+
+        def commit(self, project_path, message, paths, timeout_seconds=60):
+            return CommandResult(command=["git", "commit"], cwd=project_path, exit_code=0)
+
+        def head_sha(self, project_path):
+            return CommandResult(command=["git", "rev-parse", "HEAD"], cwd=project_path, exit_code=0, stdout="abc1234\n")
+
+        def push(self, project_path, remote="origin", branch=None, set_upstream=True, timeout_seconds=120):
+            return CommandResult(command=["git", "push"], cwd=project_path, exit_code=0, stdout="PUSH_OK\nsha=abc1234\n")
+
+    class FakeOdooSh:
+        def check_commit_deployed(self, sha):
+            calls["check"] += 1
+            deployed = calls["check"] >= 3
+            return CommandResult(
+                command=["odoosh", "check"],
+                cwd="odoosh:ssh",
+                exit_code=0 if deployed else 1,
+                stdout='{"deployed": true}' if deployed else '{"deployed": false}',
+            )
+
+        def verify_module_manifest(self, module_name):
+            return CommandResult(command=["odoosh", "manifest"], cwd="odoosh:ssh", exit_code=0, stdout="ok")
+
+    def fake_deploy(req):
+        calls["deploy"] += 1
+        return OdooRpcResult(status="ok", result={"finished": True, "module_name": req.module_name})
+
+    class FakeOdooRpc:
+        def module_status(self, module_name):
+            return OdooRpcResult(status="ok", result=[{"name": module_name, "state": "installed"}])
+
+        def registry_smoke_test(self, module_name, model_names=None, menu_names=None, strict=True):
+            return OdooRpcResult(status="ok", result={"module": module_name})
+
+    monkeypatch.setattr(workflow, "GitService", lambda: FakeGit())
+    monkeypatch.setattr(workflow, "OdooShService", lambda: FakeOdooSh())
+    monkeypatch.setattr(workflow, "start_odoo_module_deploy_job", fake_deploy)
+    monkeypatch.setattr(workflow, "OdooRpcService", lambda: FakeOdooRpc())
+
+    workflow._run_safe_deploy(
+        SafeDeployModuleRequest(
+            project_path=str(project),
+            module_name="x_module",
+            commit_message="Deploy x_module",
+            run_qa=False,
+            wait_for_odoosh=True,
+            upgrade_module=True,
+            odoosh_deploy_timeout_seconds=5,
+            odoosh_deploy_poll_interval_seconds=0.25,
+        ),
+        job.id,
+    )
+
+    finished = store.get_job(job.id)
+    assert finished.status == JobStatus.passed
+    assert calls == {"check": 3, "deploy": 1}
+    assert any(step.name == "odoosh_check_commit" and step.status == "passed" for step in finished.steps)
 
 
 def test_resume_job_rechecks_deploy_without_replaying_commit_or_push(tmp_path, monkeypatch):

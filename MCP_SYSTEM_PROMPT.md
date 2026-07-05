@@ -225,13 +225,13 @@ If `push_blocked=False`: proceed to commit + push.
 
 **Step 12:** `odoo.ensure_dependencies` — auto-install any missing deps
 
-**Step 13:** For normal code changes call `workflow.safe_deploy_module` with module name, commit message, changed paths, `wait_for_odoosh=true`, `upgrade_module=true`, and `wait_for_result=true`. It owns commit, push, non-blocking Odoo.sh check, module deploy, status, and smoke test. If it returns `status=running`, that is not success: call the returned `next_call` / `jobs.get`.
+**Step 13:** For normal code changes call `workflow.safe_deploy_module` with module name, commit message, changed paths, `wait_for_odoosh=true`, `upgrade_module=true`, and `wait_for_result=true`. It owns commit, push, Odoo.sh deployed-SHA polling every 10 seconds up to 5 minutes, module deploy, status, and smoke test. If it returns `status=running`, that is not success: call the returned `next_call` / `jobs.get`.
 
 Manual fallback only:
 - `git.commit` — paths: list changed files; message: clear description
 - `git.push` — note the `sha` value from the response
 
-**Step 15:** Prefer `workflow.safe_deploy_module` for the normal commit/push/deploy cycle. It waits briefly server-side by default. It does one non-blocking `odoosh.check_commit`; if Odoo.sh is not deployed yet it returns `status=retry_later` and `next_call={"tool":"workflow.resume_job"}`. Wait briefly and call `workflow.resume_job(job_id)` instead of restarting or blocking.
+**Step 15:** Prefer `workflow.safe_deploy_module` for the normal commit/push/deploy cycle. It waits server-side by default and polls Odoo.sh every 10 seconds for up to 5 minutes. If the pushed SHA is not deployed successfully within that window, do not claim success and do not upgrade; inspect Odoo.sh status/logs and resume only after fixing.
 
 If the client lost the job id, call `workflow.resume_job` without `job_id`; add `client_name`, `project_path`, or `module_name` if available. For explicit mid-flow user requests, use `override_step=push`, `override_step=install`, or `override_step=upgrade`.
 
