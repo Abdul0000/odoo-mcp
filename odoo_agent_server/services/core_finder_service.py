@@ -136,12 +136,7 @@ class CoreFinderService:
 
         for priority, root in roots:
             root_path = Path(root)
-            if not root_path.exists():
-                continue
-            module_dir = self._find_module_dir(root_path, module_name)
-            if not module_dir:
-                core_sync_service.ensure_module_synced(root, module_name)
-                module_dir = self._find_module_dir(root_path, module_name)
+            module_dir = self._module_dir_with_sync(root_path, root, module_name)
             if not module_dir:
                 continue
 
@@ -198,15 +193,12 @@ class CoreFinderService:
 
         for priority, root in roots:
             root_path = Path(root)
-            if not root_path.exists():
-                continue
-            module_dir = self._find_module_dir(root_path, module_candidate)
-            if not module_dir:
-                core_sync_service.ensure_module_synced(root, module_candidate)
-                module_dir = self._find_module_dir(root_path, module_candidate)
+            module_dir = self._module_dir_with_sync(root_path, root, module_candidate)
             search_dirs: list[Path] = []
             if module_dir:
                 search_dirs.append(module_dir)
+            elif not root_path.exists():
+                continue
             else:
                 search_dirs.append(root_path)
 
@@ -434,12 +426,7 @@ class CoreFinderService:
         roots = self._resolve_roots(search_roots)
         for priority, root in roots:
             root_path = Path(root)
-            if not root_path.exists():
-                continue
-            module_dir = self._find_module_dir(root_path, module_name)
-            if not module_dir:
-                core_sync_service.ensure_module_synced(root, module_name)
-                module_dir = self._find_module_dir(root_path, module_name)
+            module_dir = self._module_dir_with_sync(root_path, root, module_name)
             if not module_dir:
                 continue
 
@@ -508,6 +495,24 @@ class CoreFinderService:
         if client:
             return [(i + 1, root) for i, root in enumerate(ClientResolverService().search_roots(client))]
         return _DEFAULT_ROOTS
+
+    def _module_dir_with_sync(self, root_path: Path, root: str, module_name: str) -> Path | None:
+        module_dir = self._find_module_dir(root_path, module_name) if root_path.exists() else None
+        if module_dir:
+            return module_dir
+        core_sync_service.ensure_module_synced(root, module_name)
+        return self._find_module_dir(root_path, module_name) if root_path.exists() else None
+
+    @staticmethod
+    def _find_module_dir(root_path: Path, module_name: str) -> Path | None:
+        for candidate in (
+            root_path / module_name,
+            root_path / "addons" / module_name,
+            root_path / "odoo" / "addons" / module_name,
+        ):
+            if candidate.is_dir():
+                return candidate
+        return None
 
     @staticmethod
     def _walk_module(module_dir: Path, subdirs: list[str]) -> list[Path]:
