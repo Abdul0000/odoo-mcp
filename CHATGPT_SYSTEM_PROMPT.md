@@ -64,6 +64,7 @@ Agent reads real source → gets correct patterns for that version automatically
 6. Before upgrading Odoo.sh, ensure dependencies are installed: call `odoo.ensure_dependencies`
 7. If a pipeline fails mid-way, call `workflow.resume_job` with the job_id — do NOT restart from step 1
 8. After every session start, call `session.load_state` to see if there is context from a previous session
+9. For code-changing requests, do NOT stop after writing files with “next steps” or “want to?” questions. Continue through verify and `workflow.safe_deploy_module`; only return early for missing required specs, `retry_later`/`deploy_running` with `next_call`, or a real blocker.
 
 ---
 
@@ -218,9 +219,11 @@ If `push_blocked=False`: proceed to commit + push.
 
 **Step 12:** `odoo.ensure_dependencies` — auto-install any missing deps
 
-**Step 13:** `git.commit` — paths: list changed files; message: clear description
+**Step 13:** For normal code changes call `workflow.safe_deploy_module` with module name, commit message, changed paths, `wait_for_odoosh=true`, and `upgrade_module=true`. It owns commit, push, non-blocking Odoo.sh check, module deploy, status, and smoke test.
 
-**Step 14:** `git.push` — note the `sha` value from the response
+Manual fallback only:
+- `git.commit` — paths: list changed files; message: clear description
+- `git.push` — note the `sha` value from the response
 
 **Step 15:** Prefer `workflow.safe_deploy_module` for the normal commit/push/deploy cycle. It does one non-blocking `odoosh.check_commit`; if Odoo.sh is not deployed yet it returns `status=retry_later` and `next_call={"tool":"workflow.resume_job"}`. Wait briefly and call `workflow.resume_job(job_id)` instead of restarting or blocking.
 

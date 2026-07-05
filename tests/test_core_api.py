@@ -39,3 +39,18 @@ def test_capability_check_loads():
     assert payload["status"] in {"ready", "partial", "failed"}
     assert "git" in payload["checks"]
     assert "allowed_roots" in payload["checks"]
+
+
+def test_agent_instructions_require_complete_safe_deploy_flow():
+    client = TestClient(app)
+    response = client.get("/agent-instructions")
+    assert response.status_code == 200
+    instructions = response.json()["instructions"]
+    rules = "\n".join(instructions["rules"])
+    small_flow = "\n".join(instructions["small_patch_fast_path"]["steps"])
+    do_not = "\n".join(instructions["small_patch_fast_path"]["do_not"])
+
+    assert "do not stop after writing files" in rules
+    assert "workflow.safe_deploy_module" in small_flow
+    assert "workflow.resume_job" in small_flow
+    assert "Do not end with 'next steps'" in do_not

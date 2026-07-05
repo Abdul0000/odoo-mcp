@@ -448,10 +448,13 @@ For code-changing work, prefer `workflow.safe_deploy_module` instead of manually
 3. configure repo-local Git author identity from `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL`;
 4. validate `TARGET_GIT_REPO` and `TARGET_GIT_BRANCH` before push;
 5. commit and push the selected paths;
-6. wait until Odoo.sh `~/src/user` reaches the pushed SHA;
+6. check Odoo.sh once for the pushed SHA and return `retry_later` with `workflow.resume_job` if it is not deployed yet;
 7. verify the deployed module manifest exists and has `installable: True`;
-8. run `odoo-bin -u` with an explicit addons path that includes `/home/odoo/src/user`;
-9. classify Odoo logs as failed when they contain patterns such as `not installable`, `inconsistent states`, `Traceback`, `ParseError`, or `ImportError`.
+8. call the background `odoo.module_deploy` path with a short wait window so install/upgrade continues without blocking;
+9. return `deploy_running` with `jobs.get` when the module deploy is still running;
+10. run module status and registry smoke checks when deploy completes.
+
+Agents must not stop after editing files with “next steps” or ask the user to run `-u`. After changing code they should continue through verification and `workflow.safe_deploy_module`, returning only when complete, blocked, `retry_later`, or `deploy_running`.
 
 Recommended production variables:
 
@@ -472,7 +475,7 @@ ODOOSH_WAIT_INTERVAL_SECONDS=10
 For every coding task, ChatGPT should start with the repository tools, not with Odoo database reads:
 
 ```text
-repo_prepare → repo_list_custom_modules → repo_read → repo_apply_patch_atomic or repo_write_many_smart → git_diff → qa_self_run → workflow_verify_against_core(changed files only) → git_commit → git_push → workflow_safe_deploy_module or odoosh_check_commit polling → odoo_module_deploy
+repo_prepare → repo_list_custom_modules → repo_read → repo_apply_patch_atomic or repo_write_many_smart → git_diff → qa_self_run → workflow_verify_against_core(changed files only) → workflow_safe_deploy_module → workflow_resume_job/jobs_get only when returned as next_call
 ```
 
 New MCP/REST tools:
