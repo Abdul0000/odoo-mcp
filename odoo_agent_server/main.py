@@ -78,6 +78,7 @@ def agent_instructions() -> dict:
                 "For any code-changing request, do not stop after writing files and ask the user to run upgrade/tests. Continue through git.diff, qa_self_run, verify_against_core, and workflow.safe_deploy_module. Only ask the user when required information is missing or a real blocker remains after diagnostics.",
                 "Never answer a code-changing request by printing JSON MCP tool calls or saying the client/user should execute them. You are connected to the MCP tools; call them yourself.",
                 "Never create module schema changes by direct ORM/Studio writes to ir.model.fields or ir.ui.view unless the user explicitly asks for a no-code Studio/database customization. For normal Odoo development, write Python/XML files in the custom module and deploy the module.",
+                "Never generate Pydantic models/imports inside Odoo addon code. Pydantic is only for this MCP server's API schemas; Odoo modules must use the normal Odoo ORM: models.Model, fields, api, and XML views.",
                 "For hard UI/POS/website/view tasks, include exact post-upgrade Odoo paths in workflow.safe_deploy_module.verify_ui_paths so the deploy job opens each page through CDP and records console/network errors plus Odoo UI breakage.",
                 "SMART ROUTER: for coding tasks, call workflow.smart_tool_router early to choose the fastest correct path. For pure data queries, use direct odoo.search_read and skip repo tools.",
                 "STRICT FRONTEND: before writing any Odoo JS/OWL/POS/website/payment/QWeb/XML/SCSS asset code, call workflow.frontend_pattern_preflight and read the mandatory pattern files it returns. Results are cached; do not guess framework syntax.",
@@ -94,6 +95,7 @@ def agent_instructions() -> dict:
                     "3. repo.prepare once, then read only the target manifest/model/view files.",
                     "4. Read core/enterprise only for the exact inherited model/view pattern that is not already clear from existing custom code.",
                     "4a. For field/view changes, use module files only. Do not create ir.model.fields or patch ir.ui.view records directly as a Studio shortcut.",
+                    "4b. For Odoo Python files, use Odoo ORM only. Do not import pydantic or create Pydantic BaseModel classes inside addons.",
                     "5. Patch with repo.apply_patch_atomic or repo.write_many_smart. Use repo.write_many_atomic only for large/risky refactors.",
                     "6. Run git.diff and qa.self_run(run_pytest=false) unless tests/shared logic are touched.",
                     "7. workflow.verify_against_core only for changed files.",
@@ -108,6 +110,7 @@ def agent_instructions() -> dict:
                     "Do not end with 'next steps', 'want to', or ask the user to run module upgrade after you have changed code. Use workflow.safe_deploy_module yourself.",
                     "Do not print sample MCP JSON blocks for the user to execute. Call the MCP tools directly.",
                     "Do not use Studio/ORM database schema mutations for normal module-code requests.",
+                    "Do not put Pydantic code in Odoo addons.",
                 ],
             },
             "mandatory_dual_read": {

@@ -67,6 +67,7 @@ Agent reads real source → gets correct patterns for that version automatically
 9. For code-changing requests, do NOT stop after writing files with “next steps” or “want to?” questions. Continue through verify and `workflow.safe_deploy_module`; only return early for missing required specs, `retry_later`/`deploy_running` with `next_call`, or a real blocker.
 10. NEVER answer by printing MCP JSON blocks and telling the client/user to execute them. You are connected to MCP tools; call the tools yourself.
 11. NEVER use direct ORM/Studio writes to `ir.model.fields` or `ir.ui.view` for normal module code changes. Add fields/views in Python/XML files, verify source, and deploy the module. Only use database/Studio customization if the user explicitly asks for no-code Studio behavior.
+12. NEVER import or use Pydantic inside Odoo addon Python code. Pydantic is only for this MCP server's API schemas; Odoo modules must use normal Odoo ORM code (`models.Model`, `fields`, `api`) and XML views.
 
 ---
 
@@ -129,7 +130,7 @@ The scope expands automatically — if L0 reads reveal `_inherit`, L1 kicks in. 
 2. `repo.read(manifest_path)` — verify the exact technical name
 3. Add only verified module names to `depends`
 
-**Search priority:** `/home/odoo/src/user` → `/home/odoo/src/enterprise` → `/home/odoo/src/odoo`
+**Search priority:** `/home/odoo/src/enterprise` → `/home/odoo/src/odoo` → `/home/odoo/src/user` fallback for other related custom dependencies. The current custom module must be read from the active checkout, not duplicated from `/home/odoo/src/user`.
 
 ---
 
@@ -191,6 +192,7 @@ The scope expands automatically — if L0 reads reveal `_inherit`, L1 kicks in. 
 - **Large single file >1000 lines** → `repo.write` in chunked mode (chunk_index/total_chunks)
 - Write COMPLETE file content — never partial
 - Do not create fields/views through `ir.model.fields` or direct `ir.ui.view` updates for module-code requests.
+- Do not put Pydantic imports or BaseModel classes in Odoo addons.
 
 **Step 9:** `git.diff` — verify all changes look correct
 

@@ -222,6 +222,8 @@ def test_coding_task_plan_uses_fast_path_for_small_field_change(monkeypatch, tmp
     assert "odoo.search_read" in result.required_tools
     assert "workflow.safe_deploy_module" in result.required_tools
     assert "workflow.resume_job" in result.required_tools
+    assert "repo.write_many_smart" in result.required_tools
+    assert "repo.write_many_atomic" not in result.required_tools
     assert "git.commit" not in result.required_tools
     assert "git.push" not in result.required_tools
     assert "odoo.module_deploy" not in result.required_tools
@@ -229,6 +231,7 @@ def test_coding_task_plan_uses_fast_path_for_small_field_change(monkeypatch, tmp
     plan_text = "\n".join(result.ordered_steps + result.guardrails)
     assert "ir.model.fields" in plan_text
     assert "ir.ui.view" in plan_text
+    assert "Pydantic" in plan_text
     assert "printing MCP JSON blocks" in plan_text
 
 

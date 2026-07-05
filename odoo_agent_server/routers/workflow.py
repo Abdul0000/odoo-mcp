@@ -114,7 +114,8 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "For POS work, never use legacy load_fields('pos.config', ...) / models.load_fields for pos.config; read installed point_of_sale source and use the version's real loader/backend pattern.",
             "MANDATORY Odoo.sh source layer before writing: call workflow.scope_advice after reading custom files from the checkout, then repo.read every mandatory related installed-source path it returns. Do not re-read the same current module from /home/odoo/src/user; /home/odoo/src/user is only for other related custom dependencies. This verifies Enterprise/core syntax and patterns before any patch.",
             "For field/view changes, never use direct ORM/Studio writes to ir.model.fields or ir.ui.view unless the user explicitly asked for no-code Studio customization. Normal development must patch Python/XML files in the custom module.",
-            "Patch the smallest file set with repo.apply_patch_atomic or repo.write_many_atomic; do not run broad module discovery again after the target module is known.",
+            "For Odoo Python files, never import pydantic or create Pydantic BaseModel classes. Use Odoo ORM models.Model, fields, api, and XML views only.",
+            "Patch the smallest file set with repo.apply_patch_atomic or repo.write_many_smart; use repo.write_many_atomic only for large/risky refactors. Do not run broad module discovery again after the target module is known.",
             "Run git.diff and qa.self_run with run_pytest=false unless Python tests are present or the patch touches shared logic.",
             "MANDATORY before deploy: run workflow.verify_against_core for changed .py/.xml/.js/__manifest__.py files. If push_blocked=true, fix and re-run; only then continue.",
             "Call workflow.safe_deploy_module with module_name, commit_message, changed paths, run_qa=false if qa.self_run already passed, wait_for_odoosh=true, and upgrade_module=true. Do not manually chain git.commit/git.push/odoosh.check_commit/odoo.module_deploy for the normal path.",
@@ -127,7 +128,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "repo.read",
             "workflow.scope_advice",
             "repo.apply_patch_atomic",
-            "repo.write_many_atomic",
+            "repo.write_many_smart",
             "git.diff",
             "qa.self_run",
             "workflow.verify_against_core",
@@ -147,7 +148,8 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "For POS work, never use legacy load_fields('pos.config', ...) / models.load_fields for pos.config; read installed point_of_sale source and use the version's real loader/backend pattern.",
             "MANDATORY Odoo.sh source layer before writing: call workflow.scope_advice after reading custom files from the checkout, then repo.read every mandatory related installed-source path it returns. Do not re-read the same current module from /home/odoo/src/user; /home/odoo/src/user is only for other related custom dependencies. This is the Enterprise/core syntax and pattern verification layer.",
             "For field/view changes, never use direct ORM/Studio writes to ir.model.fields or ir.ui.view unless the user explicitly asked for no-code Studio customization. Normal development must patch Python/XML files in the custom module.",
-            "Apply edits atomically: use repo.apply_patch_atomic for multi-file diffs or repo.write_many_atomic for multi-file/new-module writes. Use repo.apply_patch/repo.write only for small single-file changes. Do not edit Odoo core, enterprise, .git, or unrelated modules.",
+            "For Odoo Python files, never import pydantic or create Pydantic BaseModel classes. Use Odoo ORM models.Model, fields, api, and XML views only.",
+            "Apply edits safely: use repo.apply_patch_atomic for multi-file diffs or repo.write_many_smart for normal multi-file writes. Use repo.write_many_atomic only for large/risky refactors, and repo.apply_patch/repo.write only for small single-file changes. Do not edit Odoo core, enterprise, .git, or unrelated modules.",
             "Run git.diff and qa.self_run. Treat pytest environment failures separately from real module errors.",
             "MANDATORY before deploy: run workflow.verify_against_core for changed .py/.xml/.js/__manifest__.py files. If push_blocked=true, fix and re-run; do not deploy while blocked.",
             "Call workflow.safe_deploy_module with module_name, commit_message, changed paths, wait_for_odoosh=true, upgrade_module=true, and exact verify_ui_paths for UI/POS/website/view tasks. It owns commit, push, non-blocking Odoo.sh check, module deploy, module status, smoke test, and optional browser verification.",
@@ -161,7 +163,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "workflow.frontend_pattern_preflight",
             "workflow.scope_advice",
             "repo.apply_patch_atomic",
-            "repo.write_many_atomic",
+            "repo.write_many_smart",
             "repo.apply_patch",
             "git.diff",
             "qa.self_run",
@@ -504,26 +506,51 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
     The MCP agent must poll /jobs/{job_id} via jobs.get tool until status != running.
     This prevents Render/Koyeb HTTP timeouts from killing long-running deploys.
     """
-    approval = ApprovalService()
-    approval.ensure_allowed("workflow.safe_deploy_module", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
+    try:
+        approval = ApprovalService()
+        approval.ensure_allowed("workflow.safe_deploy_module", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
 
-    store = JsonStore()
-    job = store.create_job(JobRecord(
-        job_type="safe_deploy_module",
-        status=JobStatus.running,
-        request=payload.model_dump(mode="json"),
-    ))
+        store = JsonStore()
+        job = store.create_job(JobRecord(
+            job_type="safe_deploy_module",
+            status=JobStatus.running,
+            request=payload.model_dump(mode="json"),
+        ))
 
-    def _background():
-        try:
-            _run_safe_deploy(payload, job.id)
-        except Exception as exc:
-            store2 = JsonStore()
-            j = store2.get_job(job.id)
-            if j.status == JobStatus.running:
-                store2.finish_job(j, JobStatus.failed, {"error": f"Unhandled exception: {exc}"})
+        def _background():
+            try:
+                _run_safe_deploy(payload, job.id)
+            except Exception as exc:
+                try:
+                    store2 = JsonStore()
+                    j = store2.get_job(job.id)
+                    if j.status == JobStatus.running:
+                        store2.finish_job(j, JobStatus.failed, {"error": f"Unhandled exception: {exc}"})
+                except Exception:
+                    # The foreground response already returned the job id. Avoid
+                    # leaking background exception handling back to the MCP stream.
+                    pass
 
-    submit_background(_background)
+        submit_background(_background)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        return WorkflowReport(
+            status="failed",
+            job_id="",
+            steps=[
+                JobStep(
+                    name="safe_deploy_start",
+                    status="failed",
+                    error=str(exc),
+                )
+            ],
+            summary={
+                "message": "Safe deploy could not start. No commit or push was attempted.",
+                "error": str(exc),
+                "module_name": payload.module_name,
+            },
+        )
 
     return WorkflowReport(
         status="running",

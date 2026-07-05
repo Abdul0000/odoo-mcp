@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 
 from fastapi import APIRouter, HTTPException
+from pydantic import ValidationError
 
 from ..auth import AuthDependency
 from ..config import settings
@@ -259,7 +260,8 @@ _TOOL_DESCRIPTORS = [
         description=(
             "PREFERRED for multi-file writes. Auto-selects fast-safe lock+backup+rollback for small related edits "
             "and falls back to git temp-worktree atomic for large/risky writes. Keeps quality high while avoiding "
-            "slow repo.write_many_atomic for normal OWL/POS/website/XML changes."
+            "slow repo.write_many_atomic for normal OWL/POS/website/XML changes. Each file should use "
+            "relative_path; path is also accepted as a compatibility alias."
         ),
         requires_approval=True,
     ),
@@ -615,8 +617,21 @@ async def call_tool(payload: ToolCallRequest) -> ToolCallResult:
         return ToolCallResult(name=external_name, status="ok", result=result)
     except HTTPException as exc:
         return ToolCallResult(name=external_name, status="failed", error=str(exc.detail))
+    except ValidationError as exc:
+        return ToolCallResult(name=external_name, status="failed", error=format_tool_validation_error(exc))
     except Exception as exc:  # noqa: BLE001
         return ToolCallResult(name=external_name, status="failed", error=str(exc))
+
+
+def format_tool_validation_error(exc: ValidationError) -> str:
+    """Return concise agent-facing validation text without Pydantic internals."""
+    parts: list[str] = []
+    for error in exc.errors(include_url=False):
+        loc = ".".join(str(part) for part in error.get("loc", ())) or "arguments"
+        message = str(error.get("msg", "invalid value"))
+        parts.append(f"{loc}: {message}")
+    details = "; ".join(parts) if parts else str(exc)
+    return f"Tool input invalid: {details}"
 
 
 

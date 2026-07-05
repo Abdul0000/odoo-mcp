@@ -358,6 +358,8 @@ If the job is still running, the response contains `job_id`; call `jobs.get` wit
 
 `/tools/list` and MCP `tools/list` now expose the same operational tool surface with strict underscore tool names. `/mcp` also returns proper per-tool input schemas generated from the Pydantic request models instead of a generic object schema.
 
+Those Pydantic schemas belong only to the MCP connector API. Generated Odoo addon Python code must stay plain Odoo ORM code (`models.Model`, `fields`, `api`) and must not import or use Pydantic.
+
 The following REST endpoints are intentionally not exposed as MCP tools because they are protocol/documentation endpoints, not operational tools:
 
 ```text

@@ -5,13 +5,14 @@ import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
+from pydantic import ValidationError
 
 from ..auth import AuthDependency
 from ..config import settings
 from ..services.oauth_service import OAuthStore
 from ..services.qwen_token_service import QwenTokenService
 from ..services.store_service import JsonStore
-from .tools import _dispatch, internal_tool_name, list_tools, strict_safe_tool_name, tool_input_schema
+from .tools import _dispatch, format_tool_validation_error, internal_tool_name, list_tools, strict_safe_tool_name, tool_input_schema
 
 router = APIRouter(prefix="/mcp", tags=["mcp"], dependencies=[AuthDependency])
 qwen_router = APIRouter(prefix="/qwen", tags=["mcp-qwen"] )
@@ -430,6 +431,20 @@ async def _handle_rpc(payload: dict[str, Any], profile: str | None = None) -> di
                     "content": [{"type": "text", "text": text}],
                     "structuredContent": structured,
                     "isError": False,
+                },
+            )
+        except ValidationError as exc:
+            message = format_tool_validation_error(exc)
+            return _rpc_response(
+                request_id,
+                {
+                    "content": [{"type": "text", "text": message}],
+                    "structuredContent": {
+                        "status": "failed",
+                        "error": message,
+                        "error_type": "tool_input_invalid",
+                    },
+                    "isError": True,
                 },
             )
         except Exception as exc:  # noqa: BLE001

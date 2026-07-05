@@ -25,6 +25,64 @@ def _init_repo(path):
     subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.local", "commit", "-m", "init"], cwd=path, check=True, capture_output=True, text=True)
 
 
+def test_safe_deploy_starter_failure_returns_report(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+
+    class FakeApproval:
+        def ensure_allowed(self, *args, **kwargs):
+            return None
+
+    class BrokenStore:
+        def create_job(self, job):
+            raise OSError("state store unavailable")
+
+    monkeypatch.setattr(workflow, "ApprovalService", lambda: FakeApproval())
+    monkeypatch.setattr(workflow, "JsonStore", lambda: BrokenStore())
+
+    result = asyncio.run(workflow.safe_deploy_module(SafeDeployModuleRequest(
+        project_path=str(tmp_path),
+        module_name="sale_order_notebook_tab",
+        commit_message="[ADD] field",
+        branch="test_stagging_18",
+        run_qa=False,
+        wait_for_odoosh=True,
+        upgrade_module=True,
+        timeout_seconds=900,
+    )))
+
+    assert result.status == "failed"
+    assert result.job_id == ""
+    assert result.steps[0].name == "safe_deploy_start"
+    assert "state store unavailable" in result.summary["error"]
+
+
+def test_safe_deploy_endpoint_starts_job_for_grok_payload(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    (project / "sale_order_notebook_tab").mkdir(parents=True)
+
+    def fake_submit(callback):
+        return None
+
+    monkeypatch.setattr(workflow, "submit_background", fake_submit)
+
+    result = asyncio.run(workflow.safe_deploy_module(SafeDeployModuleRequest(
+        project_path=str(project),
+        module_name="sale_order_notebook_tab",
+        commit_message="[ADD] test_qwen field before quotation template in sale order form",
+        branch="test_stagging_18",
+        run_qa=False,
+        wait_for_odoosh=True,
+        upgrade_module=True,
+        timeout_seconds=900,
+    )))
+
+    assert result.status == "running"
+    assert result.job_id
+    assert result.summary["module_name"] == "sale_order_notebook_tab"
+
+
 def test_git_commit_configures_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "git_author_name", "MCP Bot")

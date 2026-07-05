@@ -100,6 +100,67 @@ def test_mcp_supports_health_approval_job_and_audit_tools(tmp_path, monkeypatch)
     assert any(event["action"].startswith("approval.") for event in audit_payload["items"])
 
 
+def test_mcp_repo_write_many_smart_accepts_path_alias(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    project.mkdir()
+    client = TestClient(app)
+
+    response = client.post(
+        "/mcp",
+        headers=_auth(),
+        json={
+            "jsonrpc": "2.0",
+            "id": 70,
+            "method": "tools/call",
+            "params": {
+                "name": "repo_write_many_smart",
+                "arguments": {
+                    "project_path": str(project),
+                    "files": [
+                        {"path": "sale_order_notebook_tab/models/sale_order.py", "content": "from odoo import fields, models\n"}
+                    ],
+                },
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["result"]
+    assert payload["isError"] is False
+    assert payload["structuredContent"]["exit_code"] == 0
+    assert "Pydantic" not in payload["content"][0]["text"]
+    assert (project / "sale_order_notebook_tab" / "models" / "sale_order.py").read_text(encoding="utf-8") == "from odoo import fields, models\n"
+
+
+def test_mcp_validation_errors_are_agent_friendly(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    project.mkdir()
+    client = TestClient(app)
+
+    response = client.post(
+        "/mcp",
+        headers=_auth(),
+        json={
+            "jsonrpc": "2.0",
+            "id": 71,
+            "method": "tools/call",
+            "params": {
+                "name": "repo_write_many_smart",
+                "arguments": {"project_path": str(project), "files": [{"path": "x.py"}]},
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()["result"]
+    assert payload["isError"] is True
+    assert payload["structuredContent"]["error_type"] == "tool_input_invalid"
+    assert "Tool input invalid" in payload["content"][0]["text"]
+    assert "pydantic.dev" not in payload["content"][0]["text"]
+
+
 def test_mcp_workflow_capability_check_tool():
     client = TestClient(app)
     response = client.post(

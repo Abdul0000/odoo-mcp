@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, computed_field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, computed_field, field_validator
 
 
 class Severity(str, Enum):
@@ -200,7 +200,10 @@ class RepoWriteRequest(BaseProjectRequest, ApprovalMixin):
 
 
 class RepoWriteItem(BaseModel):
-    relative_path: str
+    relative_path: str = Field(
+        validation_alias=AliasChoices("relative_path", "path"),
+        description="Path relative to project_path. The alias 'path' is accepted for compatibility with MCP clients.",
+    )
     content: str
     create_dirs: bool = True
 
