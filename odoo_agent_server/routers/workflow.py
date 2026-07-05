@@ -543,14 +543,16 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
         block_payload = safe_deploy_block_payload("safe_deploy_module", job)
 
         if job.status in _ACTIVE_JOB_STATUSES:
+            report_status = "already_in_progress"
             message = (
-                "A workflow.safe_deploy_module job is already running for this "
+                "A workflow.safe_deploy_module job is already in progress for this "
                 "project_path + module_name. No new deploy thread was started; "
                 "poll the existing job instead of replaying commit/push/upgrade."
             )
             next_call = {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True}}
             blocking_reason = "active_job"
         elif result_status in _RESUMABLE_SAFE_DEPLOY_RESULTS:
+            report_status = "resumable_existing_job"
             message = (
                 "A previous workflow.safe_deploy_module job for this project_path + "
                 "module_name stopped in a resumable state. No new deploy thread was "
@@ -560,6 +562,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             next_call = {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}}
             blocking_reason = "resumable_job"
         else:
+            report_status = "already_in_progress"
             # Defensive fallback; find_blocking_safe_deploy should only return
             # active/resumable safe deploy jobs.
             message = block_payload.get("message") or "Existing safe deploy job found."
@@ -567,13 +570,13 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             blocking_reason = "existing_job"
 
         return WorkflowReport(
-            status="already_running",
+            status=report_status,
             job_id=job.id,
             steps=job.steps,
             summary={
                 **block_payload,
                 **result,
-                "status": "already_running",
+                "status": report_status,
                 "blocking_reason": blocking_reason,
                 "message": message,
                 "job_id": job.id,
@@ -1033,7 +1036,19 @@ def _start_and_wait_module_deploy(payload: SafeDeployModuleRequest) -> OdooRpcRe
     )
 
 
-def _poll_odoosh_deployed(odoosh: OdooShService, pushed_sha: str, timeout_seconds: int, interval_seconds: float) -> CommandResult:
+def _poll_odoosh_deployed(
+    odoosh: OdooShService,
+    pushed_sha: str,
+    timeout_seconds: int,
+    interval_seconds: float,
+    progress_cb=None,
+) -> CommandResult:
+    """Poll Odoo.sh for the pushed SHA.
+
+    Runs only from the background safe-deploy worker. ``progress_cb`` is called
+    after every poll attempt so jobs.get shows fresh timestamps/progress for
+    impatient MCP clients while Odoo.sh is still building.
+    """
     deadline = time.monotonic() + max(timeout_seconds, 0)
     attempts: list[dict[str, object]] = []
     attempt = 0
@@ -1042,12 +1057,21 @@ def _poll_odoosh_deployed(odoosh: OdooShService, pushed_sha: str, timeout_second
         attempt += 1
         check_result = odoosh.check_commit_deployed(pushed_sha)
         deployed = check_result.exit_code == 0 and '"deployed": true' in (check_result.stdout or "").lower()
-        attempts.append({
+        attempt_payload = {
             "attempt": attempt,
             "exit_code": check_result.exit_code,
             "stdout": check_result.stdout,
             "stderr": check_result.stderr,
-        })
+            "deployed": deployed,
+            "expected_sha": pushed_sha,
+            "poll_interval_seconds": interval_seconds,
+        }
+        attempts.append(attempt_payload)
+        if progress_cb is not None:
+            try:
+                progress_cb(attempt_payload)
+            except Exception:
+                pass
         if deployed:
             return check_result.model_copy(update={
                 "command": ["odoosh.check_commit_poll", pushed_sha],
@@ -1168,17 +1192,37 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         return
     changed_files = _changed_file_set(changed_files_result)
     _step("git_changed_files", "passed", changed_files_result)
+    idempotent_clean_retry = False
+    idempotent_head_path_gate: CommandResult | None = None
     if not _paths_touch_changed_files(deploy_paths, changed_files):
-        _fail(
-            "deploy_dirty_path_gate",
-            changed_files_result,
-            (
-                "No changed files in the selected project_path match the requested deploy paths. "
-                "Refusing commit/push because the edits may be in another checkout. "
-                f"project_path={project_path}; deploy_paths={deploy_paths}; changed_files={sorted(changed_files)}"
-            ),
-        )
-        return
+        # Defense-in-depth: duplicate safe_deploy invocations may arrive after a
+        # previous request already committed the expected files but before the
+        # client observed the job_id. In that case the working tree is clean for
+        # the requested paths. Do not create a second commit/push; prove HEAD
+        # already contains those paths and continue to Odoo.sh polling with HEAD.
+        idempotent_head_path_gate = _assert_head_commit_contains_paths(git, project_path, deploy_paths)
+        if idempotent_head_path_gate.exit_code == 0:
+            idempotent_clean_retry = True
+            _step(
+                "idempotent_commit_push_skip",
+                "passed",
+                {
+                    "message": "No working-tree changes matched deploy paths; HEAD already contains the requested paths. Skipping duplicate commit/push and continuing with HEAD SHA.",
+                    "deploy_paths": deploy_paths,
+                    "changed_files": sorted(changed_files),
+                },
+            )
+        else:
+            _fail(
+                "deploy_dirty_path_gate",
+                changed_files_result,
+                (
+                    "No changed files in the selected project_path match the requested deploy paths, and HEAD did not prove an already-committed retry. "
+                    "Refusing commit/push because the edits may be in another checkout. "
+                    f"project_path={project_path}; deploy_paths={deploy_paths}; changed_files={sorted(changed_files)}"
+                ),
+            )
+            return
 
     if payload.run_qa:
         qa_report = self_run(SelfRunRequest(
@@ -1231,31 +1275,44 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         return
     _step("git_validate_target", "passed", target_result)
 
-    commit_result = git.commit(str(project_path), payload.commit_message, deploy_paths, min(payload.timeout_seconds, 300))
-    if commit_result.exit_code != 0:
-        _fail("git_commit", commit_result)
-        return
-    _step("git_commit", "passed", commit_result)
+    if idempotent_clean_retry:
+        _step("git_commit", "skipped", {"message": "Skipped duplicate commit because requested paths are already represented in HEAD."})
+        head_path_gate = idempotent_head_path_gate or _assert_head_commit_contains_paths(git, project_path, deploy_paths)
+        _step("git_head_commit_path_gate", "passed", head_path_gate)
+        sha_result = git.head_sha(str(project_path))
+        if sha_result.exit_code != 0:
+            _fail("git_head_sha", sha_result)
+            return
+        pushed_sha = sha_result.stdout.strip()
+        _step("git_head_sha", "passed", sha_result)
+        push_started_epoch = int(time.time())
+        _step("git_push", "skipped", {"message": "Skipped duplicate push; remote SHA will be verified before Odoo.sh polling.", "sha": pushed_sha})
+    else:
+        commit_result = git.commit(str(project_path), payload.commit_message, deploy_paths, min(payload.timeout_seconds, 300))
+        if commit_result.exit_code != 0:
+            _fail("git_commit", commit_result)
+            return
+        _step("git_commit", "passed", commit_result)
 
-    head_path_gate = _assert_head_commit_contains_paths(git, project_path, deploy_paths)
-    if head_path_gate.exit_code != 0:
-        _fail("git_head_commit_path_gate", head_path_gate)
-        return
-    _step("git_head_commit_path_gate", "passed", head_path_gate)
+        head_path_gate = _assert_head_commit_contains_paths(git, project_path, deploy_paths)
+        if head_path_gate.exit_code != 0:
+            _fail("git_head_commit_path_gate", head_path_gate)
+            return
+        _step("git_head_commit_path_gate", "passed", head_path_gate)
 
-    sha_result = git.head_sha(str(project_path))
-    if sha_result.exit_code != 0:
-        _fail("git_head_sha", sha_result)
-        return
-    pushed_sha = sha_result.stdout.strip()
-    _step("git_head_sha", "passed", sha_result)
+        sha_result = git.head_sha(str(project_path))
+        if sha_result.exit_code != 0:
+            _fail("git_head_sha", sha_result)
+            return
+        pushed_sha = sha_result.stdout.strip()
+        _step("git_head_sha", "passed", sha_result)
 
-    push_started_epoch = int(time.time())
-    push_result = git.push(str(project_path), payload.remote, branch, True, min(payload.timeout_seconds, 600))
-    if push_result.exit_code != 0:
-        _fail("git_push", push_result)
-        return
-    _step("git_push", "passed", push_result)
+        push_started_epoch = int(time.time())
+        push_result = git.push(str(project_path), payload.remote, branch, True, min(payload.timeout_seconds, 600))
+        if push_result.exit_code != 0:
+            _fail("git_push", push_result)
+            return
+        _step("git_push", "passed", push_result)
 
     if hasattr(git, "remote_head_sha"):
         remote_head = git.remote_head_sha(str(project_path), payload.remote, branch, 60)
@@ -1285,11 +1342,15 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     store.update_job(pushed_job)
 
     if payload.wait_for_odoosh:
+        def _odoosh_poll_progress(attempt_payload: dict[str, object]) -> None:
+            _step("odoosh_check_commit_poll", "passed" if attempt_payload.get("deployed") else "running", attempt_payload)
+
         check_result = _poll_odoosh_deployed(
             odoosh,
             pushed_sha,
             payload.odoosh_deploy_timeout_seconds,
             payload.odoosh_deploy_poll_interval_seconds,
+            progress_cb=_odoosh_poll_progress,
         )
         deployed = check_result.exit_code == 0 and '"deployed": true' in (check_result.stdout or "").lower()
         _step("odoosh_check_commit", "passed" if deployed else "failed", check_result)

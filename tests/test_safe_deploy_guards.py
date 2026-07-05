@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import time
 
 from fastapi import HTTPException
 
@@ -1093,7 +1094,7 @@ def test_safe_deploy_duplicate_call_returns_existing_running_job(tmp_path, monke
     second = asyncio.run(workflow.safe_deploy_module(payload))
 
     assert first.status == "running"
-    assert second.status == "already_running"
+    assert second.status == "already_in_progress"
     assert second.job_id == first.job_id
     assert second.summary["blocking_reason"] == "active_job"
     assert second.summary["next_call"]["tool"] == "jobs.get"
@@ -1136,7 +1137,7 @@ def test_safe_deploy_resumable_failure_returns_existing_job_to_resume(tmp_path, 
         wait_for_result=False,
     )))
 
-    assert result.status == "already_running"
+    assert result.status == "resumable_existing_job"
     assert result.job_id == existing.id
     assert result.summary["blocking_reason"] == "resumable_job"
     assert result.summary["result_status"] == "deploy_failed_or_timeout"
@@ -1187,3 +1188,204 @@ def test_safe_deploy_force_new_after_resumable_failure_starts_new_job(tmp_path, 
     jobs = JsonStore().list_jobs()
     assert len(jobs) == 2
     assert {job.id for job in jobs} == {existing.id, result.job_id}
+
+
+
+def test_safe_deploy_request_defaults_to_fast_response_and_qa_enabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    (project / "sale_order_notebook_tab").mkdir(parents=True)
+    submit_calls = {"count": 0}
+
+    def fake_submit(callback):
+        submit_calls["count"] += 1
+        # Do not execute the background callback; this test asserts the HTTP
+        # handler returns immediately with a resumable/pollable job id.
+        return None
+
+    monkeypatch.setattr(workflow, "submit_background", fake_submit)
+
+    payload = SafeDeployModuleRequest(
+        project_path=str(project),
+        module_name="sale_order_notebook_tab",
+        commit_message="Add field grok_fast",
+        branch="test_stagging_18",
+        wait_for_odoosh=True,
+        upgrade_module=True,
+    )
+
+    assert payload.run_qa is True
+    assert payload.wait_for_result is False
+
+    started = time.monotonic()
+    result = asyncio.run(workflow.safe_deploy_module(payload))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0
+    assert result.status == "running"
+    assert result.job_id
+    assert result.summary["next_call"]["tool"] == "jobs.get"
+    assert submit_calls == {"count": 1}
+
+
+def test_run_safe_deploy_runs_qa_by_default_when_omitted(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    changed = project / "x_module" / "models" / "a.py"
+    changed.parent.mkdir(parents=True)
+    changed.write_text("from odoo import fields, models\n", encoding="utf-8")
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running))
+    calls = {"qa": 0}
+
+    class FakeGit:
+        def status(self, project_path):
+            return CommandResult(command=["git", "status"], cwd=project_path, exit_code=0, stdout=" M x_module/models/a.py\n")
+        def diff(self, project_path, staged=False, timeout_seconds=30):
+            return CommandResult(command=["git", "diff"], cwd=project_path, exit_code=0, stdout="")
+        def changed_files(self, project_path):
+            return CommandResult(command=["git", "changed-files"], cwd=project_path, exit_code=0, stdout="x_module/models/a.py\n")
+        def configure_identity(self, project_path):
+            return CommandResult(command=["git", "config"], cwd=project_path, exit_code=0)
+        def validate_target(self, project_path, branch=None, remote="origin"):
+            return CommandResult(command=["git", "validate-target"], cwd=project_path, exit_code=0)
+        def commit(self, project_path, message, paths, timeout_seconds=60):
+            return CommandResult(command=["git", "commit"], cwd=project_path, exit_code=0)
+        def head_changed_files(self, project_path, timeout_seconds=20):
+            return CommandResult(command=["git", "diff-tree"], cwd=project_path, exit_code=0, stdout="x_module/models/a.py\n")
+        def head_sha(self, project_path):
+            return CommandResult(command=["git", "rev-parse", "HEAD"], cwd=project_path, exit_code=0, stdout="abc1234\n")
+        def push(self, project_path, remote="origin", branch=None, set_upstream=True, timeout_seconds=120):
+            return CommandResult(command=["git", "push"], cwd=project_path, exit_code=0, stdout="PUSH_OK\nsha=abc1234\n")
+        def remote_head_sha(self, project_path, remote="origin", branch=None, timeout_seconds=30):
+            return CommandResult(command=["git", "remote-head-sha"], cwd=project_path, exit_code=0, stdout="abc1234\n")
+
+    class FakeSyntaxVerifier:
+        def verify(self, req):
+            class Result:
+                push_blocked = False
+                def model_dump(self, mode="json"):
+                    return {"push_blocked": False}
+            return Result()
+
+    class FakeOdooSh:
+        def verify_module_manifest(self, module_name):
+            return CommandResult(command=["odoosh", "manifest"], cwd="odoosh:ssh", exit_code=0, stdout="ok")
+
+    class FakeOdooRpc:
+        def module_status(self, module_name):
+            return OdooRpcResult(status="ok", result=[{"name": module_name, "state": "installed"}])
+        def registry_smoke_test(self, module_name, model_names=None, menu_names=None, strict=True):
+            return OdooRpcResult(status="ok", result={"module": module_name})
+
+    class QaReport:
+        status = "passed"
+        def model_dump(self, mode="json"):
+            return {"status": "passed"}
+
+    def fake_self_run(req):
+        calls["qa"] += 1
+        return QaReport()
+
+    monkeypatch.setattr(workflow, "GitService", lambda: FakeGit())
+    monkeypatch.setattr(workflow, "SyntaxVerifierService", lambda: FakeSyntaxVerifier())
+    monkeypatch.setattr(workflow, "OdooShService", lambda: FakeOdooSh())
+    monkeypatch.setattr(workflow, "OdooRpcService", lambda: FakeOdooRpc())
+    monkeypatch.setattr(workflow, "self_run", fake_self_run)
+
+    workflow._run_safe_deploy(
+        SafeDeployModuleRequest(
+            project_path=str(project),
+            module_name="x_module",
+            commit_message="Deploy x_module",
+            paths=["x_module/models/a.py"],
+            wait_for_odoosh=False,
+            upgrade_module=False,
+        ),
+        job.id,
+    )
+
+    finished = store.get_job(job.id)
+    assert calls == {"qa": 1}
+    assert any(step.name == "qa_self_run" and step.status == "passed" for step in finished.steps)
+
+
+def test_run_safe_deploy_idempotent_retry_skips_commit_and_push_when_head_already_matches(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    changed = project / "x_module" / "models" / "a.py"
+    changed.parent.mkdir(parents=True)
+    changed.write_text("from odoo import fields, models\n", encoding="utf-8")
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running))
+    calls = {"commit": 0, "push": 0}
+
+    class FakeGit:
+        def status(self, project_path):
+            return CommandResult(command=["git", "status"], cwd=project_path, exit_code=0, stdout="")
+        def diff(self, project_path, staged=False, timeout_seconds=30):
+            return CommandResult(command=["git", "diff"], cwd=project_path, exit_code=0, stdout="")
+        def changed_files(self, project_path):
+            return CommandResult(command=["git", "changed-files"], cwd=project_path, exit_code=0, stdout="")
+        def head_changed_files(self, project_path, timeout_seconds=20):
+            return CommandResult(command=["git", "diff-tree"], cwd=project_path, exit_code=0, stdout="x_module/models/a.py\n")
+        def configure_identity(self, project_path):
+            return CommandResult(command=["git", "config"], cwd=project_path, exit_code=0)
+        def validate_target(self, project_path, branch=None, remote="origin"):
+            return CommandResult(command=["git", "validate-target"], cwd=project_path, exit_code=0)
+        def commit(self, project_path, message, paths, timeout_seconds=60):
+            calls["commit"] += 1
+            return CommandResult(command=["git", "commit"], cwd=project_path, exit_code=0)
+        def head_sha(self, project_path):
+            return CommandResult(command=["git", "rev-parse", "HEAD"], cwd=project_path, exit_code=0, stdout="abc1234\n")
+        def push(self, project_path, remote="origin", branch=None, set_upstream=True, timeout_seconds=120):
+            calls["push"] += 1
+            return CommandResult(command=["git", "push"], cwd=project_path, exit_code=0, stdout="PUSH_OK\nsha=abc1234\n")
+        def remote_head_sha(self, project_path, remote="origin", branch=None, timeout_seconds=30):
+            return CommandResult(command=["git", "remote-head-sha"], cwd=project_path, exit_code=0, stdout="abc1234\n")
+
+    class FakeSyntaxVerifier:
+        def verify(self, req):
+            class Result:
+                push_blocked = False
+                def model_dump(self, mode="json"):
+                    return {"push_blocked": False}
+            return Result()
+
+    class FakeOdooSh:
+        def verify_module_manifest(self, module_name):
+            return CommandResult(command=["odoosh", "manifest"], cwd="odoosh:ssh", exit_code=0, stdout="ok")
+
+    class FakeOdooRpc:
+        def module_status(self, module_name):
+            return OdooRpcResult(status="ok", result=[{"name": module_name, "state": "installed"}])
+        def registry_smoke_test(self, module_name, model_names=None, menu_names=None, strict=True):
+            return OdooRpcResult(status="ok", result={"module": module_name})
+
+    monkeypatch.setattr(workflow, "GitService", lambda: FakeGit())
+    monkeypatch.setattr(workflow, "SyntaxVerifierService", lambda: FakeSyntaxVerifier())
+    monkeypatch.setattr(workflow, "OdooShService", lambda: FakeOdooSh())
+    monkeypatch.setattr(workflow, "OdooRpcService", lambda: FakeOdooRpc())
+
+    workflow._run_safe_deploy(
+        SafeDeployModuleRequest(
+            project_path=str(project),
+            module_name="x_module",
+            commit_message="Deploy x_module",
+            paths=["x_module/models/a.py"],
+            run_qa=False,
+            wait_for_odoosh=False,
+            upgrade_module=False,
+        ),
+        job.id,
+    )
+
+    finished = store.get_job(job.id)
+    assert finished.status == JobStatus.passed
+    assert calls == {"commit": 0, "push": 0}
+    assert any(step.name == "idempotent_commit_push_skip" and step.status == "passed" for step in finished.steps)
+    assert any(step.name == "git_commit" and step.status == "skipped" for step in finished.steps)
+    assert any(step.name == "git_push" and step.status == "skipped" for step in finished.steps)

@@ -597,7 +597,7 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     paths: list[str] = Field(default_factory=list, description="Relative paths to add before commit. Empty means git add -A.")
     remote: str = Field(default="origin")
     branch: str | None = Field(default=None, description="Defaults to current branch or TARGET_GIT_BRANCH")
-    run_qa: bool = Field(default=True)
+    run_qa: bool = Field(default=True, description="Run qa.self_run by default so deploy failures surface before long Odoo.sh polling. Set False only for an explicit, intentional bypass.")
     wait_for_odoosh: bool = Field(default=True)
     upgrade_module: bool = Field(default=True)
     verify_ui_paths: list[str] = Field(
@@ -610,7 +610,7 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     )
     verify_ui_screenshot_prefix: str = Field(default="safe_deploy_ui", description="Screenshot filename prefix for verify_ui_paths")
     verify_ui_timeout_seconds: int = Field(default=45, ge=10, le=180, description="Per-page browser timeout for verify_ui_paths")
-    wait_for_result: bool = Field(default=True, description="Wait server-side for the safe deploy job until done or wait_timeout_seconds expires")
+    wait_for_result: bool = Field(default=False, description="Return the background safe-deploy job_id immediately. Set True only for clients that can safely hold a long tool call open.")
     wait_timeout_seconds: int = Field(default=300, ge=0, le=300, description="Maximum server-side wait before returning job_id/next_call")
     poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between safe deploy job polls while waiting")
     odoosh_deploy_timeout_seconds: int = Field(default=300, ge=0, le=600, description="Maximum time to poll Odoo.sh after git push for the pushed SHA to become deployed")
@@ -695,7 +695,7 @@ class MenuCrawlerRequest(BaseModel):
 
 
 class WorkflowReport(BaseModel):
-    status: Literal["passed", "failed", "warning", "running", "already_running"]
+    status: Literal["passed", "failed", "warning", "running", "already_running", "already_in_progress", "resumable_existing_job"]
     job_id: str
     steps: list[JobStep]
     summary: dict[str, Any]
