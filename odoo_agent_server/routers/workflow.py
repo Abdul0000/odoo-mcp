@@ -4,7 +4,6 @@ import asyncio
 import ast
 import hashlib
 import json
-import logging
 import os
 import shutil
 import time
@@ -88,7 +87,6 @@ from .qa import self_run
 from .odoo import start_odoo_module_deploy_job
 
 router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDependency])
-logger = logging.getLogger(__name__)
 
 # Serializes the safe_deploy_module entry gate inside this process so two
 # near-simultaneous retries cannot both pass the duplicate-job check before the
@@ -604,21 +602,6 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                     client_name=payload.client_name,
                 )
             if existing_job is not None:
-                existing_result = existing_job.result if isinstance(existing_job.result, dict) else {}
-                result_status = existing_result.get("status")
-                response_status = "already_in_progress" if existing_job.status in _ACTIVE_JOB_STATUSES else "resumable_existing_job"
-                logger.info(
-                    "safe_deploy_module_duplicate_call",
-                    extra={
-                        "response_status": response_status,
-                        "job_id": existing_job.id,
-                        "job_status": getattr(existing_job.status, "value", str(existing_job.status)),
-                        "result_status": result_status,
-                        "client_name": payload.client_name,
-                        "project_path": payload.project_path,
-                        "module_name": payload.module_name,
-                    },
-                )
                 return _existing_job_report(existing_job)
 
             store = JsonStore()

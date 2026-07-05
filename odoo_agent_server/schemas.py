@@ -274,14 +274,6 @@ class GitPushRequest(BaseProjectRequest, ApprovalMixin):
     remote: str = Field(default="origin")
     branch: str | None = Field(default=None, description="Defaults to the current branch")
     set_upstream: bool = Field(default=True)
-    acknowledge_manual_deploy: bool = Field(
-        default=False,
-        description=(
-            "Explicitly allow raw git.push for Odoo module changes without running "
-            "workflow.safe_deploy_module. When false, module pushes are blocked so "
-            "code cannot be pushed without an automatic Odoo.sh upgrade."
-        ),
-    )
     timeout_seconds: int = Field(default=120, ge=10, le=600)
 
 

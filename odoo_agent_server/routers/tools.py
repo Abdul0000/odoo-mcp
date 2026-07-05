@@ -307,18 +307,8 @@ _TOOL_DESCRIPTORS = [
         title="Review code changes (diff)", description="Read git diff", read_only=True),
     ToolDescriptor(name="git.commit",
         title="Commit code changes", description="Create a git commit", requires_approval=True),
-    ToolDescriptor(
-        name="git.push",
-        title="Push code to GitHub",
-        description=(
-            "Push current branch to remote. Do not call this directly for Odoo module changes after coding; "
-            "use workflow.safe_deploy_module so code is pushed and the module is upgraded in one guaranteed flow. "
-            "By default this tool refuses raw pushes that touch directories with __manifest__.py unless "
-            "acknowledge_manual_deploy=true is provided, and successful acknowledged raw module pushes return a "
-            "warning/next_call because Odoo.sh is not upgraded automatically."
-        ),
-        requires_approval=True,
-    ),
+    ToolDescriptor(name="git.push",
+        title="Push code to GitHub", description="Push current branch to remote", requires_approval=True),
     ToolDescriptor(
         name="odoosh.module_install_ssh",
         title="Install module via SSH",
