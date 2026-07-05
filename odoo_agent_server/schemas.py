@@ -411,40 +411,6 @@ class PosFlowCheckResult(BaseModel):
     error: str | None = None
 
 
-class PosFlowCheckRequest(BaseModel):
-    """Run a real multi-step POS interaction inside one persistent session,
-    instead of a single cold-load screenshot. Steps are fixed (open POS ->
-    open session if needed -> click first product -> open payment screen ->
-    validate order -> receipt screen) because POS component/state bugs only
-    surface once you actually interact with the app, not on initial mount.
-    """
-    base_url: str | None = Field(default=None)
-    login: str | None = Field(default=None)
-    password: str | None = Field(default=None)
-    pos_config_name: str | None = Field(default=None, description="Optional POS config display name to open; if omitted, opens the first available POS.")
-    product_name: str | None = Field(default=None, description="Optional exact/partial product name to click; if omitted, clicks the first product tile found.")
-    payment_method_name: str | None = Field(default=None, description="Optional payment method button label; if omitted, clicks the first payment method tile found.")
-    screenshot_prefix: str = Field(default="pos_flow")
-    timeout_seconds: int = Field(default=60, ge=15, le=180)
-
-
-class PosFlowStepResult(BaseModel):
-    step: str
-    status: Literal["ok", "failed", "skipped"]
-    screenshot_path: str | None = None
-    console_errors: list[str] = Field(default_factory=list)
-    network_errors: list[str] = Field(default_factory=list)
-    error: str | None = None
-
-
-class PosFlowCheckResult(BaseModel):
-    status: Literal["ok", "failed"]
-    steps: list[PosFlowStepResult] = Field(default_factory=list)
-    console_errors: list[str] = Field(default_factory=list, description="All console errors across the whole session, deduplicated.")
-    network_errors: list[str] = Field(default_factory=list, description="All network errors across the whole session, deduplicated.")
-    error: str | None = None
-
-
 class ApprovalStatus(str, Enum):
     pending = "pending"
     approved = "approved"
@@ -876,7 +842,10 @@ class ResumeJobRequest(BaseModel):
         default=None,
         description=(
             "If provided, start from this step name instead of the auto-detected last successful step. "
-            "Supported values: 'qa', 'commit', 'push', 'wait_odoosh', 'upgrade', 'smoke_test'."
+            "Supported values include actual safe-deploy step names such as "
+            "'qa_self_run', 'git_commit', 'git_push', 'odoosh_check_commit', "
+            "'odoo_module_deploy', and 'registry_smoke_test'. Legacy aliases "
+            "'qa', 'commit', 'push', 'wait_odoosh', 'upgrade', and 'smoke_test' are accepted."
         ),
     )
 
@@ -1007,6 +976,12 @@ class VerifyFinding(BaseModel):
     message: str = Field(..., description="Human-readable description of the mismatch")
     fix_hint: str = Field("", description="What to do to fix this issue")
     line: int | None = Field(default=None, description="Line number in `file` where the issue was found, when known (e.g. real JS parse errors).")
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def code(self) -> str:
+        """Backward-compatible alias used by older tests/clients."""
+        return self.check
 
 
 class SyntaxVerifyRequest(BaseModel):

@@ -55,6 +55,7 @@ Agent reads real source → gets correct patterns for that version automatically
 
 ## GOLDEN RULES
 
+0. Tools/list returns strict underscore names (for example `qa_self_run`); tools/call may still use dotted aliases for compatibility.
 1. NEVER call the same tool twice in a row with the same arguments — if it fails, diagnose first
 2. NEVER use `odoosh.wait_for_commit` — always use `odoosh.check_commit` in a polling loop
 3. ALWAYS call `workflow.agent_instructions` first in every new session and follow exactly
@@ -213,7 +214,7 @@ If `push_blocked=False`: proceed to commit + push.
 
 ---
 
-### PHASE 4 — DEPLOY (commit → push → wait → install)
+### PHASE 4 — DEPLOY (commit → push → check → install)
 
 **Step 12:** `odoo.ensure_dependencies` — auto-install any missing deps
 
@@ -221,7 +222,9 @@ If `push_blocked=False`: proceed to commit + push.
 
 **Step 14:** `git.push` — note the `sha` value from the response
 
-**Step 15:** `odoosh.check_commit` polling loop
+**Step 15:** Prefer `workflow.safe_deploy_module` for the normal commit/push/deploy cycle. It does one non-blocking `odoosh.check_commit`; if Odoo.sh is not deployed yet it returns `status=retry_later` and `next_call={"tool":"workflow.resume_job"}`. Wait briefly and call `workflow.resume_job(job_id)` instead of restarting or blocking.
+
+Manual fallback only: use `odoosh.check_commit` polling loop.
 - Adaptive: attempts 0-2 → wait 5s | 3-7 → wait 10s | 8+ → wait 15s | max 20 retries
 
 **Step 16:** `odoo.module_deploy` — smart install/upgrade; returns job_id if running
@@ -241,7 +244,7 @@ Instead of restarting from step 0:
 2. Call `workflow.resume_job(job_id)`
 3. It reads which steps already passed and continues from the next one
 4. Optional: pass `override_step` to force a specific restart point:
-   `qa | commit | push | wait_odoosh | upgrade | smoke_test`
+   `qa_self_run | git_commit | git_push | odoosh_check_commit | odoo_module_deploy | registry_smoke_test`
 
 ---
 
@@ -269,12 +272,13 @@ If `repo.write` response includes `large_file_warning` (file > 1000 lines):
 |---|---|
 | `repo not found / path not found` | Call workflow.start_session |
 | `SSH auth failed` | Call workflow.capability_check — SSH key issue |
-| `Module not found in registry` | Call odoosh.module_update first, then odoo.module_deploy |
+| `Module not found in registry` | Call odoo.module_deploy; it auto-runs update_list, chooses install/upgrade, and falls back to SSH deploy if the DB has not registered the source module |
 | `ODOO_WRONG_IMPORT` | Fix the import pattern, rerun qa.self_run |
 | `Missing/uninstalled dependencies` | Call odoo.ensure_dependencies(module_name) |
 | `ImportError: cannot import` | Read the file, fix import, recommit |
 | `ParseError` in XML | Read the XML file, fix syntax, recommit |
 | `deployed: false after 20 retries` | Call odoosh.grep_errors — build may have failed |
+| `workflow.resume_job status=retry_later` | Odoo.sh has not deployed the SHA yet — wait briefly and call workflow.resume_job again |
 | `Pipeline failed at step X` | Call workflow.resume_job(job_id) — NOT restart from step 0 |
 | `git push rejected` | TARGET_GIT_REPO must use HTTPS+token format |
 | `415 UnicodeDecodeError` | Binary file — skip repo.read for .png/.jpg/.ico/.woff/.ttf |

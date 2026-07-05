@@ -27,9 +27,10 @@ from ..schemas import (
 # Regex helpers
 # ---------------------------------------------------------------------------
 _FIELD_NAME_RE     = re.compile(r'^\s{4,}(\w+)\s*=\s*fields\.', re.MULTILINE)
-_INHERIT_RE        = re.compile(r'_inherit\s*=\s*["\']([^"\']+)["\']')
+_INHERIT_RE        = re.compile(r'_inherit\s*=\s*([^\n#]+)')
+_MODEL_LITERAL_RE  = re.compile(r'["\']([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z0-9_.]+)["\']')
 _DEPENDS_PY_RE     = re.compile(r'depends\(\[([^\]]+)\]\)')
-_COMODEL_RE        = re.compile(r'comodel_name\s*=\s*["\']([^"\']+)["\']')
+_COMODEL_RE        = re.compile(r'(?:comodel_name\s*=\s*["\']([^"\']+)["\']|fields\.(?:Many2one|One2many|Many2many)\s*\(\s*["\']([^"\']+)["\'])')
 _RELATED_RE        = re.compile(r'related\s*=\s*["\']([^"\']+)["\']')
 _COMPUTE_RE        = re.compile(r'compute\s*=\s*["\']([^"\']+)["\']')
 _XPATH_EXPR_RE     = re.compile(r'expr=["\']([^"\']+)["\']')
@@ -47,11 +48,11 @@ _T_CALL_RE         = re.compile(r't-call=["\']([^"\']+)["\']')
 _T_XPATH_RE        = re.compile(r'<xpath\b[^>]*expr=["\']([^"\']+)["\']', re.DOTALL)
 _CLASS_IN_EXPR_RE  = re.compile(r'contains\(@class,\s*["\']([^"\']+)["\']\)|hasclass\(["\']([^"\']+)["\']\)')
 
-# Search roots (same as CoreFinderService): custom/user, enterprise, community.
+# Search roots for installed-source reads: enterprise, community, then user fallback.
 _SRC_ROOTS = [
-    Path("/home/odoo/src/user"),
     Path("/home/odoo/src/enterprise"),
     Path("/home/odoo/src/odoo"),
+    Path("/home/odoo/src/user"),
 ]
 
 _ALIAS_MODULES = {
@@ -142,6 +143,11 @@ def _extract_core_field_names(core_content: str) -> set[str]:
     return {m.group(1) for m in _FIELD_NAME_RE.finditer(core_content)}
 
 
+def _extract_model_literals(raw: str) -> list[str]:
+    """Extract Odoo model strings from scalar or list/tuple assignments."""
+    return [m.group(1) for m in _MODEL_LITERAL_RE.finditer(raw)]
+
+
 def _find_core_view_content(model_name: str) -> str:
     """Return concatenated content of core view XML files for a model."""
     if not model_name:
@@ -202,6 +208,10 @@ def _resolve_odoo_alias(import_path: str) -> list[Path]:
             candidates.extend([base, base.with_suffix(".js"), base.with_suffix(".xml"), base / "index.js"])
         return candidates
     return []
+
+
+def _known_odoo_alias(import_path: str) -> bool:
+    return any(import_path.startswith(alias) for alias in _ALIAS_MODULES)
 
 
 def _asset_path_exists(module_root: Path, asset: str) -> bool:
@@ -437,10 +447,13 @@ class SyntaxVerifierService:
 
     def _verify_python_model(self, file_path: str, content: str) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
-        inherit_models = [m.group(1) for m in _INHERIT_RE.finditer(content)]
+        inherit_models: list[str] = []
+        for m in _INHERIT_RE.finditer(content):
+            inherit_models.extend(_extract_model_literals(m.group(1)))
 
         for model_name in inherit_models:
             core_content = _find_core_model_content(model_name)
+            core_fields: set[str] = set()
             if not core_content:
                 findings.append(VerifyFinding(
                     file=file_path,
@@ -449,28 +462,27 @@ class SyntaxVerifierService:
                     message=f"_inherit '{model_name}' — core model source not found in /home/odoo/src/*. Cannot cross-check fields.",
                     fix_hint=f"Run workflow.find_core_file('{model_name.split('.')[0]}', 'model', '{model_name.split('.')[-1]}') manually.",
                 ))
-                continue
-
-            core_fields = _extract_core_field_names(core_content)
-            for dep_m in _DEPENDS_PY_RE.finditer(content):
-                raw = dep_m.group(1)
-                field_refs = [s.strip().strip("'\"") for s in raw.split(",")]
-                for ref in field_refs:
-                    first_field = ref.split(".")[0] if "." in ref else ref
-                    if first_field and first_field not in core_fields:
-                        findings.append(VerifyFinding(
-                            file=file_path,
-                            severity=VerifySeverity.CRITICAL,
-                            check="depends_field_exists",
-                            message=f"depends(['{ref}']) — field '{first_field}' not found in core model '{model_name}'.",
-                            fix_hint=(
-                                f"Core fields available: {sorted(list(core_fields))[:20]}... "
-                                "Re-read core model with repo.read and use only real field names."
-                            ),
-                        ))
+            else:
+                core_fields = _extract_core_field_names(core_content)
+                for dep_m in _DEPENDS_PY_RE.finditer(content):
+                    raw = dep_m.group(1)
+                    field_refs = [s.strip().strip("'\"") for s in raw.split(",")]
+                    for ref in field_refs:
+                        first_field = ref.split(".")[0] if "." in ref else ref
+                        if first_field and first_field not in core_fields:
+                            findings.append(VerifyFinding(
+                                file=file_path,
+                                severity=VerifySeverity.CRITICAL,
+                                check="depends_field_exists",
+                                message=f"depends(['{ref}']) — field '{first_field}' not found in core model '{model_name}'.",
+                                fix_hint=(
+                                    f"Core fields available: {sorted(list(core_fields))[:20]}... "
+                                    "Re-read core model with repo.read and use only real field names."
+                                ),
+                            ))
 
             for cm_m in _COMODEL_RE.finditer(content):
-                comodel = cm_m.group(1)
+                comodel = cm_m.group(1) or cm_m.group(2) or ""
                 if "." in comodel:
                     comodel_module = comodel.split(".")[0]
                     if not _module_exists_in_src(comodel_module):
@@ -714,13 +726,22 @@ class SyntaxVerifierService:
             if import_path.startswith("@"):
                 candidates = _resolve_odoo_alias(import_path)
                 if not candidates:
-                    findings.append(VerifyFinding(
-                        file=file_path,
-                        severity=VerifySeverity.WARNING,
-                        check="js_import_alias_known",
-                        message=f"Import alias '{import_path}' is not in the verifier's known Odoo aliases.",
-                        fix_hint="Read real Odoo source and verify this alias exists before pushing.",
-                    ))
+                    if _known_odoo_alias(import_path) and not _core_source_available():
+                        findings.append(VerifyFinding(
+                            file=file_path,
+                            severity=VerifySeverity.WARNING,
+                            check="js_import_resolves",
+                            message=f"Import '{import_path}' could not be verified: Odoo core source is not reachable in this environment (no local /home/odoo/src/* tree and no Odoo.sh SSH sync configured).",
+                            fix_hint="Set ODOOSH_SSH_HOST/ODOOSH_SSH_KEY_PATH to enable core sync, or verify this import manually before pushing.",
+                        ))
+                    else:
+                        findings.append(VerifyFinding(
+                            file=file_path,
+                            severity=VerifySeverity.WARNING,
+                            check="js_import_alias_known",
+                            message=f"Import alias '{import_path}' is not in the verifier's known Odoo aliases.",
+                            fix_hint="Read real Odoo source and verify this alias exists before pushing.",
+                        ))
                 elif not any(candidate.exists() for candidate in candidates):
                     source_available = _core_source_available()
                     findings.append(VerifyFinding(

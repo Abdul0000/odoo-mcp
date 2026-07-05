@@ -27,6 +27,7 @@ from ..schemas import (
     WorkflowReport,
     SafeDeployModuleRequest,
     SelfRunRequest,
+    OdooRpcModuleRequest,
     OdooRpcResult,
     # V14: Self-Learning Agent — Core Discovery
     FindCoreFileRequest,
@@ -70,6 +71,7 @@ from ..services.syntax_verifier_service import SyntaxVerifierService  # V14+
 from ..services.frontend_pattern_service import FrontendPatternService  # V15
 from ..services.repo_index_service import RepoIndexService  # V16
 from .qa import self_run
+from .odoo import start_odoo_module_deploy_job
 
 router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDependency])
 
@@ -620,7 +622,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
 
     def _fail(name: str, result=None, error: str | None = None) -> None:
         _step(name, "failed", result, error)
-        if name in {"odoosh_wait_for_commit", "odoosh_verify_module_manifest", "odoosh_module_update", "odoo_module_status", "browser_ui_verify"}:
+        if name in {"odoosh_verify_module_manifest", "odoo_module_deploy", "odoo_module_status", "browser_ui_verify"}:
             _rollback_after_failure(name)
         job = store.get_job(job_id)
         store.finish_job(job, JobStatus.failed, {"failed_step": name, "module_name": payload.module_name, "rollback_attempted": rollback_attempted})
@@ -726,11 +728,29 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     _step("git_push", "passed", push_result)
 
     if payload.wait_for_odoosh:
-        wait_result = odoosh.wait_for_commit(pushed_sha, min(payload.timeout_seconds, 1800), settings.odoosh_wait_interval_seconds)
-        if wait_result.exit_code != 0:
-            _fail("odoosh_wait_for_commit", wait_result)
+        check_result = odoosh.check_commit_deployed(pushed_sha)
+        deployed = check_result.exit_code == 0 and '"deployed": true' in (check_result.stdout or "").lower()
+        _step("odoosh_check_commit", "passed" if deployed else "warning", check_result)
+        if not deployed:
+            job = store.get_job(job_id)
+            result = {
+                "status": "retry_later",
+                "message": "Odoo.sh has not deployed the pushed commit yet. Resume after a short wait; no commit or push will be repeated.",
+                "module_name": payload.module_name,
+                "sha": pushed_sha,
+                "next_call": {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}},
+            }
+            store.finish_job(job, JobStatus.warning, result)
+            store.save_session_state({
+                "last_safe_deploy_job_id": job_id,
+                "last_sha": pushed_sha,
+                "module_name": payload.module_name,
+                "project_path": str(project_path),
+                "branch": branch,
+                "client_name": client.name if client else payload.client_name,
+                "safe_deploy_status": "retry_later",
+            }, client_name=client.name if client else payload.client_name or None)
             return
-        _step("odoosh_wait_for_commit", "passed", wait_result)
 
     manifest_result = odoosh.verify_module_manifest(payload.module_name)
     if manifest_result.exit_code != 0:
@@ -740,11 +760,32 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
 
     if payload.upgrade_module:
         _step("db_rollback_checkpoint", "warning", {"note": "Code rollback is automatic, but database schema/data rollback requires an Odoo.sh backup or duplicate staging before upgrade. Create/confirm backup before destructive migrations."})
-        update_result = odoosh.module_update(payload.module_name, min(payload.timeout_seconds, 1800))
-        if update_result.exit_code != 0:
-            _fail("odoosh_module_update", update_result)
+        deploy_result = start_odoo_module_deploy_job(OdooRpcModuleRequest(
+            module_name=payload.module_name,
+            wait_for_result=True,
+            wait_timeout_seconds=5,
+            poll_interval_seconds=1.0,
+        ))
+        deploy_payload = deploy_result.model_dump(mode="json") if hasattr(deploy_result, "model_dump") else deploy_result
+        deploy_finished = bool(isinstance(deploy_payload.get("result"), dict) and deploy_payload["result"].get("finished"))
+        deploy_running = deploy_result.status == "ok" and not deploy_finished
+        _step("odoo_module_deploy", "warning" if deploy_running else "passed" if deploy_result.status == "ok" else "failed", deploy_result)
+        if deploy_running:
+            job = store.get_job(job_id)
+            nested_result = deploy_payload.get("result") if isinstance(deploy_payload.get("result"), dict) else {}
+            result = {
+                "status": "deploy_running",
+                "message": "Odoo module deploy is still running in its own job. Poll that job for the final install/upgrade result.",
+                "module_name": payload.module_name,
+                "sha": pushed_sha,
+                "odoo_module_deploy": nested_result,
+                "next_call": nested_result.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": nested_result.get("job_id"), "wait_for_result": True}},
+            }
+            store.finish_job(job, JobStatus.warning, result)
             return
-        _step("odoosh_module_update", "passed", update_result)
+        if deploy_result.status != "ok":
+            _fail("odoo_module_deploy", deploy_result)
+            return
 
     module_status = OdooRpcService().module_status(payload.module_name)
     status_ = "passed" if module_status.status == "ok" else "warning"

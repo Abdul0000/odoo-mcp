@@ -4,7 +4,9 @@ from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
+from odoo_agent_server.routers.odoo import start_odoo_module_deploy_job
 from odoo_agent_server.schemas import CommandResult, OdooRpcResult
+from odoo_agent_server.schemas import OdooRpcModuleRequest
 from odoo_agent_server.services.approval_service import ApprovalService
 from odoo_agent_server.services.odoo_rpc_service import OdooRpcService
 from odoo_agent_server.services.odoosh_service import OdooShService
@@ -28,8 +30,8 @@ def test_tools_list_reports_no_approval_when_global_approval_disabled(monkeypatc
 
     assert response.status_code == 200
     items = {row["name"]: row for row in response.json()}
-    assert items["odoo.module_deploy"]["requires_approval"] is False
-    assert items["odoosh.module_update"]["requires_approval"] is False
+    assert items["odoo_module_deploy"]["requires_approval"] is False
+    assert items["odoosh_module_update"]["requires_approval"] is False
 
 
 def test_module_deploy_falls_back_to_ssh_when_update_list_access_denied(monkeypatch):
@@ -50,6 +52,50 @@ def test_module_deploy_falls_back_to_ssh_when_update_list_access_denied(monkeypa
     assert result.result["fallback"] == "odoosh"
     assert result.result["operation"] == "deploy"
     assert result.result["ssh"]["stdout"] == "SSH_OK"
+
+
+def test_module_deploy_falls_back_to_ssh_when_module_missing_after_update_list(monkeypatch):
+    def fake_execute_kw(self, model, method, args=None, kwargs=None, superuser=False):
+        if model == "ir.module.module" and method == "update_list":
+            return OdooRpcResult(status="ok", result=True)
+        if model == "ir.module.module" and method == "search_read":
+            return OdooRpcResult(status="ok", result=[])
+        raise AssertionError(f"unexpected XML-RPC call: {model}.{method}")
+
+    def fake_ssh_deploy(self, module_name, timeout_seconds=600):
+        return CommandResult(command=["odoosh.module_deploy_ssh", module_name], cwd="odoosh:ssh", exit_code=0, stdout="SSH_DEPLOY_OK")
+
+    monkeypatch.setattr(OdooRpcService, "execute_kw", fake_execute_kw)
+    monkeypatch.setattr(OdooShService, "module_deploy_ssh", fake_ssh_deploy)
+
+    result = OdooRpcService().module_deploy("new_custom_module")
+
+    assert result.status == "ok"
+    assert result.result["fallback"] == "odoosh"
+    assert result.result["operation"] == "deploy"
+    assert "not found in ir.module.module" in result.result["cause"]
+    assert result.result["ssh"]["stdout"] == "SSH_DEPLOY_OK"
+
+
+def test_internal_module_deploy_job_does_not_require_second_approval(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "require_approval", True)
+    monkeypatch.setattr(settings, "approval_required_actions_raw", "odoo.module_deploy")
+
+    def fake_module_deploy(self, module_name):
+        return OdooRpcResult(status="ok", result={"module_name": module_name})
+
+    monkeypatch.setattr(OdooRpcService, "module_deploy", fake_module_deploy)
+
+    result = start_odoo_module_deploy_job(OdooRpcModuleRequest(
+        module_name="karachi_school_management",
+        wait_timeout_seconds=2,
+        poll_interval_seconds=0.25,
+    ))
+
+    assert result.status == "ok"
+    assert result.result["finished"] is True
+    assert result.result["job_status"] == "passed"
 
 
 def test_odoosh_module_deploy_ssh_uses_upgrade_for_installed_module(monkeypatch):

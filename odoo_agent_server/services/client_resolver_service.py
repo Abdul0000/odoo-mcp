@@ -101,10 +101,11 @@ class ClientResolverService:
             os.environ["ODOO_PASSWORD"] = client.odoo_password
 
     def search_roots(self, client: ResolvedClient | None) -> list[str]:
-        roots: list[str] = []
-        if client and client.path:
-            roots.append(client.path)
-        roots.extend(["/home/odoo/src/odoo", "/home/odoo/src/enterprise", "/home/odoo/src/user"])
+        roots: list[str] = [
+            "/home/odoo/src/enterprise",
+            "/home/odoo/src/odoo",
+            "/home/odoo/src/user",
+        ]
         seen: set[str] = set()
         result: list[str] = []
         for root in roots:

@@ -104,11 +104,13 @@ def odoo_module_update(payload: OdooRpcModuleRequest) -> OdooRpcResult:
     return _background_job_response(store, job, payload, "Upgrade started.")
 
 
-@router.post("/module-deploy", response_model=OdooRpcResult)
-def odoo_module_deploy(payload: OdooRpcModuleRequest) -> OdooRpcResult:
-    """Smart deploy: update_list → check state → install/upgrade. Background job."""
-    approval = ApprovalService()
-    approval.ensure_allowed("odoo.module_deploy", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
+def start_odoo_module_deploy_job(payload: OdooRpcModuleRequest, approval: ApprovalService | None = None) -> OdooRpcResult:
+    """Start smart deploy in the existing background-job path.
+
+    Public router calls pass an ApprovalService after approval succeeds. Internal
+    workflows that already enforced their own approval can reuse the same job
+    path without asking for a second, mismatched approval.
+    """
     store = JsonStore()
     job = store.create_job(JobRecord(job_type="odoo.module_deploy", status=JobStatus.running, request={"module_name": payload.module_name}))
 
@@ -119,11 +121,20 @@ def odoo_module_deploy(payload: OdooRpcModuleRequest) -> OdooRpcResult:
             result = OdooRpcResult(status="failed", error=f"Unexpected error: {exc}")
         j = store.get_job(job.id)
         store.finish_job(j, JobStatus.passed if result.status == "ok" else JobStatus.failed, result.model_dump(mode="json"))
-        approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_deploy succeeded", "odoo.module_deploy failed")
+        if approval:
+            approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_deploy succeeded", "odoo.module_deploy failed")
         store.log_audit("odoo.module_deploy", result.status, payload.module_name)
 
     submit_background(_bg)
     return _background_job_response(store, job, payload, "Deploy started.")
+
+
+@router.post("/module-deploy", response_model=OdooRpcResult)
+def odoo_module_deploy(payload: OdooRpcModuleRequest) -> OdooRpcResult:
+    """Smart deploy: update_list → check state → install/upgrade. Background job."""
+    approval = ApprovalService()
+    approval.ensure_allowed("odoo.module_deploy", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
+    return start_odoo_module_deploy_job(payload, approval)
 
 
 @router.post("/search-read", response_model=OdooRpcResult)

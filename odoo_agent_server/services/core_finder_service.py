@@ -98,10 +98,18 @@ _MIXIN_DETECT_RE = re.compile(
     re.IGNORECASE,
 )
 _ABSTRACT_DETECT_RE = re.compile(r'_abstract\s*=\s*True|class\s+\w+.*AbstractModel')
-_INHERIT_DETECT_RE  = re.compile(r'_inherit\s*=\s*["\']([^"\']+)["\']')
+_INHERIT_DETECT_RE  = re.compile(r'_inherit\s*=\s*([^\n#]+)')
+_MODEL_LITERAL_RE   = re.compile(r'["\']([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z0-9_.]+)["\']')
 _COMPUTED_DETECT_RE = re.compile(r'fields\.(Many2many|One2many|Many2one)\s*\(|compute\s*=')
 _IRMODEL_DETECT_RE  = re.compile(r'ir\.model|env\[.+\]\.fields_get\(')
-_CROSSMOD_DETECT_RE = re.compile(r'comodel_name\s*=\s*["\'](\w+)\.')
+_CROSSMOD_DETECT_RE = re.compile(
+    r'(?:comodel_name\s*=\s*["\']([^"\']+)["\']|fields\.(?:Many2many|One2many|Many2one)\s*\(\s*["\']([^"\']+)["\'])'
+)
+
+
+def _extract_model_literals(raw: str) -> list[str]:
+    """Extract Odoo model strings from scalar or list/tuple assignments."""
+    return [m.group(1) for m in _MODEL_LITERAL_RE.finditer(raw)]
 
 
 def _model_to_filename_hints(model: str) -> list[str]:
@@ -298,8 +306,7 @@ class CoreFinderService:
 
             # L1: detect _inherit
             for m in _INHERIT_DETECT_RE.finditer(content):
-                model_name = m.group(1)
-                if model_name and "." in model_name:
+                for model_name in _extract_model_literals(m.group(1)):
                     inherit_models.append(model_name)
 
             # L2: detect mixin / abstract
@@ -314,7 +321,8 @@ class CoreFinderService:
 
             # L4: detect cross-module comodel references
             for cm in _CROSSMOD_DETECT_RE.finditer(content):
-                mod = cm.group(1)
+                comodel = cm.group(1) or cm.group(2) or ""
+                mod = comodel.split(".", 1)[0] if "." in comodel else ""
                 if mod and mod != custom_module_name:
                     cross_modules.add(mod)
 

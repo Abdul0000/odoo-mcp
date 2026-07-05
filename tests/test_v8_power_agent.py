@@ -10,7 +10,7 @@ from odoo_agent_server.main import app
 from odoo_agent_server.routers import workflow
 from odoo_agent_server.services.lock_service import RepoLockService
 from odoo_agent_server.services.odoosh_service import OdooShService
-from odoo_agent_server.schemas import BrowserCheckResult, SafeDeployModuleRequest
+from odoo_agent_server.schemas import BrowserCheckResult, PosFlowCheckResult, PosFlowStepResult, SafeDeployModuleRequest
 from odoo_agent_server.services.validator_service import OdooModuleValidator
 from odoo_agent_server.schemas import Severity
 
@@ -48,6 +48,18 @@ def test_safe_deploy_request_accepts_ui_paths(tmp_path):
     )
     assert payload.verify_ui_paths[0].startswith("/web#action=")
     assert payload.verify_ui_timeout_seconds == 45
+
+
+def test_pos_flow_result_preserves_console_all_fields():
+    result = PosFlowCheckResult(
+        status="ok",
+        console_all=["log: boot ok"],
+        steps=[PosFlowStepResult(step="open_pos", status="ok", console_all=["debug: ready"])],
+    )
+    payload = result.model_dump(mode="json")
+
+    assert payload["console_all"] == ["log: boot ok"]
+    assert payload["steps"][0]["console_all"] == ["debug: ready"]
 
 
 def test_browser_menu_crawl_fails_on_odoo_ui_breakage(monkeypatch):

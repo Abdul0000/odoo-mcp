@@ -24,11 +24,11 @@ def test_tools_are_exposed_for_direct_chatgpt():
     response = client.get("/tools/list", headers=_auth())
     assert response.status_code == 200
     names = {item["name"] for item in response.json()}
-    assert "qa.self_run" in names
-    assert "repo.apply_patch" in names
-    assert "git.push" in names
-    assert "odoosh.grep_errors" in names
-    assert "browser.screenshot" in names
+    assert "qa_self_run" in names
+    assert "repo_apply_patch_atomic" in names
+    assert "git_push" in names
+    assert "odoosh_grep_errors" in names
+    assert "browser_screenshot" in names
 
 
 def test_capability_check_loads():

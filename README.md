@@ -188,7 +188,7 @@ Example:
   "id": 1,
   "method": "tools/call",
   "params": {
-    "name": "qa.self_run",
+    "name": "qa_self_run",
     "arguments": {
       "project_path": "/workspace/repos/my-odoo-repo",
       "module_name": "my_custom_module",
@@ -212,7 +212,7 @@ Example:
 
 ```json
 {
-  "name": "qa.self_run",
+  "name": "qa_self_run",
   "arguments": {
     "project_path": "/workspace/repos/my-odoo-repo",
     "module_name": "my_custom_module",
@@ -245,7 +245,7 @@ curl -X POST http://localhost:8080/workflow/full-verify \
 
 ## Approval-free tool execution
 
-This build removes approval blocking for MCP tools. Do not pass `approval_id`; tools such as `repo.apply_patch`, `git.commit`, `git.push`, `odoo.module_update`, `odoosh.module_update`, and `workflow.safe_deploy_module` execute directly when the API token and path guardrails allow the request.
+This build removes approval blocking for MCP tools. Do not pass `approval_id`; listed tools such as `repo_apply_patch_atomic`, `git_commit`, `git_push`, `odoo_module_deploy`, `odoosh_module_update`, and `workflow_safe_deploy_module` execute directly when the API token and path guardrails allow the request.
 
 ## Production rules
 
@@ -303,6 +303,7 @@ Protected branches such as `main`, `master`, `production`, `prod`, and `live` al
 ## Full MCP conversion
 
 All operational REST APIs are also exposed as MCP-callable tools through `POST /mcp` using JSON-RPC `tools/list` and `tools/call`.
+Tool lists expose strict underscore names such as `qa_self_run`, `git_push`, and `odoo_module_deploy`; `tools/call` still accepts the older dotted aliases such as `qa.self_run` for compatibility.
 
 Current MCP tool count: `33`.
 
@@ -310,12 +311,12 @@ Current MCP tool count: `33`.
 connector.health
 workflow.capability_check
 workflow.full_verify
-qa.self_run
+qa_self_run
 repo.list
 repo.read
 repo.write
 repo.delete
-repo.apply_patch
+repo_apply_patch_atomic
 repo.clean_pyc
 git.status
 git.current_branch
@@ -345,7 +346,7 @@ audit.list
 
 ### v10 polling/wait behavior
 
-Long install/upgrade commands still run in background jobs, but `odoo.module_deploy`, `odoo.module_install`, `odoo.module_update`, direct Odoo.sh SSH module tools, and `jobs.get` now wait server-side by default for a short safe window. This avoids fragile repeated ChatGPT polling and prevents Render HTTP timeouts.
+Long install/upgrade commands still run in background jobs, but `odoo.module_deploy`, `odoo.module_install`, `odoo.module_update`, direct Odoo.sh SSH module tools, and `jobs.get` now wait server-side by default for a short safe window. This avoids fragile repeated ChatGPT polling and prevents Render HTTP timeouts. `workflow.safe_deploy_module` performs only one non-blocking Odoo.sh commit check; if the SHA is not deployed yet, it returns `status=retry_later` with `next_call={"tool":"workflow.resume_job"}` instead of blocking the request.
 
 Recommended call:
 
@@ -355,7 +356,7 @@ Recommended call:
 
 If the job is still running, the response contains `job_id`; call `jobs.get` with the same `job_id`. `jobs.get` also waits by default.
 
-`/tools/list` and MCP `tools/list` now expose the same operational tool surface. `/mcp` also returns proper per-tool input schemas generated from the Pydantic request models instead of a generic object schema.
+`/tools/list` and MCP `tools/list` now expose the same operational tool surface with strict underscore tool names. `/mcp` also returns proper per-tool input schemas generated from the Pydantic request models instead of a generic object schema.
 
 The following REST endpoints are intentionally not exposed as MCP tools because they are protocol/documentation endpoints, not operational tools:
 
@@ -435,7 +436,7 @@ Then enter this client ID in ChatGPT. Leave client secret empty unless you expli
 - The old `Authorization: Bearer ODOO_AGENT_API_TOKEN` still works for REST/OpenAPI Actions.
 - OAuth access tokens also work for `/mcp`, `/tools/list`, and protected APIs.
 - `WWW-Authenticate` now advertises protected-resource metadata when an unauthenticated MCP request is made.
-- Approval gating is disabled; write tools like `git.push`, `repo.apply_patch`, and module updates execute directly after authentication.
+- Approval gating is disabled; write tools like `git_push`, `repo_apply_patch_atomic`, and module updates execute directly after authentication.
 - Rotate `ODOO_AGENT_API_TOKEN` if it was pasted anywhere public.
 
 ## Safe Odoo.sh deployment workflow
@@ -471,7 +472,7 @@ ODOOSH_WAIT_INTERVAL_SECONDS=10
 For every coding task, ChatGPT should start with the repository tools, not with Odoo database reads:
 
 ```text
-repo.prepare → repo.list_custom_modules → repo.read → repo.apply_patch_atomic or repo.write_many_smart → git.diff → qa.self_run → workflow.verify_against_core(changed files only) → git.commit → git.push → odoosh.check_commit polling → odoosh.module_update
+repo_prepare → repo_list_custom_modules → repo_read → repo_apply_patch_atomic or repo_write_many_smart → git_diff → qa_self_run → workflow_verify_against_core(changed files only) → git_commit → git_push → workflow_safe_deploy_module or odoosh_check_commit polling → odoo_module_deploy
 ```
 
 New MCP/REST tools:

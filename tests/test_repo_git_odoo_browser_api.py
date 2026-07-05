@@ -82,8 +82,12 @@ def test_git_status_current_branch_and_diff(tmp_path, monkeypatch):
 
 
 def test_odoo_health_without_config_returns_failed(monkeypatch):
+    for key in ("ODOO_BASE_URL", "ODOO_DB_NAME", "ODOO_LOGIN", "ODOO_PASSWORD", "ODOO_CLIENTS"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(settings, "odoo_base_url", None)
     monkeypatch.setattr(settings, "odoo_db_name", None)
+    monkeypatch.setattr(settings, "odoo_login", None)
+    monkeypatch.setattr(settings, "odoo_password", None)
     client = TestClient(app)
     response = client.post("/odoo/health", headers=_auth())
     assert response.status_code == 200

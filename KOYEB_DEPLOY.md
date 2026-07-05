@@ -26,7 +26,7 @@ ODOOSH_WAIT_TIMEOUT_SECONDS=600
 ODOOSH_WAIT_INTERVAL_SECONDS=10
 ```
 
-Use `workflow.safe_deploy_module` for normal changes. It waits for Odoo.sh to deploy the pushed commit before running module upgrade.
+Use `workflow.safe_deploy_module` for normal changes. It checks Odoo.sh once after push; if the pushed SHA is not deployed yet it returns a pollable `retry_later` state with `next_call=workflow.resume_job` instead of blocking the request.
 
 ## Important OAuth persistence setting
 

@@ -82,7 +82,7 @@ from ..services.repo_service import RepoService
 from .qa import self_run
 from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_write_many_fast_safe, repo_write_many_smart, repo_apply_patch, repo_apply_patch_atomic, repo_clean_pyc, repo_prepare, repo_custom_modules
 from .git import git_commit, git_push
-from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy
+from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy, start_odoo_module_deploy_job
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
 from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index
 from ..schemas import ApprovalRecord, ApprovalStatus
@@ -752,12 +752,10 @@ async def _dispatch(name: str, args: dict) -> object:
         req = ArtifactReadRequest.model_validate(args)
         return JsonStore().read_artifact(req.artifact_id, req.offset, req.max_chars)
     if name == "workflow.agent_instructions":
-        import httpx, asyncio
-        from ..config import settings
-        base = settings.public_base_url or "http://localhost:8080"
         try:
-            resp = httpx.get(f"{base}/agent-instructions", timeout=5)
-            return resp.json()
+            from ..main import agent_instructions
+
+            return agent_instructions()
         except Exception as exc:
             return {"error": str(exc), "fallback": "Call workflow.coding_task_plan for workflow guidance"}
     if name == "workflow.capability_check":
@@ -940,7 +938,55 @@ async def _dispatch(name: str, args: dict) -> object:
 # Fix 3: Resume job implementation
 # ---------------------------------------------------------------------------
 
-_SAFE_DEPLOY_STEPS = ["qa", "commit", "push", "wait_odoosh", "upgrade", "smoke_test"]
+_SAFE_DEPLOY_STEPS = [
+    "qa_self_run",
+    "git_configure_identity",
+    "git_validate_target",
+    "git_commit",
+    "git_head_sha",
+    "git_push",
+    "odoosh_check_commit",
+    "odoosh_verify_module_manifest",
+    "odoo_module_deploy",
+    "odoo_module_status",
+    "registry_smoke_test",
+    "browser_ui_verify",
+]
+_SAFE_DEPLOY_STEP_ALIASES = {
+    "qa": "qa_self_run",
+    "commit": "git_commit",
+    "push": "git_push",
+    "wait_odoosh": "odoosh_check_commit",
+    "upgrade": "odoo_module_deploy",
+    "smoke_test": "registry_smoke_test",
+}
+_RESUME_COMPLETED_STATUSES = {"ok", "passed", "skipped"}
+
+
+def _step_payload(result: object) -> object:
+    return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+
+
+def _extract_sha_from_steps(job) -> str | None:
+    for step in reversed(job.steps or []):
+        result = step.result
+        if hasattr(result, "model_dump"):
+            result = result.model_dump(mode="json")
+        if not isinstance(result, dict):
+            continue
+        for key in ("sha", "last_sha"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        stdout = str(result.get("stdout") or "")
+        match = re.search(r"(?:^|\n)sha=([0-9a-fA-F]{7,40})(?:\n|$)", stdout)
+        if match:
+            return match.group(1)
+        if step.name == "git_head_sha":
+            value = stdout.strip()
+            if re.fullmatch(r"[0-9a-fA-F]{7,40}", value):
+                return value
+    return None
 
 
 async def _resume_job(req: "ResumeJobRequest") -> dict:
@@ -956,18 +1002,16 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
     except Exception:
         raise HTTPException(status_code=404, detail=f"Job {req.job_id} not found")
 
-    # Find last successful step name
-    completed_steps = [
-        s.name for s in (job.steps or []) if s.status in ("ok", "passed", "skipped")
-    ]
+    completed_steps = [s.name for s in (job.steps or []) if s.status in _RESUME_COMPLETED_STATUSES]
     # Determine resume point
     if req.override_step:
-        if req.override_step not in _SAFE_DEPLOY_STEPS:
+        override_step = _SAFE_DEPLOY_STEP_ALIASES.get(req.override_step, req.override_step)
+        if override_step not in _SAFE_DEPLOY_STEPS:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unknown override_step '{req.override_step}'. Valid: {_SAFE_DEPLOY_STEPS}",
             )
-        start_from = req.override_step
+        start_from = override_step
     else:
         # Find the first step NOT in completed_steps
         start_from = None
@@ -988,6 +1032,13 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
             detail=f"Cannot resume: job {req.job_id} is missing module_name or project_path in its request payload.",
         )
 
+    remote = original_request.get("remote", "origin")
+    branch = original_request.get("branch") or settings.target_git_branch
+    pushed_sha = original_request.get("last_sha") or _extract_sha_from_steps(job)
+    git = GitService()
+    odoosh = OdooShService()
+    odoo = OdooRpcService()
+
     # Re-run from start_from step
     store.log_audit(
         "workflow.resume_job",
@@ -1005,61 +1056,136 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
 
     for step_name in step_order:
         try:
-            if step_name == "qa":
-                qa_req = SelfRunRequest(project_path=project_path)
+            if step_name == "qa_self_run":
+                if not original_request.get("run_qa", True):
+                    resume_results["steps_run"][step_name] = {"status": "skipped"}
+                    continue
+                qa_req = SelfRunRequest(project_path=project_path, module_name=module_name)
                 result = self_run(qa_req)
-                resume_results["steps_run"]["qa"] = {"status": "ok", "passed": result.passed if hasattr(result, "passed") else True}
+                resume_results["steps_run"][step_name] = {"status": result.status, "result": _step_payload(result)}
+                if result.status == "failed":
+                    resume_results["status"] = "failed"
+                    resume_results["error"] = f"qa_self_run failed: {getattr(result, 'summary', '')}"
+                    return resume_results
 
-            elif step_name == "commit":
+            elif step_name == "git_configure_identity":
+                result = git.configure_identity(project_path)
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "result": _step_payload(result)}
+                if result.exit_code != 0:
+                    resume_results["status"] = "failed"
+                    resume_results["error"] = f"git identity configuration failed: {result.stderr}"
+                    return resume_results
+
+            elif step_name == "git_validate_target":
+                result = git.validate_target(project_path, branch, remote)
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "result": _step_payload(result)}
+                if result.exit_code != 0:
+                    resume_results["status"] = "failed"
+                    resume_results["error"] = f"git target validation failed: {result.stderr}"
+                    return resume_results
+
+            elif step_name == "git_commit":
                 commit_msg = original_request.get("commit_message", f"Resume: update {module_name}")
                 paths = original_request.get("paths", [])
-                result = GitService().commit(project_path, commit_msg, paths, timeout_seconds=60)
-                resume_results["steps_run"]["commit"] = {"status": "ok" if result.exit_code == 0 else "failed", "sha": result.stdout.strip()}
+                result = git.commit(project_path, commit_msg, paths, timeout_seconds=60)
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "result": _step_payload(result)}
                 if result.exit_code != 0:
+                    resume_results["status"] = "failed"
                     resume_results["error"] = f"git commit failed: {result.stderr}"
                     return resume_results
 
-            elif step_name == "push":
-                remote = original_request.get("remote", "origin")
-                branch = original_request.get("branch")
-                result = GitService().push(project_path, remote, branch, timeout_seconds=60)
-                resume_results["steps_run"]["push"] = {"status": "ok" if result.exit_code == 0 else "failed"}
+            elif step_name == "git_head_sha":
+                result = git.head_sha(project_path)
+                if result.exit_code == 0:
+                    pushed_sha = result.stdout.strip()
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "sha": pushed_sha, "result": _step_payload(result)}
                 if result.exit_code != 0:
+                    resume_results["status"] = "failed"
+                    resume_results["error"] = f"git head SHA lookup failed: {result.stderr}"
+                    return resume_results
+
+            elif step_name == "git_push":
+                result = git.push(project_path, remote, branch, timeout_seconds=60)
+                if result.exit_code == 0:
+                    pushed_sha = _extract_sha_from_steps(job) or pushed_sha or git.head_sha(project_path).stdout.strip()
+                    match = re.search(r"(?:^|\n)sha=([0-9a-fA-F]{7,40})(?:\n|$)", result.stdout or "")
+                    if match:
+                        pushed_sha = match.group(1)
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "sha": pushed_sha, "result": _step_payload(result)}
+                if result.exit_code != 0:
+                    resume_results["status"] = "failed"
                     resume_results["error"] = f"git push failed: {result.stderr}"
                     return resume_results
 
-            elif step_name == "wait_odoosh":
-                # NON-BLOCKING single check — mirrors odoosh.check_commit behaviour.
-                # Resuming a job must return fast; the event loop must never block here.
-                # If not yet deployed, the agent should call workflow.resume_job again
-                # after a short wait, exactly like polling odoosh.check_commit directly.
-                odoosh = OdooShService()
-                check = odoosh.check_commit_deployed(
-                    original_request.get("last_sha", "HEAD")
-                )
-                deployed = check.exit_code == 0 and "true" in check.stdout.lower()
-                resume_results["steps_run"]["wait_odoosh"] = {"deployed": deployed}
+            elif step_name == "odoosh_check_commit":
+                pushed_sha = pushed_sha or git.head_sha(project_path).stdout.strip()
+                check = odoosh.check_commit_deployed(pushed_sha)
+                deployed = check.exit_code == 0 and '"deployed": true' in (check.stdout or "").lower()
+                resume_results["steps_run"][step_name] = {"status": "ok" if deployed else "warning", "sha": pushed_sha, "deployed": deployed, "result": _step_payload(check)}
                 if not deployed:
-                    resume_results["error"] = (
-                        "Not deployed yet. This is not a failure — wait ~15s and call "
-                        "workflow.resume_job again with the same job_id to re-check."
-                    )
                     resume_results["status"] = "retry_later"
+                    resume_results["message"] = "Odoo.sh has not deployed the pushed commit yet. Resume later; completed commit/push steps will not be replayed."
+                    resume_results["next_call"] = {"tool": "workflow.resume_job", "arguments": {"job_id": req.job_id}}
                     return resume_results
 
-            elif step_name == "upgrade":
-                result = OdooRpcService().module_deploy(module_name)
-                resume_results["steps_run"]["upgrade"] = {"status": result.status, "error": result.error}
+            elif step_name == "odoosh_verify_module_manifest":
+                result = odoosh.verify_module_manifest(module_name)
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "result": _step_payload(result)}
+                if result.exit_code != 0:
+                    resume_results["status"] = "failed"
+                    resume_results["error"] = f"manifest verification failed: {result.stderr}"
+                    return resume_results
+
+            elif step_name == "odoo_module_deploy":
+                if not original_request.get("upgrade_module", True):
+                    resume_results["steps_run"][step_name] = {"status": "skipped"}
+                    continue
+                result = start_odoo_module_deploy_job(OdooRpcModuleRequest(
+                    module_name=module_name,
+                    wait_for_result=True,
+                    wait_timeout_seconds=5,
+                    poll_interval_seconds=1.0,
+                ))
+                payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+                nested = payload.get("result") if isinstance(payload, dict) and isinstance(payload.get("result"), dict) else {}
+                finished = bool(nested.get("finished"))
+                running = result.status == "ok" and not finished
+                resume_results["steps_run"][step_name] = {"status": "running" if running else result.status, "result": payload}
+                if running:
+                    resume_results["status"] = "deploy_running"
+                    resume_results["message"] = "Odoo module deploy is still running in its own job. Poll that job for completion."
+                    resume_results["next_call"] = nested.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": nested.get("job_id"), "wait_for_result": True}}
+                    return resume_results
                 if result.status != "ok":
-                    resume_results["error"] = f"upgrade failed: {result.error}"
+                    resume_results["status"] = "failed"
+                    resume_results["error"] = f"module deploy failed: {result.error}"
                     return resume_results
 
-            elif step_name == "smoke_test":
-                result = OdooRpcService().registry_smoke_test(module_name)
-                resume_results["steps_run"]["smoke_test"] = {"status": result.status}
+            elif step_name == "odoo_module_status":
+                result = odoo.module_status(module_name)
+                resume_results["steps_run"][step_name] = {"status": result.status, "result": _step_payload(result)}
+
+            elif step_name == "registry_smoke_test":
+                result = odoo.registry_smoke_test(module_name, [], [], strict=False)
+                resume_results["steps_run"][step_name] = {"status": result.status, "result": _step_payload(result)}
+
+            elif step_name == "browser_ui_verify":
+                verify_paths = original_request.get("verify_ui_paths") or []
+                if not verify_paths:
+                    resume_results["steps_run"][step_name] = {"status": "skipped"}
+                    continue
+                browser_results = []
+                browser = CdpBrowserService()
+                for index, path in enumerate(verify_paths, start=1):
+                    browser_results.append(_step_payload(await browser.screenshot_odoo_page(
+                        start_path=path,
+                        screenshot_name=f"{module_name}_resume_ui_{index}.png",
+                    )))
+                resume_results["steps_run"][step_name] = {"status": "ok", "result": browser_results}
 
         except Exception as exc:
             resume_results["steps_run"][step_name] = {"status": "error", "error": str(exc)}
+            resume_results["status"] = "failed"
             resume_results["error"] = f"Step '{step_name}' raised exception: {exc}"
             return resume_results
 
