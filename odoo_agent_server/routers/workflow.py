@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
+from threading import Lock
 
 from fastapi import APIRouter, HTTPException, status
 
@@ -76,10 +77,22 @@ from ..services.core_finder_service import CoreFinderService          # V14
 from ..services.syntax_verifier_service import SyntaxVerifierService  # V14+
 from ..services.frontend_pattern_service import FrontendPatternService  # V15
 from ..services.repo_index_service import RepoIndexService  # V16
+from ..services.workflow_guard_service import (
+    _ACTIVE_JOB_STATUSES,
+    _RESUMABLE_SAFE_DEPLOY_RESULTS,
+    find_blocking_safe_deploy,
+    safe_deploy_block_payload,
+)
 from .qa import self_run
 from .odoo import start_odoo_module_deploy_job
 
 router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDependency])
+
+# Serializes the safe_deploy_module entry gate inside this process so two
+# near-simultaneous retries cannot both pass the duplicate-job check before the
+# first JobRecord is persisted. JsonStore still provides the durable state; this
+# lock closes the in-process check/create window.
+_SAFE_DEPLOY_ENTRY_LOCK = Lock()
 
 
 def _looks_like_small_patch(task: str) -> bool:
@@ -511,29 +524,97 @@ async def full_verify(payload: FullVerifyRequest) -> WorkflowReport:
 
 @router.post("/safe-deploy-module", response_model=WorkflowReport)
 async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport:
-    """Non-blocking deploy: spawns a background thread and returns job_id immediately.
+    """Start the single owner deploy pipeline for one project/module.
 
-    The MCP agent must poll /jobs/{job_id} via jobs.get tool until status != running.
-    This prevents Render/Koyeb HTTP timeouts from killing long-running deploys.
+    This entry point is intentionally idempotent for the same
+    ``project_path + module_name``. Some MCP clients retry a tool call when the
+    HTTP stream times out even though the first request already persisted a
+    background job. Before creating a new JobRecord, we look for an existing
+    active or resumable safe_deploy_module job and return that job instead of
+    spawning a second thread that could race git commit/push or Odoo.sh module
+    upgrade.
     """
+
+    def _existing_job_report(job: JobRecord) -> WorkflowReport:
+        request = job.request or {}
+        result = job.result if isinstance(job.result, dict) else {}
+        result_status = result.get("status")
+        job_status = getattr(job.status, "value", str(job.status))
+        block_payload = safe_deploy_block_payload("safe_deploy_module", job)
+
+        if job.status in _ACTIVE_JOB_STATUSES:
+            message = (
+                "A workflow.safe_deploy_module job is already running for this "
+                "project_path + module_name. No new deploy thread was started; "
+                "poll the existing job instead of replaying commit/push/upgrade."
+            )
+            next_call = {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True}}
+            blocking_reason = "active_job"
+        elif result_status in _RESUMABLE_SAFE_DEPLOY_RESULTS:
+            message = (
+                "A previous workflow.safe_deploy_module job for this project_path + "
+                "module_name stopped in a resumable state. No new deploy thread was "
+                "started; resume the existing job, or call safe_deploy_module with "
+                "force_new_deploy=true if a fresh deploy is genuinely required."
+            )
+            next_call = {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}}
+            blocking_reason = "resumable_job"
+        else:
+            # Defensive fallback; find_blocking_safe_deploy should only return
+            # active/resumable safe deploy jobs.
+            message = block_payload.get("message") or "Existing safe deploy job found."
+            next_call = block_payload.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": job.id}}
+            blocking_reason = "existing_job"
+
+        return WorkflowReport(
+            status="already_running",
+            job_id=job.id,
+            steps=job.steps,
+            summary={
+                **block_payload,
+                **result,
+                "status": "already_running",
+                "blocking_reason": blocking_reason,
+                "message": message,
+                "job_id": job.id,
+                "job_status": job_status,
+                "result_status": result_status,
+                "module_name": request.get("module_name") or payload.module_name,
+                "project_path": request.get("project_path") or payload.project_path,
+                "force_new_deploy": False,
+                "next_call": next_call,
+            },
+        )
+
     try:
         approval = ApprovalService()
         approval.ensure_allowed("workflow.safe_deploy_module", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
 
-        store = JsonStore()
-        job = store.create_job(JobRecord(
-            job_type="safe_deploy_module",
-            status=JobStatus.running,
-            request=payload.model_dump(mode="json"),
-        ))
-        store.save_session_state({
-            "last_safe_deploy_job_id": job.id,
-            "module_name": payload.module_name,
-            "project_path": payload.project_path,
-            "branch": payload.branch,
-            "client_name": payload.client_name,
-            "safe_deploy_status": "running",
-        }, client_name=payload.client_name)
+        with _SAFE_DEPLOY_ENTRY_LOCK:
+            existing_job = None
+            if not payload.force_new_deploy:
+                existing_job = find_blocking_safe_deploy(
+                    project_path=payload.project_path,
+                    module_name=payload.module_name,
+                    client_name=payload.client_name,
+                )
+            if existing_job is not None:
+                return _existing_job_report(existing_job)
+
+            store = JsonStore()
+            job = store.create_job(JobRecord(
+                job_type="safe_deploy_module",
+                status=JobStatus.running,
+                request=payload.model_dump(mode="json"),
+            ))
+            store.save_session_state({
+                "last_safe_deploy_job_id": job.id,
+                "module_name": payload.module_name,
+                "project_path": payload.project_path,
+                "branch": payload.branch,
+                "client_name": payload.client_name,
+                "safe_deploy_status": "running",
+            }, client_name=payload.client_name)
 
         def _background():
             try:

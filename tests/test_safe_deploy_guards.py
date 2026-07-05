@@ -1063,3 +1063,127 @@ def test_safe_deploy_fails_when_inferred_field_missing_after_upgrade(tmp_path, m
     assert finished.status == JobStatus.failed
     assert finished.result["status"] == "registry_field_missing"
     assert any(step.name == "registry_field_verify" and step.status == "failed" for step in finished.steps)
+
+
+def test_safe_deploy_duplicate_call_returns_existing_running_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    (project / "sale_order_notebook_tab").mkdir(parents=True)
+    submit_calls = {"count": 0}
+
+    def fake_submit(callback):
+        submit_calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(workflow, "submit_background", fake_submit)
+
+    payload = SafeDeployModuleRequest(
+        project_path=str(project),
+        module_name="sale_order_notebook_tab",
+        commit_message="Add field grok_a",
+        branch="test_stagging_18",
+        run_qa=False,
+        wait_for_odoosh=True,
+        upgrade_module=True,
+        wait_for_result=False,
+    )
+
+    first = asyncio.run(workflow.safe_deploy_module(payload))
+    second = asyncio.run(workflow.safe_deploy_module(payload))
+
+    assert first.status == "running"
+    assert second.status == "already_running"
+    assert second.job_id == first.job_id
+    assert second.summary["blocking_reason"] == "active_job"
+    assert second.summary["next_call"]["tool"] == "jobs.get"
+    assert submit_calls == {"count": 1}
+    assert len(JsonStore().list_jobs()) == 1
+
+
+def test_safe_deploy_resumable_failure_returns_existing_job_to_resume(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    (project / "sale_order_notebook_tab").mkdir(parents=True)
+    store = JsonStore()
+    existing = store.create_job(JobRecord(
+        job_type="safe_deploy_module",
+        status=JobStatus.failed,
+        request={
+            "project_path": str(project),
+            "module_name": "sale_order_notebook_tab",
+            "commit_message": "Add field grok_a",
+        },
+        result={"status": "deploy_failed_or_timeout", "message": "Odoo.sh did not deploy the pushed SHA yet."},
+    ))
+    submit_calls = {"count": 0}
+
+    def fake_submit(callback):
+        submit_calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(workflow, "submit_background", fake_submit)
+
+    result = asyncio.run(workflow.safe_deploy_module(SafeDeployModuleRequest(
+        project_path=str(project),
+        module_name="sale_order_notebook_tab",
+        commit_message="Add field grok_a retry",
+        branch="test_stagging_18",
+        run_qa=False,
+        wait_for_odoosh=True,
+        upgrade_module=True,
+        wait_for_result=False,
+    )))
+
+    assert result.status == "already_running"
+    assert result.job_id == existing.id
+    assert result.summary["blocking_reason"] == "resumable_job"
+    assert result.summary["result_status"] == "deploy_failed_or_timeout"
+    assert result.summary["next_call"] == {"tool": "workflow.resume_job", "arguments": {"job_id": existing.id}}
+    assert submit_calls == {"count": 0}
+    assert len(JsonStore().list_jobs()) == 1
+
+
+def test_safe_deploy_force_new_after_resumable_failure_starts_new_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    (project / "sale_order_notebook_tab").mkdir(parents=True)
+    store = JsonStore()
+    existing = store.create_job(JobRecord(
+        job_type="safe_deploy_module",
+        status=JobStatus.failed,
+        request={
+            "project_path": str(project),
+            "module_name": "sale_order_notebook_tab",
+            "commit_message": "Add field grok_a",
+        },
+        result={"status": "deploy_code_mismatch", "message": "Deployed source did not match the pushed files."},
+    ))
+    submit_calls = {"count": 0}
+
+    def fake_submit(callback):
+        submit_calls["count"] += 1
+        return None
+
+    monkeypatch.setattr(workflow, "submit_background", fake_submit)
+
+    result = asyncio.run(workflow.safe_deploy_module(SafeDeployModuleRequest(
+        project_path=str(project),
+        module_name="sale_order_notebook_tab",
+        commit_message="Force restart deploy",
+        branch="test_stagging_18",
+        run_qa=False,
+        wait_for_odoosh=True,
+        upgrade_module=True,
+        wait_for_result=False,
+        force_new_deploy=True,
+    )))
+
+    assert result.status == "running"
+    assert result.job_id != existing.id
+    assert submit_calls == {"count": 1}
+    jobs = JsonStore().list_jobs()
+    assert len(jobs) == 2
+    assert {job.id for job in jobs} == {existing.id, result.job_id}

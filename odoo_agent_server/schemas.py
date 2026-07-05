@@ -618,6 +618,15 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     odoo_module_deploy_timeout_seconds: int = Field(default=300, ge=0, le=900, description="Maximum time for the internal Odoo module install/upgrade job to finish before returning a non-success resumable state")
     odoo_module_deploy_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for the internal Odoo module install/upgrade job")
     expected_registry_fields: dict[str, list[str]] = Field(default_factory=dict, description="Optional live registry fields to verify after upgrade, e.g. {'purchase.order': ['grok_y']}. If omitted, safe_deploy infers Python fields from changed addon files.")
+    force_new_deploy: bool = Field(
+        default=False,
+        description=(
+            "When False, duplicate workflow.safe_deploy_module calls for the same "
+            "project_path + module_name return the existing running/resumable job instead "
+            "of spawning a concurrent commit/push/upgrade. Set True only to intentionally "
+            "restart after a resumable deploy failure."
+        ),
+    )
     timeout_seconds: int = Field(default=900, ge=60, le=2400)
 
     @field_validator("module_name")
@@ -686,7 +695,7 @@ class MenuCrawlerRequest(BaseModel):
 
 
 class WorkflowReport(BaseModel):
-    status: Literal["passed", "failed", "warning", "running"]
+    status: Literal["passed", "failed", "warning", "running", "already_running"]
     job_id: str
     steps: list[JobStep]
     summary: dict[str, Any]
