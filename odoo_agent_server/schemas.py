@@ -561,6 +561,9 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     )
     verify_ui_screenshot_prefix: str = Field(default="safe_deploy_ui", description="Screenshot filename prefix for verify_ui_paths")
     verify_ui_timeout_seconds: int = Field(default=45, ge=10, le=180, description="Per-page browser timeout for verify_ui_paths")
+    wait_for_result: bool = Field(default=True, description="Wait server-side for the safe deploy job until done or wait_timeout_seconds expires")
+    wait_timeout_seconds: int = Field(default=20, ge=0, le=240, description="Maximum server-side wait before returning job_id/next_call")
+    poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between safe deploy job polls while waiting")
     timeout_seconds: int = Field(default=900, ge=60, le=2400)
 
     @field_validator("module_name")
@@ -840,15 +843,26 @@ class ResumeJobRequest(BaseModel):
     Instead of starting over from step 1, the agent calls workflow.resume_job
     with the job_id from the failed run.
     """
-    job_id: str = Field(..., description="Job ID returned by a previous safe_deploy_module or start_session call")
+    job_id: str | None = Field(
+        default=None,
+        description=(
+            "Job ID returned by a previous safe_deploy_module or start_session call. "
+            "When omitted, the connector uses the last saved safe-deploy job from session state, "
+            "or the latest matching safe_deploy_module job."
+        ),
+    )
+    client_name: str | None = Field(default=None, description="Optional client session to load when job_id is omitted")
+    project_path: str | None = Field(default=None, description="Optional project path filter when selecting the latest job without job_id")
+    module_name: str | None = Field(default=None, description="Optional module filter when selecting the latest job without job_id")
     override_step: str | None = Field(
         default=None,
         description=(
             "If provided, start from this step name instead of the auto-detected last successful step. "
             "Supported values include actual safe-deploy step names such as "
             "'qa_self_run', 'git_commit', 'git_push', 'odoosh_check_commit', "
-            "'odoo_module_deploy', and 'registry_smoke_test'. Legacy aliases "
-            "'qa', 'commit', 'push', 'wait_odoosh', 'upgrade', and 'smoke_test' are accepted."
+            "'odoo_module_deploy', and 'registry_smoke_test'. Aliases "
+            "'qa', 'commit', 'push', 'wait_odoosh', 'install', 'upgrade', "
+            "'module_install', 'module_update', and 'smoke_test' are accepted."
         ),
     )
 

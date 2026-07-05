@@ -75,12 +75,52 @@ def test_safe_deploy_endpoint_starts_job_for_grok_payload(tmp_path, monkeypatch)
         run_qa=False,
         wait_for_odoosh=True,
         upgrade_module=True,
+        wait_for_result=False,
         timeout_seconds=900,
     )))
 
     assert result.status == "running"
     assert result.job_id
     assert result.summary["module_name"] == "sale_order_notebook_tab"
+    assert result.summary["next_call"]["tool"] == "jobs.get"
+    assert JsonStore().load_session_state()["last_safe_deploy_job_id"] == result.job_id
+
+
+def test_safe_deploy_waits_and_returns_finished_job(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    (project / "sale_order_notebook_tab").mkdir(parents=True)
+
+    def fake_run(payload, job_id):
+        store = JsonStore()
+        job = store.get_job(job_id)
+        store.add_step(job, JobStep(name="git_push", status="passed"))
+        job = store.get_job(job_id)
+        store.finish_job(job, JobStatus.passed, {"module_name": payload.module_name, "sha": "abc1234"})
+
+    def fake_submit(callback):
+        callback()
+
+    monkeypatch.setattr(workflow, "_run_safe_deploy", fake_run)
+    monkeypatch.setattr(workflow, "submit_background", fake_submit)
+
+    result = asyncio.run(workflow.safe_deploy_module(SafeDeployModuleRequest(
+        project_path=str(project),
+        module_name="sale_order_notebook_tab",
+        commit_message="[ADD] field",
+        branch="test_stagging_18",
+        run_qa=False,
+        wait_for_odoosh=True,
+        upgrade_module=True,
+        wait_for_result=True,
+        wait_timeout_seconds=5,
+    )))
+
+    assert result.status == "passed"
+    assert result.summary["module_name"] == "sale_order_notebook_tab"
+    assert result.summary["sha"] == "abc1234"
+    assert any(step.name == "git_push" for step in result.steps)
 
 
 def test_git_commit_configures_identity(tmp_path, monkeypatch):
@@ -302,5 +342,60 @@ def test_resume_job_rechecks_deploy_without_replaying_commit_or_push(tmp_path, m
     assert result["status"] == "ok"
     assert result["resumed_from"] == "odoosh_check_commit"
     assert calls == {"commit": 0, "push": 0}
+    assert "git_commit" not in result["steps_run"]
+    assert "git_push" not in result["steps_run"]
+
+
+def test_resume_job_without_id_uses_saved_job_and_upgrade_alias(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    (project / "x_module").mkdir(parents=True)
+    calls = {"deploy": 0}
+
+    store = JsonStore()
+    job = store.create_job(JobRecord(
+        job_type="safe_deploy_module",
+        status=JobStatus.warning,
+        request={
+            "project_path": str(project),
+            "module_name": "x_module",
+            "commit_message": "Deploy x_module",
+            "remote": "origin",
+            "branch": "main",
+            "run_qa": False,
+            "upgrade_module": True,
+            "verify_ui_paths": [],
+        },
+        steps=[
+            JobStep(name="git_commit", status="passed"),
+            JobStep(name="git_head_sha", status="passed", result={"stdout": "abc1234\n"}),
+            JobStep(name="git_push", status="passed"),
+            JobStep(name="odoosh_check_commit", status="passed"),
+            JobStep(name="odoosh_verify_module_manifest", status="passed"),
+        ],
+    ))
+    store.save_session_state({"last_safe_deploy_job_id": job.id, "project_path": str(project), "module_name": "x_module"})
+
+    def fake_deploy(req):
+        calls["deploy"] += 1
+        return OdooRpcResult(status="ok", result={"finished": True, "module_name": req.module_name})
+
+    class FakeOdooRpc:
+        def module_status(self, module_name):
+            return OdooRpcResult(status="ok", result=[{"name": module_name, "state": "installed"}])
+
+        def registry_smoke_test(self, module_name, model_names=None, menu_names=None, strict=True):
+            return OdooRpcResult(status="ok", result={"module": module_name})
+
+    monkeypatch.setattr(tools, "start_odoo_module_deploy_job", fake_deploy)
+    monkeypatch.setattr(tools, "OdooRpcService", lambda: FakeOdooRpc())
+
+    result = asyncio.run(tools._resume_job(ResumeJobRequest(override_step="upgrade")))
+
+    assert result["status"] == "ok"
+    assert result["original_job_id"] == job.id
+    assert result["resumed_from"] == "odoo_module_deploy"
+    assert calls == {"deploy": 1}
     assert "git_commit" not in result["steps_run"]
     assert "git_push" not in result["steps_run"]

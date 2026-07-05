@@ -68,6 +68,7 @@ Agent reads real source → gets correct patterns for that version automatically
 10. NEVER answer by printing MCP JSON blocks and telling the client/user to execute them. You are connected to MCP tools; call the tools yourself.
 11. NEVER use direct ORM/Studio writes to `ir.model.fields` or `ir.ui.view` for normal module code changes. Add fields/views in Python/XML files, verify source, and deploy the module. Only use database/Studio customization if the user explicitly asks for no-code Studio behavior.
 12. NEVER import or use Pydantic inside Odoo addon Python code. Pydantic is only for this MCP server's API schemas; Odoo modules must use normal Odoo ORM code (`models.Model`, `fields`, `api`) and XML views.
+13. If a deploy cycle breaks mid-flow, call `workflow.resume_job`. If `job_id` was lost, omit it and provide `client_name`/`project_path`/`module_name` when known; the server will use the latest saved safe-deploy job. Use `override_step=push`, `install`, or `upgrade` only when explicitly continuing from that point.
 
 ---
 
@@ -224,13 +225,15 @@ If `push_blocked=False`: proceed to commit + push.
 
 **Step 12:** `odoo.ensure_dependencies` — auto-install any missing deps
 
-**Step 13:** For normal code changes call `workflow.safe_deploy_module` with module name, commit message, changed paths, `wait_for_odoosh=true`, and `upgrade_module=true`. It owns commit, push, non-blocking Odoo.sh check, module deploy, status, and smoke test.
+**Step 13:** For normal code changes call `workflow.safe_deploy_module` with module name, commit message, changed paths, `wait_for_odoosh=true`, `upgrade_module=true`, and `wait_for_result=true`. It owns commit, push, non-blocking Odoo.sh check, module deploy, status, and smoke test. If it returns `status=running`, that is not success: call the returned `next_call` / `jobs.get`.
 
 Manual fallback only:
 - `git.commit` — paths: list changed files; message: clear description
 - `git.push` — note the `sha` value from the response
 
-**Step 15:** Prefer `workflow.safe_deploy_module` for the normal commit/push/deploy cycle. It does one non-blocking `odoosh.check_commit`; if Odoo.sh is not deployed yet it returns `status=retry_later` and `next_call={"tool":"workflow.resume_job"}`. Wait briefly and call `workflow.resume_job(job_id)` instead of restarting or blocking.
+**Step 15:** Prefer `workflow.safe_deploy_module` for the normal commit/push/deploy cycle. It waits briefly server-side by default. It does one non-blocking `odoosh.check_commit`; if Odoo.sh is not deployed yet it returns `status=retry_later` and `next_call={"tool":"workflow.resume_job"}`. Wait briefly and call `workflow.resume_job(job_id)` instead of restarting or blocking.
+
+If the client lost the job id, call `workflow.resume_job` without `job_id`; add `client_name`, `project_path`, or `module_name` if available. For explicit mid-flow user requests, use `override_step=push`, `override_step=install`, or `override_step=upgrade`.
 
 Manual fallback only: use `odoosh.check_commit` polling loop.
 - Adaptive: attempts 0-2 → wait 5s | 3-7 → wait 10s | 8+ → wait 15s | max 20 retries

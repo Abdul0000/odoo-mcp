@@ -5,6 +5,7 @@ import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException, status
 
@@ -516,6 +517,14 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             status=JobStatus.running,
             request=payload.model_dump(mode="json"),
         ))
+        store.save_session_state({
+            "last_safe_deploy_job_id": job.id,
+            "module_name": payload.module_name,
+            "project_path": payload.project_path,
+            "branch": payload.branch,
+            "client_name": payload.client_name,
+            "safe_deploy_status": "running",
+        }, client_name=payload.client_name)
 
         def _background():
             try:
@@ -552,14 +561,33 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             },
         )
 
+    if payload.wait_for_result:
+        waited = store.wait_job(job.id, payload.wait_timeout_seconds, payload.poll_interval_seconds)
+        if waited.status not in {JobStatus.queued, JobStatus.running}:
+            final_status: Literal["passed", "failed", "warning", "running"] = "passed" if waited.status == JobStatus.passed else "failed" if waited.status == JobStatus.failed else "warning"
+            result = waited.result if isinstance(waited.result, dict) else {"result": waited.result}
+            return WorkflowReport(
+                status=final_status,
+                job_id=job.id,
+                steps=waited.steps,
+                summary={
+                    **result,
+                    "job_id": job.id,
+                    "module_name": payload.module_name,
+                    "message": result.get("message") or f"Safe deploy job finished with status {waited.status.value}.",
+                },
+            )
+
     return WorkflowReport(
         status="running",
         job_id=job.id,
         steps=[],
         summary={
-            "message": "Deployment started in background. Poll jobs.get with this job_id until status is passed or failed.",
+            "status": "running",
+            "message": "Safe deploy is still running. Do not tell the user it is complete yet; call jobs.get with this job_id until status is passed, failed, or warning with next_call.",
             "job_id": job.id,
             "module_name": payload.module_name,
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True}},
         },
     )
 

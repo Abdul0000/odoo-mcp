@@ -200,7 +200,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.full_verify",
         title="Run full verification", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module",
-        title="Deploy module (full pipeline)", description="Safely commit, push, wait for Odoo.sh deployment, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths", requires_approval=True),
+        title="Deploy module (full pipeline)", description="Safely commit, push, wait briefly for Odoo.sh deployment, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths. Defaults to wait_for_result=true; status=running is not success and must be followed via next_call/jobs.get.", requires_approval=True),
     ToolDescriptor(name="workflow.start_session",
         title="Start coding session", description="Bootstrap a coding session: capability check, repo.prepare, git status, module discovery, Odoo/Odoo.sh health", requires_approval=True),
     ToolDescriptor(name="workflow.registry_smoke_test",
@@ -389,9 +389,11 @@ _TOOL_DESCRIPTORS = [
         title="Resume interrupted job",
         description=(
             "Fix 3 — Resume a failed safe_deploy_module or start_session pipeline from its last "
-            "successful step. Pass the job_id from the failed run. Instead of starting over from "
-            "step 1, the agent continues from where it left off. Optionally override the start "
-            "step with override_step (qa | commit | push | wait_odoosh | upgrade | smoke_test)."
+            "successful step. Pass job_id when available; if omitted, the connector resumes the "
+            "last saved safe-deploy job from session state or the latest matching job. Instead of "
+            "starting over from step 1, the agent continues from where it left off. Optionally "
+            "override the start step with override_step (qa | commit | push | wait_odoosh | "
+            "install | upgrade | module_update | smoke_test)."
         ),
         requires_approval=True,
     ),
@@ -972,7 +974,13 @@ _SAFE_DEPLOY_STEP_ALIASES = {
     "commit": "git_commit",
     "push": "git_push",
     "wait_odoosh": "odoosh_check_commit",
+    "odoosh": "odoosh_check_commit",
+    "install": "odoo_module_deploy",
     "upgrade": "odoo_module_deploy",
+    "module_install": "odoo_module_deploy",
+    "module_update": "odoo_module_deploy",
+    "module_upgrade": "odoo_module_deploy",
+    "deploy": "odoo_module_deploy",
     "smoke_test": "registry_smoke_test",
 }
 _RESUME_COMPLETED_STATUSES = {"ok", "passed", "skipped"}
@@ -1004,6 +1012,24 @@ def _extract_sha_from_steps(job) -> str | None:
     return None
 
 
+def _latest_safe_deploy_job_id(req: "ResumeJobRequest", store: JsonStore) -> str | None:
+    state = store.load_session_state(req.client_name)
+    saved_job_id = state.get("last_safe_deploy_job_id")
+    if isinstance(saved_job_id, str) and saved_job_id.strip():
+        return saved_job_id.strip()
+
+    for job in store.list_jobs(limit=100):
+        if job.job_type != "safe_deploy_module":
+            continue
+        request = job.request or {}
+        if req.project_path and request.get("project_path") != req.project_path:
+            continue
+        if req.module_name and request.get("module_name") != req.module_name:
+            continue
+        return job.id
+    return None
+
+
 async def _resume_job(req: "ResumeJobRequest") -> dict:
     """Fix 3: Resume a safe_deploy_module pipeline from last successful step.
 
@@ -1012,10 +1038,19 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
     stored in job.request is used to rebuild the context.
     """
     store = JsonStore()
+    job_id = req.job_id or _latest_safe_deploy_job_id(req, store)
+    if not job_id:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No resumable safe_deploy_module job found. Pass job_id, or provide client_name/project_path/module_name "
+                "matching a previous safe deploy."
+            ),
+        )
     try:
-        job = store.get_job(req.job_id)
+        job = store.get_job(job_id)
     except Exception:
-        raise HTTPException(status_code=404, detail=f"Job {req.job_id} not found")
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
     completed_steps = [s.name for s in (job.steps or []) if s.status in _RESUME_COMPLETED_STATUSES]
     # Determine resume point
@@ -1035,7 +1070,7 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                 start_from = step_name
                 break
         if start_from is None:
-            return {"status": "already_complete", "message": "All pipeline steps already completed.", "job_id": req.job_id}
+            return {"status": "already_complete", "message": "All pipeline steps already completed.", "job_id": job_id}
 
     # Recover original request payload
     original_request = job.request or {}
@@ -1044,7 +1079,7 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
     if not module_name or not project_path:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot resume: job {req.job_id} is missing module_name or project_path in its request payload.",
+            detail=f"Cannot resume: job {job_id} is missing module_name or project_path in its request payload.",
         )
 
     remote = original_request.get("remote", "origin")
@@ -1058,11 +1093,11 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
     store.log_audit(
         "workflow.resume_job",
         "running",
-        f"Resuming job {req.job_id} from step '{start_from}' (completed: {completed_steps})",
+        f"Resuming job {job_id} from step '{start_from}' (completed: {completed_steps})",
     )
     resume_results: dict = {
         "resumed_from": start_from,
-        "original_job_id": req.job_id,
+        "original_job_id": job_id,
         "completed_steps": completed_steps,
         "steps_run": {},
     }
@@ -1140,7 +1175,7 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                 if not deployed:
                     resume_results["status"] = "retry_later"
                     resume_results["message"] = "Odoo.sh has not deployed the pushed commit yet. Resume later; completed commit/push steps will not be replayed."
-                    resume_results["next_call"] = {"tool": "workflow.resume_job", "arguments": {"job_id": req.job_id}}
+                    resume_results["next_call"] = {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}}
                     return resume_results
 
             elif step_name == "odoosh_verify_module_manifest":
@@ -1206,5 +1241,5 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
 
     resume_results["status"] = "ok"
     resume_results["message"] = f"Pipeline resumed and completed from step '{start_from}'"
-    store.log_audit("workflow.resume_job", "ok", f"Completed resume of job {req.job_id}")
+    store.log_audit("workflow.resume_job", "ok", f"Completed resume of job {job_id}")
     return resume_results

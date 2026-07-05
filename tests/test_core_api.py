@@ -59,9 +59,11 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
     assert "ir.model.fields" in rules
     assert "ir.ui.view" in rules
     assert "Never generate Pydantic models/imports inside Odoo addon code" in rules
+    assert "If the deploy cycle breaks mid-flow" in rules
     assert "repo.write_many_smart" in small_flow
     assert "workflow.safe_deploy_module" in small_flow
     assert "workflow.resume_job" in small_flow
+    assert "override_step=push/install/upgrade" in small_flow
     assert "Do not end with 'next steps'" in do_not
     assert "Do not print sample MCP JSON blocks" in do_not
     assert "Do not use Studio/ORM database schema mutations" in do_not
