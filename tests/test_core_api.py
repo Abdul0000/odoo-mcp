@@ -13,14 +13,10 @@ def test_health_and_root_are_backend_only():
     health = client.get("/health")
     assert health.status_code == 200
     assert health.json()["status"] == "ok"
-    assert health.json()["service"] == "odoo-mcp-agent-connector"
     root = client.get("/")
     assert root.status_code == 200
-    assert root.json()["service"] == "Odoo MCP Agent Connector"
     assert root.json()["ui"] == "not_required"
     assert root.json()["openapi"] == "/openapi.json"
-    assert root.json()["mcp"] == "/mcp"
-    assert root.json()["compatibility_mcp"]["chatgpt"] == "/chatgpt/mcp"
 
 
 def test_tools_are_exposed_for_direct_chatgpt():
@@ -28,13 +24,11 @@ def test_tools_are_exposed_for_direct_chatgpt():
     response = client.get("/tools/list", headers=_auth())
     assert response.status_code == 200
     names = {item["name"] for item in response.json()}
-    assert "qa_self_run" in names
-    assert "repo_apply_patch_atomic" in names
-    assert "git_push" in names
-    assert "odoosh_grep_errors" in names
-    assert "odoosh_read_user_file" in names
-    assert "workflow_verify_deployed_module" in names
-    assert "browser_screenshot" in names
+    assert "qa.self_run" in names
+    assert "repo.apply_patch" in names
+    assert "git.push" in names
+    assert "odoosh.grep_errors" in names
+    assert "browser.screenshot" in names
 
 
 def test_capability_check_loads():
@@ -45,28 +39,3 @@ def test_capability_check_loads():
     assert payload["status"] in {"ready", "partial", "failed"}
     assert "git" in payload["checks"]
     assert "allowed_roots" in payload["checks"]
-
-
-def test_agent_instructions_require_complete_safe_deploy_flow():
-    client = TestClient(app)
-    response = client.get("/agent-instructions")
-    assert response.status_code == 200
-    instructions = response.json()["instructions"]
-    rules = "\n".join(instructions["rules"])
-    small_flow = "\n".join(instructions["small_patch_fast_path"]["steps"])
-    do_not = "\n".join(instructions["small_patch_fast_path"]["do_not"])
-
-    assert "do not stop after writing files" in rules
-    assert "printing JSON MCP tool calls" in rules
-    assert "ir.model.fields" in rules
-    assert "ir.ui.view" in rules
-    assert "Never generate Pydantic models/imports inside Odoo addon code" in rules
-    assert "If the deploy cycle breaks mid-flow" in rules
-    assert "repo.write_many_smart" in small_flow
-    assert "workflow.safe_deploy_module" in small_flow
-    assert "workflow.resume_job" in small_flow
-    assert "override_step=push/install/upgrade" in small_flow
-    assert "Do not end with 'next steps'" in do_not
-    assert "Do not print sample MCP JSON blocks" in do_not
-    assert "Do not use Studio/ORM database schema mutations" in do_not
-    assert "Do not put Pydantic code in Odoo addons" in do_not

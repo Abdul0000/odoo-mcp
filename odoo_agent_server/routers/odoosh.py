@@ -23,9 +23,7 @@ from ..schemas import (
 from ..services.approval_service import ApprovalService
 from ..services.odoosh_service import OdooShService
 from ..services.store_service import JsonStore
-from ..services.workflow_guard_service import safe_deploy_command_block
 from ..services.background_executor import submit_background
-from ..services.git_service import GitService
 
 router = APIRouter(prefix="/odoosh", tags=["odoosh"], dependencies=[AuthDependency])
 
@@ -39,94 +37,6 @@ def _run(name: str, callback) -> CommandResult:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
-
-
-def _resolve_manual_project_path(payload) -> str | None:
-    """Resolve the checkout path needed for local-vs-remote SHA proof."""
-    explicit = getattr(payload, "project_path", None)
-    if explicit:
-        return str(explicit)
-    store = JsonStore()
-    state = store.load_session_state()
-    state_project = state.get("project_path")
-    if isinstance(state_project, str) and state_project.strip():
-        return state_project.strip()
-    module_name = getattr(payload, "module_name", None)
-    for job in store.list_jobs(limit=100):
-        if job.job_type != "safe_deploy_module":
-            continue
-        request = job.request or {}
-        if module_name and request.get("module_name") != module_name:
-            continue
-        job_project = request.get("project_path")
-        if isinstance(job_project, str) and job_project.strip():
-            return job_project.strip()
-    return None
-
-
-def _manual_odoosh_pushed_sha_guard(action: str, payload, cwd: str = "odoosh:ssh") -> tuple[CommandResult | None, str | None]:
-    """Fail closed unless manual Odoo.sh upgrades can prove code was pushed.
-
-    expected_sha remains the explicit safest path: the callback waits for that
-    SHA to be deployed before running odoo-bin. If the caller omits it, prove
-    that the relevant local checkout's HEAD is already the remote branch HEAD;
-    otherwise manual install/upgrade could run against stale Odoo.sh source.
-    """
-    expected_sha = (getattr(payload, "expected_sha", None) or "").strip()
-    if expected_sha:
-        return None, expected_sha
-
-    project_path = _resolve_manual_project_path(payload)
-    if not project_path:
-        message = (
-            "Refusing to deploy: expected_sha or project_path is required so the connector can prove "
-            "local HEAD is pushed to the remote branch. Run workflow.safe_deploy_module instead."
-        )
-        return CommandResult(command=[action, "push-guard"], cwd=cwd, exit_code=2, stderr=message), None
-
-    git = GitService()
-    local = git.head_sha(project_path)
-    if local.exit_code != 0:
-        message = "Refusing to deploy: could not resolve local HEAD. Run workflow.safe_deploy_module first."
-        return CommandResult(
-            command=[action, "git", "rev-parse", "HEAD"],
-            cwd=project_path,
-            exit_code=2,
-            stdout=local.stdout,
-            stderr=f"{message}\n{local.stderr}".strip(),
-        ), None
-    local_sha = (local.stdout or "").strip()
-    remote = git.remote_head_sha(
-        project_path,
-        getattr(payload, "remote", "origin") or "origin",
-        getattr(payload, "branch", None),
-        60,
-    )
-    if remote.exit_code != 0:
-        message = "Refusing to deploy: could not resolve remote branch HEAD. Run workflow.safe_deploy_module or git.push first."
-        return CommandResult(
-            command=[action, "git", "remote-head-sha"],
-            cwd=project_path,
-            exit_code=2,
-            stdout=remote.stdout,
-            stderr=f"{message}\n{remote.stderr}".strip(),
-        ), None
-    remote_sha = (remote.stdout or "").strip()
-    if not local_sha or not remote_sha or local_sha != remote_sha:
-        message = (
-            "Refusing to deploy: local commits are not pushed to remote. "
-            f"Local HEAD={local_sha or 'unknown'}, Remote HEAD={remote_sha or 'unknown'}. "
-            "Run workflow.safe_deploy_module or git.push first."
-        )
-        return CommandResult(
-            command=[action, "git", "remote-head-verify"],
-            cwd=project_path,
-            exit_code=2,
-            stdout=json.dumps({"project_path": project_path, "local_head": local_sha, "remote_head": remote_sha}),
-            stderr=message,
-        ), None
-    return None, local_sha
-
 def _background_command_job(
     name: str,
     request: dict,
@@ -139,7 +49,7 @@ def _background_command_job(
     """Start a long Odoo.sh SSH command in the background and return immediately.
 
     Render and many MCP HTTP clients can drop long requests at about 30 seconds.
-    This wrapper persists the command as a job so MCP agents can poll jobs.get.
+    This wrapper persists the command as a job so ChatGPT can poll jobs.get.
     """
     store = JsonStore()
     approval = ApprovalService()
@@ -250,32 +160,13 @@ def odoosh_grep_errors(payload: OdooShCommandRequest) -> CommandResult:
 
 @router.post("/module-install-ssh", response_model=CommandResult)
 def odoosh_module_install_ssh(payload: OdooRpcModuleRequest) -> CommandResult:
-    blocked = safe_deploy_command_block(
-        "odoosh.module_install_ssh",
-        project_path=payload.project_path,
-        module_name=payload.module_name,
-        cwd="odoosh:ssh",
-    )
-    if blocked:
-        return blocked
-    push_guard, resolved_sha = _manual_odoosh_pushed_sha_guard("odoosh.module_install_ssh", payload)
-    if push_guard:
-        return push_guard
     approval = ApprovalService()
     approval.ensure_allowed("odoosh.module_install_ssh", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     service = OdooShService()
-
-    def _callback() -> CommandResult:
-        if resolved_sha:
-            wait = service.wait_for_commit(resolved_sha, payload.deploy_guard_timeout_seconds, None)
-            if wait.exit_code != 0:
-                return wait
-        return service.module_install_ssh(payload.module_name, 1800)
-
     return _background_command_job(
         "odoosh.module_install_ssh",
         payload.model_dump(exclude={"approval_id"}, mode="json"),
-        _callback,
+        lambda: service.module_install_ssh(payload.module_name, 1800),
         payload.approval_id,
         payload.wait_for_result,
         payload.wait_timeout_seconds,
@@ -286,24 +177,13 @@ def odoosh_module_install_ssh(payload: OdooRpcModuleRequest) -> CommandResult:
 @router.post("/module-deploy-ssh", response_model=CommandResult)
 def odoosh_module_deploy_ssh(payload: OdooShModuleUpdateRequest) -> CommandResult:
     """SSH smart install/upgrade. Background job: poll jobs.get."""
-    blocked = safe_deploy_command_block(
-        "odoosh.module_deploy_ssh",
-        project_path=payload.project_path,
-        module_name=payload.module_name,
-        cwd="odoosh:ssh",
-    )
-    if blocked:
-        return blocked
-    push_guard, resolved_sha = _manual_odoosh_pushed_sha_guard("odoosh.module_deploy_ssh", payload)
-    if push_guard:
-        return push_guard
     approval = ApprovalService()
     approval.ensure_allowed("odoosh.module_deploy_ssh", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     service = OdooShService()
 
     def _callback() -> CommandResult:
-        if resolved_sha:
-            wait = service.wait_for_commit(resolved_sha, payload.timeout_seconds, None)
+        if payload.expected_sha:
+            wait = service.wait_for_commit(payload.expected_sha, payload.timeout_seconds, None)
             if wait.exit_code != 0:
                 return wait
         return service.module_deploy_ssh(payload.module_name, payload.timeout_seconds)
@@ -321,24 +201,13 @@ def odoosh_module_deploy_ssh(payload: OdooShModuleUpdateRequest) -> CommandResul
 
 @router.post("/module-update", response_model=CommandResult)
 def odoosh_module_update(payload: OdooShModuleUpdateRequest) -> CommandResult:
-    blocked = safe_deploy_command_block(
-        "odoosh.module_update",
-        project_path=payload.project_path,
-        module_name=payload.module_name,
-        cwd="odoosh:ssh",
-    )
-    if blocked:
-        return blocked
-    push_guard, resolved_sha = _manual_odoosh_pushed_sha_guard("odoosh.module_update", payload)
-    if push_guard:
-        return push_guard
     approval = ApprovalService()
     approval.ensure_allowed("odoosh.module_update", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
     service = OdooShService()
 
     def _callback() -> CommandResult:
-        if resolved_sha:
-            wait = service.wait_for_commit(resolved_sha, payload.timeout_seconds, None)
+        if payload.expected_sha:
+            wait = service.wait_for_commit(payload.expected_sha, payload.timeout_seconds, None)
             if wait.exit_code != 0:
                 return wait
         return service.module_update(payload.module_name, payload.timeout_seconds)
@@ -352,5 +221,3 @@ def odoosh_module_update(payload: OdooShModuleUpdateRequest) -> CommandResult:
         payload.wait_timeout_seconds,
         payload.poll_interval_seconds,
     )
-
-

@@ -65,7 +65,7 @@ def require_token(
     """Accept the connector bearer token, API-key compatibility, or OAuth access tokens.
 
     The legacy token keeps REST/OpenAPI Actions and non-OAuth MCP clients such
-    as compatibility clients working. OAuth access tokens are required by MCP
+    as Qwen working. OAuth access tokens are required by ChatGPT custom MCP
     apps/connectors.
     """
     token = _request_token(request, authorization, x_api_key)

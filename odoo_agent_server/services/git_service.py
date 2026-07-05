@@ -47,58 +47,9 @@ class GitService:
     def head_sha(self, project_path: str, timeout_seconds: int = 20) -> CommandResult:
         return self._run(["git", "rev-parse", "HEAD"], self._project(project_path), timeout_seconds)
 
-    def head_changed_files(self, project_path: str, timeout_seconds: int = 20) -> CommandResult:
-        return self._run(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"], self._project(project_path), timeout_seconds)
-
     def diff(self, project_path: str, staged: bool = False, timeout_seconds: int = 30) -> CommandResult:
         command = ["git", "diff", "--cached"] if staged else ["git", "diff"]
         return self._run(command, self._project(project_path), timeout_seconds)
-
-
-    def changed_files(self, project_path: str, timeout_seconds: int = 30) -> CommandResult:
-        """Return all unstaged/staged/untracked changed files relative to repo root."""
-        project = self._project(project_path)
-        commands = [
-            ["git", "diff", "--name-only"],
-            ["git", "diff", "--cached", "--name-only"],
-            ["git", "ls-files", "--others", "--exclude-standard"],
-        ]
-        seen: list[str] = []
-        stdout_parts: list[str] = []
-        for command in commands:
-            result = self._run(command, project, timeout_seconds)
-            if result.exit_code != 0:
-                return result
-            stdout_parts.append(result.stdout or "")
-            for line in (result.stdout or "").splitlines():
-                rel = line.strip()
-                if rel and rel not in seen:
-                    seen.append(rel)
-        return CommandResult(
-            command=["git", "changed-files"],
-            cwd=str(project),
-            exit_code=0,
-            stdout="\n".join(seen) + ("\n" if seen else ""),
-        )
-
-    def remote_head_sha(self, project_path: str, remote: str = "origin", branch: str | None = None, timeout_seconds: int = 30) -> CommandResult:
-        """Read the remote branch SHA after push so safe deploy can prove GitHub received it."""
-        project = self._project(project_path)
-        if not branch:
-            branch_result = self.current_branch(str(project))
-            if branch_result.exit_code != 0:
-                return branch_result
-            branch = branch_result.stdout.strip()
-        if branch in {"", "HEAD", None}:
-            return CommandResult(command=["git", "ls-remote", remote], cwd=str(project), exit_code=2, stderr="Cannot verify remote SHA without an explicit branch.")
-        result = self._run(["git", "ls-remote", "--heads", remote, branch], project, timeout_seconds)
-        if result.exit_code != 0:
-            return result
-        line = (result.stdout or "").strip().splitlines()[:1]
-        if not line:
-            return CommandResult(command=["git", "ls-remote", "--heads", remote, branch], cwd=str(project), exit_code=1, stderr=f"Remote branch not found: {remote}/{branch}")
-        sha = line[0].split()[0]
-        return CommandResult(command=["git", "remote-head-sha", remote, branch], cwd=str(project), exit_code=0, stdout=sha + "\n")
 
     def configure_identity(self, project_path: str) -> CommandResult:
         project = self._project(project_path)

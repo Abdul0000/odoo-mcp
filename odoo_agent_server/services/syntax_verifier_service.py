@@ -27,10 +27,9 @@ from ..schemas import (
 # Regex helpers
 # ---------------------------------------------------------------------------
 _FIELD_NAME_RE     = re.compile(r'^\s{4,}(\w+)\s*=\s*fields\.', re.MULTILINE)
-_INHERIT_RE        = re.compile(r'_inherit\s*=\s*([^\n#]+)')
-_MODEL_LITERAL_RE  = re.compile(r'["\']([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z0-9_.]+)["\']')
+_INHERIT_RE        = re.compile(r'_inherit\s*=\s*["\']([^"\']+)["\']')
 _DEPENDS_PY_RE     = re.compile(r'depends\(\[([^\]]+)\]\)')
-_COMODEL_RE        = re.compile(r'(?:comodel_name\s*=\s*["\']([^"\']+)["\']|fields\.(?:Many2one|One2many|Many2many)\s*\(\s*["\']([^"\']+)["\'])')
+_COMODEL_RE        = re.compile(r'comodel_name\s*=\s*["\']([^"\']+)["\']')
 _RELATED_RE        = re.compile(r'related\s*=\s*["\']([^"\']+)["\']')
 _COMPUTE_RE        = re.compile(r'compute\s*=\s*["\']([^"\']+)["\']')
 _XPATH_EXPR_RE     = re.compile(r'expr=["\']([^"\']+)["\']')
@@ -41,18 +40,17 @@ _MODULE_NAME_RE    = re.compile(r"['\"]([A-Za-z0-9_]+)['\"]")
 
 _JS_IMPORT_RE      = re.compile(r'(?:from\s+["\']([^"\']+)["\']|import\s*\(\s*["\']([^"\']+)["\']\s*\))')
 _JS_TEMPLATE_RE    = re.compile(r'(?:static\s+template\s*=|\.template\s*=)\s*["\']([^"\']+)["\']')
-_POS_CONFIG_LOAD_FIELDS_RE = re.compile(r'load_fields\s*\(\s*["\']pos\.config["\']', re.IGNORECASE)
 _T_NAME_RE         = re.compile(r't-name=["\']([^"\']+)["\']')
 _T_INHERIT_RE      = re.compile(r't-inherit=["\']([^"\']+)["\']')
 _T_CALL_RE         = re.compile(r't-call=["\']([^"\']+)["\']')
 _T_XPATH_RE        = re.compile(r'<xpath\b[^>]*expr=["\']([^"\']+)["\']', re.DOTALL)
 _CLASS_IN_EXPR_RE  = re.compile(r'contains\(@class,\s*["\']([^"\']+)["\']\)|hasclass\(["\']([^"\']+)["\']\)')
 
-# Search roots for installed-source reads: enterprise, community, then user fallback.
+# Search roots (same as CoreFinderService): custom/user, enterprise, community.
 _SRC_ROOTS = [
+    Path("/home/odoo/src/user"),
     Path("/home/odoo/src/enterprise"),
     Path("/home/odoo/src/odoo"),
-    Path("/home/odoo/src/user"),
 ]
 
 _ALIAS_MODULES = {
@@ -103,26 +101,6 @@ def _iter_module_dirs(module_name: str) -> list[Path]:
     return dirs
 
 
-def _core_source_available() -> bool:
-    """True if at least one of the Odoo core/enterprise/user source roots is
-    actually reachable on this machine — either it already exists locally,
-    or on-demand sync (core_sync_service, rsync over SSH to Odoo.sh) is
-    configured and able to reach the build host.
-
-    This exists because /home/odoo/src/* is a HARDCODED path. On a Render
-    deployment with no Odoo.sh SSH configured (ODOOSH_SSH_HOST unset, or
-    CORE_SYNC_ENABLED=false), none of that tree exists, ensure_module_synced()
-    silently returns False every time, and every downstream lookup returns
-    "not found" — indistinguishable from a genuinely-missing module/import.
-    Without this check, comodel_module_exists and js_import_resolves would
-    report CRITICAL/push-blocking findings for perfectly valid Odoo code,
-    purely because core source isn't reachable, not because the code is wrong.
-    """
-    if any(root.exists() and any(root.iterdir()) for root in _SRC_ROOTS if root.exists()):
-        return True
-    return bool(settings.core_sync_enabled and settings.odoosh_ssh_host)
-
-
 def _find_core_model_content(model_name: str) -> str:
     """Return concatenated content of core model files for a given model."""
     module = model_name.split(".")[0]
@@ -141,11 +119,6 @@ def _find_core_model_content(model_name: str) -> str:
 def _extract_core_field_names(core_content: str) -> set[str]:
     """Extract field names defined in core model source."""
     return {m.group(1) for m in _FIELD_NAME_RE.finditer(core_content)}
-
-
-def _extract_model_literals(raw: str) -> list[str]:
-    """Extract Odoo model strings from scalar or list/tuple assignments."""
-    return [m.group(1) for m in _MODEL_LITERAL_RE.finditer(raw)]
 
 
 def _find_core_view_content(model_name: str) -> str:
@@ -210,10 +183,6 @@ def _resolve_odoo_alias(import_path: str) -> list[Path]:
     return []
 
 
-def _known_odoo_alias(import_path: str) -> bool:
-    return any(import_path.startswith(alias) for alias in _ALIAS_MODULES)
-
-
 def _asset_path_exists(module_root: Path, asset: str) -> bool:
     """Return True if a manifest asset string resolves to at least one file."""
     if not isinstance(asset, str):
@@ -254,21 +223,6 @@ class SyntaxVerifierService:
         xml_contents: dict[str, str] = {}
         js_contents: dict[str, str] = {}
 
-        if not _core_source_available():
-            findings.append(VerifyFinding(
-                file=request.written_files[0] if request.written_files else "(no files)",
-                severity=VerifySeverity.INFO,
-                check="core_source_unavailable",
-                message=(
-                    "Odoo core/enterprise source is not reachable from this environment (no local "
-                    "/home/odoo/src/* tree, and Odoo.sh SSH sync is disabled or unconfigured). "
-                    "comodel_module_exists, js_import_resolves, and manifest_depends checks below have been "
-                    "downgraded to WARNING instead of CRITICAL because they cannot be reliably verified — "
-                    "they are NOT proof the code is correct, just that it couldn't be checked."
-                ),
-                fix_hint="Set ODOOSH_SSH_HOST and ODOOSH_SSH_KEY_PATH env vars to enable on-demand core sync via core_sync_service.",
-            ))
-
         written_files = self._impact_aware_files(request)
 
         # First pass: read files and collect XML/JS context for template matching.
@@ -305,7 +259,6 @@ class SyntaxVerifierService:
                 findings.extend(self._verify_xml_view(file_path, content))
                 findings.extend(self._verify_qweb_template(file_path, content, xml_contents))
             elif path.suffix == ".js":
-                findings.extend(self._verify_js_syntax_real(file_path, content))
                 findings.extend(self._verify_js_owl(file_path, content, template_names))
             elif path.suffix == ".scss":
                 findings.extend(self._verify_scss_asset(file_path, content))
@@ -372,21 +325,14 @@ class SyntaxVerifierService:
                 if dep in {"base", "web", "mail", "sale", "purchase", "account", "stock", "hr"}:
                     continue
                 if not _module_exists_in_src(dep):
-                    source_available = _core_source_available()
                     findings.append(VerifyFinding(
                         file=file_path,
-                        severity=VerifySeverity.CRITICAL if source_available else VerifySeverity.WARNING,
+                        severity=VerifySeverity.CRITICAL,
                         check="manifest_depends",
-                        message=(
-                            f"depends[] contains '{dep}' but module directory not found in any /home/odoo/src/* root."
-                            if source_available else
-                            f"depends[] contains '{dep}' — could not verify: Odoo core/enterprise source is not reachable in this environment."
-                        ),
+                        message=f"depends[] contains '{dep}' but module directory not found in any /home/odoo/src/* root.",
                         fix_hint=(
                             f"Run workflow.find_core_file('{dep}', 'manifest', '{dep}') to verify the exact module name. "
                             "Then correct the depends[] entry."
-                            if source_available else
-                            "Set ODOOSH_SSH_HOST/ODOOSH_SSH_KEY_PATH to enable core sync, or verify this dependency manually before pushing."
                         ),
                     ))
                 else:
@@ -447,13 +393,10 @@ class SyntaxVerifierService:
 
     def _verify_python_model(self, file_path: str, content: str) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
-        inherit_models: list[str] = []
-        for m in _INHERIT_RE.finditer(content):
-            inherit_models.extend(_extract_model_literals(m.group(1)))
+        inherit_models = [m.group(1) for m in _INHERIT_RE.finditer(content)]
 
         for model_name in inherit_models:
             core_content = _find_core_model_content(model_name)
-            core_fields: set[str] = set()
             if not core_content:
                 findings.append(VerifyFinding(
                     file=file_path,
@@ -462,45 +405,37 @@ class SyntaxVerifierService:
                     message=f"_inherit '{model_name}' — core model source not found in /home/odoo/src/*. Cannot cross-check fields.",
                     fix_hint=f"Run workflow.find_core_file('{model_name.split('.')[0]}', 'model', '{model_name.split('.')[-1]}') manually.",
                 ))
-            else:
-                core_fields = _extract_core_field_names(core_content)
-                for dep_m in _DEPENDS_PY_RE.finditer(content):
-                    raw = dep_m.group(1)
-                    field_refs = [s.strip().strip("'\"") for s in raw.split(",")]
-                    for ref in field_refs:
-                        first_field = ref.split(".")[0] if "." in ref else ref
-                        if first_field and first_field not in core_fields:
-                            findings.append(VerifyFinding(
-                                file=file_path,
-                                severity=VerifySeverity.CRITICAL,
-                                check="depends_field_exists",
-                                message=f"depends(['{ref}']) — field '{first_field}' not found in core model '{model_name}'.",
-                                fix_hint=(
-                                    f"Core fields available: {sorted(list(core_fields))[:20]}... "
-                                    "Re-read core model with repo.read and use only real field names."
-                                ),
-                            ))
+                continue
+
+            core_fields = _extract_core_field_names(core_content)
+            for dep_m in _DEPENDS_PY_RE.finditer(content):
+                raw = dep_m.group(1)
+                field_refs = [s.strip().strip("'\"") for s in raw.split(",")]
+                for ref in field_refs:
+                    first_field = ref.split(".")[0] if "." in ref else ref
+                    if first_field and first_field not in core_fields:
+                        findings.append(VerifyFinding(
+                            file=file_path,
+                            severity=VerifySeverity.CRITICAL,
+                            check="depends_field_exists",
+                            message=f"depends(['{ref}']) — field '{first_field}' not found in core model '{model_name}'.",
+                            fix_hint=(
+                                f"Core fields available: {sorted(list(core_fields))[:20]}... "
+                                "Re-read core model with repo.read and use only real field names."
+                            ),
+                        ))
 
             for cm_m in _COMODEL_RE.finditer(content):
-                comodel = cm_m.group(1) or cm_m.group(2) or ""
+                comodel = cm_m.group(1)
                 if "." in comodel:
                     comodel_module = comodel.split(".")[0]
                     if not _module_exists_in_src(comodel_module):
-                        source_available = _core_source_available()
                         findings.append(VerifyFinding(
                             file=file_path,
-                            severity=VerifySeverity.CRITICAL if source_available else VerifySeverity.WARNING,
+                            severity=VerifySeverity.CRITICAL,
                             check="comodel_module_exists",
-                            message=(
-                                f"comodel_name='{comodel}' — module '{comodel_module}' not found in src roots."
-                                if source_available else
-                                f"comodel_name='{comodel}' — could not verify: Odoo core/enterprise source is not reachable in this environment (no local /home/odoo/src/* tree and no Odoo.sh SSH sync configured)."
-                            ),
-                            fix_hint=(
-                                f"Run workflow.find_core_file('{comodel_module}', 'model', '{comodel.split('.')[-1]}') to verify."
-                                if source_available else
-                                "Set ODOOSH_SSH_HOST/ODOOSH_SSH_KEY_PATH to enable core sync, or verify this comodel manually before pushing."
-                            ),
+                            message=f"comodel_name='{comodel}' — module '{comodel_module}' not found in src roots.",
+                            fix_hint=f"Run workflow.find_core_file('{comodel_module}', 'model', '{comodel.split('.')[-1]}') to verify.",
                         ))
 
             for rel_m in _RELATED_RE.finditer(content):
@@ -690,18 +625,6 @@ class SyntaxVerifierService:
         findings: list[VerifyFinding] = []
         modern_signals = ("from \"@" in content or "from '@" in content or "import " in content or "registry.category" in content or "Component" in content)
 
-        if _POS_CONFIG_LOAD_FIELDS_RE.search(content):
-            findings.append(VerifyFinding(
-                file=file_path,
-                severity=VerifySeverity.CRITICAL,
-                check="pos_config_no_load_fields",
-                message="POS code must not use load_fields('pos.config', ...).",
-                fix_hint=(
-                    "Read the installed point_of_sale source first and extend the correct loader/backend pattern. "
-                    "For pos.config data, use the Odoo version's real loader params/model-loading mechanism instead of legacy load_fields."
-                ),
-            ))
-
         if modern_signals and "/** @odoo-module **/" not in content:
             findings.append(VerifyFinding(
                 file=file_path,
@@ -726,38 +649,20 @@ class SyntaxVerifierService:
             if import_path.startswith("@"):
                 candidates = _resolve_odoo_alias(import_path)
                 if not candidates:
-                    if _known_odoo_alias(import_path) and not _core_source_available():
-                        findings.append(VerifyFinding(
-                            file=file_path,
-                            severity=VerifySeverity.WARNING,
-                            check="js_import_resolves",
-                            message=f"Import '{import_path}' could not be verified: Odoo core source is not reachable in this environment (no local /home/odoo/src/* tree and no Odoo.sh SSH sync configured).",
-                            fix_hint="Set ODOOSH_SSH_HOST/ODOOSH_SSH_KEY_PATH to enable core sync, or verify this import manually before pushing.",
-                        ))
-                    else:
-                        findings.append(VerifyFinding(
-                            file=file_path,
-                            severity=VerifySeverity.WARNING,
-                            check="js_import_alias_known",
-                            message=f"Import alias '{import_path}' is not in the verifier's known Odoo aliases.",
-                            fix_hint="Read real Odoo source and verify this alias exists before pushing.",
-                        ))
-                elif not any(candidate.exists() for candidate in candidates):
-                    source_available = _core_source_available()
                     findings.append(VerifyFinding(
                         file=file_path,
-                        severity=VerifySeverity.CRITICAL if source_available else VerifySeverity.WARNING,
+                        severity=VerifySeverity.WARNING,
+                        check="js_import_alias_known",
+                        message=f"Import alias '{import_path}' is not in the verifier's known Odoo aliases.",
+                        fix_hint="Read real Odoo source and verify this alias exists before pushing.",
+                    ))
+                elif not any(candidate.exists() for candidate in candidates):
+                    findings.append(VerifyFinding(
+                        file=file_path,
+                        severity=VerifySeverity.CRITICAL,
                         check="js_import_resolves",
-                        message=(
-                            f"Import '{import_path}' did not resolve to any source file in /home/odoo/src roots."
-                            if source_available else
-                            f"Import '{import_path}' could not be verified: Odoo core source is not reachable in this environment (no local /home/odoo/src/* tree and no Odoo.sh SSH sync configured)."
-                        ),
-                        fix_hint=(
-                            "Correct the import path after reading the installed Odoo source file that exports it."
-                            if source_available else
-                            "Set ODOOSH_SSH_HOST/ODOOSH_SSH_KEY_PATH to enable core sync, or verify this import manually before pushing."
-                        ),
+                        message=f"Import '{import_path}' did not resolve to any source file in /home/odoo/src roots.",
+                        fix_hint="Correct the import path after reading the installed Odoo source file that exports it.",
                     ))
                 else:
                     findings.append(VerifyFinding(
@@ -805,91 +710,6 @@ class SyntaxVerifierService:
                 message="POS JS file does not import from @point_of_sale and is not legacy odoo.define.",
                 fix_hint="Verify this exact POS pattern from point_of_sale/static/src before pushing.",
             ))
-        return findings
-
-    @staticmethod
-    def _verify_js_syntax_real(file_path: str, content: str) -> list[VerifyFinding]:
-        """Actually parse the JS file with Node instead of regex heuristics.
-
-        Regex checks (js_odoo_module_header, js_no_mixed_legacy_modern, etc.)
-        can never catch a plain broken-syntax file (unmatched brace, stray
-        token, bad destructuring) because they only look for known substrings.
-        This runs `node --check` against the real file content, which is a
-        full parse and will fail on any genuine syntax error, with an exact
-        line number. Odoo OWL/JS files are ES modules, so the temp file is
-        written with a .mjs extension — Node infers module parsing from the
-        extension without needing --input-type (which only works on stdin).
-
-        If Node is not installed in this environment, this degrades to a
-        single INFO finding rather than crashing verify_against_core.
-        """
-        import shutil
-        import subprocess
-        import tempfile
-
-        findings: list[VerifyFinding] = []
-        node_path = shutil.which("node")
-        if not node_path:
-            findings.append(VerifyFinding(
-                file=file_path,
-                severity=VerifySeverity.INFO,
-                check="js_real_syntax_check_skipped",
-                message="Node.js not found in this environment; falling back to regex-only JS checks.",
-                fix_hint="Install Node.js in the container so `node --check` can catch real JS syntax errors.",
-            ))
-            return findings
-
-        tmp_path: str | None = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False, encoding="utf-8") as tmp:
-                tmp.write(content)
-                tmp_path = tmp.name
-            completed = subprocess.run(
-                [node_path, "--check", tmp_path],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-            if completed.returncode != 0:
-                stderr = completed.stderr or ""
-                line_no = None
-                line_match = re.search(re.escape(tmp_path) + r":(\d+)", stderr)
-                if line_match:
-                    line_no = int(line_match.group(1))
-                error_line = next(
-                    (ln for ln in stderr.splitlines() if "Error" in ln or "SyntaxError" in ln),
-                    stderr.strip().splitlines()[-1] if stderr.strip() else "Unknown syntax error",
-                )
-                findings.append(VerifyFinding(
-                    file=file_path,
-                    severity=VerifySeverity.CRITICAL,
-                    check="js_real_syntax_error",
-                    message=f"Node failed to parse this JS file: {error_line.strip()}",
-                    line=line_no,
-                    fix_hint="This is a genuine JS syntax error (not a style/pattern warning) — fix the exact line before anything else.",
-                ))
-        except subprocess.TimeoutExpired:
-            findings.append(VerifyFinding(
-                file=file_path,
-                severity=VerifySeverity.WARNING,
-                check="js_real_syntax_check_timeout",
-                message="Node syntax check timed out after 10s.",
-                fix_hint="File may be unusually large or Node startup is slow in this environment; re-run if this persists.",
-            ))
-        except Exception as exc:  # noqa: BLE001 - this check must never crash verify_against_core
-            findings.append(VerifyFinding(
-                file=file_path,
-                severity=VerifySeverity.INFO,
-                check="js_real_syntax_check_error",
-                message=f"Could not run real JS syntax check: {exc}",
-            ))
-        finally:
-            if tmp_path:
-                try:
-                    Path(tmp_path).unlink(missing_ok=True)
-                except Exception:
-                    pass
         return findings
 
     @staticmethod

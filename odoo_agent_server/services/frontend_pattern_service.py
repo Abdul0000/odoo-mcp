@@ -207,35 +207,8 @@ class FrontendPatternService:
         return result
 
     def _cache_key(self, request: FrontendPatternPreflightRequest) -> str:
-        payload = json.dumps(
-            {
-                "request": request.model_dump(mode="json"),
-                "fingerprint": self._source_fingerprint(request),
-            },
-            sort_keys=True,
-            ensure_ascii=False,
-        )
+        payload = json.dumps(request.model_dump(mode="json"), sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
-
-    @staticmethod
-    def _source_fingerprint(request: FrontendPatternPreflightRequest) -> dict[str, object]:
-        paths = list(request.custom_file_paths or []) + list(request.planned_file_paths or [])
-        roots = request.search_roots or [
-            "/home/odoo/src/enterprise",
-            "/home/odoo/src/odoo",
-            "/home/odoo/src/user",
-        ]
-        stats: dict[str, int | None] = {}
-        for raw in paths + roots:
-            try:
-                path = Path(raw)
-                stats[str(path)] = path.stat().st_mtime_ns
-            except OSError:
-                stats[str(raw)] = None
-        return {
-            "paths": stats,
-            "core_sync_host": settings.odoosh_ssh_host or "",
-        }
 
     def _cache_path(self, request: FrontendPatternPreflightRequest) -> Path:
         return settings.cache_path / "frontend_patterns" / f"{self._cache_key(request)}.json"

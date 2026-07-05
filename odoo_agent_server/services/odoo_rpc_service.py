@@ -327,13 +327,15 @@ class OdooRpcService:
 
         records = status_result.result or []
         if not records:
-            return self._ssh_fallback_result(
-                module_name,
-                "deploy",
-                (
-                    f"Module {module_name!r} was not found in ir.module.module after update_list. "
-                    "The addon may exist in Odoo.sh source but not be registered/installed in the database yet."
-                ),
+            return OdooRpcResult(
+                status="failed",
+                error=(
+                    f"Module {module_name!r} not found after update_list.\n"
+                    "ACTIONS:\n"
+                    "1. Call odoosh.grep_errors — check for Python import errors\n"
+                    "2. Verify __manifest__.py has installable=True\n"
+                    "3. Call odoosh.module_update (SSH) then retry odoo.module_deploy"
+                )
             )
 
         state = records[0].get("state", "unknown")

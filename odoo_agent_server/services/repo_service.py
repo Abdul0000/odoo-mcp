@@ -53,7 +53,7 @@ class RepoService:
     ) -> RepoPrepareResult:
         """Clone or refresh the target repository before any coding task.
 
-        This is the repo-first entry point MCP agents should use for coding work:
+        This is the repo-first entry point ChatGPT should use for coding work:
         clone if missing; otherwise fetch, checkout, and pull the requested branch.
         """
         resolver = ClientResolverService()
@@ -284,93 +284,6 @@ class RepoService:
             raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Only UTF-8 text files are supported") from exc
         return FileContent(path=target.relative_to(self.project(project_path)).as_posix(), content=content, size=size)
 
-    def read_range(self, project_path: str, relative_path: str, start_line: int = 1, max_lines: int = 200) -> dict:
-        project = self.project(project_path)
-        target = self._safe_join(project, relative_path)
-        if not target.exists() or not target.is_file():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: {target}")
-        try:
-            lines = target.read_text(encoding="utf-8").splitlines()
-        except UnicodeDecodeError as exc:
-            raise HTTPException(status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail="Only UTF-8 text files are supported") from exc
-        start = max(start_line, 1)
-        end = min(start + max_lines - 1, len(lines))
-        selected = lines[start - 1:end]
-        numbered = "\n".join(f"{line_no}: {text}" for line_no, text in enumerate(selected, start=start))
-        return {
-            "path": target.relative_to(project).as_posix(),
-            "start_line": start,
-            "end_line": end,
-            "total_lines": len(lines),
-            "truncated": end < len(lines),
-            "next_call": {
-                "tool": "repo.read_range",
-                "arguments": {
-                    "project_path": str(project),
-                    "relative_path": target.relative_to(project).as_posix(),
-                    "start_line": end + 1,
-                    "max_lines": max_lines,
-                },
-            } if end < len(lines) else None,
-            "content": numbered,
-        }
-
-    def search(self, project_path: str, pattern: str, relative_path: str = ".", max_matches: int = 100, context_lines: int = 2, regex: bool = False) -> dict:
-        project = self.project(project_path)
-        root = self._safe_join(project, relative_path)
-        if not root.exists():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Path not found: {root}")
-        try:
-            compiled = re.compile(pattern if regex else re.escape(pattern))
-        except re.error as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid regex pattern: {exc}") from exc
-        files = [root] if root.is_file() else self._iter_search_files(root)
-        matches: list[dict[str, object]] = []
-        scanned_files = 0
-        skipped_binary = 0
-        for file_path in files:
-            if len(matches) >= max_matches:
-                break
-            scanned_files += 1
-            try:
-                lines = file_path.read_text(encoding="utf-8").splitlines()
-            except UnicodeDecodeError:
-                skipped_binary += 1
-                continue
-            except OSError:
-                continue
-            for index, line in enumerate(lines):
-                if not compiled.search(line):
-                    continue
-                context_start = max(0, index - context_lines)
-                context_end = min(len(lines), index + context_lines + 1)
-                context = [
-                    {"line": line_no + 1, "text": lines[line_no]}
-                    for line_no in range(context_start, context_end)
-                ]
-                rel = file_path.relative_to(project).as_posix()
-                matches.append({"path": rel, "line": index + 1, "text": line, "context": context})
-                if len(matches) >= max_matches:
-                    break
-        return {
-            "pattern": pattern,
-            "regex": regex,
-            "relative_path": root.relative_to(project).as_posix() if root != project else ".",
-            "matches": matches,
-            "count": len(matches),
-            "truncated": len(matches) >= max_matches,
-            "scanned_files": scanned_files,
-            "skipped_binary_files": skipped_binary,
-            "next_action": "Use repo.read_range on a matched path and line number for exact surrounding code.",
-        }
-
-    def _iter_search_files(self, root: Path):
-        skip_dirs = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", ".venv", "venv", "env", "static/lib"}
-        for current, dirs, files in os.walk(root):
-            dirs[:] = sorted(d for d in dirs if d not in skip_dirs)
-            for filename in sorted(files):
-                yield Path(current) / filename
-
     # Fix 2/6: line-count threshold above which chunked mode is recommended.
     _LARGE_FILE_LINE_THRESHOLD = 1000
     # Fix 6: unified-diff line limit to include in response (keeps payload small)
@@ -394,7 +307,7 @@ class RepoService:
 
         Fix 2: Files written in a single call (total_chunks==1) that exceed
         _LARGE_FILE_LINE_THRESHOLD lines will carry a 'large_file_warning' in
-        the response extra — MCP agents must use chunked mode next time.
+        the response extra — ChatGPT must use chunked mode next time.
 
         Fix 6: When overwriting an existing file in single-write mode (chunk_index==0,
         total_chunks==1), the response always includes a short unified diff showing

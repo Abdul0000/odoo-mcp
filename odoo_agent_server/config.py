@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import base64
-import os
 from pathlib import Path
 from typing import List
 
@@ -10,7 +8,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Runtime settings for the Odoo MCP agent connector."""
+    """Runtime settings for the direct ChatGPT Odoo agent connector."""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -18,9 +16,8 @@ class Settings(BaseSettings):
     allowed_roots_raw: str = Field(default="/workspace/repos,/tmp,/home/odoo/src", alias="ODOO_AGENT_ALLOWED_ROOTS")
     state_dir: str = Field(default="/tmp/odoo_agent_state", alias="ODOO_AGENT_STATE_DIR")
     screenshot_dir: str = Field(default="/tmp/odoo_agent_screenshots", alias="ODOO_AGENT_SCREENSHOT_DIR")
-    cdp_url: str | None = Field(default=None, alias="ODOO_AGENT_CDP_URL")
 
-    # Approval gating is disabled in this build so MCP tools can write, commit, push, and deploy directly.
+    # Approval gating is disabled in this build so ChatGPT MCP tools can write, commit, push, and deploy directly.
     require_approval: bool = Field(default=False, alias="ODOO_AGENT_REQUIRE_APPROVAL")
     approval_required_actions_raw: str = Field(default="", alias="ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS")
     protected_branches_raw: str = Field(default="", alias="ODOO_AGENT_PROTECTED_BRANCHES")
@@ -34,22 +31,22 @@ class Settings(BaseSettings):
     git_author_name: str = Field(default="Odoo MCP Agent", alias="GIT_AUTHOR_NAME")
     git_author_email: str = Field(default="odoo-mcp@example.local", alias="GIT_AUTHOR_EMAIL")
 
-    # OAuth 2.1 / MCP App authentication for generic and compatibility MCP clients.
+    # OAuth 2.1 / MCP App authentication. Required for ChatGPT custom MCP apps.
     public_base_url: str | None = Field(default=None, alias="ODOO_AGENT_PUBLIC_BASE_URL")
     oauth_issuer: str | None = Field(default=None, alias="ODOO_AGENT_OAUTH_ISSUER")
     oauth_default_scope: str = Field(default="odoo.agent", alias="ODOO_AGENT_OAUTH_DEFAULT_SCOPE")
     oauth_auto_approve: bool = Field(default=False, alias="ODOO_AGENT_OAUTH_AUTO_APPROVE")
-    oauth_static_client_id: str = Field(default="odoo-agent-mcp", alias="ODOO_AGENT_OAUTH_STATIC_CLIENT_ID")
+    oauth_static_client_id: str = Field(default="odoo-agent-chatgpt", alias="ODOO_AGENT_OAUTH_STATIC_CLIENT_ID")
     oauth_static_client_secret: str | None = Field(default=None, alias="ODOO_AGENT_OAUTH_STATIC_CLIENT_SECRET")
     oauth_token_secret: str | None = Field(default=None, alias="ODOO_AGENT_OAUTH_TOKEN_SECRET")
     oauth_allowed_redirect_uris_raw: str = Field(default="", alias="ODOO_AGENT_OAUTH_ALLOWED_REDIRECT_URIS")
     oauth_authorization_code_ttl_seconds: int = Field(default=600, alias="ODOO_AGENT_OAUTH_AUTH_CODE_TTL_SECONDS")
     oauth_access_token_ttl_seconds: int = Field(default=3600, alias="ODOO_AGENT_OAUTH_ACCESS_TOKEN_TTL_SECONDS")
     oauth_refresh_token_ttl_seconds: int = Field(default=2592000, alias="ODOO_AGENT_OAUTH_REFRESH_TOKEN_TTL_SECONDS")
-    # Recover dynamic OAuth clients after ephemeral-state redeploys.
+    # Recover ChatGPT dynamic OAuth clients after ephemeral-state redeploys.
     # When enabled, unknown dcr_* client IDs are accepted only with normal
-    # redirect validation. Compatibility redirect hosts remain allowed for
-    # static/recovered clients when no explicit allowlist is configured.
+    # redirect validation, which permits ChatGPT/OpenAI redirect hosts for
+    # static/recovered clients.
     oauth_accept_unknown_dcr_clients: bool = Field(default=False, alias="ODOO_AGENT_OAUTH_ACCEPT_UNKNOWN_DCR_CLIENTS")
 
     # Optional compatibility for MCP clients that cannot send Authorization
@@ -74,9 +71,6 @@ class Settings(BaseSettings):
     repo_index_cache_seconds: int = Field(default=3600, alias="ODOO_AGENT_REPO_INDEX_CACHE_SECONDS")
     verify_impact_aware_default: bool = Field(default=True, alias="ODOO_AGENT_VERIFY_IMPACT_AWARE_DEFAULT")
 
-    # Best-effort deploy follow-through for raw git.push fallback paths.
-    auto_upgrade_on_push: bool = Field(default=True, alias="ODOO_AGENT_AUTO_UPGRADE_ON_PUSH")
-
     # Qwen URL-token fallback hardening. Qwen app may not pass headers, so the
     # server can mint a short-lived URL token that maps to the real API/OAuth token.
     qwen_short_token_ttl_seconds: int = Field(default=3600, alias="ODOO_AGENT_QWEN_SHORT_TOKEN_TTL_SECONDS")
@@ -92,7 +86,6 @@ class Settings(BaseSettings):
     odoosh_ssh_user: str = Field(default="odoo", alias="ODOOSH_SSH_USER")
     odoosh_ssh_port: int = Field(default=22, alias="ODOOSH_SSH_PORT")
     odoosh_ssh_key_path: str | None = Field(default=None, alias="ODOOSH_SSH_KEY_PATH")
-    odoosh_ssh_private_key_b64: str | None = Field(default=None, alias="ODOOSH_SSH_PRIVATE_KEY_B64")
     odoosh_db_name: str | None = Field(default=None, alias="ODOOSH_DB_NAME")
     odoosh_odoo_path: str = Field(default="/home/odoo/src/odoo", alias="ODOOSH_ODOO_PATH")
     odoosh_user_addons_path: str = Field(default="/home/odoo/src/user", alias="ODOOSH_USER_ADDONS_PATH")
@@ -143,24 +136,6 @@ class Settings(BaseSettings):
         path = Path(raw).expanduser().resolve()
         path.mkdir(parents=True, exist_ok=True)
         return path
-
-    @property
-    def effective_odoosh_ssh_key_path(self) -> Path | None:
-        if self.odoosh_ssh_key_path:
-            return Path(self.odoosh_ssh_key_path).expanduser().resolve()
-        if not self.odoosh_ssh_private_key_b64:
-            return None
-        key_dir = self.state_path / "keys"
-        key_dir.mkdir(parents=True, exist_ok=True)
-        key_path = key_dir / "odoosh_key"
-        if not key_path.exists():
-            raw = base64.b64decode(self.odoosh_ssh_private_key_b64.encode("ascii"))
-            key_path.write_bytes(raw)
-            try:
-                os.chmod(key_path, 0o600)
-            except OSError:
-                pass
-        return key_path
 
 
 settings = Settings()

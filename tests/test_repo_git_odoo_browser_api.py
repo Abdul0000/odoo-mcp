@@ -46,30 +46,6 @@ def test_repo_read_write_and_clean_pyc(tmp_path, monkeypatch):
     assert not cache_dir.exists()
 
 
-def test_repo_write_many_smart_accepts_path_alias(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
-    project = tmp_path / "repo"
-    project.mkdir()
-    client = TestClient(app)
-
-    response = client.post(
-        "/repo/write-many-smart",
-        headers=_auth(),
-        json={
-            "project_path": str(project),
-            "files": [
-                {"path": "sale_order_notebook_tab/models/sale_order.py", "content": "from odoo import fields, models\n"},
-                {"path": "sale_order_notebook_tab/views/sale_order_views.xml", "content": "<odoo/>\n"},
-            ],
-        },
-    )
-
-    assert response.status_code == 200
-    assert response.json()["exit_code"] == 0
-    assert (project / "sale_order_notebook_tab" / "models" / "sale_order.py").read_text(encoding="utf-8") == "from odoo import fields, models\n"
-    assert (project / "sale_order_notebook_tab" / "views" / "sale_order_views.xml").read_text(encoding="utf-8") == "<odoo/>\n"
-
-
 def test_repo_rejects_path_escape(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     project = tmp_path / "repo"
@@ -106,12 +82,8 @@ def test_git_status_current_branch_and_diff(tmp_path, monkeypatch):
 
 
 def test_odoo_health_without_config_returns_failed(monkeypatch):
-    for key in ("ODOO_BASE_URL", "ODOO_DB_NAME", "ODOO_LOGIN", "ODOO_PASSWORD", "ODOO_CLIENTS"):
-        monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(settings, "odoo_base_url", None)
     monkeypatch.setattr(settings, "odoo_db_name", None)
-    monkeypatch.setattr(settings, "odoo_login", None)
-    monkeypatch.setattr(settings, "odoo_password", None)
     client = TestClient(app)
     response = client.post("/odoo/health", headers=_auth())
     assert response.status_code == 200

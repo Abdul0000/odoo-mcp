@@ -1,19 +1,17 @@
 """V14+ — Self-Learning Agent: Core File Discovery + Adaptive Scope Advisor.
 
-Mandatory dual source read:
-  Every coding task MUST read the custom module from the active checkout first,
-  then read only the relevant installed Odoo/Odoo.sh source files. The scope
-  advisor decides how deeply to read based on what is found (L0 → L4 adaptive
-  levels), but it does not duplicate the current custom module from
-  /home/odoo/src/user.
+Mandatory Dual Read:
+  Every coding task MUST read both the custom module AND the relevant Odoo core
+  source files. The ScopeAdvisorService decides how deeply to read based on what
+  is found (L0 → L4 adaptive levels).
 
-Search priority for installed-source reads:
-  1. /home/odoo/src/enterprise (priority 1)
-  2. /home/odoo/src/odoo       (priority 2)
-  3. /home/odoo/src/user       (priority 3 — fallback for other related custom addons)
+Search priority (matches Odoo.sh module load order):
+  1. /home/odoo/src/user       (priority 1 — custom addons already on this server)
+  2. /home/odoo/src/enterprise (priority 2)
+  3. /home/odoo/src/odoo       (priority 3)
 
 Adaptive scope levels:
-  L0 (base)     — Custom module already read from checkout; no extra source read
+  L0 (base)     — Always: custom module + core direct files
   L1 (inherit)  — _inherit chain detected → also read parent model
   L2 (mixin)    — Abstract model / mixin detected → read all mixins (mail.thread etc.)
   L3 (computed) — ir.model / computed fields → full module models/ dir scan
@@ -43,9 +41,9 @@ from ..schemas import (
 # Default search roots ordered by priority
 # ---------------------------------------------------------------------------
 _DEFAULT_ROOTS: list[tuple[int, str]] = [
-    (1, "/home/odoo/src/enterprise"),
-    (2, "/home/odoo/src/odoo"),
-    (3, "/home/odoo/src/user"),
+    (1, "/home/odoo/src/user"),
+    (2, "/home/odoo/src/enterprise"),
+    (3, "/home/odoo/src/odoo"),
 ]
 
 # ---------------------------------------------------------------------------
@@ -98,18 +96,10 @@ _MIXIN_DETECT_RE = re.compile(
     re.IGNORECASE,
 )
 _ABSTRACT_DETECT_RE = re.compile(r'_abstract\s*=\s*True|class\s+\w+.*AbstractModel')
-_INHERIT_DETECT_RE  = re.compile(r'_inherit\s*=\s*([^\n#]+)')
-_MODEL_LITERAL_RE   = re.compile(r'["\']([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z0-9_.]+)["\']')
+_INHERIT_DETECT_RE  = re.compile(r'_inherit\s*=\s*["\']([^"\']+)["\']')
 _COMPUTED_DETECT_RE = re.compile(r'fields\.(Many2many|One2many|Many2one)\s*\(|compute\s*=')
 _IRMODEL_DETECT_RE  = re.compile(r'ir\.model|env\[.+\]\.fields_get\(')
-_CROSSMOD_DETECT_RE = re.compile(
-    r'(?:comodel_name\s*=\s*["\']([^"\']+)["\']|fields\.(?:Many2many|One2many|Many2one)\s*\(\s*["\']([^"\']+)["\'])'
-)
-
-
-def _extract_model_literals(raw: str) -> list[str]:
-    """Extract Odoo model strings from scalar or list/tuple assignments."""
-    return [m.group(1) for m in _MODEL_LITERAL_RE.finditer(raw)]
+_CROSSMOD_DETECT_RE = re.compile(r'comodel_name\s*=\s*["\'](\w+)\.')
 
 
 def _model_to_filename_hints(model: str) -> list[str]:
@@ -144,7 +134,12 @@ class CoreFinderService:
 
         for priority, root in roots:
             root_path = Path(root)
-            module_dir = self._module_dir_with_sync(root_path, root, module_name)
+            if not root_path.exists():
+                continue
+            module_dir = self._find_module_dir(root_path, module_name)
+            if not module_dir:
+                core_sync_service.ensure_module_synced(root, module_name)
+                module_dir = self._find_module_dir(root_path, module_name)
             if not module_dir:
                 continue
 
@@ -201,12 +196,15 @@ class CoreFinderService:
 
         for priority, root in roots:
             root_path = Path(root)
-            module_dir = self._module_dir_with_sync(root_path, root, module_candidate)
+            if not root_path.exists():
+                continue
+            module_dir = self._find_module_dir(root_path, module_candidate)
+            if not module_dir:
+                core_sync_service.ensure_module_synced(root, module_candidate)
+                module_dir = self._find_module_dir(root_path, module_candidate)
             search_dirs: list[Path] = []
             if module_dir:
                 search_dirs.append(module_dir)
-            elif not root_path.exists():
-                continue
             else:
                 search_dirs.append(root_path)
 
@@ -291,6 +289,15 @@ class CoreFinderService:
         reached_level = ScopeLevel.L0
         cross_modules: set[str] = set()
 
+        # L0 baseline: always read custom module manifest
+        instructions.append(ScopeReadInstruction(
+            level=ScopeLevel.L0,
+            reason="Mandatory baseline: always read custom module manifest",
+            read_type="custom_manifest",
+            path=f"{custom_module_name}/__manifest__.py",
+            mandatory=True,
+        ))
+
         # Scan provided custom Python files for patterns
         inherit_models: list[str] = []
         has_mixin = False
@@ -306,7 +313,8 @@ class CoreFinderService:
 
             # L1: detect _inherit
             for m in _INHERIT_DETECT_RE.finditer(content):
-                for model_name in _extract_model_literals(m.group(1)):
+                model_name = m.group(1)
+                if model_name and "." in model_name:
                     inherit_models.append(model_name)
 
             # L2: detect mixin / abstract
@@ -321,8 +329,7 @@ class CoreFinderService:
 
             # L4: detect cross-module comodel references
             for cm in _CROSSMOD_DETECT_RE.finditer(content):
-                comodel = cm.group(1) or cm.group(2) or ""
-                mod = comodel.split(".", 1)[0] if "." in comodel else ""
+                mod = cm.group(1)
                 if mod and mod != custom_module_name:
                     cross_modules.add(mod)
 
@@ -434,7 +441,12 @@ class CoreFinderService:
         roots = self._resolve_roots(search_roots)
         for priority, root in roots:
             root_path = Path(root)
-            module_dir = self._module_dir_with_sync(root_path, root, module_name)
+            if not root_path.exists():
+                continue
+            module_dir = self._find_module_dir(root_path, module_name)
+            if not module_dir:
+                core_sync_service.ensure_module_synced(root, module_name)
+                module_dir = self._find_module_dir(root_path, module_name)
             if not module_dir:
                 continue
 
@@ -503,24 +515,6 @@ class CoreFinderService:
         if client:
             return [(i + 1, root) for i, root in enumerate(ClientResolverService().search_roots(client))]
         return _DEFAULT_ROOTS
-
-    def _module_dir_with_sync(self, root_path: Path, root: str, module_name: str) -> Path | None:
-        module_dir = self._find_module_dir(root_path, module_name) if root_path.exists() else None
-        if module_dir:
-            return module_dir
-        core_sync_service.ensure_module_synced(root, module_name)
-        return self._find_module_dir(root_path, module_name) if root_path.exists() else None
-
-    @staticmethod
-    def _find_module_dir(root_path: Path, module_name: str) -> Path | None:
-        for candidate in (
-            root_path / module_name,
-            root_path / "addons" / module_name,
-            root_path / "odoo" / "addons" / module_name,
-        ):
-            if candidate.is_dir():
-                return candidate
-        return None
 
     @staticmethod
     def _walk_module(module_dir: Path, subdirs: list[str]) -> list[Path]:

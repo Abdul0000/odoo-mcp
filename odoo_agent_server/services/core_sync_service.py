@@ -134,9 +134,8 @@ def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: in
             "-o", "ConnectTimeout=10",
             "-p", str(settings.odoosh_ssh_port),
         ]
-        key_path = settings.effective_odoosh_ssh_key_path
-        if key_path:
-            ssh_opts += ["-i", str(key_path)]
+        if settings.odoosh_ssh_key_path:
+            ssh_opts += ["-i", settings.odoosh_ssh_key_path]
         remote = f"{settings.odoosh_ssh_user}@{settings.odoosh_ssh_host}:{remote_root}/{module_name}/"
         cmd = [
             "rsync", "-az", "--delete", "--timeout", str(timeout_seconds),

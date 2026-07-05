@@ -5,7 +5,7 @@ from enum import Enum
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import AliasChoices, BaseModel, Field, computed_field, field_validator
+from pydantic import BaseModel, Field, computed_field, field_validator
 
 
 class Severity(str, Enum):
@@ -72,12 +72,6 @@ class JobGetRequest(BaseModel):
     wait_for_result: bool = Field(default=True, description="Wait server-side until the job finishes or the wait timeout expires")
     wait_timeout_seconds: int = Field(default=20, ge=0, le=25, description="Maximum server-side wait. Kept under Render request timeout.")
     poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
-
-
-class ArtifactReadRequest(BaseModel):
-    artifact_id: str = Field(..., min_length=1, max_length=120, description="Artifact id returned by a previous tool response")
-    offset: int = Field(default=0, ge=0, description="Zero-based character offset for text artifacts")
-    max_chars: int = Field(default=12000, ge=1, le=50000, description="Maximum characters to return")
 
 
 class SelfRunRequest(BaseProjectRequest):
@@ -173,20 +167,6 @@ class RepoReadRequest(BaseProjectRequest):
     max_bytes: int = Field(default=300_000, ge=100, le=2_000_000)
 
 
-class RepoReadRangeRequest(BaseProjectRequest):
-    relative_path: str
-    start_line: int = Field(default=1, ge=1, description="1-based first line to read")
-    max_lines: int = Field(default=200, ge=1, le=2000, description="Maximum number of lines to return")
-
-
-class RepoSearchRequest(BaseProjectRequest):
-    pattern: str = Field(..., min_length=1, max_length=500, description="Literal text or regex pattern to search for")
-    relative_path: str = Field(default=".", description="Directory or file inside project_path to search")
-    max_matches: int = Field(default=100, ge=1, le=1000)
-    context_lines: int = Field(default=2, ge=0, le=10)
-    regex: bool = Field(default=False, description="Treat pattern as a Python regular expression instead of literal text")
-
-
 class RepoWriteRequest(BaseProjectRequest, ApprovalMixin):
     relative_path: str
     content: str
@@ -200,10 +180,7 @@ class RepoWriteRequest(BaseProjectRequest, ApprovalMixin):
 
 
 class RepoWriteItem(BaseModel):
-    relative_path: str = Field(
-        validation_alias=AliasChoices("relative_path", "path"),
-        description="Path relative to project_path. The alias 'path' is accepted for compatibility with MCP clients.",
-    )
+    relative_path: str
     content: str
     create_dirs: bool = True
 
@@ -308,48 +285,10 @@ class OdooShVerifyManifestRequest(BaseModel):
         return validate_safe_name(value, "module_name")
 
 
-class OdooShUserFileReadRequest(BaseModel):
-    relative_path: str = Field(
-        ...,
-        description="Path relative to /home/odoo/src/user, e.g. sale_order_notebook_tab/models/purchase_order.py",
-    )
-    max_bytes: int = Field(default=300000, ge=1, le=1000000)
-
-    @field_validator("relative_path")
-    @classmethod
-    def relative_path_must_be_safe(cls, value: str) -> str:
-        rel = value.replace("\\", "/").strip("/")
-        if not rel or rel.startswith("../") or "/../" in rel or rel.startswith(".git/") or rel == ".git":
-            raise ValueError("relative_path must stay inside /home/odoo/src/user")
-        return rel
-
-
-class OdooShUserFilesListRequest(BaseModel):
-    module_name: str = Field(..., description="Custom module folder under /home/odoo/src/user")
-    subdir: str = Field(default="", description="Optional module subdirectory such as models, views, static/src")
-    max_items: int = Field(default=200, ge=1, le=2000)
-
-    @field_validator("module_name")
-    @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
-
-    @field_validator("subdir")
-    @classmethod
-    def subdir_must_be_safe(cls, value: str) -> str:
-        rel = value.replace("\\", "/").strip("/")
-        if rel.startswith("../") or "/../" in rel or rel.startswith(".git/") or rel == ".git":
-            raise ValueError("subdir must stay inside the module")
-        return rel
-
-
 class OdooShModuleUpdateRequest(ApprovalMixin):
     module_name: str = Field(..., description="Technical module folder/name to update")
-    project_path: str | None = Field(default=None, description="Optional local checkout path used to prove local HEAD is pushed before manual Odoo.sh update/install. If omitted, session state is used when available.")
-    remote: str = Field(default="origin", description="Git remote used for the local-vs-remote HEAD safety check")
-    branch: str | None = Field(default=None, description="Git branch used for the local-vs-remote HEAD safety check. Defaults to current branch.")
     timeout_seconds: int = Field(default=600, ge=30, le=1800)
-    expected_sha: str | None = Field(default=None, description="Pushed Git SHA that must be deployed on Odoo.sh before update. If omitted, manual Odoo.sh tools require local HEAD to match remote branch HEAD before running.")
+    expected_sha: str | None = Field(default=None, description="Optional pushed Git SHA that must be deployed on Odoo.sh before update")
     wait_for_result: bool = Field(default=True, description="Wait server-side for background SSH job until done or wait timeout")
     wait_timeout_seconds: int = Field(default=20, ge=0, le=25, description="Maximum server-side wait. Kept under Render request timeout.")
     poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
@@ -362,27 +301,9 @@ class OdooShModuleUpdateRequest(ApprovalMixin):
 
 class OdooRpcModuleRequest(ApprovalMixin):
     module_name: str = Field(..., description="Technical module name")
-    project_path: str | None = Field(default=None, description="Optional local checkout path used by manual Odoo.sh SSH install to prove local HEAD is pushed before running. If omitted, session state is used when available.")
-    remote: str = Field(default="origin", description="Git remote used for the local-vs-remote HEAD safety check")
-    branch: str | None = Field(default=None, description="Git branch used for the local-vs-remote HEAD safety check. Defaults to current branch.")
-    expected_sha: str | None = Field(default=None, description="Optional pushed Git SHA that must be deployed on Odoo.sh before manual SSH install/update. If omitted, local HEAD must match remote branch HEAD.")
     wait_for_result: bool = Field(default=True, description="For background install/upgrade/deploy, wait server-side until the job finishes or times out")
     wait_timeout_seconds: int = Field(default=20, ge=0, le=25, description="Maximum server-side wait. Kept under Render request timeout.")
     poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
-    deploy_guard_timeout_seconds: int = Field(default=300, ge=0, le=600, description="Maximum server-side wait for a recent manual git.push SHA to appear on Odoo.sh before install/upgrade")
-    deploy_guard_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for the deploy guard used by direct module install/upgrade calls")
-
-    @field_validator("module_name")
-    @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
-
-
-class DeployedModuleVerifyRequest(BaseProjectRequest):
-    module_name: str = Field(..., description="Custom module folder/name to compare against /home/odoo/src/user")
-    paths: list[str] = Field(default_factory=list, description="Repo-relative files to compare. Empty compares module code/XML/assets up to max_files.")
-    max_files: int = Field(default=200, ge=1, le=1000, description="Maximum module files to compare when paths is empty")
-    include_module_status: bool = Field(default=True, description="Also read live Odoo module installation state")
 
     @field_validator("module_name")
     @classmethod
@@ -428,44 +349,7 @@ class BrowserCheckResult(BaseModel):
     url: str | None = None
     title: str | None = None
     screenshot_path: str | None = None
-    console_errors: list[str] = Field(default_factory=list, description="console.error/warning + pageerror entries.")
-    console_all: list[str] = Field(default_factory=list, description="EVERY console message (log/info/debug/warning/error), in order. Always populated — read this for full console output on every run, not just when something fails.")
-    network_errors: list[str] = Field(default_factory=list)
-    error: str | None = None
-
-
-class PosFlowCheckRequest(BaseModel):
-    """Run a real multi-step POS interaction inside one persistent session,
-    instead of a single cold-load screenshot. Steps are fixed (open POS ->
-    open session if needed -> click first product -> open payment screen ->
-    validate order -> receipt screen) because POS component/state bugs only
-    surface once you actually interact with the app, not on initial mount.
-    """
-    base_url: str | None = Field(default=None)
-    login: str | None = Field(default=None)
-    password: str | None = Field(default=None)
-    pos_config_name: str | None = Field(default=None, description="Optional POS config display name to open; if omitted, opens the first available POS.")
-    product_name: str | None = Field(default=None, description="Optional exact/partial product name to click; if omitted, clicks the first product tile found.")
-    payment_method_name: str | None = Field(default=None, description="Optional payment method button label; if omitted, clicks the first payment method tile found.")
-    screenshot_prefix: str = Field(default="pos_flow")
-    timeout_seconds: int = Field(default=60, ge=15, le=180)
-
-
-class PosFlowStepResult(BaseModel):
-    step: str
-    status: Literal["ok", "failed", "skipped"]
-    screenshot_path: str | None = None
-    console_errors: list[str] = Field(default_factory=list, description="console.error/warning + pageerror entries for this step only.")
-    console_all: list[str] = Field(default_factory=list, description="EVERY console message (log/info/debug/warning/error) for this step, in order. Read this whenever you need full console output, not just errors.")
-    network_errors: list[str] = Field(default_factory=list)
-    error: str | None = None
-
-
-class PosFlowCheckResult(BaseModel):
-    status: Literal["ok", "failed"]
-    steps: list[PosFlowStepResult] = Field(default_factory=list)
-    console_errors: list[str] = Field(default_factory=list, description="All console errors/warnings across the whole session, deduplicated.")
-    console_all: list[str] = Field(default_factory=list, description="EVERY console message across the whole session (log/info/debug/warning/error), in order. Always populated regardless of pass/fail — read this for full console output on every run.")
+    console_errors: list[str] = Field(default_factory=list)
     network_errors: list[str] = Field(default_factory=list)
     error: str | None = None
 
@@ -573,7 +457,7 @@ class ToolDescriptor(BaseModel):
     title: str | None = Field(
         default=None,
         description=(
-            "Human-readable action label shown in MCP/client tool-call UI "
+            "Human-readable action label shown in ChatGPT's tool-call UI "
             "(e.g. 'Push code to GitHub' instead of raw name 'git.push'). "
             "Falls back to a humanized version of `name` if not set."
         ),
@@ -604,7 +488,7 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     paths: list[str] = Field(default_factory=list, description="Relative paths to add before commit. Empty means git add -A.")
     remote: str = Field(default="origin")
     branch: str | None = Field(default=None, description="Defaults to current branch or TARGET_GIT_BRANCH")
-    run_qa: bool = Field(default=True, description="Run qa.self_run by default so deploy failures surface before long Odoo.sh polling. Set False only for an explicit, intentional bypass.")
+    run_qa: bool = Field(default=True)
     wait_for_odoosh: bool = Field(default=True)
     upgrade_module: bool = Field(default=True)
     verify_ui_paths: list[str] = Field(
@@ -617,23 +501,6 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     )
     verify_ui_screenshot_prefix: str = Field(default="safe_deploy_ui", description="Screenshot filename prefix for verify_ui_paths")
     verify_ui_timeout_seconds: int = Field(default=45, ge=10, le=180, description="Per-page browser timeout for verify_ui_paths")
-    wait_for_result: bool = Field(default=False, description="Return the background safe-deploy job_id immediately. Set True only for clients that can safely hold a long tool call open.")
-    wait_timeout_seconds: int = Field(default=300, ge=0, le=300, description="Maximum server-side wait before returning job_id/next_call")
-    poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between safe deploy job polls while waiting")
-    odoosh_deploy_timeout_seconds: int = Field(default=300, ge=0, le=600, description="Maximum time to poll Odoo.sh after git push for the pushed SHA to become deployed")
-    odoosh_deploy_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for Odoo.sh deployed SHA checks")
-    odoo_module_deploy_timeout_seconds: int = Field(default=300, ge=0, le=900, description="Maximum time for the internal Odoo module install/upgrade job to finish before returning a non-success resumable state")
-    odoo_module_deploy_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for the internal Odoo module install/upgrade job")
-    expected_registry_fields: dict[str, list[str]] = Field(default_factory=dict, description="Optional live registry fields to verify after upgrade, e.g. {'purchase.order': ['grok_y']}. If omitted, safe_deploy infers Python fields from changed addon files.")
-    force_new_deploy: bool = Field(
-        default=False,
-        description=(
-            "When False, duplicate workflow.safe_deploy_module calls for the same "
-            "project_path + module_name return the existing running/resumable job instead "
-            "of spawning a concurrent commit/push/upgrade. Set True only to intentionally "
-            "restart after a resumable deploy failure."
-        ),
-    )
     timeout_seconds: int = Field(default=900, ge=60, le=2400)
 
     @field_validator("module_name")
@@ -702,7 +569,7 @@ class MenuCrawlerRequest(BaseModel):
 
 
 class WorkflowReport(BaseModel):
-    status: Literal["passed", "failed", "warning", "running", "already_running", "already_in_progress", "resumable_existing_job"]
+    status: Literal["passed", "failed", "warning", "running"]
     job_id: str
     steps: list[JobStep]
     summary: dict[str, Any]
@@ -745,9 +612,9 @@ class FindCoreFileRequest(BaseModel):
     """V14: Locate an Odoo core source file by module + type + keyword.
 
     Search priority:
-      1. /home/odoo/src/enterprise
-      2. /home/odoo/src/odoo
-      3. /home/odoo/src/user       (fallback for other related custom dependencies)
+      1. /home/odoo/src/user       (custom, already installed)
+      2. /home/odoo/src/enterprise
+      3. /home/odoo/src/odoo
 
     Use before any _inherit, view inherit, or depends to read exact
     fields/methods/xpath structure directly from source.
@@ -772,7 +639,7 @@ class FindCoreFileRequest(BaseModel):
         default_factory=list,
         description=(
             "Override search roots (absolute paths). Defaults to "
-            "['/home/odoo/src/enterprise', '/home/odoo/src/odoo', '/home/odoo/src/user']"
+            "['/home/odoo/src/user', '/home/odoo/src/enterprise', '/home/odoo/src/odoo']"
         ),
     )
 
@@ -795,7 +662,7 @@ class CoreFileMatch(BaseModel):
     path: str = Field(..., description="Absolute path to the found file")
     relative_path: str = Field(..., description="Path relative to its search root")
     root: str = Field(..., description="Which search root this file was found in")
-    priority: int = Field(..., description="1=enterprise, 2=odoo, 3=user fallback — lower is higher priority")
+    priority: int = Field(..., description="1=user, 2=enterprise, 3=odoo — lower is higher priority")
     size: int = Field(..., description="File size in bytes")
 
 
@@ -817,7 +684,7 @@ class FindSimilarViewRequest(BaseModel):
     exact xpath structure, field names, and string attributes before
     writing a <xpath expr="..."> element.
 
-    Search priority: enterprise → odoo → user fallback (same as find_core_file).
+    Search priority: user → enterprise → odoo (same as find_core_file).
     """
     model: str = Field(
         ...,
@@ -829,7 +696,7 @@ class FindSimilarViewRequest(BaseModel):
     )
     search_roots: list[str] = Field(
         default_factory=list,
-        description="Override search roots. Defaults to enterprise → odoo → user fallback.",
+        description="Override search roots. Defaults to user → enterprise → odoo.",
     )
 
     @field_validator("view_type")
@@ -846,7 +713,7 @@ class SimilarViewMatch(BaseModel):
     path: str = Field(..., description="Absolute path to the view XML file")
     relative_path: str = Field(..., description="Relative path within its search root")
     root: str = Field(..., description="Which search root this was found in")
-    priority: int = Field(..., description="1=enterprise, 2=odoo, 3=user fallback")
+    priority: int = Field(..., description="1=user, 2=enterprise, 3=odoo")
     model_hint: str = Field(..., description="Model name extracted from file/path heuristic")
     size: int
 
@@ -874,7 +741,7 @@ class ListModuleFilesRequest(BaseModel):
     )
     search_roots: list[str] = Field(
         default_factory=list,
-        description="Override search roots. Defaults to enterprise → odoo → user fallback.",
+        description="Override search roots. Defaults to user → enterprise → odoo.",
     )
 
     @field_validator("module_name")
@@ -913,26 +780,12 @@ class ResumeJobRequest(BaseModel):
     Instead of starting over from step 1, the agent calls workflow.resume_job
     with the job_id from the failed run.
     """
-    job_id: str | None = Field(
-        default=None,
-        description=(
-            "Job ID returned by a previous safe_deploy_module or start_session call. "
-            "When omitted, the connector uses the last saved safe-deploy job from session state, "
-            "or the latest matching safe_deploy_module job."
-        ),
-    )
-    client_name: str | None = Field(default=None, description="Optional client session to load when job_id is omitted")
-    project_path: str | None = Field(default=None, description="Optional project path filter when selecting the latest job without job_id")
-    module_name: str | None = Field(default=None, description="Optional module filter when selecting the latest job without job_id")
+    job_id: str = Field(..., description="Job ID returned by a previous safe_deploy_module or start_session call")
     override_step: str | None = Field(
         default=None,
         description=(
             "If provided, start from this step name instead of the auto-detected last successful step. "
-            "Supported values include actual safe-deploy step names such as "
-            "'qa_self_run', 'git_commit', 'git_push', 'odoosh_check_commit', "
-            "'odoo_module_deploy', and 'registry_smoke_test'. Aliases "
-            "'qa', 'commit', 'push', 'wait_odoosh', 'install', 'upgrade', "
-            "'module_install', 'module_update', and 'smoke_test' are accepted."
+            "Supported values: 'qa', 'commit', 'push', 'wait_odoosh', 'upgrade', 'smoke_test'."
         ),
     )
 
@@ -972,7 +825,7 @@ class EnsureDependenciesRequest(ApprovalMixin):
 
 class ScopeLevel(str, Enum):
     """Adaptive scope level reached during analysis."""
-    L0 = "L0"  # Baseline: custom module already read from checkout
+    L0 = "L0"  # Baseline: custom + core direct files
     L1 = "L1"  # _inherit chain: read parent model
     L2 = "L2"  # Mixin/abstract: read all mixins
     L3 = "L3"  # Computed fields / ir.model: scan full models/ dir
@@ -986,7 +839,7 @@ class ScopeReadInstruction(BaseModel):
     read_type: str = Field(
         ...,
         description=(
-            "Instruction type: core_model | core_model_missing | "
+            "Instruction type: custom_manifest | core_model | core_model_missing | "
             "core_mixin | core_models_dir_scan | cross_module_manifest"
         ),
     )
@@ -997,11 +850,10 @@ class ScopeReadInstruction(BaseModel):
 class ScopeAdviceRequest(BaseModel):
     """V14+: Request adaptive scope analysis for a coding task.
 
-    Call this AFTER reading custom module files from the active repo checkout
-    and BEFORE writing any code. The service scans those custom files for
-    _inherit, mixins, computed fields, and cross-module refs, then returns an
-    ordered list of additional installed-source reads. It should not duplicate
-    the current custom module from /home/odoo/src/user.
+    Call this AFTER reading custom module files (repo.read) and BEFORE
+    writing any code. The service scans the custom files for _inherit,
+    mixins, computed fields, and cross-module refs, then returns an
+    ordered list of mandatory reads.
     """
     custom_module_name: str = Field(
         ...,
@@ -1021,7 +873,7 @@ class ScopeAdviceRequest(BaseModel):
     )
     search_roots: list[str] = Field(
         default_factory=list,
-        description="Override search roots. Defaults to enterprise → odoo → user fallback.",
+        description="Override search roots. Defaults to user → enterprise → odoo.",
     )
 
 
@@ -1062,13 +914,6 @@ class VerifyFinding(BaseModel):
     check: str = Field(..., description="Name of the check that fired")
     message: str = Field(..., description="Human-readable description of the mismatch")
     fix_hint: str = Field("", description="What to do to fix this issue")
-    line: int | None = Field(default=None, description="Line number in `file` where the issue was found, when known (e.g. real JS parse errors).")
-
-    @computed_field  # type: ignore[misc]
-    @property
-    def code(self) -> str:
-        """Backward-compatible alias used by older tests/clients."""
-        return self.check
 
 
 class SyntaxVerifyRequest(BaseModel):
@@ -1137,31 +982,6 @@ class SyntaxVerifyResult(BaseModel):
     info_count: int = 0
     fix_cycle: int = 0
 
-
-class PosChangeVerifyRequest(BaseModel):
-    """Combined static + live-browser verification for a POS-touching change.
-
-    This exists because verify_against_core alone only catches static
-    pattern mistakes (regex + now real JS parse errors); it never proves the
-    POS UI actually still works. This wraps verify_against_core AND
-    browser.pos_flow behind one bounded fix-cycle counter, mirroring the
-    existing verify_against_core contract (push_blocked / fix_cycle / max 3).
-    """
-    written_files: list[str] = Field(..., description="Absolute paths of files changed in this task (.py/.xml/.js/.scss/__manifest__.py).")
-    fix_cycle: int = Field(default=0, description="Current fix cycle number (0-indexed). After 3 cycles, stop and report to the user.")
-    project_path: str | None = Field(default=None)
-    run_pos_flow: bool = Field(default=True, description="If true and any written_files look POS-related, also run a live browser.pos_flow check.")
-    pos_flow_request: "PosFlowCheckRequest | None" = Field(default=None, description="Optional overrides (base_url/login/product_name/etc.) for the POS flow step.")
-
-
-class PosChangeVerifyResult(BaseModel):
-    push_blocked: bool
-    status: str
-    static_result: SyntaxVerifyResult
-    pos_flow_result: "PosFlowCheckResult | None" = None
-    fix_cycle: int = 0
-    message: str
-
 # ===========================================================================
 # V15 — Strict Odoo Frontend / OWL / JS / XML Preflight
 # ===========================================================================
@@ -1202,7 +1022,7 @@ class FrontendPatternPreflightRequest(BaseModel):
     )
     search_roots: list[str] = Field(
         default_factory=list,
-        description="Override source roots. Defaults to enterprise → odoo → user fallback.",
+        description="Override source roots. Defaults to user → enterprise → odoo.",
     )
 
 

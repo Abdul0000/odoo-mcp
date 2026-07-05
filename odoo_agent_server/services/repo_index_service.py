@@ -10,7 +10,6 @@ import ast
 import hashlib
 import json
 import re
-import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,12 +33,11 @@ class RepoIndexService:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Project path not found: {project}")
 
         cache_file = self._cache_file(project)
-        fingerprint = self._fingerprint(project)
         if settings.repo_index_enabled and not force_refresh and cache_file.exists():
             try:
                 data = json.loads(cache_file.read_text(encoding="utf-8") or "{}")
                 age = time.time() - float(data.get("_saved_at", 0))
-                if age <= max(1, settings.repo_index_cache_seconds) and data.get("_fingerprint") == fingerprint:
+                if age <= max(1, settings.repo_index_cache_seconds):
                     result_data = data.get("result") or {}
                     result_data["cached"] = True
                     return RepoIndexResult.model_validate(result_data)
@@ -50,7 +48,7 @@ class RepoIndexService:
         if settings.repo_index_enabled:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             cache_file.write_text(
-                json.dumps({"_saved_at": time.time(), "_fingerprint": fingerprint, "result": result.model_dump(mode="json")}, indent=2, sort_keys=True),
+                json.dumps({"_saved_at": time.time(), "result": result.model_dump(mode="json")}, indent=2, sort_keys=True),
                 encoding="utf-8",
             )
         return result
@@ -180,36 +178,6 @@ class RepoIndexService:
     def _cache_file(self, project: Path) -> Path:
         key = hashlib.sha256(str(project).encode("utf-8")).hexdigest()[:24]
         return settings.cache_path / "repo_index" / f"{key}.json"
-
-    def _fingerprint(self, project: Path) -> str:
-        try:
-            head = subprocess.run(
-                ["git", "rev-parse", "HEAD"],
-                cwd=str(project),
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-            status = subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=str(project),
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-            if head.returncode == 0 and status.returncode == 0:
-                payload = f"git:{head.stdout.strip()}:{status.stdout.strip()}"
-                return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-        except Exception:
-            pass
-        try:
-            stat = project.stat()
-            payload = f"fs:{stat.st_mtime_ns}:{stat.st_size}"
-        except OSError:
-            payload = f"fs:{project}"
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     def _walk(self, project: Path):
         for path in project.rglob("*"):
