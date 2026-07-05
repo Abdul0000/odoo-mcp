@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import hashlib
+import time
+from pathlib import Path
+
 from fastapi import APIRouter, HTTPException, status
 
 from ..auth import AuthDependency
@@ -25,6 +29,31 @@ def _is_protected_branch(branch: str | None) -> bool:
     normalised = _normalise_branch(branch)
     protected = {"main", "master", "production"} | {_normalise_branch(item) for item in settings.protected_branches}
     return bool(normalised and normalised in protected)
+
+
+def _push_file_hashes(project_path: str, changed_stdout: str) -> dict[str, str]:
+    project = Path(project_path).resolve()
+    expected: dict[str, str] = {}
+    allowed_suffixes = (".py", ".xml", ".js", ".scss", "__manifest__.py")
+    for raw_line in changed_stdout.splitlines():
+        rel = raw_line.strip().replace("\\", "/")
+        if not rel or rel.startswith(".git/") or not rel.endswith(allowed_suffixes):
+            continue
+        file_path = (project / rel).resolve()
+        if not file_path.is_file() or not (file_path == project or project in file_path.parents):
+            continue
+        expected[rel] = hashlib.sha256(file_path.read_bytes()).hexdigest()
+    return expected
+
+
+def _module_names_from_paths(project_path: str, paths: list[str]) -> list[str]:
+    project = Path(project_path).resolve()
+    names: set[str] = set()
+    for rel in paths:
+        first = rel.split("/", 1)[0]
+        if first and (project / first / "__manifest__.py").exists():
+            names.add(first)
+    return sorted(names)
 
 
 def _ensure_protected_branch_approval(branch: str | None, approval_id: str | None) -> bool:
@@ -91,7 +120,29 @@ def git_push(payload: GitPushRequest) -> CommandResult:
     approval = ApprovalService()
     if not protected_approval:
         approval.ensure_allowed("git.push", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
-    result = GitService().push(payload.project_path, payload.remote, payload.branch, payload.set_upstream, payload.timeout_seconds)
+    git = GitService()
+    push_started_epoch = int(time.time())
+    changed_result = git.head_changed_files(payload.project_path)
+    result = git.push(payload.project_path, payload.remote, payload.branch, payload.set_upstream, payload.timeout_seconds)
     approval.finalize_command(payload.approval_id, result.exit_code, "git.push succeeded", "git.push failed")
     JsonStore().log_audit("git.push", "ok" if result.exit_code == 0 else "failed", branch or "current", {"remote": payload.remote})
+    if result.exit_code == 0:
+        sha_result = git.head_sha(payload.project_path)
+        pushed_sha = sha_result.stdout.strip() if sha_result.exit_code == 0 else ""
+        expected_hashes = _push_file_hashes(payload.project_path, changed_result.stdout if changed_result.exit_code == 0 else "")
+        JsonStore().save_session_state({
+            "last_git_push": {
+                "project_path": str(Path(payload.project_path).resolve()),
+                "branch": branch or payload.branch,
+                "remote": payload.remote,
+                "sha": pushed_sha,
+                "started_epoch": push_started_epoch,
+                "changed_files": sorted(expected_hashes),
+                "module_names": _module_names_from_paths(payload.project_path, sorted(expected_hashes)),
+                "expected_user_file_hashes": expected_hashes,
+                "verified_for_module_deploy": False,
+            },
+            "last_sha": pushed_sha,
+            "safe_deploy_status": "manual_push_pending_deploy_verification",
+        })
     return result

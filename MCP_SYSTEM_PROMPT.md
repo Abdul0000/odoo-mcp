@@ -238,7 +238,7 @@ If the client lost the job id, call `workflow.resume_job` without `job_id`; add 
 Manual fallback only: use `odoosh.check_commit` polling loop.
 - Adaptive: attempts 0-2 → wait 5s | 3-7 → wait 10s | 8+ → wait 15s | max 20 retries
 
-**Step 16:** `odoo.module_deploy` — smart install/upgrade; returns job_id if running
+**Step 16:** `odoo.module_deploy` — smart install/upgrade; returns job_id if running. If a recent manual `git.push` was recorded, it first verifies Odoo.sh SHA deployment, recent failure logs, and changed `/home/odoo/src/user` file hashes. If it blocks, the module was not upgraded; do not claim success.
 - `jobs.get(job_id)` to await result server-side
 
 **Step 17:** `odoo.module_status` — state should be `installed` ✅

@@ -352,6 +352,8 @@ _TOOL_DESCRIPTORS = [
         title="Install or upgrade module",
         description=(
             "SMART INSTALL/UPGRADE — always use this for ALL first-time installs and upgrades. "
+            "If a recent manual git.push was recorded, this tool first verifies the pushed SHA, recent "
+            "Odoo.sh failure logs, and changed /home/odoo/src/user file hashes before touching the DB. "
             "Runs XML-RPC when allowed; if update_list/buttons fail with Access Denied, "
             "it automatically falls back to Odoo.sh SSH in the same background job. "
             "Waits server-side by default; returns final result if quick, otherwise returns job_id for jobs.get which also waits."
