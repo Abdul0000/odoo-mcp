@@ -21,11 +21,35 @@ def self_run(payload: SelfRunRequest) -> SelfRunReport:
     findings: list[Finding] = []
     commands = []
 
+    # Do not let a stale/missing checkout be reported as a successful QA cycle.
+    # resolve_allowed_path proves containment only; the repo must also exist.
+    project_is_valid = True
+    if not project_path.exists():
+        project_is_valid = False
+        findings.append(
+            Finding(
+                severity=Severity.error,
+                code="PROJECT_PATH_NOT_FOUND",
+                message=f"Project path does not exist: {project_path}",
+                hint="Run repo.prepare or workflow.start_session to clone/refresh the checkout, then rerun qa.self_run.",
+            )
+        )
+    elif not project_path.is_dir():
+        project_is_valid = False
+        findings.append(
+            Finding(
+                severity=Severity.error,
+                code="PROJECT_PATH_NOT_DIRECTORY",
+                message=f"Project path is not a directory: {project_path}",
+                hint="Use the repository root as project_path.",
+            )
+        )
+
     validator = OdooModuleValidator()
     findings.extend(validator.validate(module_path))
 
     runner = TestRunner()
-    if payload.include_git_status:
+    if payload.include_git_status and project_is_valid:
         git_result = runner.git_status(project_path)
         commands.append(git_result)
         if git_result.exit_code not in (0, 128):
@@ -38,7 +62,7 @@ def self_run(payload: SelfRunRequest) -> SelfRunReport:
                 )
             )
 
-    if payload.run_pytest:
+    if payload.run_pytest and project_is_valid:
         has_tests = (module_path / "tests").exists() or (project_path / "tests").exists()
         if has_tests:
             pytest_result = runner.pytest(project_path, timeout_seconds=payload.timeout_seconds)
@@ -77,5 +101,6 @@ def self_run(payload: SelfRunRequest) -> SelfRunReport:
             "warnings": warning_count,
             "infos": sum(1 for item in findings if item.severity == Severity.info),
             "commands_run": len(commands),
+            "project_path_valid": project_is_valid,
         },
     )

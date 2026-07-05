@@ -297,14 +297,42 @@ class JsonStore:
         isolated state file — recommended once you have more than one client
         configured, so a resumed session can never pick up another client's
         project_path/sha by accident.
+
+        Stale session project paths are marked unsafe before they reach the
+        agent.  This prevents a new chat from reusing /workspace/repos/<old>
+        after an ephemeral redeploy removed the checkout and then falsely
+        claiming that git/QA/deploy steps succeeded.
         """
         path = self._session_file_for_client(client_name) if client_name else self._session_file
         if not path.exists():
             return {}
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            state = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return {}
+        if not isinstance(state, dict):
+            return {}
+
+        project_path = state.get("project_path")
+        if isinstance(project_path, str) and project_path.strip():
+            try:
+                from .path_service import resolve_allowed_path
+
+                resolved = resolve_allowed_path(project_path)
+                if not resolved.exists() or not resolved.is_dir():
+                    state["stale_project_path"] = str(resolved)
+                    state["project_path_valid"] = False
+                    state["project_path_error"] = f"Saved project_path is missing or not a directory: {resolved}"
+                    state["project_path"] = None
+                else:
+                    state["project_path"] = str(resolved)
+                    state["project_path_valid"] = True
+            except Exception as exc:  # noqa: BLE001 - state load must not crash tools/list loops
+                state["stale_project_path"] = project_path
+                state["project_path_valid"] = False
+                state["project_path_error"] = str(exc)
+                state["project_path"] = None
+        return state
 
     def clear_session_state(self, client_name: str | None = None) -> None:
         """Wipe the session state file (e.g. after a successful full deploy)."""

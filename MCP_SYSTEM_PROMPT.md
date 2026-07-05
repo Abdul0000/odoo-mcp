@@ -69,7 +69,10 @@ Agent reads real source → gets correct patterns for that version automatically
 11. NEVER use direct ORM/Studio writes to `ir.model.fields` or `ir.ui.view` for normal module code changes. Add fields/views in Python/XML files, verify source, and deploy the module. Only use database/Studio customization if the user explicitly asks for no-code Studio behavior.
 12. NEVER import or use Pydantic inside Odoo addon Python code. Pydantic is only for this MCP server's API schemas; Odoo modules must use normal Odoo ORM code (`models.Model`, `fields`, `api`) and XML views.
 13. If a deploy cycle breaks mid-flow, call `workflow.resume_job`. If `job_id` was lost, omit it and provide `client_name`/`project_path`/`module_name` when known; the server will use the latest saved safe-deploy job. Use `override_step=push`, `install`, or `upgrade` only when explicitly continuing from that point.
-14. NEVER claim a custom module change is already live/deployed/done from `repo.read` or GitHub/local checkout alone. For deployed proof, call `workflow.verify_deployed_module` or read the exact file with `odoosh.read_user_file` from `/home/odoo/src/user`.
+14. If `session.load_state` returns `project_path_valid=false`, `project_path=null`, or `stale_project_path`, the saved checkout is stale. Do not reuse it and do not run shell commands; call `repo.prepare` or `workflow.start_session` to recover a real checkout first.
+15. Any command/tool with `status=failed` or `exit_code != 0` is a blocker. Never claim success, staged, pushed, deployed, or upgraded after a failed `cd`, `git`, `pytest`, or QA command; fix and rerun the failed step.
+16. Use MCP git/workflow tools for commit/push/deploy. Do not manually run bash like `cd <project_path> && git add/commit/push`; `workflow.safe_deploy_module` owns commit, push, Odoo.sh polling, module upgrade, and verification.
+17. NEVER claim a custom module change is already live/deployed/done from `repo.read` or GitHub/local checkout alone. For deployed proof, call `workflow.verify_deployed_module` or read the exact file with `odoosh.read_user_file` from `/home/odoo/src/user`.
 
 ---
 
