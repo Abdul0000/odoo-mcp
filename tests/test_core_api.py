@@ -32,6 +32,8 @@ def test_tools_are_exposed_for_direct_chatgpt():
     assert "repo_apply_patch_atomic" in names
     assert "git_push" in names
     assert "odoosh_grep_errors" in names
+    assert "odoosh_read_user_file" in names
+    assert "workflow_verify_deployed_module" in names
     assert "browser_screenshot" in names
 
 

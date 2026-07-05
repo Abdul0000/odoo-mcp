@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import settings
-from ..schemas import CommandResult, OdooShLogName
+from ..schemas import CommandResult, FileContent, OdooShLogName
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +262,128 @@ class OdooShService:
             f"echo MODULE_MANIFEST_OK:{module_name}"
         )
         return self.run_shell(script, timeout_seconds=30)
+
+    def _safe_user_relative_path(self, relative_path: str) -> str:
+        rel = str(relative_path).replace("\\", "/").strip("/")
+        if (
+            not rel
+            or rel.startswith("../")
+            or "/../" in rel
+            or rel == ".git"
+            or rel.startswith(".git/")
+        ):
+            raise ValueError("Path must stay inside /home/odoo/src/user")
+        return rel
+
+    def read_user_file(self, relative_path: str, max_bytes: int = 300000) -> FileContent:
+        """Read the actual deployed custom-source file from Odoo.sh /home/odoo/src/user."""
+        rel = self._safe_user_relative_path(relative_path)
+        safe_max = max(1, min(int(max_bytes), 1_000_000))
+        script = (
+            "python3 - <<'PY'\n"
+            "import base64, json, os\n"
+            f"base = {settings.odoosh_user_addons_path!r}\n"
+            f"rel = {rel!r}\n"
+            f"limit = {safe_max!r}\n"
+            "base_real = os.path.realpath(base)\n"
+            "target = os.path.realpath(os.path.join(base_real, rel))\n"
+            "if not (target == base_real or target.startswith(base_real + os.sep)):\n"
+            "    print(json.dumps({'ok': False, 'error': 'path escapes /home/odoo/src/user', 'path': target}))\n"
+            "elif not os.path.isfile(target):\n"
+            "    print(json.dumps({'ok': False, 'error': 'file not found', 'path': target}))\n"
+            "else:\n"
+            "    size = os.path.getsize(target)\n"
+            "    with open(target, 'rb') as fh:\n"
+            "        raw = fh.read(limit + 1)\n"
+            "    truncated = len(raw) > limit\n"
+            "    raw = raw[:limit]\n"
+            "    print(json.dumps({'ok': True, 'path': target, 'relative_path': rel, 'size': size, 'truncated': truncated, 'content_b64': base64.b64encode(raw).decode('ascii')}))\n"
+            "PY"
+        )
+        result = self.run_shell(script, timeout_seconds=30)
+        if result.exit_code != 0:
+            return FileContent(
+                path=f"{settings.odoosh_user_addons_path.rstrip('/')}/{rel}",
+                content="",
+                size=0,
+                extra={"source": "odoosh_user", "status": "failed", "ssh": result.model_dump(mode="json")},
+            )
+        try:
+            payload = json.loads((result.stdout or "").strip().splitlines()[-1])
+        except Exception:
+            return FileContent(
+                path=f"{settings.odoosh_user_addons_path.rstrip('/')}/{rel}",
+                content="",
+                size=0,
+                extra={"source": "odoosh_user", "status": "failed", "raw": result.stdout[-4000:]},
+            )
+        if not payload.get("ok"):
+            return FileContent(
+                path=str(payload.get("path") or f"{settings.odoosh_user_addons_path.rstrip('/')}/{rel}"),
+                content="",
+                size=0,
+                extra={"source": "odoosh_user", "status": "missing", "error": payload.get("error"), "relative_path": rel},
+            )
+        import base64
+
+        raw = base64.b64decode(str(payload.get("content_b64") or "").encode("ascii"))
+        text = raw.decode("utf-8", errors="replace")
+        return FileContent(
+            path=str(payload.get("path")),
+            content=text,
+            size=int(payload.get("size") or len(raw)),
+            extra={
+                "source": "odoosh_user",
+                "relative_path": payload.get("relative_path") or rel,
+                "truncated": bool(payload.get("truncated")),
+                "base": settings.odoosh_user_addons_path,
+            },
+        )
+
+    def list_user_files(self, module_name: str, subdir: str = "", max_items: int = 200) -> dict:
+        """List actual deployed files from Odoo.sh /home/odoo/src/user/<module>."""
+        safe_module = self._safe_user_relative_path(module_name)
+        safe_subdir = self._safe_user_relative_path(f"{module_name}/{subdir}") if subdir else safe_module
+        safe_max = max(1, min(int(max_items), 2000))
+        script = (
+            "python3 - <<'PY'\n"
+            "import json, os\n"
+            f"base = {settings.odoosh_user_addons_path!r}\n"
+            f"module_name = {safe_module!r}\n"
+            f"rel = {safe_subdir!r}\n"
+            f"limit = {safe_max!r}\n"
+            "base_real = os.path.realpath(base)\n"
+            "target = os.path.realpath(os.path.join(base_real, rel))\n"
+            "module_path = os.path.realpath(os.path.join(base_real, module_name))\n"
+            "if not (target == base_real or target.startswith(base_real + os.sep)):\n"
+            "    print(json.dumps({'found': False, 'error': 'path escapes /home/odoo/src/user', 'module_name': module_name, 'files': []}))\n"
+            "elif not os.path.isdir(target):\n"
+            "    print(json.dumps({'found': False, 'error': 'directory not found', 'module_name': module_name, 'module_path': module_path, 'target': target, 'files': []}))\n"
+            "else:\n"
+            "    files = []\n"
+            "    for current, dirs, names in os.walk(target):\n"
+            "        dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__']\n"
+            "        for name in names:\n"
+            "            full = os.path.join(current, name)\n"
+            "            try:\n"
+            "                st = os.stat(full)\n"
+            "            except OSError:\n"
+            "                continue\n"
+            "            files.append({'path': full, 'relative_path': os.path.relpath(full, base_real).replace(os.sep, '/'), 'size': st.st_size})\n"
+            "            if len(files) >= limit:\n"
+            "                break\n"
+            "        if len(files) >= limit:\n"
+            "            break\n"
+            "    print(json.dumps({'found': True, 'module_name': module_name, 'module_path': module_path, 'target': target, 'base': base_real, 'files': files, 'total_found': len(files), 'truncated': len(files) >= limit}))\n"
+            "PY"
+        )
+        result = self.run_shell(script, timeout_seconds=45)
+        if result.exit_code != 0:
+            return {"found": False, "module_name": module_name, "files": [], "error": result.stderr or result.stdout, "ssh": result.model_dump(mode="json")}
+        try:
+            return json.loads((result.stdout or "").strip().splitlines()[-1])
+        except Exception:
+            return {"found": False, "module_name": module_name, "files": [], "error": "Could not parse Odoo.sh file list", "raw": result.stdout[-4000:]}
 
     def verify_user_file_hashes(self, expected_hashes: dict[str, str]) -> CommandResult:
         """Verify changed user-addon files on Odoo.sh match the pushed checkout.

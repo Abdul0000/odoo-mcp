@@ -308,6 +308,41 @@ class OdooShVerifyManifestRequest(BaseModel):
         return validate_safe_name(value, "module_name")
 
 
+class OdooShUserFileReadRequest(BaseModel):
+    relative_path: str = Field(
+        ...,
+        description="Path relative to /home/odoo/src/user, e.g. sale_order_notebook_tab/models/purchase_order.py",
+    )
+    max_bytes: int = Field(default=300000, ge=1, le=1000000)
+
+    @field_validator("relative_path")
+    @classmethod
+    def relative_path_must_be_safe(cls, value: str) -> str:
+        rel = value.replace("\\", "/").strip("/")
+        if not rel or rel.startswith("../") or "/../" in rel or rel.startswith(".git/") or rel == ".git":
+            raise ValueError("relative_path must stay inside /home/odoo/src/user")
+        return rel
+
+
+class OdooShUserFilesListRequest(BaseModel):
+    module_name: str = Field(..., description="Custom module folder under /home/odoo/src/user")
+    subdir: str = Field(default="", description="Optional module subdirectory such as models, views, static/src")
+    max_items: int = Field(default=200, ge=1, le=2000)
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        return validate_safe_name(value, "module_name")
+
+    @field_validator("subdir")
+    @classmethod
+    def subdir_must_be_safe(cls, value: str) -> str:
+        rel = value.replace("\\", "/").strip("/")
+        if rel.startswith("../") or "/../" in rel or rel.startswith(".git/") or rel == ".git":
+            raise ValueError("subdir must stay inside the module")
+        return rel
+
+
 class OdooShModuleUpdateRequest(ApprovalMixin):
     module_name: str = Field(..., description="Technical module folder/name to update")
     timeout_seconds: int = Field(default=600, ge=30, le=1800)
@@ -329,6 +364,18 @@ class OdooRpcModuleRequest(ApprovalMixin):
     poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
     deploy_guard_timeout_seconds: int = Field(default=300, ge=0, le=600, description="Maximum server-side wait for a recent manual git.push SHA to appear on Odoo.sh before install/upgrade")
     deploy_guard_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for the deploy guard used by direct module install/upgrade calls")
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        return validate_safe_name(value, "module_name")
+
+
+class DeployedModuleVerifyRequest(BaseProjectRequest):
+    module_name: str = Field(..., description="Custom module folder/name to compare against /home/odoo/src/user")
+    paths: list[str] = Field(default_factory=list, description="Repo-relative files to compare. Empty compares module code/XML/assets up to max_files.")
+    max_files: int = Field(default=200, ge=1, le=1000, description="Maximum module files to compare when paths is empty")
+    include_module_status: bool = Field(default=True, description="Also read live Odoo module installation state")
 
     @field_validator("module_name")
     @classmethod

@@ -16,6 +16,7 @@ from ..schemas import (
     AuditListRequest,
     BaseProjectRequest,
     BrowserCheckRequest,
+    DeployedModuleVerifyRequest,
     PosFlowCheckRequest,
     StartSessionRequest,
     RegistrySmokeTestRequest,
@@ -37,6 +38,8 @@ from ..schemas import (
     OdooShCommandRequest,
     OdooShLogRequest,
     OdooShModuleUpdateRequest,
+    OdooShUserFileReadRequest,
+    OdooShUserFilesListRequest,
     OdooShVerifyManifestRequest,
     OdooShWaitForCommitRequest,
     RepoAtomicPatchRequest,
@@ -87,7 +90,7 @@ from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_write_ma
 from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy, start_odoo_module_deploy_job
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
-from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index, _poll_odoosh_deployed, _pre_push_verify_files, _expected_user_file_hashes
+from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index, verify_deployed_module, _poll_odoosh_deployed, _pre_push_verify_files, _expected_user_file_hashes
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
@@ -203,6 +206,15 @@ _TOOL_DESCRIPTORS = [
         title="Run full verification", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module",
         title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 5 minutes for the pushed SHA, reject recent Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths. Defaults to wait_for_result=true; status=running is not success and must be followed via next_call/jobs.get.", requires_approval=True),
+    ToolDescriptor(
+        name="workflow.verify_deployed_module",
+        title="Verify deployed source",
+        description=(
+            "Compare active checkout files to the real Odoo.sh /home/odoo/src/user files and optionally live module status. "
+            "Use before saying a local/GitHub change is already deployed, already live, or already done. repo.read alone is not proof."
+        ),
+        read_only=True,
+    ),
     ToolDescriptor(name="workflow.start_session",
         title="Start coding session", description="Bootstrap a coding session: capability check, repo.prepare, git status, module discovery, Odoo/Odoo.sh health", requires_approval=True),
     ToolDescriptor(name="workflow.registry_smoke_test",
@@ -323,6 +335,18 @@ _TOOL_DESCRIPTORS = [
         title="Wait for Odoo.sh deployment", description="[DEPRECATED - use odoosh.check_commit in a polling loop] Blocking wait for Odoo.sh deploy", read_only=True),
     ToolDescriptor(name="odoosh.verify_module_manifest",
         title="Verify module manifest", description="Verify a module manifest exists and is installable on Odoo.sh", read_only=True),
+    ToolDescriptor(
+        name="odoosh.read_user_file",
+        title="Read deployed user file",
+        description="Read the actual Odoo.sh /home/odoo/src/user file content. Use this when checking deployed custom module code; repo.read only reads the local/GitHub checkout.",
+        read_only=True,
+    ),
+    ToolDescriptor(
+        name="odoosh.list_user_files",
+        title="List deployed user files",
+        description="List actual Odoo.sh /home/odoo/src/user files for a custom module/subdirectory. Use before claiming code already exists on Odoo.sh.",
+        read_only=True,
+    ),
     ToolDescriptor(name="odoosh.log",
         title="Read Odoo.sh server log", description="Tail an Odoo.sh log", read_only=True),
     ToolDescriptor(name="odoosh.grep_errors",
@@ -524,6 +548,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.repo_index": RepoIndexRequest,
     "workflow.full_verify": FullVerifyRequest,
     "workflow.safe_deploy_module": SafeDeployModuleRequest,
+    "workflow.verify_deployed_module": DeployedModuleVerifyRequest,
     "workflow.start_session": StartSessionRequest,
     "workflow.registry_smoke_test": RegistrySmokeTestRequest,
     "workflow.restore_last_good_commit": RestoreLastGoodCommitRequest,
@@ -555,6 +580,8 @@ _TOOL_INPUT_MODELS = {
     "odoosh.check_commit": OdooShCheckCommitRequest,
     "odoosh.wait_for_commit": OdooShWaitForCommitRequest,
     "odoosh.verify_module_manifest": OdooShVerifyManifestRequest,
+    "odoosh.read_user_file": OdooShUserFileReadRequest,
+    "odoosh.list_user_files": OdooShUserFilesListRequest,
     "odoosh.log": OdooShLogRequest,
     "odoosh.grep_errors": OdooShCommandRequest,
     "odoosh.error_pack": OdooShCommandRequest,
@@ -791,6 +818,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return await full_verify(FullVerifyRequest.model_validate(args))
     if name == "workflow.safe_deploy_module":
         return safe_deploy_module(SafeDeployModuleRequest.model_validate(args))
+    if name == "workflow.verify_deployed_module":
+        return verify_deployed_module(DeployedModuleVerifyRequest.model_validate(args))
     if name == "workflow.start_session":
         return start_session(StartSessionRequest.model_validate(args))
     if name == "workflow.registry_smoke_test":
@@ -861,6 +890,12 @@ async def _dispatch(name: str, args: dict) -> object:
         return odoosh_wait_for_commit(OdooShWaitForCommitRequest.model_validate(args))
     if name == "odoosh.verify_module_manifest":
         return odoosh_verify_module_manifest(OdooShVerifyManifestRequest.model_validate(args))
+    if name == "odoosh.read_user_file":
+        req = OdooShUserFileReadRequest.model_validate(args)
+        return OdooShService().read_user_file(req.relative_path, req.max_bytes)
+    if name == "odoosh.list_user_files":
+        req = OdooShUserFilesListRequest.model_validate(args)
+        return OdooShService().list_user_files(req.module_name, req.subdir, req.max_items)
     if name == "odoosh.log":
         req = OdooShLogRequest.model_validate(args)
         return OdooShService().tail_log(req.log_name, req.tail_lines)

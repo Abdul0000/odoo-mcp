@@ -19,6 +19,7 @@ from ..schemas import (
     CodingTaskPlanRequest,
     CodingTaskPlanResult,
     CommandResult,
+    DeployedModuleVerifyRequest,
     FullVerifyRequest,
     StartSessionRequest,
     RegistrySmokeTestRequest,
@@ -116,13 +117,14 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Call repo.prepare once, then read only the target module manifest plus the specific model/view files needed for the requested field or notebook change.",
             "If the patch touches JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, call workflow.frontend_pattern_preflight after reading custom files and read every mandatory source pattern before coding.",
             "For POS work, never use legacy load_fields('pos.config', ...) / models.load_fields for pos.config; read installed point_of_sale source and use the version's real loader/backend pattern.",
-            "MANDATORY Odoo.sh source layer before writing: call workflow.scope_advice after reading custom files from the checkout, then repo.read every mandatory related installed-source path it returns. Do not re-read the same current module from /home/odoo/src/user; /home/odoo/src/user is only for other related custom dependencies. This verifies Enterprise/core syntax and patterns before any patch.",
+            "MANDATORY Odoo.sh source layer before writing: call workflow.scope_advice after reading custom files from the checkout, then repo.read every mandatory related installed-source path it returns. For editing, do not re-read the same current module from /home/odoo/src/user; /home/odoo/src/user is only for other related custom dependencies. For claims like already deployed/live/done, verify the current module with workflow.verify_deployed_module or odoosh.read_user_file.",
             "For field/view changes, never use direct ORM/Studio writes to ir.model.fields or ir.ui.view unless the user explicitly asked for no-code Studio customization. Normal development must patch Python/XML files in the custom module.",
             "For Odoo Python files, never import pydantic or create Pydantic BaseModel classes. Use Odoo ORM models.Model, fields, api, and XML views only.",
             "Patch the smallest file set with repo.apply_patch_atomic or repo.write_many_smart; use repo.write_many_atomic only for large/risky refactors. Do not run broad module discovery again after the target module is known.",
             "Run git.diff and qa.self_run with run_pytest=false unless Python tests are present or the patch touches shared logic.",
             "MANDATORY before deploy: run workflow.verify_against_core for changed .py/.xml/.js/__manifest__.py files. If push_blocked=true, fix and re-run; only then continue.",
             "Call workflow.safe_deploy_module with module_name, commit_message, changed paths, run_qa=false if qa.self_run already passed, wait_for_odoosh=true, and upgrade_module=true. Do not manually chain git.commit/git.push/odoosh.check_commit/odoo.module_deploy for the normal path.",
+            "If the repo already contains the requested change and no edit is needed, do not say done from repo.read alone; call workflow.verify_deployed_module and continue deploy/resume if /home/odoo/src/user does not match.",
             "If safe deploy returns retry_later, wait briefly and call workflow.resume_job with the job_id. If it returns deploy_running, call jobs.get on the nested job. Do not repeat commit/push.",
             "Verify the exact field with odoo.search_read or workflow.registry_smoke_test; if the user asks for visible UI proof, pass the exact Odoo web path in verify_ui_paths during deploy or call workflow.browser_menu_crawl once.",
         ]
@@ -138,6 +140,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "workflow.verify_against_core",
             "workflow.frontend_pattern_preflight",
             "workflow.safe_deploy_module",
+            "workflow.verify_deployed_module",
             "workflow.resume_job",
             "jobs.get",
             "odoo.search_read",
@@ -150,13 +153,14 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             f"Read the target module files first: {module_name}/__manifest__.py, models, views, security, and relevant static files.",
             "For JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, call workflow.frontend_pattern_preflight with task_description, target_module_name, custom_file_paths, and planned_file_paths; then repo.read all mandatory pattern files returned before implementation.",
             "For POS work, never use legacy load_fields('pos.config', ...) / models.load_fields for pos.config; read installed point_of_sale source and use the version's real loader/backend pattern.",
-            "MANDATORY Odoo.sh source layer before writing: call workflow.scope_advice after reading custom files from the checkout, then repo.read every mandatory related installed-source path it returns. Do not re-read the same current module from /home/odoo/src/user; /home/odoo/src/user is only for other related custom dependencies. This is the Enterprise/core syntax and pattern verification layer.",
+            "MANDATORY Odoo.sh source layer before writing: call workflow.scope_advice after reading custom files from the checkout, then repo.read every mandatory related installed-source path it returns. For editing, do not re-read the same current module from /home/odoo/src/user; /home/odoo/src/user is only for other related custom dependencies. For claims like already deployed/live/done, verify the current module with workflow.verify_deployed_module or odoosh.read_user_file.",
             "For field/view changes, never use direct ORM/Studio writes to ir.model.fields or ir.ui.view unless the user explicitly asked for no-code Studio customization. Normal development must patch Python/XML files in the custom module.",
             "For Odoo Python files, never import pydantic or create Pydantic BaseModel classes. Use Odoo ORM models.Model, fields, api, and XML views only.",
             "Apply edits safely: use repo.apply_patch_atomic for multi-file diffs or repo.write_many_smart for normal multi-file writes. Use repo.write_many_atomic only for large/risky refactors, and repo.apply_patch/repo.write only for small single-file changes. Do not edit Odoo core, enterprise, .git, or unrelated modules.",
             "Run git.diff and qa.self_run. Treat pytest environment failures separately from real module errors.",
             "MANDATORY before deploy: run workflow.verify_against_core for changed .py/.xml/.js/__manifest__.py files. If push_blocked=true, fix and re-run; do not deploy while blocked.",
             "Call workflow.safe_deploy_module with module_name, commit_message, changed paths, wait_for_odoosh=true, upgrade_module=true, and exact verify_ui_paths for UI/POS/website/view tasks. It owns commit, push, non-blocking Odoo.sh check, module deploy, module status, smoke test, and optional browser verification.",
+            "If the repo already contains the requested change and no edit is needed, do not say done from repo.read alone; call workflow.verify_deployed_module and continue deploy/resume if /home/odoo/src/user does not match.",
             "If safe_deploy returns retry_later, wait briefly and call workflow.resume_job with the job_id. If it returns deploy_running, call jobs.get on the nested job. Do not repeat commit/push.",
             "Finish only after safe deploy/resume reports passed, or report the exact blocker and next_call returned by the workflow.",
         ]
@@ -173,6 +177,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "qa.self_run",
             "workflow.verify_against_core",
             "workflow.safe_deploy_module",
+            "workflow.verify_deployed_module",
             "workflow.resume_job",
             "jobs.get",
         ]
@@ -654,6 +659,68 @@ def _expected_user_file_hashes(project: Path, verify_files: list[str]) -> dict[s
             continue
         expected[rel] = hashlib.sha256(file_path.read_bytes()).hexdigest()
     return expected
+
+
+def _deployed_compare_files(project: Path, module_name: str, paths: list[str], max_files: int) -> list[str]:
+    if paths:
+        return _pre_push_verify_files(project, module_name, paths, "")
+    allowed_suffixes = (".py", ".xml", ".js", ".scss", "__manifest__.py")
+    module_path = (project / module_name).resolve()
+    if not module_path.is_dir() or not (module_path == project or project in module_path.parents):
+        return []
+    files: list[str] = []
+    for file_path in sorted(p for p in module_path.rglob("*") if p.is_file()):
+        rel = file_path.relative_to(project).as_posix()
+        if rel.startswith(".git/") or not rel.endswith(allowed_suffixes):
+            continue
+        files.append(str(file_path))
+        if len(files) >= max_files:
+            break
+    return files
+
+
+@router.post("/verify-deployed-module")
+def verify_deployed_module(payload: DeployedModuleVerifyRequest) -> dict:
+    """Compare active checkout files to real Odoo.sh /home/odoo/src/user files.
+
+    This is the source-of-truth check for claims like "already added", "already
+    deployed", or "live now". repo.read only proves the GitHub/local checkout;
+    this proves the Odoo.sh user source.
+    """
+    project = resolve_allowed_path(payload.project_path)
+    compare_files = _deployed_compare_files(project, payload.module_name, payload.paths, payload.max_files)
+    expected_hashes = _expected_user_file_hashes(project, compare_files)
+    odoosh = OdooShService()
+    list_result = odoosh.list_user_files(payload.module_name, max_items=min(payload.max_files, 2000))
+    if expected_hashes:
+        hash_result = odoosh.verify_user_file_hashes(expected_hashes)
+        source_status = "matched" if hash_result.exit_code == 0 else "mismatch"
+    else:
+        hash_result = CommandResult(
+            command=["workflow.verify_deployed_module"],
+            cwd=str(project),
+            exit_code=2,
+            stderr="No local module code/XML/assets files were found to compare.",
+        )
+        source_status = "no_local_files"
+    module_status = None
+    if payload.include_module_status:
+        module_status = OdooRpcService().module_status(payload.module_name).model_dump(mode="json")
+    return {
+        "status": "passed" if source_status == "matched" else "failed",
+        "source_status": source_status,
+        "message": (
+            "Odoo.sh /home/odoo/src/user matches the active checkout for the compared files."
+            if source_status == "matched"
+            else "Odoo.sh /home/odoo/src/user does not prove the active checkout is deployed. Do not claim live/deployed/already done."
+        ),
+        "module_name": payload.module_name,
+        "project_path": str(project),
+        "compared_files": sorted(expected_hashes),
+        "odoosh_user_files": list_result,
+        "hash_check": hash_result.model_dump(mode="json"),
+        "module_status": module_status,
+    }
 
 
 def _poll_odoosh_deployed(odoosh: OdooShService, pushed_sha: str, timeout_seconds: int, interval_seconds: float) -> CommandResult:

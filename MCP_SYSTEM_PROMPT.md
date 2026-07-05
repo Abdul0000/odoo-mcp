@@ -69,6 +69,7 @@ Agent reads real source → gets correct patterns for that version automatically
 11. NEVER use direct ORM/Studio writes to `ir.model.fields` or `ir.ui.view` for normal module code changes. Add fields/views in Python/XML files, verify source, and deploy the module. Only use database/Studio customization if the user explicitly asks for no-code Studio behavior.
 12. NEVER import or use Pydantic inside Odoo addon Python code. Pydantic is only for this MCP server's API schemas; Odoo modules must use normal Odoo ORM code (`models.Model`, `fields`, `api`) and XML views.
 13. If a deploy cycle breaks mid-flow, call `workflow.resume_job`. If `job_id` was lost, omit it and provide `client_name`/`project_path`/`module_name` when known; the server will use the latest saved safe-deploy job. Use `override_step=push`, `install`, or `upgrade` only when explicitly continuing from that point.
+14. NEVER claim a custom module change is already live/deployed/done from `repo.read` or GitHub/local checkout alone. For deployed proof, call `workflow.verify_deployed_module` or read the exact file with `odoosh.read_user_file` from `/home/odoo/src/user`.
 
 ---
 
@@ -131,7 +132,7 @@ The scope expands automatically — if L0 reads reveal `_inherit`, L1 kicks in. 
 2. `repo.read(manifest_path)` — verify the exact technical name
 3. Add only verified module names to `depends`
 
-**Search priority:** `/home/odoo/src/enterprise` → `/home/odoo/src/odoo` → `/home/odoo/src/user` fallback for other related custom dependencies. The current custom module must be read from the active checkout, not duplicated from `/home/odoo/src/user`.
+**Search priority:** `/home/odoo/src/enterprise` → `/home/odoo/src/odoo` → `/home/odoo/src/user` fallback for other related custom dependencies. For editing/planning, read the current custom module from the active checkout. For claims that code is already deployed/live/done, the active checkout is not proof: verify `/home/odoo/src/user` with `workflow.verify_deployed_module` or `odoosh.read_user_file`.
 
 ---
 
@@ -312,9 +313,12 @@ If `repo.write` response includes `large_file_warning` (file > 1000 lines):
 | `workflow.find_similar_view` | **V14** — Find core view XML before xpath inherit |
 | `workflow.scope_advice` | **V14+ NEW** — Get adaptive mandatory read plan after reading custom files |
 | `workflow.verify_against_core` | **V14+ NEW** — Pre-push cross-check against core — MANDATORY before git.push |
+| `workflow.verify_deployed_module` | Compare active checkout to real Odoo.sh `/home/odoo/src/user`; mandatory before saying a change is already live/deployed |
 | `workflow.resume_job` | Resume a failed pipeline from last good step |
 | `repo.list_custom_modules` | Discover modules from repo manifests |
-| `repo.read` | Read file before editing (also reads /home/odoo/src/* files) |
+| `repo.read` | Read file before editing from the active checkout or allowed local source roots; not proof of deployed Odoo.sh user source |
+| `odoosh.read_user_file` | Read the actual deployed custom module file from `/home/odoo/src/user` |
+| `odoosh.list_user_files` | List actual deployed custom module files from `/home/odoo/src/user` |
 | `repo.write` | Write one complete file up to 1000 lines in one pass; chunked mode for >1000 lines |
 | `repo.write_many_smart` | Preferred for multi-file writes; auto fast-safe for small edits, atomic for large/risky edits |
 | `repo.write_many_fast_safe` | Small multi-file writer using repo lock + backups + rollback, no git worktree overhead |

@@ -6,7 +6,7 @@ import subprocess
 from fastapi import HTTPException
 
 from odoo_agent_server.config import settings
-from odoo_agent_server.schemas import ApprovalRecord, ApprovalStatus, CommandResult, JobRecord, JobStatus, JobStep, OdooRpcResult, SafeDeployModuleRequest, ResumeJobRequest
+from odoo_agent_server.schemas import ApprovalRecord, ApprovalStatus, CommandResult, DeployedModuleVerifyRequest, JobRecord, JobStatus, JobStep, OdooRpcResult, SafeDeployModuleRequest, ResumeJobRequest
 from odoo_agent_server.services.approval_service import ApprovalService
 from odoo_agent_server.services.git_service import GitService
 from odoo_agent_server.services.odoosh_service import OdooShService
@@ -615,6 +615,49 @@ def test_safe_deploy_blocks_upgrade_when_deployed_user_file_differs(tmp_path, mo
     assert finished.result["status"] == "deploy_code_mismatch"
     assert calls == {"manifest": 0, "deploy": 0}
     assert any(step.name == "odoosh_user_file_verify" and step.status == "failed" for step in finished.steps)
+
+
+def test_verify_deployed_module_compares_against_odoosh_user_source(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    changed = project / "x_module" / "models" / "a.py"
+    changed.parent.mkdir(parents=True)
+    changed.write_text("from odoo import fields, models\n", encoding="utf-8")
+    calls = {"verify": 0, "list": 0}
+
+    class FakeOdooSh:
+        def list_user_files(self, module_name, subdir="", max_items=200):
+            calls["list"] += 1
+            return {
+                "found": True,
+                "module_name": module_name,
+                "base": "/home/odoo/src/user",
+                "files": [{"relative_path": "x_module/models/a.py", "path": "/home/odoo/src/user/x_module/models/a.py", "size": 10}],
+            }
+
+        def verify_user_file_hashes(self, expected_hashes):
+            calls["verify"] += 1
+            assert set(expected_hashes) == {"x_module/models/a.py"}
+            return CommandResult(command=["odoosh", "verify_user_file_hashes"], cwd="odoosh:ssh", exit_code=1, stdout="MISMATCH x_module/models/a.py")
+
+    class FakeOdooRpc:
+        def module_status(self, module_name):
+            return OdooRpcResult(status="ok", result=[{"name": module_name, "state": "installed"}])
+
+    monkeypatch.setattr(workflow, "OdooShService", lambda: FakeOdooSh())
+    monkeypatch.setattr(workflow, "OdooRpcService", lambda: FakeOdooRpc())
+
+    result = workflow.verify_deployed_module(DeployedModuleVerifyRequest(
+        project_path=str(project),
+        module_name="x_module",
+        paths=["x_module/models/a.py"],
+    ))
+
+    assert result["status"] == "failed"
+    assert result["source_status"] == "mismatch"
+    assert "Do not claim live/deployed/already done" in result["message"]
+    assert result["odoosh_user_files"]["base"] == "/home/odoo/src/user"
+    assert calls == {"verify": 1, "list": 1}
 
 
 def test_resume_job_rechecks_deploy_without_replaying_commit_or_push(tmp_path, monkeypatch):
