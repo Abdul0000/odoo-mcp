@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     repo_index_cache_seconds: int = Field(default=3600, alias="ODOO_AGENT_REPO_INDEX_CACHE_SECONDS")
     verify_impact_aware_default: bool = Field(default=True, alias="ODOO_AGENT_VERIFY_IMPACT_AWARE_DEFAULT")
 
+    # Best-effort deploy follow-through for raw git.push fallback paths.
+    auto_upgrade_on_push: bool = Field(default=True, alias="ODOO_AGENT_AUTO_UPGRADE_ON_PUSH")
+
     # Qwen URL-token fallback hardening. Qwen app may not pass headers, so the
     # server can mint a short-lived URL token that maps to the real API/OAuth token.
     qwen_short_token_ttl_seconds: int = Field(default=3600, alias="ODOO_AGENT_QWEN_SHORT_TOKEN_TTL_SECONDS")

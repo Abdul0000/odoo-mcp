@@ -224,6 +224,97 @@ class OdooShService:
             stdout=payload,
         )
 
+    @staticmethod
+    def _check_result_deployed(result: CommandResult) -> bool:
+        try:
+            payload = json.loads(result.stdout or "{}")
+            return result.exit_code == 0 and bool(payload.get("deployed"))
+        except Exception:
+            return result.exit_code == 0 and '"deployed": true' in (result.stdout or "").lower()
+
+    def poll_deployed_commit(
+        self,
+        expected_sha: str,
+        timeout_seconds: int = 300,
+        interval_seconds: float = 10.0,
+        progress_cb=None,
+    ) -> CommandResult:
+        """Poll Odoo.sh until ``expected_sha`` is active in ``~/src/user``.
+
+        This shared polling loop is intentionally separate from ``wait_for_commit``
+        because post-push automation needs structured attempt counts, elapsed
+        timing, and resumable timeout metadata in the background job record.
+        ``progress_cb`` receives one dict per poll attempt so callers can append
+        live job steps without blocking the original HTTP response.
+        """
+        expected = expected_sha.strip()
+        timeout_seconds = max(int(timeout_seconds), 0)
+        interval_seconds = max(float(interval_seconds), 0.0)
+        started = time.monotonic()
+        deadline = started + timeout_seconds
+        attempts: list[dict[str, object]] = []
+        attempt = 0
+
+        while True:
+            attempt += 1
+            check_result = self.check_commit_deployed(expected)
+            deployed = OdooShService._check_result_deployed(check_result)
+            elapsed_seconds = round(time.monotonic() - started, 3)
+            attempt_payload = {
+                "attempt": attempt,
+                "exit_code": check_result.exit_code,
+                "stdout": check_result.stdout,
+                "stderr": check_result.stderr,
+                "deployed": deployed,
+                "expected_sha": expected,
+                "poll_interval_seconds": interval_seconds,
+                "elapsed_seconds": elapsed_seconds,
+            }
+            attempts.append(attempt_payload)
+            if progress_cb is not None:
+                try:
+                    progress_cb(attempt_payload)
+                except Exception:
+                    pass
+
+            if deployed:
+                return check_result.model_copy(update={
+                    "command": ["odoosh.check_commit_poll", expected],
+                    "stdout": json.dumps({
+                        "deployed": True,
+                        "expected_sha": expected,
+                        "attempts": attempt,
+                        "poll_interval_seconds": interval_seconds,
+                        "elapsed_seconds": elapsed_seconds,
+                        "message": "Odoo.sh deployed the pushed commit. Proceeding to module upgrade.",
+                        "last_check": check_result.stdout,
+                    }),
+                })
+
+            now = time.monotonic()
+            if now >= deadline:
+                elapsed_seconds = round(now - started, 3)
+                return CommandResult(
+                    command=["odoosh.check_commit_poll", expected],
+                    cwd="odoosh:ssh",
+                    exit_code=124,
+                    stdout=json.dumps({
+                        "deployed": False,
+                        "expected_sha": expected,
+                        "attempts": attempt,
+                        "poll_interval_seconds": interval_seconds,
+                        "elapsed_seconds": elapsed_seconds,
+                        "timeout_seconds": timeout_seconds,
+                        "recent_checks": attempts[-10:],
+                    }),
+                    stderr=f"Odoo.sh did not deploy pushed commit {expected} within {timeout_seconds}s.",
+                    timed_out=True,
+                )
+
+            sleep_for = min(interval_seconds, max(deadline - now, 0.0))
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
     # Kept for safe_deploy_module internal use only (not exposed as MCP tool)
     def wait_for_commit(self, expected_sha: str, timeout_seconds: int | None = None, interval_seconds: int | None = None) -> CommandResult:
         timeout_seconds = timeout_seconds or settings.odoosh_wait_timeout_seconds

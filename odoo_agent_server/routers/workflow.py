@@ -1043,63 +1043,26 @@ def _poll_odoosh_deployed(
     interval_seconds: float,
     progress_cb=None,
 ) -> CommandResult:
-    """Poll Odoo.sh for the pushed SHA.
+    """Compatibility wrapper around the shared Odoo.sh commit polling loop."""
+    poller = getattr(odoosh, "poll_deployed_commit", None)
+    if callable(poller):
+        return poller(
+            expected_sha=pushed_sha,
+            timeout_seconds=timeout_seconds,
+            interval_seconds=interval_seconds,
+            progress_cb=progress_cb,
+        )
+    # Test fakes and older service-like adapters may only implement
+    # check_commit_deployed(); still exercise the same shared loop.
+    from ..services.odoosh_service import OdooShService as SharedOdooShService
 
-    Runs only from the background safe-deploy worker. ``progress_cb`` is called
-    after every poll attempt so jobs.get shows fresh timestamps/progress for
-    impatient MCP clients while Odoo.sh is still building.
-    """
-    deadline = time.monotonic() + max(timeout_seconds, 0)
-    attempts: list[dict[str, object]] = []
-    attempt = 0
-
-    while True:
-        attempt += 1
-        check_result = odoosh.check_commit_deployed(pushed_sha)
-        deployed = check_result.exit_code == 0 and '"deployed": true' in (check_result.stdout or "").lower()
-        attempt_payload = {
-            "attempt": attempt,
-            "exit_code": check_result.exit_code,
-            "stdout": check_result.stdout,
-            "stderr": check_result.stderr,
-            "deployed": deployed,
-            "expected_sha": pushed_sha,
-            "poll_interval_seconds": interval_seconds,
-        }
-        attempts.append(attempt_payload)
-        if progress_cb is not None:
-            try:
-                progress_cb(attempt_payload)
-            except Exception:
-                pass
-        if deployed:
-            return check_result.model_copy(update={
-                "command": ["odoosh.check_commit_poll", pushed_sha],
-                "stdout": json.dumps({
-                    "deployed": True,
-                    "expected_sha": pushed_sha,
-                    "attempts": attempt,
-                    "poll_interval_seconds": interval_seconds,
-                    "message": "Odoo.sh deployed the pushed commit. Proceeding to module upgrade.",
-                    "last_check": check_result.stdout,
-                }),
-            })
-        if time.monotonic() >= deadline:
-            return CommandResult(
-                command=["odoosh.check_commit_poll", pushed_sha],
-                cwd="odoosh:ssh",
-                exit_code=124,
-                stdout=json.dumps({
-                    "deployed": False,
-                    "expected_sha": pushed_sha,
-                    "attempts": attempt,
-                    "poll_interval_seconds": interval_seconds,
-                    "recent_checks": attempts[-10:],
-                }),
-                stderr=f"Odoo.sh did not deploy pushed commit {pushed_sha} within {timeout_seconds}s.",
-                timed_out=True,
-            )
-        time.sleep(min(interval_seconds, max(deadline - time.monotonic(), 0.0)))
+    return SharedOdooShService.poll_deployed_commit(
+        odoosh,
+        expected_sha=pushed_sha,
+        timeout_seconds=timeout_seconds,
+        interval_seconds=interval_seconds,
+        progress_cb=progress_cb,
+    )
 
 
 def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
