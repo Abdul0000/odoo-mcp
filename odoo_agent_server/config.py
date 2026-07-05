@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     protected_branches_raw: str = Field(default="", alias="ODOO_AGENT_PROTECTED_BRANCHES")
 
     # Git deployment guardrails. These are optional but strongly recommended in production.
+    block_raw_push_for_modules: bool = Field(default=True, alias="ODOO_AGENT_BLOCK_RAW_PUSH_FOR_MODULES")
     target_git_repo: str | None = Field(default=None, alias="TARGET_GIT_REPO")
     target_git_branch: str | None = Field(default=None, alias="TARGET_GIT_BRANCH")
     target_project_path: str | None = Field(default=None, alias="TARGET_PROJECT_PATH")
