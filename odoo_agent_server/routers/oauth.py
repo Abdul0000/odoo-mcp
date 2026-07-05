@@ -106,14 +106,14 @@ def _authorization_form(params: dict[str, str], error: str | None = None) -> str
 <body>
   <main class="card">
     <h1>Authorize Odoo Agent Connector</h1>
-    <p>ChatGPT is requesting access to the MCP tools exposed by your local/VPS Odoo Agent Connector.</p>
+    <p>An MCP client is requesting access to the MCP tools exposed by your local/VPS Odoo Agent Connector.</p>
     <div class="warning">Only approve this if you started this connector and trust the tunnel/domain. Write tools run directly after connector authentication; keep this service private and token-protected.</div>
     {error_html}
     <form method="post" action="/oauth/authorize">
       {hidden}
       <label>Connector admin token</label>
       <input type="password" name="connector_token" autocomplete="off" placeholder="Paste ODOO_AGENT_API_TOKEN to approve" />
-      <button type="submit">Authorize ChatGPT</button>
+      <button type="submit">Authorize MCP Client</button>
     </form>
   </main>
 </body>

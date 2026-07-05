@@ -1,18 +1,18 @@
-# Odoo ChatGPT Direct Connector — Full Backend Plan
+# Odoo MCP Agent Connector — Full Backend Plan
 
 This package implements the backend-only connector from the final plan:
 
 ```text
-ChatGPT = AI brain
+Any MCP-capable agent = AI brain
         ↓
-Custom GPT Actions / lightweight MCP JSON-RPC bridge
+OpenAPI Actions / lightweight MCP JSON-RPC bridge
         ↓
 FastAPI Odoo Agent Server = tools only
         ↓
 GitHub + Odoo.sh + Odoo RPC + optional external CDP browser
 ```
 
-No Codex, no CLI agent, no backend AI model, and no frontend UI are required. ChatGPT writes and reasons about code; this server performs the allowed operations.
+No Codex, no CLI agent, no backend AI model, and no frontend UI are required. The connected MCP agent writes and reasons about code; this server performs the allowed operations.
 
 ## Implemented components
 
@@ -151,9 +151,9 @@ Example local Chrome launch:
 chrome --remote-debugging-port=9222 --headless=new --disable-gpu --no-sandbox
 ```
 
-## Connect to ChatGPT
+## Connect an MCP Client
 
-### Option A: Custom GPT Actions
+### Option A: OpenAPI Actions
 
 Deploy this server with HTTPS and import:
 
@@ -222,7 +222,7 @@ Example:
 }
 ```
 
-This package includes both OpenAPI/Actions and a lightweight MCP JSON-RPC bridge. If your ChatGPT workspace requires a specific official remote MCP transport profile, the same service layer can be adapted without changing the Odoo/Git/Odoo.sh tools.
+This package includes both OpenAPI/Actions and a lightweight MCP JSON-RPC bridge. The standard endpoint is `/mcp`; compatibility profiles also exist for clients with stricter transport or auth behavior.
 
 ## Example full verify
 
@@ -253,7 +253,7 @@ This build removes approval blocking for MCP tools. Do not pass `approval_id`; l
 2. Use staging/development Odoo.sh first.
 3. Keep `ODOO_AGENT_ALLOWED_ROOTS` and target branch/repo settings strict because approval gating is disabled.
 4. Store GitHub/Odoo.sh SSH keys only on this backend server.
-5. Do not expose Odoo passwords, SSH keys, API keys, or cookies to ChatGPT.
+5. Do not expose Odoo passwords, SSH keys, API keys, or cookies to the MCP client.
 6. Push only current branch unless a branch is explicitly provided.
 7. Avoid adding production branches to target settings unless you intentionally want direct deploy/push access.
 8. Review `GET /jobs/audit/events` regularly.
@@ -346,7 +346,7 @@ audit.list
 
 ### v10 polling/wait behavior
 
-Long install/upgrade commands still run in background jobs, but `odoo.module_deploy`, `odoo.module_install`, `odoo.module_update`, direct Odoo.sh SSH module tools, and `jobs.get` now wait server-side by default for a short safe window. This avoids fragile repeated ChatGPT polling and prevents Render HTTP timeouts. `workflow.safe_deploy_module` performs only one non-blocking Odoo.sh commit check; if the SHA is not deployed yet, it returns `status=retry_later` with `next_call={"tool":"workflow.resume_job"}` instead of blocking the request.
+Long install/upgrade commands still run in background jobs, but `odoo.module_deploy`, `odoo.module_install`, `odoo.module_update`, direct Odoo.sh SSH module tools, and `jobs.get` now wait server-side by default for a short safe window. This avoids fragile repeated client-side polling and prevents Render HTTP timeouts. `workflow.safe_deploy_module` performs only one non-blocking Odoo.sh commit check; if the SHA is not deployed yet, it returns `status=retry_later` with `next_call={"tool":"workflow.resume_job"}` instead of blocking the request.
 
 Recommended call:
 
@@ -369,11 +369,11 @@ The following REST endpoints are intentionally not exposed as MCP tools because 
 /mcp
 ```
 
-Use MCP `tools/list` instead of `/tools/list`, and MCP `tools/call` instead of `/tools/call` when connecting ChatGPT through MCP.
+Use MCP `tools/list` instead of `/tools/list`, and MCP `tools/call` instead of `/tools/call` when connecting through MCP.
 
-## ChatGPT Custom MCP App OAuth upgrade
+## MCP OAuth Setup
 
-This package now supports the OAuth 2.1 / PKCE flow required by ChatGPT custom MCP Apps, in addition to the legacy Bearer token used by Custom GPT Actions.
+This package supports OAuth 2.1 / PKCE for MCP clients, in addition to legacy Bearer token auth used by OpenAPI/Actions integrations.
 
 ### New OAuth/MCP endpoints
 
@@ -388,7 +388,7 @@ This package now supports the OAuth 2.1 / PKCE flow required by ChatGPT custom M
 /mcp
 ```
 
-### Recommended ChatGPT MCP setup
+### Recommended MCP setup
 
 1. Keep the connector running behind HTTPS, for example with Cloudflare Tunnel:
 
@@ -410,7 +410,7 @@ ODOO_AGENT_OAUTH_AUTO_APPROVE=false
 
 4. Restart the FastAPI server after changing `.env`.
 
-5. In ChatGPT custom MCP app setup, use:
+5. In your MCP client setup, use:
 
 ```text
 MCP URL: https://your-current-tunnel.trycloudflare.com/mcp
@@ -418,18 +418,18 @@ Authentication: OAuth
 Registration method: Dynamic Client Registration
 ```
 
-The connector advertises `/oauth/register`, `/oauth/authorize`, and `/oauth/token`. During authorization, the browser will show a small consent form. Paste your `ODOO_AGENT_API_TOKEN` into that form to approve ChatGPT. The connector then issues short-lived OAuth access tokens and refresh tokens for ChatGPT.
+The connector advertises `/oauth/register`, `/oauth/authorize`, and `/oauth/token`. During authorization, the browser will show a small consent form. Paste your `ODOO_AGENT_API_TOKEN` into that form to approve the MCP client. The connector then issues short-lived OAuth access tokens and refresh tokens.
 
 ### Static OAuth client fallback
 
-If ChatGPT asks for a user-defined OAuth client, use:
+If your MCP client asks for a user-defined OAuth client, use:
 
 ```env
-ODOO_AGENT_OAUTH_STATIC_CLIENT_ID=odoo-agent-chatgpt
+ODOO_AGENT_OAUTH_STATIC_CLIENT_ID=odoo-agent-mcp
 ODOO_AGENT_OAUTH_STATIC_CLIENT_SECRET=
 ```
 
-Then enter this client ID in ChatGPT. Leave client secret empty unless you explicitly set `ODOO_AGENT_OAUTH_STATIC_CLIENT_SECRET`.
+Then enter this client ID in the MCP client. Leave client secret empty unless you explicitly set `ODOO_AGENT_OAUTH_STATIC_CLIENT_SECRET`.
 
 ### Security notes
 
@@ -456,6 +456,8 @@ For code-changing work, prefer `workflow.safe_deploy_module` instead of manually
 
 Agents must not stop after editing files with “next steps” or ask the user to run `-u`. After changing code they should continue through verification and `workflow.safe_deploy_module`, returning only when complete, blocked, `retry_later`, or `deploy_running`.
 
+For normal Odoo module-code requests, agents must not create fields or views by direct `ir.model.fields` / `ir.ui.view` ORM writes or a Studio-style shortcut. They must patch the custom module's Python/XML files, verify against Enterprise/Community source, and run the safe deployment workflow. Agents also must not print sample MCP JSON blocks and tell the user/client to execute them; they should call the MCP tools directly.
+
 Recommended production variables:
 
 ```env
@@ -470,9 +472,9 @@ ODOOSH_WAIT_TIMEOUT_SECONDS=600
 ODOOSH_WAIT_INTERVAL_SECONDS=10
 ```
 
-## Repo-first ChatGPT/MCP coding workflow
+## Repo-first MCP coding workflow
 
-For every coding task, ChatGPT should start with the repository tools, not with Odoo database reads:
+For every coding task, the MCP agent should start with the repository tools, not with Odoo database reads:
 
 ```text
 repo_prepare → repo_list_custom_modules → repo_read → repo_apply_patch_atomic or repo_write_many_smart → git_diff → qa_self_run → workflow_verify_against_core(changed files only) → workflow_safe_deploy_module → workflow_resume_job/jobs_get only when returned as next_call
@@ -486,7 +488,7 @@ New MCP/REST tools:
 - `repo.write_many_fast_safe`: small multi-file writer with path validation, repo lock, backups, temporary replacement, and rollback; no git worktree overhead.
 - `repo.write_many_atomic`: large/risky multi-file writer; writes many files as one all-or-none temp worktree transaction; the real checkout is touched only after the full generated diff validates.
 - `repo.apply_patch_atomic`: validates and applies a multi-file patch in a temporary worktree/branch, then validates the resulting diff against the real checkout before applying it.
-- `workflow.coding_task_plan`: returns the canonical ordered tool plan and guardrails for ChatGPT before patching code.
+- `workflow.coding_task_plan`: returns the canonical ordered tool plan and guardrails for MCP agents before patching code.
 
 Recommended environment:
 

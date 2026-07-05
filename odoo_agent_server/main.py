@@ -22,10 +22,10 @@ from .routers.workflow import router as workflow_router
 limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 
 app = FastAPI(
-    title="Odoo ChatGPT Direct Connector",
+    title="Odoo MCP Agent Connector",
     version="1.4.0",
     description=(
-        "V14 Self-Learning Agent connector for ChatGPT Odoo development automation: "
+        "V14 Self-Learning Agent connector for Odoo development automation over MCP/HTTP: "
         "core file discovery (find_core_file + find_similar_view), "
         "repo patching, self QA, Git, Odoo.sh, Odoo RPC, CDP browser diagnostics, "
         "approvals, jobs/audit, full MCP conversion, OAuth 2.1/PKCE MCP auth, and tool-call bridge."
@@ -35,13 +35,13 @@ app = FastAPI(
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "service": "odoo-chatgpt-direct-connector"}
+    return {"status": "ok", "service": "odoo-mcp-agent-connector"}
 
 
 @app.get("/agent-instructions")
 def agent_instructions() -> dict:
     """Full agent system prompt stored in connector.
-    ChatGPT Custom Instructions should contain ONLY:
+    MCP client system instructions can contain only:
     'Before any task, call workflow.agent_instructions first and follow exactly.'
     """
     from .config import settings, get_client_names
@@ -76,6 +76,8 @@ def agent_instructions() -> dict:
                 "For files >300KB pass max_bytes=500000 to repo.read",
                 "For simple field/view/notebook edits, use the small_patch_fast_path: reuse session state, read only targeted files, skip broad discovery/health/browser diagnostics unless needed.",
                 "For any code-changing request, do not stop after writing files and ask the user to run upgrade/tests. Continue through git.diff, qa_self_run, verify_against_core, and workflow.safe_deploy_module. Only ask the user when required information is missing or a real blocker remains after diagnostics.",
+                "Never answer a code-changing request by printing JSON MCP tool calls or saying the client/user should execute them. You are connected to the MCP tools; call them yourself.",
+                "Never create module schema changes by direct ORM/Studio writes to ir.model.fields or ir.ui.view unless the user explicitly asks for a no-code Studio/database customization. For normal Odoo development, write Python/XML files in the custom module and deploy the module.",
                 "For hard UI/POS/website/view tasks, include exact post-upgrade Odoo paths in workflow.safe_deploy_module.verify_ui_paths so the deploy job opens each page through CDP and records console/network errors plus Odoo UI breakage.",
                 "SMART ROUTER: for coding tasks, call workflow.smart_tool_router early to choose the fastest correct path. For pure data queries, use direct odoo.search_read and skip repo tools.",
                 "STRICT FRONTEND: before writing any Odoo JS/OWL/POS/website/payment/QWeb/XML/SCSS asset code, call workflow.frontend_pattern_preflight and read the mandatory pattern files it returns. Results are cached; do not guess framework syntax.",
@@ -91,6 +93,7 @@ def agent_instructions() -> dict:
                     "2. If no session exists, call workflow.start_session(include_odoo=false, include_odoosh=false) to avoid slow health probes.",
                     "3. repo.prepare once, then read only the target manifest/model/view files.",
                     "4. Read core/enterprise only for the exact inherited model/view pattern that is not already clear from existing custom code.",
+                    "4a. For field/view changes, use module files only. Do not create ir.model.fields or patch ir.ui.view records directly as a Studio shortcut.",
                     "5. Patch with repo.apply_patch_atomic or repo.write_many_smart. Use repo.write_many_atomic only for large/risky refactors.",
                     "6. Run git.diff and qa.self_run(run_pytest=false) unless tests/shared logic are touched.",
                     "7. workflow.verify_against_core only for changed files.",
@@ -103,6 +106,8 @@ def agent_instructions() -> dict:
                     "Do not crawl all custom modules when the target module is already known.",
                     "Do not run browser diagnostics for a backend field unless the user asks for visible UI proof.",
                     "Do not end with 'next steps', 'want to', or ask the user to run module upgrade after you have changed code. Use workflow.safe_deploy_module yourself.",
+                    "Do not print sample MCP JSON blocks for the user to execute. Call the MCP tools directly.",
+                    "Do not use Studio/ORM database schema mutations for normal module-code requests.",
                 ],
             },
             "mandatory_dual_read": {
@@ -282,13 +287,17 @@ def agent_instructions() -> dict:
 @app.get("/")
 def root() -> dict[str, object]:
     return {
-        "service": "Odoo ChatGPT Direct Connector",
+        "service": "Odoo MCP Agent Connector",
         "ui": "not_required",
         "docs": "/docs",
         "openapi": "/openapi.json",
         "tools": "/tools/list",
         "mcp": "/mcp",
-        "chatgpt_mcp": "/chatgpt/mcp",
+        "compatibility_mcp": {
+            "chatgpt": "/chatgpt/mcp",
+            "claude": "/claude/mcp",
+            "qwen": "/qwen/mcp",
+        },
         "workflow": ["/workflow/capability-check", "/workflow/full-verify", "/workflow/safe-deploy-module"],
     }
 

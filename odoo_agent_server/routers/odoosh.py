@@ -49,7 +49,7 @@ def _background_command_job(
     """Start a long Odoo.sh SSH command in the background and return immediately.
 
     Render and many MCP HTTP clients can drop long requests at about 30 seconds.
-    This wrapper persists the command as a job so ChatGPT can poll jobs.get.
+    This wrapper persists the command as a job so MCP agents can poll jobs.get.
     """
     store = JsonStore()
     approval = ApprovalService()

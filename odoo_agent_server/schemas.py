@@ -514,7 +514,7 @@ class ToolDescriptor(BaseModel):
     title: str | None = Field(
         default=None,
         description=(
-            "Human-readable action label shown in ChatGPT's tool-call UI "
+            "Human-readable action label shown in MCP/client tool-call UI "
             "(e.g. 'Push code to GitHub' instead of raw name 'git.push'). "
             "Falls back to a humanized version of `name` if not set."
         ),

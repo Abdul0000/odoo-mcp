@@ -30,10 +30,10 @@ Use `workflow.safe_deploy_module` for normal changes. It checks Odoo.sh once aft
 
 ## Important OAuth persistence setting
 
-Set a stable secret so ChatGPT OAuth sessions survive Koyeb redeploys:
+Set a stable secret so MCP OAuth sessions survive Koyeb redeploys:
 
 ```env
 ODOO_AGENT_OAUTH_TOKEN_SECRET=<long-random-stable-secret>
 ```
 
-If omitted, the connector falls back to `ODOO_AGENT_API_TOKEN`. Keep that value stable across redeploys too. After deploying this build, reconnect the ChatGPT MCP once so it receives the new stateless refresh token format.
+If omitted, the connector falls back to `ODOO_AGENT_API_TOKEN`. Keep that value stable across redeploys too. After deploying this build, reconnect the MCP client once so it receives the new stateless refresh token format.

@@ -16,6 +16,10 @@ EXPECTED_OPERATIONAL_MCP_TOOLS = {tool.name for tool in list_tools()}
 
 def test_mcp_tools_list_exposes_every_operational_api_tool():
     client = TestClient(app)
+    initialized = client.post("/mcp", headers=_auth(), json={"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}})
+    assert initialized.status_code == 200
+    assert initialized.json()["result"]["serverInfo"]["name"] == "odoo-mcp-agent-connector"
+
     response = client.post("/mcp", headers=_auth(), json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
     assert response.status_code == 200
     tools = response.json()["result"]["tools"]
@@ -57,6 +61,7 @@ def test_mcp_supports_health_approval_job_and_audit_tools(tmp_path, monkeypatch)
     )
     assert health.status_code == 200
     assert health.json()["result"]["structuredContent"]["status"] == "ok"
+    assert health.json()["result"]["structuredContent"]["service"] == "odoo-mcp-agent-connector"
 
     requested = client.post(
         "/mcp",

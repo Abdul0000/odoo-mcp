@@ -10,7 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Runtime settings for the direct ChatGPT Odoo agent connector."""
+    """Runtime settings for the Odoo MCP agent connector."""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     screenshot_dir: str = Field(default="/tmp/odoo_agent_screenshots", alias="ODOO_AGENT_SCREENSHOT_DIR")
     cdp_url: str | None = Field(default=None, alias="ODOO_AGENT_CDP_URL")
 
-    # Approval gating is disabled in this build so ChatGPT MCP tools can write, commit, push, and deploy directly.
+    # Approval gating is disabled in this build so MCP tools can write, commit, push, and deploy directly.
     require_approval: bool = Field(default=False, alias="ODOO_AGENT_REQUIRE_APPROVAL")
     approval_required_actions_raw: str = Field(default="", alias="ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS")
     protected_branches_raw: str = Field(default="", alias="ODOO_AGENT_PROTECTED_BRANCHES")
@@ -34,22 +34,22 @@ class Settings(BaseSettings):
     git_author_name: str = Field(default="Odoo MCP Agent", alias="GIT_AUTHOR_NAME")
     git_author_email: str = Field(default="odoo-mcp@example.local", alias="GIT_AUTHOR_EMAIL")
 
-    # OAuth 2.1 / MCP App authentication. Required for ChatGPT custom MCP apps.
+    # OAuth 2.1 / MCP App authentication for generic and compatibility MCP clients.
     public_base_url: str | None = Field(default=None, alias="ODOO_AGENT_PUBLIC_BASE_URL")
     oauth_issuer: str | None = Field(default=None, alias="ODOO_AGENT_OAUTH_ISSUER")
     oauth_default_scope: str = Field(default="odoo.agent", alias="ODOO_AGENT_OAUTH_DEFAULT_SCOPE")
     oauth_auto_approve: bool = Field(default=False, alias="ODOO_AGENT_OAUTH_AUTO_APPROVE")
-    oauth_static_client_id: str = Field(default="odoo-agent-chatgpt", alias="ODOO_AGENT_OAUTH_STATIC_CLIENT_ID")
+    oauth_static_client_id: str = Field(default="odoo-agent-mcp", alias="ODOO_AGENT_OAUTH_STATIC_CLIENT_ID")
     oauth_static_client_secret: str | None = Field(default=None, alias="ODOO_AGENT_OAUTH_STATIC_CLIENT_SECRET")
     oauth_token_secret: str | None = Field(default=None, alias="ODOO_AGENT_OAUTH_TOKEN_SECRET")
     oauth_allowed_redirect_uris_raw: str = Field(default="", alias="ODOO_AGENT_OAUTH_ALLOWED_REDIRECT_URIS")
     oauth_authorization_code_ttl_seconds: int = Field(default=600, alias="ODOO_AGENT_OAUTH_AUTH_CODE_TTL_SECONDS")
     oauth_access_token_ttl_seconds: int = Field(default=3600, alias="ODOO_AGENT_OAUTH_ACCESS_TOKEN_TTL_SECONDS")
     oauth_refresh_token_ttl_seconds: int = Field(default=2592000, alias="ODOO_AGENT_OAUTH_REFRESH_TOKEN_TTL_SECONDS")
-    # Recover ChatGPT dynamic OAuth clients after ephemeral-state redeploys.
+    # Recover dynamic OAuth clients after ephemeral-state redeploys.
     # When enabled, unknown dcr_* client IDs are accepted only with normal
-    # redirect validation, which permits ChatGPT/OpenAI redirect hosts for
-    # static/recovered clients.
+    # redirect validation. Compatibility redirect hosts remain allowed for
+    # static/recovered clients when no explicit allowlist is configured.
     oauth_accept_unknown_dcr_clients: bool = Field(default=False, alias="ODOO_AGENT_OAUTH_ACCEPT_UNKNOWN_DCR_CLIENTS")
 
     # Optional compatibility for MCP clients that cannot send Authorization

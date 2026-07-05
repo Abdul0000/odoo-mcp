@@ -15,7 +15,7 @@ router = APIRouter(prefix="/odoo", tags=["odoo"], dependencies=[AuthDependency])
 def _background_job_response(store: JsonStore, job: JobRecord, payload: OdooRpcModuleRequest, started_message: str) -> OdooRpcResult:
     """Return a final result when the job finishes quickly, otherwise a clean running state.
 
-    This avoids fragile ChatGPT-side polling loops and keeps every HTTP request
+    This avoids fragile client-side polling loops and keeps every HTTP request
     below Render's practical timeout window.
     """
     if not payload.wait_for_result:

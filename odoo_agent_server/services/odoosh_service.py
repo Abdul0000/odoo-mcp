@@ -190,7 +190,7 @@ class OdooShService:
         script = "set -e; cd ~/src/user; git rev-parse HEAD"
         return self.run_shell(script, timeout_seconds=30)
 
-    # NON-BLOCKING single check — ChatGPT polls this instead of blocking wait
+    # NON-BLOCKING single check — MCP agents poll this instead of blocking wait
     def adaptive_poll_interval(self, attempt: int) -> float:
         """Adaptive polling: fast early, slower later to reduce SSH calls."""
         if attempt < 3:
@@ -202,7 +202,7 @@ class OdooShService:
 
     def check_commit_deployed(self, expected_sha: str) -> CommandResult:
         """Return immediately with deployed=true/false. Never blocks.
-        ChatGPT should call this in a polling loop with 15-second delays."""
+        MCP agents should call this in a polling loop with short delays."""
         result = self.deployed_sha()
         current = result.stdout.strip()
         deployed = (

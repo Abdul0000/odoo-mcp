@@ -94,7 +94,7 @@ _STRICT_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
 def strict_safe_tool_name(name: str) -> str:
-    """Return a strict MCP/Claude/ChatGPT/Qwen-safe tool name.
+    """Return a strict MCP-client-safe tool name.
 
     Some frontends validate tool names with ^[a-zA-Z0-9_-]{1,64}$.
     Internal Odoo-agent tool names use dotted namespaces such as
@@ -119,7 +119,7 @@ def internal_tool_name(name: str) -> str:
 
 
 def _agent_priority(name: str) -> tuple[int, str]:
-    """Put functional Odoo query tools early so Claude/Qwen choose them first.
+    """Put functional Odoo query tools early so MCP agents choose them first.
 
     Functional questions like "list draft invoices" should call odoo_search_read
     directly and not enter the coding workflow.
@@ -180,7 +180,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.capability_check",
         title="Check connector capabilities", description="Check local connector capabilities and missing runtime configuration", read_only=True),
     ToolDescriptor(name="workflow.coding_task_plan",
-        title="Get coding workflow plan", description="Return the repo-first coding workflow guidance for ChatGPT MCP clients", read_only=True),
+        title="Get coding workflow plan", description="Return the repo-first coding workflow guidance for MCP agents", read_only=True),
     ToolDescriptor(
         name="workflow.smart_tool_router",
         title="Choose fastest safe workflow",
@@ -336,7 +336,7 @@ _TOOL_DESCRIPTORS = [
         name="odoo.query",
         title="Smart Odoo functional query",
         description=(
-            "Best tool for simple functional Odoo questions in Claude/Qwen/ChatGPT: list users, employees, "
+            "Best tool for simple functional Odoo questions from any MCP client: list users, employees, "
             "draft invoices, unpaid invoices, customers, vendors, products, sale orders, purchase orders, or modules. "
             "Takes a natural-language query and returns parsed model/domain/fields plus live Odoo records."
         ),
@@ -399,7 +399,7 @@ _TOOL_DESCRIPTORS = [
         title="Save session state",
         description=(
             "Fix 7 — Persist session context (last_sha, module_name, step_history, etc.) so a new "
-            "ChatGPT session after a Render restart can reload it with session.load_state instead "
+            "MCP agent session after a restart can reload it with session.load_state instead "
             "of rediscovering everything from scratch."
         ),
     ),
@@ -624,7 +624,7 @@ async def call_tool(payload: ToolCallRequest) -> ToolCallResult:
 def _odoo_functional_query(req: OdooFunctionalQueryRequest) -> object:
     """Map common functional Odoo questions to safe search_read calls.
 
-    This is intentionally read-only and conservative. It gives Claude/Qwen a
+    This is intentionally read-only and conservative. It gives MCP clients a
     tiny, reliable functional tool so prompts like "List users" do not need to
     inspect the larger coding toolset or manually construct a model/domain.
     """
@@ -747,7 +747,7 @@ def _odoo_functional_query(req: OdooFunctionalQueryRequest) -> object:
 async def _dispatch(name: str, args: dict) -> object:
     if name == "connector.health":
         EmptyRequest.model_validate(args)
-        return {"status": "ok", "service": "odoo-chatgpt-direct-connector"}
+        return {"status": "ok", "service": "odoo-mcp-agent-connector"}
     if name == "artifacts.read":
         req = ArtifactReadRequest.model_validate(args)
         return JsonStore().read_artifact(req.artifact_id, req.offset, req.max_chars)

@@ -95,7 +95,7 @@ def _looks_like_frontend_task(task: str) -> bool:
 
 @router.post("/coding-task-plan", response_model=CodingTaskPlanResult)
 def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
-    """Return the canonical repo-first coding workflow for ChatGPT/MCP clients."""
+    """Return the canonical repo-first coding workflow for MCP agents."""
     client = ClientResolverService().resolve_client(
         client_name=payload.client_name,
         project_path=payload.project_path or settings.target_project_path,
@@ -113,10 +113,12 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "If the patch touches JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, call workflow.frontend_pattern_preflight after reading custom files and read every mandatory source pattern before coding.",
             "For POS work, never use legacy load_fields('pos.config', ...) / models.load_fields for pos.config; read installed point_of_sale source and use the version's real loader/backend pattern.",
             "MANDATORY Odoo.sh source layer before writing: call workflow.scope_advice after reading custom files from the checkout, then repo.read every mandatory related installed-source path it returns. Do not re-read the same current module from /home/odoo/src/user; /home/odoo/src/user is only for other related custom dependencies. This verifies Enterprise/core syntax and patterns before any patch.",
+            "For field/view changes, never use direct ORM/Studio writes to ir.model.fields or ir.ui.view unless the user explicitly asked for no-code Studio customization. Normal development must patch Python/XML files in the custom module.",
             "Patch the smallest file set with repo.apply_patch_atomic or repo.write_many_atomic; do not run broad module discovery again after the target module is known.",
             "Run git.diff and qa.self_run with run_pytest=false unless Python tests are present or the patch touches shared logic.",
-            "MANDATORY before push: run workflow.verify_against_core for changed .py/.xml/.js/__manifest__.py files. If push_blocked=true, fix and re-run; only then git.commit and git.push.",
-            "After push, poll odoosh.check_commit for the pushed SHA, then call odoo.module_deploy with wait_timeout_seconds=5; use jobs.get only if it returns a running job.",
+            "MANDATORY before deploy: run workflow.verify_against_core for changed .py/.xml/.js/__manifest__.py files. If push_blocked=true, fix and re-run; only then continue.",
+            "Call workflow.safe_deploy_module with module_name, commit_message, changed paths, run_qa=false if qa.self_run already passed, wait_for_odoosh=true, and upgrade_module=true. Do not manually chain git.commit/git.push/odoosh.check_commit/odoo.module_deploy for the normal path.",
+            "If safe deploy returns retry_later, wait briefly and call workflow.resume_job with the job_id. If it returns deploy_running, call jobs.get on the nested job. Do not repeat commit/push.",
             "Verify the exact field with odoo.search_read or workflow.registry_smoke_test; if the user asks for visible UI proof, pass the exact Odoo web path in verify_ui_paths during deploy or call workflow.browser_menu_crawl once.",
         ]
         required_tools = [
@@ -130,10 +132,9 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "qa.self_run",
             "workflow.verify_against_core",
             "workflow.frontend_pattern_preflight",
-            "git.commit",
-            "git.push",
-            "odoosh.check_commit",
-            "odoo.module_deploy",
+            "workflow.safe_deploy_module",
+            "workflow.resume_job",
+            "jobs.get",
             "odoo.search_read",
         ]
         summary = "Fast path for a small targeted Odoo code patch."
@@ -145,15 +146,13 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "For JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, call workflow.frontend_pattern_preflight with task_description, target_module_name, custom_file_paths, and planned_file_paths; then repo.read all mandatory pattern files returned before implementation.",
             "For POS work, never use legacy load_fields('pos.config', ...) / models.load_fields for pos.config; read installed point_of_sale source and use the version's real loader/backend pattern.",
             "MANDATORY Odoo.sh source layer before writing: call workflow.scope_advice after reading custom files from the checkout, then repo.read every mandatory related installed-source path it returns. Do not re-read the same current module from /home/odoo/src/user; /home/odoo/src/user is only for other related custom dependencies. This is the Enterprise/core syntax and pattern verification layer.",
+            "For field/view changes, never use direct ORM/Studio writes to ir.model.fields or ir.ui.view unless the user explicitly asked for no-code Studio customization. Normal development must patch Python/XML files in the custom module.",
             "Apply edits atomically: use repo.apply_patch_atomic for multi-file diffs or repo.write_many_atomic for multi-file/new-module writes. Use repo.apply_patch/repo.write only for small single-file changes. Do not edit Odoo core, enterprise, .git, or unrelated modules.",
             "Run git.diff and qa.self_run. Treat pytest environment failures separately from real module errors.",
-            "MANDATORY before push: run workflow.verify_against_core for changed .py/.xml/.js/__manifest__.py files. If push_blocked=true, fix and re-run; do not push while blocked.",
-            "Commit only related paths with git.commit using a clear message.",
-            "Push to the exact target branch with git.push; branch must match TARGET_GIT_BRANCH when configured. Note the 'sha' in the push response.",
-            "Poll Odoo.sh deploy using odoosh.check_commit with the pushed sha. It returns immediately with deployed=true/false. If false, wait 15 seconds and call again. Max 20 retries.",
-            "When odoosh.check_commit returns deployed=true, call odoosh.verify_module_manifest then odoosh.module_update.",
-            "For UI/POS/website/view tasks, pass exact post-upgrade paths in workflow.safe_deploy_module.verify_ui_paths or call workflow.browser_menu_crawl after upgrade; treat failed page loads, Odoo error dialogs, console errors, and network errors as breakage.",
-            "Finish with odoo.module_status, odoosh.grep_errors, registry smoke checks, and browser UI path verification for UI tasks.",
+            "MANDATORY before deploy: run workflow.verify_against_core for changed .py/.xml/.js/__manifest__.py files. If push_blocked=true, fix and re-run; do not deploy while blocked.",
+            "Call workflow.safe_deploy_module with module_name, commit_message, changed paths, wait_for_odoosh=true, upgrade_module=true, and exact verify_ui_paths for UI/POS/website/view tasks. It owns commit, push, non-blocking Odoo.sh check, module deploy, module status, smoke test, and optional browser verification.",
+            "If safe_deploy returns retry_later, wait briefly and call workflow.resume_job with the job_id. If it returns deploy_running, call jobs.get on the nested job. Do not repeat commit/push.",
+            "Finish only after safe deploy/resume reports passed, or report the exact blocker and next_call returned by the workflow.",
         ]
         required_tools = [
             "repo.prepare",
@@ -167,13 +166,11 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "git.diff",
             "qa.self_run",
             "workflow.verify_against_core",
-            "git.commit",
-            "git.push",
-            "odoosh.check_commit",
-            "odoosh.verify_module_manifest",
-            "odoosh.module_update",
+            "workflow.safe_deploy_module",
+            "workflow.resume_job",
+            "jobs.get",
         ]
-        summary = "Canonical repo-first coding workflow for ChatGPT MCP Odoo development."
+        summary = "Canonical repo-first coding workflow for Odoo MCP development."
     return CodingTaskPlanResult(
         summary=summary,
         ordered_steps=steps,
@@ -185,6 +182,8 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Use atomic multi-file tools for broad changes so incomplete states are not left in the checkout.",
             "Only patch the requested module and related files.",
             "Do not upgrade Odoo.sh until the expected pushed SHA is deployed.",
+            "Do not answer by printing MCP JSON blocks for the user/client to execute; call the MCP tools yourself.",
+            "Do not create fields/views by direct ir.model.fields or ir.ui.view database writes for normal module-code requests.",
             "For small patches, avoid repeated tool discovery, broad source reads, full health checks, and browser diagnostics unless they are needed to prove the requested change.",
             "For hard UI/POS/website/accounting view tasks, verify exact affected views in a browser after upgrade using verify_ui_paths or workflow.browser_menu_crawl.",
             "For JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, frontend_pattern_preflight is blocking: do not write code until real framework source patterns are read.",
@@ -236,7 +235,7 @@ def capability_check() -> CapabilityCheckResult:
 
 @router.post("/start-session", response_model=WorkflowReport)
 def start_session(payload: StartSessionRequest) -> WorkflowReport:
-    """V15 Multi-Client bootstrap for every ChatGPT/Claude session.
+    """V15 Multi-Client bootstrap for every MCP agent session.
 
     Pass client_name to auto-resolve repo, branch, path, token, and Odoo creds
     from ODOO_CLIENTS env var. Falls back to TARGET_GIT_* env vars if no client_name.
@@ -502,7 +501,7 @@ async def full_verify(payload: FullVerifyRequest) -> WorkflowReport:
 async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport:
     """Non-blocking deploy: spawns a background thread and returns job_id immediately.
 
-    ChatGPT must poll /jobs/{job_id} via jobs.get tool until status != running.
+    The MCP agent must poll /jobs/{job_id} via jobs.get tool until status != running.
     This prevents Render/Koyeb HTTP timeouts from killing long-running deploys.
     """
     approval = ApprovalService()

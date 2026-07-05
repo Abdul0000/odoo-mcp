@@ -13,10 +13,14 @@ def test_health_and_root_are_backend_only():
     health = client.get("/health")
     assert health.status_code == 200
     assert health.json()["status"] == "ok"
+    assert health.json()["service"] == "odoo-mcp-agent-connector"
     root = client.get("/")
     assert root.status_code == 200
+    assert root.json()["service"] == "Odoo MCP Agent Connector"
     assert root.json()["ui"] == "not_required"
     assert root.json()["openapi"] == "/openapi.json"
+    assert root.json()["mcp"] == "/mcp"
+    assert root.json()["compatibility_mcp"]["chatgpt"] == "/chatgpt/mcp"
 
 
 def test_tools_are_exposed_for_direct_chatgpt():
@@ -51,6 +55,11 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
     do_not = "\n".join(instructions["small_patch_fast_path"]["do_not"])
 
     assert "do not stop after writing files" in rules
+    assert "printing JSON MCP tool calls" in rules
+    assert "ir.model.fields" in rules
+    assert "ir.ui.view" in rules
     assert "workflow.safe_deploy_module" in small_flow
     assert "workflow.resume_job" in small_flow
     assert "Do not end with 'next steps'" in do_not
+    assert "Do not print sample MCP JSON blocks" in do_not
+    assert "Do not use Studio/ORM database schema mutations" in do_not

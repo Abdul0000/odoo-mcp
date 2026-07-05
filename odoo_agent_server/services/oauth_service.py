@@ -33,7 +33,7 @@ def _token_secret() -> bytes:
 
     Koyeb and similar platforms often restart/redeploy containers with an
     empty /tmp. Earlier builds stored access/refresh tokens only in the
-    file-backed state directory, so ChatGPT would lose its OAuth session after
+    file-backed state directory, so MCP clients could lose OAuth sessions after
     redeploy and tool calls failed with "couldn't connect your account".
 
     New tokens are signed and self-validating. The file store remains for
@@ -81,7 +81,7 @@ def _decode_signed_token(token: str, prefix: str) -> dict[str, Any] | None:
     return payload
 
 class OAuthStore:
-    """Dependency-light OAuth 2.1 storage for ChatGPT MCP auth.
+    """Dependency-light OAuth 2.1 storage for MCP auth.
 
     This implementation is intentionally small and file-backed for local/VPS use.
     Replace with PostgreSQL/Redis for multi-worker production deployments.
@@ -127,7 +127,7 @@ class OAuthStore:
         record = {
             "client_id": client_id,
             "client_id_issued_at": now,
-            "client_name": metadata.get("client_name") or "ChatGPT MCP Client",
+            "client_name": metadata.get("client_name") or "Odoo MCP Client",
             "redirect_uris": [str(uri) for uri in redirect_uris],
             "grant_types": metadata.get("grant_types") or ["authorization_code", "refresh_token"],
             "response_types": metadata.get("response_types") or ["code"],
@@ -147,7 +147,7 @@ class OAuthStore:
             return OAuthClient(
                 client_id=client_id,
                 redirect_uris=settings.oauth_allowed_redirect_uris,
-                client_name="Static ChatGPT MCP Client",
+                client_name="Static Odoo MCP Client",
                 client_secret=settings.oauth_static_client_secret,
                 token_endpoint_auth_method="client_secret_post" if settings.oauth_static_client_secret else "none",
             )
@@ -155,16 +155,16 @@ class OAuthStore:
         state = self._read()
         record = state["clients"].get(client_id)
         if not record:
-            # ChatGPT can reuse a dynamically registered dcr_* client_id after a
+            # MCP clients can reuse a dynamically registered dcr_* client_id after a
             # Render/Koyeb redeploy. If the OAuth state directory is ephemeral,
             # that client registration is gone even though the connector is the
-            # same service. This recovery path keeps ChatGPT working while still
+            # same service. This recovery path keeps clients working while still
             # validating the redirect URI later in _validate_redirect_for_client.
             if settings.oauth_accept_unknown_dcr_clients and client_id.startswith("dcr_"):
                 return OAuthClient(
                     client_id=client_id,
                     redirect_uris=[],
-                    client_name="Recovered ChatGPT Dynamic MCP Client",
+                    client_name="Recovered Dynamic MCP Client",
                     client_secret=None,
                     token_endpoint_auth_method="none",
                 )
@@ -243,7 +243,7 @@ class OAuthStore:
         client_id: str,
         client_secret: str | None = None,
     ) -> dict[str, Any]:
-        # Prefer stateless refresh tokens so ChatGPT remains connected across
+        # Prefer stateless refresh tokens so MCP clients remain connected across
         # Koyeb/container redeploys even when the file-backed state directory is
         # reset. The client_id check prevents a token issued for one client from
         # being replayed by another.
@@ -359,11 +359,11 @@ def _validate_redirect_for_client(client: OAuthClient, redirect_uri: str) -> Non
         if redirect_uri not in client.redirect_uris:
             raise HTTPException(status_code=400, detail="redirect_uri is not registered for this OAuth client")
         return
-    # Static client fallback for ChatGPT user-defined OAuth setup. In production,
+    # Static client fallback for user-defined OAuth setup. In production,
     # configure ODOO_AGENT_OAUTH_ALLOWED_REDIRECT_URIS for tighter control.
     host = urlparse(redirect_uri).hostname or ""
     if not _is_chatgpt_redirect_host(host):
-        raise HTTPException(status_code=400, detail="static OAuth client only permits ChatGPT/OpenAI redirect hosts unless allowlist is configured")
+        raise HTTPException(status_code=400, detail="static OAuth client only permits built-in compatibility redirect hosts unless an allowlist is configured")
 
 
 def _is_chatgpt_redirect_host(host: str) -> bool:

@@ -53,7 +53,7 @@ class RepoService:
     ) -> RepoPrepareResult:
         """Clone or refresh the target repository before any coding task.
 
-        This is the repo-first entry point ChatGPT should use for coding work:
+        This is the repo-first entry point MCP agents should use for coding work:
         clone if missing; otherwise fetch, checkout, and pull the requested branch.
         """
         resolver = ClientResolverService()
@@ -394,7 +394,7 @@ class RepoService:
 
         Fix 2: Files written in a single call (total_chunks==1) that exceed
         _LARGE_FILE_LINE_THRESHOLD lines will carry a 'large_file_warning' in
-        the response extra — ChatGPT must use chunked mode next time.
+        the response extra — MCP agents must use chunked mode next time.
 
         Fix 6: When overwriting an existing file in single-write mode (chunk_index==0,
         total_chunks==1), the response always includes a short unified diff showing

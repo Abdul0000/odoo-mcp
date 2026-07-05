@@ -61,7 +61,7 @@ def _to_structured_content(result: Any, tool_name: str) -> dict[str, Any]:
 
 
 def _cap_text(text: str, max_chars: int = 24000) -> str:
-    """Truncate an oversized tool-result text payload to keep ChatGPT's context
+    """Truncate an oversized tool-result text payload to keep agent context
     lean across long sessions. Keeps the head and tail (most relevant parts for
     errors/diffs/logs) and drops the middle with a clear marker.
     """
@@ -93,7 +93,7 @@ def _artifact_next_call(artifact: dict[str, Any], max_chars: int = 12000) -> dic
 
 
 def _normalize_chatgpt_structured(value: Any, tool_name: str) -> dict[str, Any]:
-    """Keep ChatGPT MCP payloads bounded, with full data available by artifact.
+    """Keep strict compatibility-profile MCP payloads bounded, with full data available by artifact.
 
     The visible content text was already capped, but several clients also load
     structuredContent into their tool-call state. That can hang on large logs,
@@ -243,7 +243,7 @@ _REMOTE_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
 def _force_remote_tool_name(name: Any, fallback_index: int = 0) -> str:
-    """Final guard for ChatGPT/Claude/Qwen strict remote-MCP name validation.
+    """Final guard for strict remote-MCP name validation.
 
     Some clients reject the whole connection when even one returned tool name
     contains a dot or other punctuation. This function is intentionally used at
@@ -292,9 +292,9 @@ def _is_claude_request(request: Request | None) -> bool:
 def _tools_for_profile(profile: str | None = None) -> list[Any]:
     tools = list_tools(strict_names=False)
     if profile == "claude":
-        # Claude currently fails more easily on very large remote MCP tool lists
+        # Some compatibility clients fail more easily on very large remote MCP tool lists
         # and complex coding schemas. Keep the Claude profile tiny and functional
-        # by default; ChatGPT/Qwen still use the full tool list on /mcp and /qwen.
+        # by default; the standard /mcp endpoint still uses the full tool list.
         return [tool for tool in tools if tool.name in _CLAUDE_TOOL_NAMES]
     if profile == "chatgpt":
         return [tool for tool in tools if tool.name in _CHATGPT_TOOL_NAMES]
@@ -347,7 +347,7 @@ def _claude_schema(schema: dict[str, Any]) -> dict[str, Any]:
 def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
     title = getattr(tool, "title", None) or _humanize_tool_name(tool.name)
     if profile in {"claude", "chatgpt"}:
-        # Claude and some ChatGPT remote-MCP builds are strict and can fail while
+        # Some remote-MCP builds are strict and can fail while
         # validating the initial tool list. Use the minimal MCP tool shape for
         # these compatibility profiles: strict-safe name, description, schema only.
         return {
@@ -401,7 +401,7 @@ async def _handle_rpc(payload: dict[str, Any], profile: str | None = None) -> di
             {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "odoo-chatgpt-direct-connector", "version": "1.1.0"},
+                "serverInfo": {"name": "odoo-mcp-agent-connector", "version": "1.1.0"},
             },
         )
     if method == "tools/list":
@@ -422,7 +422,7 @@ async def _handle_rpc(payload: dict[str, Any], profile: str | None = None) -> di
             text = json.dumps(structured, ensure_ascii=False, default=str)
             # Context-bloat guard: in long sessions, oversized tool outputs (large diffs,
             # logs, file reads) compound across many calls and slow down/derail the model.
-            # ChatGPT also receives a bounded structuredContent with artifact refs.
+            # Compatibility profiles also receive bounded structuredContent with artifact refs.
             text = _cap_text(text, max_chars=12000 if profile == "chatgpt" else 24000)
             return _rpc_response(
                 request_id,
