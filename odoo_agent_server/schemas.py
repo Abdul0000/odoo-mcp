@@ -545,6 +545,67 @@ class JobStep(BaseModel):
         return f"{icon} {self.name}"
 
 
+def _truthy_deployed_confirmation(value: Any) -> bool:
+    """Return True only for explicit structured Odoo.sh deployed proof.
+
+    Text summaries, command stdout fragments, a passed job status, or a generic
+    ``status='passed'`` field are intentionally not enough.  This helper is used
+    by the public ``deploy_confirmed`` contract so MCP clients have one boolean
+    gate they can trust before telling a user that deployment is complete.
+    """
+    if not isinstance(value, dict):
+        return False
+    if value.get("status") not in {"passed", "ok", True, None}:
+        return False
+    if value.get("deployed") is True:
+        return True
+    payload = value.get("payload")
+    if isinstance(payload, dict) and payload.get("deployed") is True:
+        return True
+    result = value.get("result")
+    if isinstance(result, dict) and result.get("deployed") is True:
+        return True
+    return False
+
+
+def _truthy_module_upgrade_confirmation(value: Any, requested: bool) -> bool:
+    """Return True only when a requested module upgrade explicitly passed."""
+    if not requested:
+        return True
+    if not isinstance(value, dict):
+        return False
+    return value.get("passed") is True or value.get("status") == "passed"
+
+
+def deployment_confirmed_from_record(status_value: Any, request: dict[str, Any] | None, result: Any) -> bool:
+    """Shared deploy-success gate for JobRecord and WorkflowReport responses.
+
+    A deployment is confirmed only when the job itself reached the success enum,
+    the final stored result contains explicit Odoo.sh ``deployed: true`` proof,
+    and any requested module-upgrade step also recorded a passed status.
+    """
+    status_text = status_value.value if isinstance(status_value, Enum) else str(status_value or "")
+    if status_text != JobStatus.passed.value:
+        return False
+    if not isinstance(result, dict):
+        return False
+
+    deployed_check = result.get("odoosh_check_commit")
+    if not _truthy_deployed_confirmation(deployed_check):
+        return False
+
+    module_upgrade = result.get("module_upgrade")
+    request = request or {}
+    if isinstance(module_upgrade, dict) and "requested" in module_upgrade:
+        upgrade_requested = bool(module_upgrade.get("requested"))
+    else:
+        upgrade_requested = bool(request.get("upgrade_module", True))
+        if request.get("trigger") == "git.push:auto_upgrade_on_push" or request.get("module_upgrade_timeout_seconds") is not None:
+            upgrade_requested = True
+
+    return _truthy_module_upgrade_confirmation(module_upgrade, upgrade_requested)
+
+
 class JobRecord(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex)
     job_type: str
@@ -554,6 +615,12 @@ class JobRecord(BaseModel):
     request: dict[str, Any] = Field(default_factory=dict)
     steps: list[JobStep] = Field(default_factory=list)
     result: Any = None
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def deploy_confirmed(self) -> bool:
+        """True only when Odoo.sh deployed proof and requested upgrade success are stored."""
+        return deployment_confirmed_from_record(self.status, self.request, self.result)
 
 
 class ToolDescriptor(BaseModel):
@@ -706,6 +773,13 @@ class WorkflowReport(BaseModel):
     job_id: str
     steps: list[JobStep]
     summary: dict[str, Any]
+    deploy_confirmed: bool = Field(
+        default=False,
+        description=(
+            "Only true when the stored job result explicitly confirms Odoo.sh deployed the pushed SHA "
+            "and any requested module upgrade passed. Do not infer deploy success from status text."
+        ),
+    )
 
     @computed_field  # type: ignore[misc]
     @property

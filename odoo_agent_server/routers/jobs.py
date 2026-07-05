@@ -26,6 +26,12 @@ def get_job(
     wait_timeout_seconds: int = 20,
     poll_interval_seconds: float = 2.0,
 ) -> JobRecord:
+    """Return one job with the top-level deploy_confirmed safety gate.
+
+    Callers must treat deployment as complete only when
+    ``deploy_confirmed`` is true; finished/running/warning text alone is not a
+    deploy-success signal.
+    """
     store = JsonStore()
     if wait_for_result:
         return store.wait_job(job_id, wait_timeout_seconds, poll_interval_seconds)

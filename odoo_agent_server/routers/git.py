@@ -221,8 +221,21 @@ def _start_auto_odoosh_upgrade_job(project_path: str, module_name: str, expected
                 "sha": expected_sha,
                 "poll_elapsed_seconds": poll_elapsed,
                 "poll_attempts": poll_payload.get("attempts"),
+                "odoosh_check_commit": {
+                    "status": "passed",
+                    "deployed": True,
+                    "expected_sha": expected_sha,
+                    "payload": poll_payload,
+                    "command_result": poll_result.model_dump(mode="json"),
+                },
+                "module_upgrade": {
+                    "requested": True,
+                    "status": "passed" if upgrade_passed else "failed",
+                    "passed": bool(upgrade_passed),
+                    "result": upgrade_result.model_dump(mode="json"),
+                },
                 "deploy_check": poll_result.model_dump(mode="json"),
-                "module_upgrade": upgrade_result.model_dump(mode="json"),
+                "module_upgrade_command": upgrade_result.model_dump(mode="json"),
             }
             _finish(JobStatus.passed if upgrade_passed else JobStatus.failed, final_result)
             store.save_session_state({
