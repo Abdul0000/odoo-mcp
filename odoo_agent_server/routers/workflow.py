@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
@@ -640,6 +641,21 @@ def _pre_push_verify_files(project: Path, module_name: str, paths: list[str], st
     return collect(status_candidates())
 
 
+def _expected_user_file_hashes(project: Path, verify_files: list[str]) -> dict[str, str]:
+    """Return repo-relative SHA-256 hashes for changed files deployed to ~/src/user."""
+    expected: dict[str, str] = {}
+    root = project.resolve()
+    for raw_path in verify_files:
+        file_path = Path(raw_path).resolve()
+        if not file_path.is_file() or not (file_path == root or root in file_path.parents):
+            continue
+        rel = file_path.relative_to(root).as_posix()
+        if not rel or rel.startswith(".git/"):
+            continue
+        expected[rel] = hashlib.sha256(file_path.read_bytes()).hexdigest()
+    return expected
+
+
 def _poll_odoosh_deployed(odoosh: OdooShService, pushed_sha: str, timeout_seconds: int, interval_seconds: float) -> CommandResult:
     deadline = time.monotonic() + max(timeout_seconds, 0)
     attempts: list[dict[str, object]] = []
@@ -795,6 +811,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 )
             },
         )
+    expected_user_hashes = _expected_user_file_hashes(project_path, verify_files)
 
     identity_result = git.configure_identity(str(project_path))
     if identity_result.exit_code != 0:
@@ -822,11 +839,16 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     pushed_sha = sha_result.stdout.strip()
     _step("git_head_sha", "passed", sha_result)
 
+    push_started_epoch = int(time.time())
     push_result = git.push(str(project_path), payload.remote, branch, True, min(payload.timeout_seconds, 600))
     if push_result.exit_code != 0:
         _fail("git_push", push_result)
         return
     _step("git_push", "passed", push_result)
+    pushed_job = store.get_job(job_id)
+    pushed_job.request["push_started_epoch"] = push_started_epoch
+    pushed_job.request["expected_user_file_hashes"] = expected_user_hashes
+    store.update_job(pushed_job)
 
     if payload.wait_for_odoosh:
         check_result = _poll_odoosh_deployed(
@@ -859,6 +881,56 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 "safe_deploy_status": "deploy_failed_or_timeout",
             }, client_name=client.name if client else payload.client_name or None)
             return
+        failure_guard = getattr(odoosh, "recent_build_failure", None)
+        if callable(failure_guard):
+            failure_result = failure_guard(push_started_epoch)
+            failure_status = "failed" if failure_result.exit_code == 1 else "passed" if failure_result.exit_code == 0 else "warning"
+            _step("odoosh_build_failure_guard", failure_status, failure_result)
+            if failure_result.exit_code == 1:
+                job = store.get_job(job_id)
+                result = {
+                    "status": "deploy_failed",
+                    "message": "Odoo.sh reported failure evidence after this push. Module upgrade was not attempted.",
+                    "module_name": payload.module_name,
+                    "sha": pushed_sha,
+                    "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+                }
+                store.finish_job(job, JobStatus.failed, result)
+                store.save_session_state({
+                    "last_safe_deploy_job_id": job_id,
+                    "last_sha": pushed_sha,
+                    "module_name": payload.module_name,
+                    "project_path": str(project_path),
+                    "branch": branch,
+                    "client_name": client.name if client else payload.client_name,
+                    "safe_deploy_status": "deploy_failed",
+                }, client_name=client.name if client else payload.client_name or None)
+                return
+
+        if expected_user_hashes:
+            code_verify = odoosh.verify_user_file_hashes(expected_user_hashes)
+            _step("odoosh_user_file_verify", "passed" if code_verify.exit_code == 0 else "failed", code_verify)
+            if code_verify.exit_code != 0:
+                job = store.get_job(job_id)
+                result = {
+                    "status": "deploy_code_mismatch",
+                    "message": "Odoo.sh source checkout did not match the changed local/GitHub files. Module upgrade was not attempted.",
+                    "module_name": payload.module_name,
+                    "sha": pushed_sha,
+                    "verified_files": sorted(expected_user_hashes),
+                    "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+                }
+                store.finish_job(job, JobStatus.failed, result)
+                store.save_session_state({
+                    "last_safe_deploy_job_id": job_id,
+                    "last_sha": pushed_sha,
+                    "module_name": payload.module_name,
+                    "project_path": str(project_path),
+                    "branch": branch,
+                    "client_name": client.name if client else payload.client_name,
+                    "safe_deploy_status": "deploy_code_mismatch",
+                }, client_name=client.name if client else payload.client_name or None)
+                return
 
     manifest_result = odoosh.verify_module_manifest(payload.module_name)
     if manifest_result.exit_code != 0:

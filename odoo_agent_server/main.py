@@ -101,7 +101,7 @@ def agent_instructions() -> dict:
                     "6. Run git.diff and qa.self_run(run_pytest=false) unless tests/shared logic are touched.",
                     "7. workflow.verify_against_core only for changed files.",
                     "8. Call workflow.safe_deploy_module with module_name, commit_message, changed paths, run_qa=false if qa.self_run already passed, wait_for_odoosh=true, upgrade_module=true, wait_for_result=true, and exact verify_ui_paths when UI proof is needed.",
-                    "9. If safe_deploy returns status=running, call the returned next_call jobs.get. If Odoo.sh deploy polling times out or fails, do not upgrade; inspect Odoo.sh status/logs and resume only after fixing. If it returns deploy_running, call jobs.get on the nested job. Do not repeat commit/push.",
+                    "9. If safe_deploy returns status=running, call the returned next_call jobs.get. If Odoo.sh deploy polling times out, recent Odoo.sh logs show build/test failure, or changed /home/odoo/src/user file hashes do not match, do not upgrade or claim success; inspect Odoo.sh status/logs and resume only after fixing. If it returns deploy_running, call jobs.get on the nested job. Do not repeat commit/push.",
                     "10. If the client loses job_id mid-flow, call workflow.resume_job without job_id to use the latest saved safe-deploy job, or pass override_step=push/install/upgrade for an explicit user-requested continuation point.",
                     "11. Finish only after safe deploy/resume reports passed, or report the exact blocker and next_call returned by the workflow.",
                 ],

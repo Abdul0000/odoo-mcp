@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import time
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 from pydantic import ValidationError
@@ -85,7 +87,7 @@ from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_write_ma
 from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy, start_odoo_module_deploy_job
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
-from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index, _poll_odoosh_deployed
+from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index, _poll_odoosh_deployed, _pre_push_verify_files, _expected_user_file_hashes
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
@@ -200,7 +202,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.full_verify",
         title="Run full verification", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module",
-        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 5 minutes for the pushed SHA to deploy, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths. Defaults to wait_for_result=true; status=running is not success and must be followed via next_call/jobs.get.", requires_approval=True),
+        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 5 minutes for the pushed SHA, reject recent Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths. Defaults to wait_for_result=true; status=running is not success and must be followed via next_call/jobs.get.", requires_approval=True),
     ToolDescriptor(name="workflow.start_session",
         title="Start coding session", description="Bootstrap a coding session: capability check, repo.prepare, git status, module discovery, Odoo/Odoo.sh health", requires_approval=True),
     ToolDescriptor(name="workflow.registry_smoke_test",
@@ -311,10 +313,9 @@ _TOOL_DESCRIPTORS = [
         name="odoosh.check_commit",
         title="Check Odoo.sh deployment status",
         description=(
-            "NON-BLOCKING single check: returns immediately with deployed=true/false. "
-            "Use this in a polling loop after git.push: call once, read the 'deployed' field. "
-            "If false, wait 15 seconds then call again. Repeat max 20 times. "
-            "When deployed=true proceed to odoosh.module_update. Never use odoosh.wait_for_commit."
+            "NON-BLOCKING single source checkout check: returns immediately with deployed=true/false. "
+            "deployed=true only means ~/src/user has the SHA; safe_deploy_module also checks recent "
+            "Odoo.sh build/test failure evidence and changed /home/odoo/src/user file hashes before module upgrade. Never use odoosh.wait_for_commit."
         ),
         read_only=True,
     ),
@@ -393,7 +394,7 @@ _TOOL_DESCRIPTORS = [
             "last saved safe-deploy job from session state or the latest matching job. Instead of "
             "starting over from step 1, the agent continues from where it left off. Optionally "
             "override the start step with override_step (qa | commit | push | wait_odoosh | "
-            "install | upgrade | module_update | smoke_test)."
+            "verify_deployed_code | install | upgrade | module_update | smoke_test)."
         ),
         requires_approval=True,
     ),
@@ -963,6 +964,7 @@ _SAFE_DEPLOY_STEPS = [
     "git_head_sha",
     "git_push",
     "odoosh_check_commit",
+    "odoosh_user_file_verify",
     "odoosh_verify_module_manifest",
     "odoo_module_deploy",
     "odoo_module_status",
@@ -975,6 +977,8 @@ _SAFE_DEPLOY_STEP_ALIASES = {
     "push": "git_push",
     "wait_odoosh": "odoosh_check_commit",
     "odoosh": "odoosh_check_commit",
+    "verify_deployed_code": "odoosh_user_file_verify",
+    "verify_user_files": "odoosh_user_file_verify",
     "install": "odoo_module_deploy",
     "upgrade": "odoo_module_deploy",
     "module_install": "odoo_module_deploy",
@@ -1085,6 +1089,16 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
     remote = original_request.get("remote", "origin")
     branch = original_request.get("branch") or settings.target_git_branch
     pushed_sha = original_request.get("last_sha") or _extract_sha_from_steps(job)
+    expected_user_hashes = original_request.get("expected_user_file_hashes") or {}
+    if not expected_user_hashes:
+        try:
+            candidate_files = _pre_push_verify_files(Path(project_path), module_name, original_request.get("paths") or [], "")
+            expected_user_hashes = _expected_user_file_hashes(Path(project_path), candidate_files)
+            if expected_user_hashes:
+                job.request["expected_user_file_hashes"] = expected_user_hashes
+                store.update_job(job)
+        except Exception:
+            expected_user_hashes = {}
     git = GitService()
     odoosh = OdooShService()
     odoo = OdooRpcService()
@@ -1155,12 +1169,17 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                     return resume_results
 
             elif step_name == "git_push":
+                push_started_epoch = int(time.time())
                 result = git.push(project_path, remote, branch, timeout_seconds=60)
                 if result.exit_code == 0:
                     pushed_sha = _extract_sha_from_steps(job) or pushed_sha or git.head_sha(project_path).stdout.strip()
                     match = re.search(r"(?:^|\n)sha=([0-9a-fA-F]{7,40})(?:\n|$)", result.stdout or "")
                     if match:
                         pushed_sha = match.group(1)
+                    job.request["push_started_epoch"] = push_started_epoch
+                    if expected_user_hashes:
+                        job.request["expected_user_file_hashes"] = expected_user_hashes
+                    store.update_job(job)
                 resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "sha": pushed_sha, "result": _step_payload(result)}
                 if result.exit_code != 0:
                     resume_results["status"] = "failed"
@@ -1181,6 +1200,28 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                     resume_results["status"] = "deploy_failed_or_timeout"
                     resume_results["message"] = "Odoo.sh did not report the pushed commit as deployed within the polling window. Completed commit/push steps will not be replayed."
                     resume_results["next_call"] = {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}}
+                    return resume_results
+                failure_guard = getattr(odoosh, "recent_build_failure", None)
+                if callable(failure_guard):
+                    since_epoch = int(original_request.get("push_started_epoch") or 0)
+                    failure = failure_guard(since_epoch)
+                    resume_results["steps_run"]["odoosh_build_failure_guard"] = {"status": "failed" if failure.exit_code == 1 else "ok" if failure.exit_code == 0 else "warning", "result": _step_payload(failure)}
+                    if failure.exit_code == 1:
+                        resume_results["status"] = "deploy_failed"
+                        resume_results["message"] = "Odoo.sh reported failure evidence after the push. Module upgrade was not attempted."
+                        resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
+                        return resume_results
+
+            elif step_name == "odoosh_user_file_verify":
+                if not expected_user_hashes:
+                    resume_results["steps_run"][step_name] = {"status": "skipped", "message": "No changed user files were available for hash verification."}
+                    continue
+                result = odoosh.verify_user_file_hashes(expected_user_hashes)
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "verified_files": sorted(expected_user_hashes), "result": _step_payload(result)}
+                if result.exit_code != 0:
+                    resume_results["status"] = "deploy_code_mismatch"
+                    resume_results["message"] = "Odoo.sh source checkout did not match the changed local/GitHub files. Module upgrade was not attempted."
+                    resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
                     return resume_results
 
             elif step_name == "odoosh_verify_module_manifest":

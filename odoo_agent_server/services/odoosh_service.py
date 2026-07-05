@@ -214,8 +214,8 @@ class OdooShService:
             "deployed": deployed,
             "current_sha": current or "unknown",
             "expected_sha": expected_sha,
-            "message": "Deployed! Proceed to module update." if deployed
-                       else "Not yet deployed. Use adaptive_poll_interval: attempts 0-2→wait 5s, 3-7→wait 10s, 8+→wait 15s, then call again.",
+            "message": "Source checkout has the pushed SHA. Verify Odoo.sh build/test success before module update." if deployed
+                       else "Not yet in source checkout. Use adaptive_poll_interval: attempts 0-2→wait 5s, 3-7→wait 10s, 8+→wait 15s, then call again.",
         })
         return CommandResult(
             command=["odoosh.check_commit", expected_sha],
@@ -263,6 +263,65 @@ class OdooShService:
         )
         return self.run_shell(script, timeout_seconds=30)
 
+    def verify_user_file_hashes(self, expected_hashes: dict[str, str]) -> CommandResult:
+        """Verify changed user-addon files on Odoo.sh match the pushed checkout.
+
+        Odoo.sh can briefly show a matching git SHA while the build still fails
+        or while the live user source is not the code the agent just wrote. This
+        verifies the concrete changed files under /home/odoo/src/user before any
+        install/upgrade step runs.
+        """
+        if not expected_hashes:
+            return CommandResult(
+                command=["odoosh.verify_user_file_hashes"],
+                cwd="odoosh:ssh",
+                exit_code=0,
+                stdout=json.dumps({"verified": True, "count": 0, "message": "No changed user files to verify."}),
+            )
+
+        entries: list[tuple[str, str]] = []
+        for rel_path, expected_hash in expected_hashes.items():
+            rel = str(rel_path).replace("\\", "/").strip("/")
+            digest = str(expected_hash).strip().lower()
+            if (
+                not rel
+                or rel.startswith("../")
+                or "/../" in rel
+                or rel == ".git"
+                or rel.startswith(".git/")
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            ):
+                return CommandResult(
+                    command=["odoosh.verify_user_file_hashes"],
+                    cwd="odoosh:ssh",
+                    exit_code=2,
+                    stderr=f"Unsafe or invalid user file hash entry: {rel_path}",
+                )
+            entries.append((rel, digest))
+
+        user_addons = settings.odoosh_user_addons_path.rstrip("/")
+        script_lines = [
+            "set +e",
+            "failures=0",
+            "echo ODOOSH_USER_FILE_VERIFY_START",
+        ]
+        for rel, expected_hash in entries:
+            remote_path = f"{user_addons}/{rel}"
+            script_lines.extend([
+                f"rel={shlex.quote(rel)}",
+                f"file={shlex.quote(remote_path)}",
+                f"expected={shlex.quote(expected_hash)}",
+                'if [ ! -f "$file" ]; then echo "MISSING $rel"; failures=1; else '
+                "actual=$(sha256sum \"$file\" 2>/dev/null | awk '{print $1}'); "
+                'if [ "$actual" = "$expected" ]; then echo "OK $rel $actual"; '
+                'else echo "MISMATCH $rel expected=$expected actual=$actual"; failures=1; fi; fi',
+            ])
+        script_lines.extend([
+            'if [ "$failures" -eq 0 ]; then echo ODOOSH_USER_FILE_VERIFY_OK; else echo ODOOSH_USER_FILE_VERIFY_FAILED; fi',
+            "exit $failures",
+        ])
+        return self.run_shell("; ".join(script_lines), timeout_seconds=45)
+
     def tail_log(self, log_name: OdooShLogName, tail_lines: int = 200) -> CommandResult:
         safe_lines = max(20, min(tail_lines, 2000))
         filename = f"~/logs/{log_name.value}.log"
@@ -291,6 +350,56 @@ class OdooShService:
         blocks = self._extract_error_blocks(result.stdout)
         summary = "\n\n".join(blocks[-20:]) if blocks else "No recent traceback/error blocks found in tailed Odoo.sh logs."
         return result.model_copy(update={"stdout": summary[-20000:]})
+
+    def recent_build_failure(self, since_epoch: int, tail_lines: int = 800) -> CommandResult:
+        """Detect Odoo.sh build/runtime failures in logs modified after ``since_epoch``.
+
+        Odoo.sh can update ``~/src/user`` to a pushed SHA even when the build test
+        fails and the running environment stays on the last successful build.
+        This guard catches that case before module upgrade.
+        """
+        safe_lines = max(100, min(tail_lines, 2000))
+        safe_since = max(0, int(since_epoch))
+        script = (
+            "set +e; "
+            f"since={safe_since}; "
+            "for f in ~/logs/*.log; do "
+            "  [ -f \"$f\" ] || continue; "
+            "  m=$(stat -c %Y \"$f\" 2>/dev/null || stat -f %m \"$f\" 2>/dev/null || echo 0); "
+            "  [ \"$m\" -ge \"$since\" ] || continue; "
+            "  echo __ODOO_MCP_LOG_FILE__:$f; "
+            f"  tail -n {safe_lines} \"$f\"; "
+            "done; exit 0"
+        )
+        result = self.run_shell(script, timeout_seconds=45)
+        if result.exit_code != 0:
+            return result
+        text = result.stdout or ""
+        blocks = self._extract_error_blocks(text)
+        failure_trigger = re.compile(
+            r"(Test:\s*Failed|Build\s+failed|\bFAILED\b|Failed to load registry|"
+            r"Traceback \(most recent call last\)|ParseError|ValidationError|"
+            r"ModuleNotFoundError|ImportError|CRITICAL|ERROR)",
+            re.I,
+        )
+        if not blocks and failure_trigger.search(text):
+            blocks = ["Recent Odoo.sh log failure marker found:\n" + text[-8000:]]
+        payload = {
+            "failed": bool(blocks),
+            "since_epoch": safe_since,
+            "message": (
+                "Recent Odoo.sh failure evidence found. Do not upgrade this build."
+                if blocks
+                else "No recent Odoo.sh failure evidence found in modified logs."
+            ),
+            "failure_blocks": blocks[-10:],
+        }
+        return CommandResult(
+            command=["odoosh.recent_build_failure", str(safe_since)],
+            cwd="odoosh:ssh",
+            exit_code=1 if blocks else 0,
+            stdout=json.dumps(payload, ensure_ascii=False)[-20000:],
+        )
 
     def _extract_error_blocks(self, text: str) -> list[str]:
         lines = text.splitlines()
