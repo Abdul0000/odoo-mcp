@@ -206,7 +206,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.full_verify",
         title="Run full verification", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module",
-        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 5 minutes for the pushed SHA, reject recent Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths. Defaults to wait_for_result=true; status=running is not success and must be followed via next_call/jobs.get. Only treat the deployment as complete when response.deploy_confirmed == true. A finished job without this field set to true means the deploy did not fully complete — do not report success to the user.", requires_approval=True),
+        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 5 minutes for the pushed SHA, reject recent Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths. Defaults to wait_for_result=true; status=running is not success and must be followed via next_call/jobs.get.", requires_approval=True),
     ToolDescriptor(
         name="workflow.verify_deployed_module",
         title="Verify deployed source",
@@ -428,7 +428,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="jobs.list",
         title="List background jobs", description="List recent connector jobs", read_only=True),
     ToolDescriptor(name="jobs.get",
-        title="Check background job status", description="Read one connector job by id; waits server-side by default until done or timeout to avoid fragile client polling. Only treat the deployment as complete when response.deploy_confirmed == true. A finished job without this field set to true means the deploy did not fully complete — do not report success to the user.", read_only=True),
+        title="Check background job status", description="Read one connector job by id; waits server-side by default until done or timeout to avoid fragile client polling", read_only=True),
     ToolDescriptor(name="audit.list",
         title="View audit log", description="List recent audit events", read_only=True),
     # Fix 3: Resume failed pipeline from last successful step

@@ -573,7 +573,6 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             status=report_status,
             job_id=job.id,
             steps=job.steps,
-            deploy_confirmed=job.deploy_confirmed,
             summary={
                 **block_payload,
                 **result,
@@ -648,7 +647,6 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                     error=str(exc),
                 )
             ],
-                deploy_confirmed=False,
             summary={
                 "message": "Safe deploy could not start. No commit or push was attempted.",
                 "error": str(exc),
@@ -665,7 +663,6 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                 status=final_status,
                 job_id=job.id,
                 steps=waited.steps,
-                deploy_confirmed=waited.deploy_confirmed,
                 summary={
                     **result,
                     "job_id": job.id,
@@ -678,7 +675,6 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
         status="running",
         job_id=job.id,
         steps=[],
-        deploy_confirmed=False,
         summary={
             "status": "running",
             "message": "Safe deploy is still running. Do not tell the user it is complete yet; call jobs.get with this job_id until status is passed, failed, or warning with next_call.",
@@ -1076,12 +1072,6 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     odoosh = OdooShService()
     approval = ApprovalService()
     pushed_sha: str | None = None
-    odoosh_deploy_confirmation: dict[str, object] | None = None
-    module_upgrade_confirmation: dict[str, object] = {
-        "requested": bool(payload.upgrade_module),
-        "status": "pending" if payload.upgrade_module else "skipped",
-        "passed": None if payload.upgrade_module else True,
-    }
     rollback_attempted = False
 
     def _step(name: str, status_: str, result=None, error: str | None = None) -> None:
@@ -1349,19 +1339,6 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 "safe_deploy_status": "deploy_failed_or_timeout",
             }, client_name=client.name if client else payload.client_name or None)
             return
-        check_payload: dict[str, object]
-        try:
-            raw_payload = json.loads(check_result.stdout or "{}")
-            check_payload = raw_payload if isinstance(raw_payload, dict) else {}
-        except Exception:
-            check_payload = {}
-        odoosh_deploy_confirmation = {
-            "status": "passed",
-            "deployed": True,
-            "expected_sha": pushed_sha,
-            "payload": check_payload,
-            "command_result": check_result.model_dump(mode="json"),
-        }
         failure_guard = getattr(odoosh, "recent_build_failure", None)
         if callable(failure_guard):
             failure_result = failure_guard(push_started_epoch)
@@ -1451,12 +1428,6 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         if deploy_result.status != "ok":
             _fail("odoo_module_deploy", deploy_result)
             return
-        module_upgrade_confirmation = {
-            "requested": True,
-            "status": "passed",
-            "passed": True,
-            "result": deploy_payload,
-        }
 
     module_status = OdooRpcService().module_status(payload.module_name)
     status_ = "passed" if module_status.status == "ok" else "warning"
@@ -1517,16 +1488,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             _step("browser_ui_verify", "passed", {"paths": payload.verify_ui_paths, "results": ui_results})
 
     fresh_job = store.get_job(job_id)
-    final_result = {
-        "status": "passed",
-        "module_name": payload.module_name,
-        "sha": pushed_sha,
-        "verify_ui_paths": payload.verify_ui_paths,
-        "expected_registry_fields": expected_registry_fields,
-        "odoosh_check_commit": odoosh_deploy_confirmation,
-        "module_upgrade": module_upgrade_confirmation,
-    }
-    store.finish_job(fresh_job, JobStatus.passed, final_result)
+    store.finish_job(fresh_job, JobStatus.passed, {"module_name": payload.module_name, "sha": pushed_sha, "verify_ui_paths": payload.verify_ui_paths, "expected_registry_fields": expected_registry_fields})
     approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module succeeded")
     # Fix 7: persist milestone so resume_job and future sessions know where we are
     store.save_session_state({
