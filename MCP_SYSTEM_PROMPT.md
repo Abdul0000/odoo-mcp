@@ -226,13 +226,13 @@ If `push_blocked=False`: proceed to commit + push.
 
 **Step 12:** `odoo.ensure_dependencies` — auto-install any missing deps
 
-**Step 13:** For normal code changes call `workflow.safe_deploy_module` with module name, commit message, changed paths, `wait_for_odoosh=true`, `upgrade_module=true`, and `wait_for_result=true`. It owns commit, push, Odoo.sh SHA polling every 10 seconds up to 5 minutes, recent Odoo.sh failure-log guard, changed-file hash verification under `/home/odoo/src/user`, module deploy, status, and smoke test. If it returns `status=running`, that is not success: call the returned `next_call` / `jobs.get`.
+**Step 13:** For normal code changes call `workflow.safe_deploy_module` with module name, commit message, changed paths, `wait_for_odoosh=true`, `upgrade_module=true`, and `wait_for_result=true`. It owns path-audited commit, push, remote SHA proof, Odoo.sh SHA polling every 10 seconds up to 5 minutes, recent Odoo.sh failure-log guard, changed-file hash verification under `/home/odoo/src/user`, module deploy, status, and smoke test. If it returns `status=running`, that is not success: call the returned `next_call` / `jobs.get`.
 
 Manual fallback only:
 - `git.commit` — paths: list changed files; message: clear description
 - `git.push` — note the `sha` value from the response
 
-**Step 15:** Prefer `workflow.safe_deploy_module` for the normal commit/push/deploy cycle. It waits server-side by default and polls Odoo.sh every 10 seconds for up to 5 minutes. A matching source SHA alone is not enough: if recent Odoo.sh logs show build/test failure, or if changed `/home/odoo/src/user` file hashes do not match the pushed/local files, do not claim success and do not upgrade; inspect Odoo.sh status/logs and resume only after fixing.
+**Step 15:** Prefer `workflow.safe_deploy_module` for the normal commit/push/deploy cycle. It waits server-side by default and polls Odoo.sh every 10 seconds for up to 5 minutes. A local edit or matching source SHA alone is not enough: explicit changed paths must be changed inside the same `project_path`, the HEAD commit must contain those files, and the remote branch tip must equal the pushed SHA; if recent Odoo.sh logs show build/test failure, or if changed `/home/odoo/src/user` file hashes do not match the pushed/local files, do not claim success and do not upgrade; inspect Odoo.sh status/logs and resume only after fixing.
 
 If the client lost the job id, call `workflow.resume_job` without `job_id`; add `client_name`, `project_path`, or `module_name` if available. For explicit mid-flow user requests, use `override_step=push`, `override_step=install`, or `override_step=upgrade`.
 

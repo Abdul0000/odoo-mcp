@@ -647,6 +647,175 @@ def _pre_push_verify_files(project: Path, module_name: str, paths: list[str], st
     return collect(status_candidates())
 
 
+
+
+def _git_status_changed_paths(status_output: str) -> set[str]:
+    """Extract repo-relative changed paths from `git status --short` output."""
+    paths: set[str] = set()
+    for raw_line in (status_output or "").splitlines():
+        line = raw_line.rstrip()
+        if not line or line.startswith("##"):
+            continue
+        path_part = line[3:].strip() if len(line) > 3 else line.strip()
+        if " -> " in path_part:
+            path_part = path_part.rsplit(" -> ", 1)[-1].strip()
+        path_part = path_part.replace("\\", "/")
+        if path_part and not path_part.startswith(".git/"):
+            paths.add(path_part)
+    return paths
+
+
+def _normalise_safe_deploy_paths(project: Path, module_name: str, paths: list[str]) -> tuple[list[str], str | None]:
+    """Normalise explicit safe-deploy paths and reject absolute/outside-module paths.
+
+    The grok failure showed a dangerous pattern: files can be edited in one
+    checkout while safe_deploy is invoked against another checkout.  Explicit
+    deploy paths are now treated as a contract: they must be relative paths
+    inside the selected module under *project_path*.
+    """
+    module_prefix = f"{module_name}/"
+    normalised: list[str] = []
+    for raw in paths or []:
+        rel = str(raw or "").replace("\\", "/").strip()
+        if not rel:
+            continue
+        candidate = Path(rel)
+        if candidate.is_absolute() or rel.startswith("~") or "\x00" in rel:
+            return [], f"PATH_MISMATCH: safe_deploy paths must be repo-relative, got {raw!r}."
+        resolved = (project / candidate).resolve()
+        if not (resolved == project or project in resolved.parents):
+            return [], f"PATH_MISMATCH: safe_deploy path escapes project_path: {raw!r}."
+        rel_posix = resolved.relative_to(project).as_posix()
+        if rel_posix == "." or rel_posix.startswith(".git/"):
+            return [], f"PATH_MISMATCH: refusing unsafe deploy path: {raw!r}."
+        if not (rel_posix == module_name or rel_posix.startswith(module_prefix)):
+            return [], (
+                "PATH_MISMATCH: safe_deploy can only commit/deploy files inside the target module. "
+                f"path={rel_posix!r}, module={module_name!r}, project_path={project}"
+            )
+        normalised.append(rel_posix)
+    return normalised, None
+
+
+def _path_covers_changed(path: str, changed_path: str) -> bool:
+    path = path.rstrip("/")
+    changed_path = changed_path.rstrip("/")
+    return changed_path == path or changed_path.startswith(path + "/")
+
+
+def _safe_deploy_path_guard(project: Path, module_name: str, paths: list[str], status_output: str) -> CommandResult:
+    """Hard gate: prove edited files belong to the same repo safe_deploy will push."""
+    normalised, error = _normalise_safe_deploy_paths(project, module_name, paths)
+    if error:
+        return CommandResult(command=["workflow.safe_deploy_path_guard"], cwd=str(project), exit_code=2, stderr=error)
+
+    changed_paths = _git_status_changed_paths(status_output)
+    module_changed = sorted(
+        path for path in changed_paths
+        if path == module_name or path.startswith(f"{module_name}/")
+    )
+
+    if normalised:
+        unmatched = [path for path in normalised if not any(_path_covers_changed(path, changed) for changed in changed_paths)]
+        if unmatched:
+            return CommandResult(
+                command=["workflow.safe_deploy_path_guard"],
+                cwd=str(project),
+                exit_code=2,
+                stderr=(
+                    "PATH_MISMATCH: explicit safe_deploy paths are not changed in this project_path. "
+                    "This usually means the agent edited a different checkout than the one it is deploying. "
+                    f"project_path={project}; unmatched_paths={unmatched}; git_status_paths={sorted(changed_paths)}"
+                ),
+            )
+
+    if not module_changed and normalised:
+        return CommandResult(
+            command=["workflow.safe_deploy_path_guard"],
+            cwd=str(project),
+            exit_code=2,
+            stderr=(
+                "NO_MODULE_CHANGES: explicit safe_deploy paths were provided, but no changed files for the target module "
+                "were found in this project_path. Refusing commit/push/module update to prevent false success from a different checkout."
+            ),
+        )
+
+    if not module_changed:
+        return CommandResult(
+            command=["workflow.safe_deploy_path_guard"],
+            cwd=str(project),
+            exit_code=0,
+            stdout=json.dumps({
+                "project_path": str(project),
+                "module_name": module_name,
+                "explicit_paths": normalised,
+                "changed_module_paths": module_changed,
+                "warning": "No explicit paths and no module changes found at path-guard stage; git.commit remains the final no-change gate.",
+            }),
+        )
+
+    return CommandResult(
+        command=["workflow.safe_deploy_path_guard"],
+        cwd=str(project),
+        exit_code=0,
+        stdout=json.dumps({
+            "project_path": str(project),
+            "module_name": module_name,
+            "explicit_paths": normalised,
+            "changed_module_paths": module_changed,
+            "message": "Safe deploy path guard passed: changed files are in the same project_path that will be committed and pushed.",
+        }),
+    )
+
+
+def _head_commit_contains_expected_files(project: Path, verify_files: list[str], head_changed_output: str) -> CommandResult:
+    expected: set[str] = set()
+    for raw in verify_files:
+        file_path = Path(raw).resolve()
+        if file_path.is_file() and (file_path == project or project in file_path.parents):
+            expected.add(file_path.relative_to(project).as_posix())
+    actual = {line.strip().replace("\\", "/") for line in (head_changed_output or "").splitlines() if line.strip()}
+    missing = sorted(expected - actual)
+    if missing:
+        return CommandResult(
+            command=["workflow.head_commit_contains_expected_files"],
+            cwd=str(project),
+            exit_code=2,
+            stdout=json.dumps({"expected": sorted(expected), "actual": sorted(actual)}),
+            stderr=(
+                "COMMIT_CONTENT_MISMATCH: the new HEAD commit does not contain the files safe_deploy is about to verify/deploy. "
+                f"missing={missing}"
+            ),
+        )
+    return CommandResult(
+        command=["workflow.head_commit_contains_expected_files"],
+        cwd=str(project),
+        exit_code=0,
+        stdout=json.dumps({"expected": sorted(expected), "actual": sorted(actual), "message": "HEAD commit contains expected module files."}),
+    )
+
+
+def _remote_head_matches_pushed_sha(project: Path, pushed_sha: str, remote_sha_output: str) -> CommandResult:
+    remote_sha = (remote_sha_output or "").strip().splitlines()[0] if (remote_sha_output or "").strip() else ""
+    ok = bool(remote_sha) and (remote_sha.startswith(pushed_sha) or pushed_sha.startswith(remote_sha))
+    if not ok:
+        return CommandResult(
+            command=["workflow.remote_head_matches_pushed_sha", pushed_sha],
+            cwd=str(project),
+            exit_code=2,
+            stdout=json.dumps({"pushed_sha": pushed_sha, "remote_sha": remote_sha}),
+            stderr=(
+                "REMOTE_PUSH_NOT_PROVEN: git push returned success, but the remote branch tip does not match the local HEAD SHA. "
+                "Odoo.sh may not receive/build the intended code, so module update is blocked."
+            ),
+        )
+    return CommandResult(
+        command=["workflow.remote_head_matches_pushed_sha", pushed_sha],
+        cwd=str(project),
+        exit_code=0,
+        stdout=json.dumps({"pushed_sha": pushed_sha, "remote_sha": remote_sha, "message": "Remote branch tip matches pushed SHA."}),
+    )
+
 def _expected_user_file_hashes(project: Path, verify_files: list[str]) -> dict[str, str]:
     """Return repo-relative SHA-256 hashes for changed files deployed to ~/src/user."""
     expected: dict[str, str] = {}
@@ -979,6 +1148,32 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         return
     _step("git_status", "passed", status_result)
 
+    git_root = getattr(git, "root", None)
+    if callable(git_root):
+        root_result = git_root(str(project_path))
+        _step("git_root_verify", "passed" if root_result.exit_code == 0 else "failed", root_result)
+        if root_result.exit_code != 0:
+            _fail("git_root_verify", root_result)
+            return
+        root_path = Path((root_result.stdout or "").strip()).expanduser().resolve()
+        if root_path != project_path.resolve():
+            _fail(
+                "git_root_verify",
+                CommandResult(
+                    command=["git", "rev-parse", "--show-toplevel"],
+                    cwd=str(project_path),
+                    exit_code=2,
+                    stderr=f"PATH_MISMATCH: project_path must be the Git top-level checkout. project_path={project_path}; git_root={root_path}",
+                ),
+            )
+            return
+
+    path_guard = _safe_deploy_path_guard(project_path, payload.module_name, payload.paths, status_result.stdout)
+    _step("safe_deploy_path_guard", "passed" if path_guard.exit_code == 0 else "failed", path_guard)
+    if path_guard.exit_code != 0:
+        _fail("safe_deploy_path_guard", path_guard)
+        return
+
     diff_result = git.diff(str(project_path), staged=False, timeout_seconds=30)
     if diff_result.exit_code != 0:
         _fail("git_diff", diff_result)
@@ -1049,12 +1244,39 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     pushed_sha = sha_result.stdout.strip()
     _step("git_head_sha", "passed", sha_result)
 
+    head_changed = getattr(git, "head_changed_files", None)
+    if callable(head_changed) and verify_files:
+        head_changed_result = head_changed(str(project_path))
+        _step("git_head_changed_files", "passed" if head_changed_result.exit_code == 0 else "failed", head_changed_result)
+        if head_changed_result.exit_code != 0:
+            _fail("git_head_changed_files", head_changed_result)
+            return
+        commit_content = _head_commit_contains_expected_files(project_path, verify_files, head_changed_result.stdout)
+        _step("git_commit_content_guard", "passed" if commit_content.exit_code == 0 else "failed", commit_content)
+        if commit_content.exit_code != 0:
+            _fail("git_commit_content_guard", commit_content)
+            return
+
     push_started_epoch = int(time.time())
     push_result = git.push(str(project_path), payload.remote, branch, True, min(payload.timeout_seconds, 600))
     if push_result.exit_code != 0:
         _fail("git_push", push_result)
         return
     _step("git_push", "passed", push_result)
+
+    remote_head = getattr(git, "remote_head_sha", None)
+    if callable(remote_head):
+        remote_head_result = remote_head(str(project_path), payload.remote, branch, min(payload.timeout_seconds, 60))
+        _step("git_remote_head_verify", "passed" if remote_head_result.exit_code == 0 else "failed", remote_head_result)
+        if remote_head_result.exit_code != 0:
+            _fail("git_remote_head_verify", remote_head_result)
+            return
+        remote_guard = _remote_head_matches_pushed_sha(project_path, pushed_sha, remote_head_result.stdout)
+        _step("git_remote_sha_guard", "passed" if remote_guard.exit_code == 0 else "failed", remote_guard)
+        if remote_guard.exit_code != 0:
+            _fail("git_remote_sha_guard", remote_guard)
+            return
+
     pushed_job = store.get_job(job_id)
     pushed_job.request["push_started_epoch"] = push_started_epoch
     pushed_job.request["expected_user_file_hashes"] = expected_user_hashes

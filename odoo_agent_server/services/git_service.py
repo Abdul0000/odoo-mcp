@@ -50,6 +50,33 @@ class GitService:
     def head_changed_files(self, project_path: str, timeout_seconds: int = 20) -> CommandResult:
         return self._run(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"], self._project(project_path), timeout_seconds)
 
+    def root(self, project_path: str, timeout_seconds: int = 20) -> CommandResult:
+        """Return Git's canonical top-level directory for project_path."""
+        return self._run(["git", "rev-parse", "--show-toplevel"], self._project(project_path), timeout_seconds)
+
+    def remote_head_sha(self, project_path: str, remote: str = "origin", branch: str | None = None, timeout_seconds: int = 30) -> CommandResult:
+        """Return the remote branch tip SHA after a push.
+
+        Safe deploy uses this as a hard proof that GitHub/remote actually
+        received the commit that will trigger Odoo.sh.
+        """
+        project = self._project(project_path)
+        if not branch:
+            branch_result = self.current_branch(str(project))
+            if branch_result.exit_code != 0:
+                return branch_result
+            branch = branch_result.stdout.strip()
+        if not branch or branch == "HEAD":
+            return CommandResult(command=["git", "ls-remote", remote, "<branch>"], cwd=str(project), exit_code=2, stderr="Cannot verify remote HEAD without an explicit branch.")
+        result = self._run(["git", "ls-remote", "--heads", remote, branch], project, timeout_seconds)
+        if result.exit_code != 0:
+            return result
+        line = (result.stdout or "").strip().splitlines()[0] if (result.stdout or "").strip() else ""
+        sha = line.split()[0] if line else ""
+        if not sha:
+            return result.model_copy(update={"exit_code": 1, "stderr": f"Remote branch not found or has no SHA: {remote}/{branch}"})
+        return result.model_copy(update={"stdout": sha + "\n"})
+
     def diff(self, project_path: str, staged: bool = False, timeout_seconds: int = 30) -> CommandResult:
         command = ["git", "diff", "--cached"] if staged else ["git", "diff"]
         return self._run(command, self._project(project_path), timeout_seconds)

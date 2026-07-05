@@ -1063,3 +1063,205 @@ def test_safe_deploy_fails_when_inferred_field_missing_after_upgrade(tmp_path, m
     assert finished.status == JobStatus.failed
     assert finished.result["status"] == "registry_field_missing"
     assert any(step.name == "registry_field_verify" and step.status == "failed" for step in finished.steps)
+
+
+def test_safe_deploy_blocks_explicit_paths_not_changed_in_project_path(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "workspace_repo"
+    (project / "x_module" / "models").mkdir(parents=True)
+    (project / "x_module" / "models" / "a.py").write_text("from odoo import models\n", encoding="utf-8")
+    calls = {"commit": 0, "push": 0}
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running))
+
+    class FakeGit:
+        def status(self, project_path):
+            # This simulates the screenshot failure: safe_deploy is invoked on
+            # one checkout, but the files were edited somewhere else, so this
+            # checkout has no change for the explicit paths.
+            return CommandResult(command=["git", "status"], cwd=project_path, exit_code=0, stdout="")
+
+        def diff(self, project_path, staged=False, timeout_seconds=30):
+            return CommandResult(command=["git", "diff"], cwd=project_path, exit_code=0, stdout="")
+
+        def configure_identity(self, project_path):
+            return CommandResult(command=["git", "config"], cwd=project_path, exit_code=0)
+
+        def validate_target(self, project_path, branch=None, remote="origin"):
+            return CommandResult(command=["git", "validate-target"], cwd=project_path, exit_code=0)
+
+        def commit(self, project_path, message, paths, timeout_seconds=60):
+            calls["commit"] += 1
+            return CommandResult(command=["git", "commit"], cwd=project_path, exit_code=0)
+
+        def push(self, project_path, remote="origin", branch=None, set_upstream=True, timeout_seconds=120):
+            calls["push"] += 1
+            return CommandResult(command=["git", "push"], cwd=project_path, exit_code=0)
+
+    monkeypatch.setattr(workflow, "GitService", lambda: FakeGit())
+
+    workflow._run_safe_deploy(
+        SafeDeployModuleRequest(
+            project_path=str(project),
+            module_name="x_module",
+            commit_message="Deploy x_module",
+            paths=["x_module/models/a.py"],
+            run_qa=False,
+            wait_for_odoosh=True,
+            upgrade_module=True,
+        ),
+        job.id,
+    )
+
+    finished = store.get_job(job.id)
+    assert finished.status == JobStatus.failed
+    assert calls == {"commit": 0, "push": 0}
+    assert any(step.name == "safe_deploy_path_guard" and step.status == "failed" for step in finished.steps)
+    assert "PATH_MISMATCH" in finished.steps[-1].result["stderr"]
+
+
+def test_safe_deploy_blocks_when_head_commit_does_not_contain_expected_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    changed = project / "x_module" / "models" / "a.py"
+    changed.parent.mkdir(parents=True)
+    changed.write_text("from odoo import fields, models\n", encoding="utf-8")
+    calls = {"push": 0}
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running))
+
+    class FakeGit:
+        def status(self, project_path):
+            return CommandResult(command=["git", "status"], cwd=project_path, exit_code=0, stdout=" M x_module/models/a.py\n")
+
+        def diff(self, project_path, staged=False, timeout_seconds=30):
+            return CommandResult(command=["git", "diff"], cwd=project_path, exit_code=0, stdout="")
+
+        def configure_identity(self, project_path):
+            return CommandResult(command=["git", "config"], cwd=project_path, exit_code=0)
+
+        def validate_target(self, project_path, branch=None, remote="origin"):
+            return CommandResult(command=["git", "validate-target"], cwd=project_path, exit_code=0)
+
+        def commit(self, project_path, message, paths, timeout_seconds=60):
+            return CommandResult(command=["git", "commit"], cwd=project_path, exit_code=0)
+
+        def head_sha(self, project_path):
+            return CommandResult(command=["git", "rev-parse", "HEAD"], cwd=project_path, exit_code=0, stdout="abc1234\n")
+
+        def head_changed_files(self, project_path):
+            return CommandResult(command=["git", "diff-tree"], cwd=project_path, exit_code=0, stdout="README.md\n")
+
+        def push(self, project_path, remote="origin", branch=None, set_upstream=True, timeout_seconds=120):
+            calls["push"] += 1
+            return CommandResult(command=["git", "push"], cwd=project_path, exit_code=0)
+
+    class FakeSyntaxVerifier:
+        def verify(self, req):
+            class Result:
+                push_blocked = False
+
+                def model_dump(self, mode="json"):
+                    return {"push_blocked": False}
+
+            return Result()
+
+    monkeypatch.setattr(workflow, "GitService", lambda: FakeGit())
+    monkeypatch.setattr(workflow, "SyntaxVerifierService", lambda: FakeSyntaxVerifier())
+
+    workflow._run_safe_deploy(
+        SafeDeployModuleRequest(
+            project_path=str(project),
+            module_name="x_module",
+            commit_message="Deploy x_module",
+            paths=["x_module/models/a.py"],
+            run_qa=False,
+            wait_for_odoosh=True,
+            upgrade_module=True,
+        ),
+        job.id,
+    )
+
+    finished = store.get_job(job.id)
+    assert finished.status == JobStatus.failed
+    assert calls == {"push": 0}
+    assert any(step.name == "git_commit_content_guard" and step.status == "failed" for step in finished.steps)
+
+
+def test_safe_deploy_blocks_when_remote_head_does_not_match_pushed_sha(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    changed = project / "x_module" / "models" / "a.py"
+    changed.parent.mkdir(parents=True)
+    changed.write_text("from odoo import fields, models\n", encoding="utf-8")
+    calls = {"odoosh_check": 0}
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running))
+
+    class FakeGit:
+        def status(self, project_path):
+            return CommandResult(command=["git", "status"], cwd=project_path, exit_code=0, stdout=" M x_module/models/a.py\n")
+
+        def diff(self, project_path, staged=False, timeout_seconds=30):
+            return CommandResult(command=["git", "diff"], cwd=project_path, exit_code=0, stdout="")
+
+        def configure_identity(self, project_path):
+            return CommandResult(command=["git", "config"], cwd=project_path, exit_code=0)
+
+        def validate_target(self, project_path, branch=None, remote="origin"):
+            return CommandResult(command=["git", "validate-target"], cwd=project_path, exit_code=0)
+
+        def commit(self, project_path, message, paths, timeout_seconds=60):
+            return CommandResult(command=["git", "commit"], cwd=project_path, exit_code=0)
+
+        def head_sha(self, project_path):
+            return CommandResult(command=["git", "rev-parse", "HEAD"], cwd=project_path, exit_code=0, stdout="abc1234\n")
+
+        def head_changed_files(self, project_path):
+            return CommandResult(command=["git", "diff-tree"], cwd=project_path, exit_code=0, stdout="x_module/models/a.py\n")
+
+        def push(self, project_path, remote="origin", branch=None, set_upstream=True, timeout_seconds=120):
+            return CommandResult(command=["git", "push"], cwd=project_path, exit_code=0, stdout="PUSH_OK\nsha=abc1234\n")
+
+        def remote_head_sha(self, project_path, remote="origin", branch=None, timeout_seconds=30):
+            return CommandResult(command=["git", "ls-remote"], cwd=project_path, exit_code=0, stdout="deadbeef\n")
+
+    class FakeSyntaxVerifier:
+        def verify(self, req):
+            class Result:
+                push_blocked = False
+
+                def model_dump(self, mode="json"):
+                    return {"push_blocked": False}
+
+            return Result()
+
+    class FakeOdooSh:
+        def check_commit_deployed(self, sha):
+            calls["odoosh_check"] += 1
+            return CommandResult(command=["odoosh", "check"], cwd="odoosh:ssh", exit_code=0, stdout='{"deployed": true}')
+
+    monkeypatch.setattr(workflow, "GitService", lambda: FakeGit())
+    monkeypatch.setattr(workflow, "SyntaxVerifierService", lambda: FakeSyntaxVerifier())
+    monkeypatch.setattr(workflow, "OdooShService", lambda: FakeOdooSh())
+
+    workflow._run_safe_deploy(
+        SafeDeployModuleRequest(
+            project_path=str(project),
+            module_name="x_module",
+            commit_message="Deploy x_module",
+            paths=["x_module/models/a.py"],
+            run_qa=False,
+            wait_for_odoosh=True,
+            upgrade_module=True,
+        ),
+        job.id,
+    )
+
+    finished = store.get_job(job.id)
+    assert finished.status == JobStatus.failed
+    assert calls == {"odoosh_check": 0}
+    assert any(step.name == "git_remote_sha_guard" and step.status == "failed" for step in finished.steps)
