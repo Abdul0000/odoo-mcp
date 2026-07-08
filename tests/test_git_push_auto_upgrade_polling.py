@@ -125,7 +125,7 @@ def _run_module_push(project, monkeypatch, fake_odoosh_cls):
 def test_post_push_auto_upgrade_polls_until_pushed_commit_is_deployed_then_upgrades(project, monkeypatch):
     result, job, fake_clock = _run_module_push(project, monkeypatch, _DeploysOnThirdPoll)
 
-    assert result.exit_code == 0
+    assert result.exit_code == 2
     assert "Detected module x_module in this push" in result.stdout
     assert job.job_type == "post_push_auto_upgrade"
     assert job.status == JobStatus.passed
@@ -145,7 +145,7 @@ def test_post_push_auto_upgrade_polls_until_pushed_commit_is_deployed_then_upgra
 def test_post_push_auto_upgrade_times_out_without_running_module_upgrade(project, monkeypatch):
     result, job, fake_clock = _run_module_push(project, monkeypatch, _NeverDeploys)
 
-    assert result.exit_code == 0
+    assert result.exit_code == 2
     assert job.job_type == "post_push_auto_upgrade"
     assert job.status == JobStatus.failed
     assert job.result["status"] == "deploy_failed_or_timeout"

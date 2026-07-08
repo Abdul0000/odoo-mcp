@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -10,8 +13,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..config import settings
-from ..schemas import CommandResult, FileContent, OdooShLogName
+from ..config import get_odoo_clients, settings
+from .client_resolver_service import ClientResolverService, ResolvedClient
+from ..schemas import CommandResult, FileContent, OdooResult, OdooShLogName
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +110,9 @@ class SshTarget:
 
 
 class OdooShService:
+    def __init__(self, client: ResolvedClient | None = None) -> None:
+        self.client = client
+
     FAILURE_PATTERNS = [
         "not installable",
         "inconsistent states",
@@ -118,15 +125,66 @@ class OdooShService:
         "Failed to load registry",
     ]
 
+    def _active_client(self) -> ResolvedClient | None:
+        if self.client:
+            return self.client
+        try:
+            return ClientResolverService().resolve_client(require_complete=False)
+        except Exception:
+            return None
+
+    def _allow_legacy_global_settings(self) -> bool:
+        return self.client is None and len(get_odoo_clients()) <= 1
+
     def _target(self) -> SshTarget:
-        if not settings.odoosh_ssh_host:
-            raise ValueError("ODOOSH_SSH_HOST is not configured")
+        client = self._active_client()
+        if client is None and not self._allow_legacy_global_settings():
+            raise ValueError("client_name is required when multiple ODOO_CLIENTS entries are configured")
+        legacy = self._allow_legacy_global_settings()
+        host = (client.odoosh_ssh_host if client else None) or ((os.environ.get("ODOOSH_SSH_HOST") or settings.odoosh_ssh_host) if legacy else None)
+        if not host:
+            raise ValueError("ODOOSH_SSH_HOST is not configured; add odoosh_ssh_host to the selected ODOO_CLIENTS entry or set global ODOOSH_SSH_HOST for single-client mode")
+        user = (client.odoosh_ssh_user if client else None) or ((os.environ.get("ODOOSH_SSH_USER") or settings.odoosh_ssh_user) if legacy else None) or "odoo"
+        port = (client.odoosh_ssh_port if client else None) or int(((os.environ.get("ODOOSH_SSH_PORT") or settings.odoosh_ssh_port) if legacy else None) or 22)
+        key_path = self._effective_ssh_key_path(client)
         return SshTarget(
-            host=settings.odoosh_ssh_host,
-            user=settings.odoosh_ssh_user or "odoo",
-            port=settings.odoosh_ssh_port,
-            key_path=settings.effective_odoosh_ssh_key_path,
+            host=host,
+            user=user,
+            port=int(port),
+            key_path=key_path,
         )
+
+    def _effective_ssh_key_path(self, client: ResolvedClient | None) -> Path | None:
+        explicit = (client.odoosh_ssh_key_path if client else None) or ((os.environ.get("ODOOSH_SSH_KEY_PATH") or settings.odoosh_ssh_key_path) if self._allow_legacy_global_settings() else None)
+        if explicit:
+            return Path(explicit).expanduser().resolve()
+        key_b64 = (client.odoosh_ssh_private_key_b64 if client else None) or ((os.environ.get("ODOOSH_SSH_PRIVATE_KEY_B64") or settings.odoosh_ssh_private_key_b64) if self._allow_legacy_global_settings() else None)
+        if not key_b64:
+            return None
+        key_dir = settings.state_path / "keys"
+        key_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(key_b64.encode("ascii")).hexdigest()[:16]
+        key_path = key_dir / f"odoosh_key_{digest}"
+        if not key_path.exists():
+            raw = base64.b64decode(key_b64.encode("ascii"))
+            key_path.write_bytes(raw)
+            try:
+                os.chmod(key_path, 0o600)
+            except OSError:
+                pass
+        return key_path
+
+    def _db_name(self) -> str | None:
+        client = self._active_client()
+        return (client.odoosh_db_name if client else None) or (client.odoo_db if client else None) or ((os.environ.get("ODOOSH_DB_NAME") or settings.odoosh_db_name) if self._allow_legacy_global_settings() else None)
+
+    def _odoo_path(self) -> str:
+        client = self._active_client()
+        return (client.odoosh_odoo_path if client else None) or ((os.environ.get("ODOOSH_ODOO_PATH") or settings.odoosh_odoo_path) if self._allow_legacy_global_settings() else settings.odoosh_odoo_path)
+
+    def _user_addons_path(self) -> str:
+        client = self._active_client()
+        return (client.odoosh_user_addons_path if client else None) or ((os.environ.get("ODOOSH_USER_ADDONS_PATH") or settings.odoosh_user_addons_path) if self._allow_legacy_global_settings() else settings.odoosh_user_addons_path)
 
     def _base_ssh_command(self, target: SshTarget) -> list[str]:
         # Fix 5: try to reuse a ControlMaster socket; fall back to a fresh connection.
@@ -176,6 +234,13 @@ class OdooShService:
                 stdout=(exc.stdout or "")[-20000:] if isinstance(exc.stdout, str) else "",
                 stderr=(exc.stderr or "")[-20000:] if isinstance(exc.stderr, str) else "",
                 timed_out=True,
+            )
+        except FileNotFoundError as exc:
+            return CommandResult(
+                command=self._redacted_command(command),
+                cwd="odoosh:ssh",
+                exit_code=127,
+                stderr=f"SSH executable not found: {exc}",
             )
 
     def health(self) -> CommandResult:
@@ -238,6 +303,8 @@ class OdooShService:
         timeout_seconds: int = 300,
         interval_seconds: float = 10.0,
         progress_cb=None,
+        failure_check_since_epoch: int | None = None,
+        early_failure_after_seconds: int = 90,
     ) -> CommandResult:
         """Poll Odoo.sh until ``expected_sha`` is active in ``~/src/user``.
 
@@ -260,12 +327,20 @@ class OdooShService:
             check_result = self.check_commit_deployed(expected)
             deployed = OdooShService._check_result_deployed(check_result)
             elapsed_seconds = round(time.monotonic() - started, 3)
+            current_sha = "unknown"
+            try:
+                check_payload = json.loads(check_result.stdout or "{}")
+                if isinstance(check_payload, dict):
+                    current_sha = str(check_payload.get("current_sha") or "unknown")
+            except Exception:
+                current_sha = "unknown"
             attempt_payload = {
                 "attempt": attempt,
                 "exit_code": check_result.exit_code,
                 "stdout": check_result.stdout,
                 "stderr": check_result.stderr,
                 "deployed": deployed,
+                "current_sha": current_sha,
                 "expected_sha": expected,
                 "poll_interval_seconds": interval_seconds,
                 "elapsed_seconds": elapsed_seconds,
@@ -282,6 +357,7 @@ class OdooShService:
                     "command": ["odoosh.check_commit_poll", expected],
                     "stdout": json.dumps({
                         "deployed": True,
+                        "current_sha": current_sha,
                         "expected_sha": expected,
                         "attempts": attempt,
                         "poll_interval_seconds": interval_seconds,
@@ -291,21 +367,66 @@ class OdooShService:
                     }),
                 })
 
+            if (
+                failure_check_since_epoch
+                and elapsed_seconds >= max(30, int(early_failure_after_seconds))
+                and attempt >= 4
+                and attempt % 3 == 0
+            ):
+                failure = self.recent_build_failure(int(failure_check_since_epoch))
+                if failure.exit_code == 1:
+                    return CommandResult(
+                        command=["odoosh.check_commit_poll", expected],
+                        cwd="odoosh:ssh",
+                        exit_code=2,
+                        stdout=json.dumps({
+                            "deployed": False,
+                            "status": "odoosh_build_failed_or_dropped",
+                            "current_sha": current_sha,
+                            "expected_sha": expected,
+                            "attempts": attempt,
+                            "poll_interval_seconds": interval_seconds,
+                            "elapsed_seconds": elapsed_seconds,
+                            "message": "Odoo.sh reported build/test failure evidence for the pushed SHA before it became active. Stop polling this SHA; fix the code and push a new commit.",
+                            "failure_guard": json.loads(failure.stdout or "{}"),
+                            "recent_checks": attempts[-5:],
+                        }, ensure_ascii=False),
+                        stderr=f"Odoo.sh build/test failed or dropped pushed commit {expected} before deployment.",
+                    )
+
             now = time.monotonic()
             if now >= deadline:
                 elapsed_seconds = round(now - started, 3)
+                recent_checks = attempts[-10:]
+                recent_current = [str(item.get("current_sha") or "unknown") for item in recent_checks]
+                known_current = [sha for sha in recent_current if sha and sha != "unknown"]
+                stable_other_sha = (
+                    len(known_current) >= 5
+                    and len(set(known_current)) == 1
+                    and known_current[-1] != expected
+                    and not expected.startswith(known_current[-1])
+                    and not known_current[-1].startswith(expected)
+                )
                 return CommandResult(
                     command=["odoosh.check_commit_poll", expected],
                     cwd="odoosh:ssh",
                     exit_code=124,
                     stdout=json.dumps({
                         "deployed": False,
+                        "status": "timeout_probable_dropped" if stable_other_sha else "timeout",
+                        "probable_dropped": stable_other_sha,
+                        "current_sha": known_current[-1] if known_current else "unknown",
                         "expected_sha": expected,
                         "attempts": attempt,
                         "poll_interval_seconds": interval_seconds,
                         "elapsed_seconds": elapsed_seconds,
                         "timeout_seconds": timeout_seconds,
-                        "recent_checks": attempts[-10:],
+                        "recent_checks": recent_checks,
+                        "message": (
+                            "Odoo.sh kept serving a different stable SHA for the full polling window; the pushed SHA was likely dropped by a failed Odoo.sh test/build. Start a new fix commit instead of resuming this SHA."
+                            if stable_other_sha
+                            else "Odoo.sh did not deploy the pushed SHA within the polling window."
+                        ),
                     }),
                     stderr=f"Odoo.sh did not deploy pushed commit {expected} within {timeout_seconds}s.",
                     timed_out=True,
@@ -343,9 +464,114 @@ class OdooShService:
             timed_out=True,
         )
 
+
+    def _source_root_path(self, base: str) -> str:
+        value = (base or "odoo_addons").strip()
+        if value == "odoo_addons":
+            return f"{self._odoo_path().rstrip('/')}/addons"
+        if value == "enterprise":
+            return "/home/odoo/src/enterprise"
+        if value == "user":
+            return self._user_addons_path().rstrip("/")
+        raise ValueError("Unknown Odoo.sh source base")
+
+    def _safe_source_relative_path(self, relative_path: str) -> str:
+        rel = str(relative_path or "").replace("\\", "/").strip("/")
+        if rel.startswith("../") or "/../" in rel or rel == ".git" or rel.startswith(".git/"):
+            raise ValueError("Path must stay inside the selected Odoo.sh source root")
+        return rel
+
+    def read_core_file(self, base: str, relative_path: str, max_bytes: int = 500000) -> FileContent:
+        """Read exact Odoo.sh installed source under /home/odoo/src/odoo/addons, enterprise, or user."""
+        root = self._source_root_path(base)
+        rel = self._safe_source_relative_path(relative_path)
+        safe_max = max(1, min(int(max_bytes), 2_000_000))
+        script = (
+            "python3 - <<'PY'\n"
+            "import base64, json, os\n"
+            f"base = {root!r}\n"
+            f"rel = {rel!r}\n"
+            f"limit = {safe_max!r}\n"
+            "base_real = os.path.realpath(base)\n"
+            "target = os.path.realpath(os.path.join(base_real, rel))\n"
+            "if not (target == base_real or target.startswith(base_real + os.sep)):\n"
+            "    print(json.dumps({'ok': False, 'error': 'path escapes source root', 'path': target, 'base': base_real}))\n"
+            "elif not os.path.isfile(target):\n"
+            "    print(json.dumps({'ok': False, 'error': 'file not found', 'path': target, 'base': base_real}))\n"
+            "else:\n"
+            "    size = os.path.getsize(target)\n"
+            "    with open(target, 'rb') as fh:\n"
+            "        raw = fh.read(limit + 1)\n"
+            "    truncated = len(raw) > limit\n"
+            "    raw = raw[:limit]\n"
+            "    print(json.dumps({'ok': True, 'path': target, 'relative_path': rel, 'size': size, 'truncated': truncated, 'content_b64': base64.b64encode(raw).decode('ascii'), 'base': base_real}))\n"
+            "PY"
+        )
+        result = self.run_shell(script, timeout_seconds=30)
+        fallback_path = f"{root.rstrip('/')}/{rel}" if rel else root
+        if result.exit_code != 0:
+            return FileContent(path=fallback_path, content="", size=0, extra={"source": "odoosh_core", "status": "failed", "base": base, "ssh": result.model_dump(mode="json")})
+        try:
+            payload = json.loads((result.stdout or "").strip().splitlines()[-1])
+        except Exception:
+            return FileContent(path=fallback_path, content="", size=0, extra={"source": "odoosh_core", "status": "failed", "base": base, "raw": result.stdout[-4000:]})
+        if not payload.get("ok"):
+            return FileContent(path=str(payload.get("path") or fallback_path), content="", size=0, extra={"source": "odoosh_core", "status": "missing", "error": payload.get("error"), "base": payload.get("base") or root, "relative_path": rel})
+        import base64
+        raw = base64.b64decode(str(payload.get("content_b64") or "").encode("ascii"))
+        text = raw.decode("utf-8", errors="replace")
+        return FileContent(path=str(payload.get("path")), content=text, size=int(payload.get("size") or len(raw)), extra={"source": "odoosh_core", "relative_path": payload.get("relative_path") or rel, "truncated": bool(payload.get("truncated")), "base": payload.get("base") or root})
+
+    def list_core_files(self, base: str, relative_path: str = "", max_items: int = 300) -> dict:
+        """List exact Odoo.sh installed source files under /home/odoo/src/odoo/addons, enterprise, or user."""
+        root = self._source_root_path(base)
+        rel = self._safe_source_relative_path(relative_path)
+        safe_max = max(1, min(int(max_items), 3000))
+        script = (
+            "python3 - <<'PY'\n"
+            "import json, os\n"
+            f"base = {root!r}\n"
+            f"rel = {rel!r}\n"
+            f"limit = {safe_max!r}\n"
+            "base_real = os.path.realpath(base)\n"
+            "target = os.path.realpath(os.path.join(base_real, rel))\n"
+            "if not (target == base_real or target.startswith(base_real + os.sep)):\n"
+            "    print(json.dumps({'found': False, 'error': 'path escapes source root', 'base': base_real, 'target': target, 'files': []}))\n"
+            "elif not os.path.isdir(target):\n"
+            "    print(json.dumps({'found': False, 'error': 'directory not found', 'base': base_real, 'target': target, 'files': []}))\n"
+            "else:\n"
+            "    files = []\n"
+            "    for current, dirs, names in os.walk(target):\n"
+            "        dirs[:] = [d for d in dirs if not d.startswith('.') and d != '__pycache__']\n"
+            "        for name in names:\n"
+            "            full = os.path.join(current, name)\n"
+            "            try:\n"
+            "                st = os.stat(full)\n"
+            "            except OSError:\n"
+            "                continue\n"
+            "            files.append({'path': full, 'relative_path': os.path.relpath(full, base_real).replace(os.sep, '/'), 'size': st.st_size})\n"
+            "            if len(files) >= limit:\n"
+            "                break\n"
+            "        if len(files) >= limit:\n"
+            "            break\n"
+            "    print(json.dumps({'found': True, 'base': base_real, 'target': target, 'count': len(files), 'truncated': len(files) >= limit, 'files': files}))\n"
+            "PY"
+        )
+        result = self.run_shell(script, timeout_seconds=60)
+        if result.exit_code != 0:
+            return {"found": False, "source": "odoosh_core", "base": base, "relative_path": rel, "error": result.stderr or result.stdout, "files": []}
+        try:
+            payload = json.loads((result.stdout or "").strip().splitlines()[-1])
+        except Exception:
+            return {"found": False, "source": "odoosh_core", "base": base, "relative_path": rel, "error": "Unable to parse SSH output", "raw": result.stdout[-4000:], "files": []}
+        payload["source"] = "odoosh_core"
+        payload["requested_base"] = base
+        payload["relative_path"] = rel
+        return payload
+
     def verify_module_manifest(self, module_name: str) -> CommandResult:
         safe_module = shlex.quote(module_name)
-        user_addons = shlex.quote(settings.odoosh_user_addons_path)
+        user_addons = shlex.quote(self._user_addons_path())
         script = (
             "set -e; "
             f"test -f {user_addons}/{safe_module}/__manifest__.py; "
@@ -373,7 +599,7 @@ class OdooShService:
         script = (
             "python3 - <<'PY'\n"
             "import base64, json, os\n"
-            f"base = {settings.odoosh_user_addons_path!r}\n"
+            f"base = {self._user_addons_path()!r}\n"
             f"rel = {rel!r}\n"
             f"limit = {safe_max!r}\n"
             "base_real = os.path.realpath(base)\n"
@@ -394,7 +620,7 @@ class OdooShService:
         result = self.run_shell(script, timeout_seconds=30)
         if result.exit_code != 0:
             return FileContent(
-                path=f"{settings.odoosh_user_addons_path.rstrip('/')}/{rel}",
+                path=f"{self._user_addons_path().rstrip('/')}/{rel}",
                 content="",
                 size=0,
                 extra={"source": "odoosh_user", "status": "failed", "ssh": result.model_dump(mode="json")},
@@ -403,14 +629,14 @@ class OdooShService:
             payload = json.loads((result.stdout or "").strip().splitlines()[-1])
         except Exception:
             return FileContent(
-                path=f"{settings.odoosh_user_addons_path.rstrip('/')}/{rel}",
+                path=f"{self._user_addons_path().rstrip('/')}/{rel}",
                 content="",
                 size=0,
                 extra={"source": "odoosh_user", "status": "failed", "raw": result.stdout[-4000:]},
             )
         if not payload.get("ok"):
             return FileContent(
-                path=str(payload.get("path") or f"{settings.odoosh_user_addons_path.rstrip('/')}/{rel}"),
+                path=str(payload.get("path") or f"{self._user_addons_path().rstrip('/')}/{rel}"),
                 content="",
                 size=0,
                 extra={"source": "odoosh_user", "status": "missing", "error": payload.get("error"), "relative_path": rel},
@@ -427,7 +653,7 @@ class OdooShService:
                 "source": "odoosh_user",
                 "relative_path": payload.get("relative_path") or rel,
                 "truncated": bool(payload.get("truncated")),
-                "base": settings.odoosh_user_addons_path,
+                "base": self._user_addons_path(),
             },
         )
 
@@ -439,7 +665,7 @@ class OdooShService:
         script = (
             "python3 - <<'PY'\n"
             "import json, os\n"
-            f"base = {settings.odoosh_user_addons_path!r}\n"
+            f"base = {self._user_addons_path()!r}\n"
             f"module_name = {safe_module!r}\n"
             f"rel = {safe_subdir!r}\n"
             f"limit = {safe_max!r}\n"
@@ -512,7 +738,7 @@ class OdooShService:
                 )
             entries.append((rel, digest))
 
-        user_addons = settings.odoosh_user_addons_path.rstrip("/")
+        user_addons = self._user_addons_path().rstrip("/")
         script_lines = [
             "set +e",
             "failures=0",
@@ -588,17 +814,19 @@ class OdooShService:
         if result.exit_code != 0:
             return result
         text = result.stdout or ""
-        blocks = self._extract_error_blocks(text)
+        raw_blocks = self._extract_error_blocks(text)
+        blocks = [block for block in raw_blocks if self._is_actionable_build_failure(block)]
         failure_trigger = re.compile(
-            r"(Test:\s*Failed|Build\s+failed|\bFAILED\b|Failed to load registry|"
+            r"(Test:\s*Failed|Build\s+failed|Failed to load registry|"
             r"Traceback \(most recent call last\)|ParseError|ValidationError|"
-            r"ModuleNotFoundError|ImportError|CRITICAL|ERROR)",
+            r"ModuleNotFoundError|ImportError|CRITICAL)",
             re.I,
         )
-        if not blocks and failure_trigger.search(text):
+        if not blocks and failure_trigger.search(text) and self._is_actionable_build_failure(text[-8000:]):
             blocks = ["Recent Odoo.sh log failure marker found:\n" + text[-8000:]]
         payload = {
             "failed": bool(blocks),
+            "ignored_non_blocking_blocks": max(0, len(raw_blocks) - len(blocks)),
             "since_epoch": safe_since,
             "message": (
                 "Recent Odoo.sh failure evidence found. Do not upgrade this build."
@@ -613,6 +841,49 @@ class OdooShService:
             exit_code=1 if blocks else 0,
             stdout=json.dumps(payload, ensure_ascii=False)[-20000:],
         )
+
+    def _is_actionable_build_failure(self, block: str) -> bool:
+        """Return True only for deploy/build blockers, not noisy runtime warnings.
+
+        A frontend asset 404 like /web/assets/.../undefined or schema warnings can
+        appear in logs modified after the pushed SHA and previously blocked the
+        entire safe-deploy flow.  This guard now blocks only errors that can make
+        the pushed build unusable: registry load failures, tracebacks, imports,
+        XML parse/validation errors, failed tests/builds, or critical logs.
+        """
+        text = block or ""
+        lowered = text.lower()
+        benign_patterns = [
+            "/web/assets/",
+            "undefined http/",
+            "parsing asset bundle undefined",
+            "not enough values to unpack (expected 2, got 1)",
+            "missing not-null constraint",
+            "werkzeug:",
+            " 404 ",
+            "generating a new asset bundle",
+            "deleting attachments",
+            "initiating shutdown",
+            "connectionpool",
+            # Runtime filestore/menu cache noise can be logged after a push but
+            # does not mean the pushed build failed. It was causing false
+            # safe-deploy failures before the module upgrade step.
+            "ir_attachment.py",
+            "_file_read",
+            "filestore",
+            "filenotfounderror",
+            "ir.ui.menu",
+            "load_menus",
+        ]
+        true_failure_re = r"Failed to load registry|ParseError|ValidationError|ModuleNotFoundError|ImportError|SyntaxError|QWebException|SCSS|CRITICAL|Build\s+failed|Test:\s*Failed"
+        filestore_noise = ("filestore" in lowered or "_file_read" in lowered or "ir_attachment.py" in lowered) and "filenotfounderror" in lowered
+        menu_cache_noise = "ir.ui.menu" in lowered and "load_menus" in lowered and "keyerror" in lowered
+        if (filestore_noise or menu_cache_noise) and not re.search(true_failure_re, text, re.I):
+            return False
+        if any(pattern in lowered for pattern in benign_patterns) and not re.search(true_failure_re, text, re.I):
+            return False
+        return bool(re.search(true_failure_re, text, re.I) or ("Traceback (most recent call last)" in text and not (filestore_noise or menu_cache_noise)))
+
 
     def _extract_error_blocks(self, text: str) -> list[str]:
         lines = text.splitlines()
@@ -683,11 +954,123 @@ class OdooShService:
         stdout = "MCP_ERROR_PACK\n" + json.dumps(pack, indent=2) + "\n\nTRACEBACK_BLOCKS\n" + base.stdout
         return base.model_copy(update={"command": ["odoosh.error_pack", str(tail_lines)], "stdout": stdout[-20000:]})
 
+
+    def search_read(
+        self,
+        model: str,
+        domain: list | None = None,
+        fields: list[str] | None = None,
+        limit: int = 20,
+        offset: int = 0,
+        order: str | None = None,
+        context: dict | None = None,
+        timeout_seconds: int = 120,
+    ) -> OdooResult:
+        """Read Odoo records through Odoo.sh SSH using ``odoo-bin shell``.
+
+        This is the read-only fallback for environments where Odoo shell login is
+        unavailable or rejected. Inputs are serialized as JSON/base64 and then
+        passed to a fixed Odoo shell snippet; no user text is interpolated as
+        Python code.
+        """
+        if not self._db_name():
+            return OdooResult(status="failed", error="ODOOSH_DB_NAME/odoosh_db_name is not configured for SSH query.")
+        if not re.fullmatch(r"[a-zA-Z0-9_.]+", model or ""):
+            return OdooResult(status="failed", error="Invalid model name for SSH query.")
+        safe_fields: list[str] = []
+        for field in fields or []:
+            if not isinstance(field, str) or not re.fullmatch(r"[a-zA-Z0-9_]+", field):
+                return OdooResult(status="failed", error=f"Invalid field name for SSH query: {field!r}")
+            safe_fields.append(field)
+        if order and not re.fullmatch(r"[a-zA-Z0-9_,.\s]+(?:\s+(?:asc|desc))?", order, flags=re.I):
+            return OdooResult(status="failed", error="Invalid order string for SSH query.")
+
+        payload = {
+            "model": model,
+            "domain": domain or [],
+            "fields": safe_fields,
+            "limit": max(1, min(int(limit or 20), 200)),
+            "offset": max(0, int(offset or 0)),
+            "order": order or None,
+            "context": context or {},
+        }
+        payload_b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+        safe_db = shlex.quote(self._db_name() or "")
+        odoo_path = shlex.quote(self._odoo_path())
+        safe_addons = shlex.quote(self._addons_path())
+        marker = "MCP_ODOOSH_QUERY_JSON:"
+        script = (
+            "set +e; "
+            f"cd {odoo_path}; "
+            f"./odoo-bin shell -d {safe_db} --addons-path={safe_addons} --no-http --log-level=error <<'PY'\n"
+            "import base64, datetime, json, traceback\n"
+            f"payload = json.loads(base64.b64decode({payload_b64!r}).decode('utf-8'))\n"
+            "marker = 'MCP_ODOOSH_QUERY_JSON:'\n"
+            "def norm(value):\n"
+            "    if isinstance(value, (datetime.date, datetime.datetime)):\n"
+            "        return value.isoformat()\n"
+            "    if isinstance(value, tuple):\n"
+            "        return [norm(v) for v in value]\n"
+            "    if isinstance(value, list):\n"
+            "        return [norm(v) for v in value]\n"
+            "    if isinstance(value, dict):\n"
+            "        return {str(k): norm(v) for k, v in value.items()}\n"
+            "    if isinstance(value, bytes):\n"
+            "        return value.decode('utf-8', 'replace')\n"
+            "    return value\n"
+            "try:\n"
+            "    records = env[payload['model']].with_context(**(payload.get('context') or {})).search_read(\n"
+            "        payload.get('domain') or [],\n"
+            "        payload.get('fields') or [],\n"
+            "        offset=int(payload.get('offset') or 0),\n"
+            "        limit=int(payload.get('limit') or 20),\n"
+            "        order=payload.get('order') or None,\n"
+            "    )\n"
+            "    print(marker + json.dumps({'status': 'ok', 'result': norm(records), 'count': len(records)}, ensure_ascii=False))\n"
+            "except Exception as exc:\n"
+            "    print(marker + json.dumps({'status': 'failed', 'error': str(exc), 'traceback': traceback.format_exc()[-4000:]}, ensure_ascii=False))\n"
+            "PY\n"
+        )
+        result = self.run_shell(script, timeout_seconds=timeout_seconds)
+        payload_line = ""
+        for line in reversed((result.stdout or "").splitlines()):
+            if line.startswith(marker):
+                payload_line = line[len(marker):]
+                break
+        if not payload_line:
+            return OdooResult(
+                status="failed",
+                database=self._db_name(),
+                error=(result.stderr or result.stdout or "Odoo.sh SSH query did not return a parseable result.")[-4000:],
+                result={"ssh": result.model_dump(mode="json")},
+            )
+        try:
+            parsed = json.loads(payload_line)
+        except Exception as exc:
+            return OdooResult(
+                status="failed",
+                database=self._db_name(),
+                error=f"Could not parse Odoo.sh SSH query JSON: {exc}",
+                result={"raw": payload_line[-4000:], "ssh": result.model_dump(mode="json")},
+            )
+        if parsed.get("status") != "ok" or result.exit_code != 0:
+            return OdooResult(
+                status="failed",
+                database=self._db_name(),
+                error=parsed.get("error") or result.stderr or f"Odoo.sh SSH query failed with exit code {result.exit_code}",
+                result={"payload": parsed, "ssh": result.model_dump(mode="json")},
+            )
+        return OdooResult(
+            status="ok",
+            database=self._db_name(),
+            result=parsed.get("result") or [],
+        )
+
     def _dependency_guard(self, module_name: str) -> CommandResult | None:
         try:
-            from .odoo_rpc_service import OdooRpcService
+            from .odoo_service import OdooService
 
-            deps = OdooRpcService().module_dependencies_status(module_name)
+            deps = OdooService(self._active_client()).module_dependencies_status(module_name)
         except Exception:
             return None
         if deps.status != "ok" or not isinstance(deps.result, dict):
@@ -697,7 +1080,7 @@ class OdooShService:
             names = ", ".join(sorted({str(row.get("name")) for row in missing}))
             return CommandResult(
                 command=["odoosh.dependency_guard", module_name],
-                cwd="odoo:xmlrpc",
+                cwd="odoo:odoo_shell",
                 exit_code=2,
                 stderr=f"Missing/uninstalled dependencies for {module_name}: {names}",
             )
@@ -714,7 +1097,7 @@ class OdooShService:
         dep_error = self._dependency_guard(module_name)
         if dep_error:
             return dep_error
-        if not settings.odoosh_db_name:
+        if not self._db_name():
             return CommandResult(
                 command=["odoosh_module_update"],
                 cwd="odoosh:ssh",
@@ -724,13 +1107,13 @@ class OdooShService:
         return self._run_module_cli(module_name, "-u", timeout_seconds)
 
     def module_deploy_ssh(self, module_name: str, timeout_seconds: int = 600) -> CommandResult:
-        """Install or upgrade a module via Odoo.sh SSH without XML-RPC admin rights.
+        """Install or upgrade a module via Odoo.sh SSH without Odoo shell admin rights.
 
-        This is the no-blockage path used when XML-RPC update_list or module
+        This is the no-blockage path used when Odoo shell update_list or module
         buttons fail with Access Denied. It first tries to read module state via
-        XML-RPC (module_status usually works for non-admin users). If the module
+        Odoo shell (module_status usually works for non-admin users). If the module
         is installed, it uses -u. If it is uninstalled or not listed yet, it uses
-        -i. If XML-RPC state cannot be read, it uses a remote odoo-bin shell
+        -i. If Odoo shell state cannot be read, it uses a remote odoo-bin shell
         probe and falls back to -u only when the probe is inconclusive, because
         that is the safest operation for already-installed modules.
         """
@@ -745,9 +1128,9 @@ class OdooShService:
 
     def _module_state_best_effort(self, module_name: str) -> str | None:
         try:
-            from .odoo_rpc_service import OdooRpcService
+            from .odoo_service import OdooService
 
-            status = OdooRpcService().module_status(module_name)
+            status = OdooService(self._active_client()).module_status(module_name)
             if status.status == "ok" and status.result:
                 return (status.result[0] or {}).get("state")
             if status.status == "ok" and status.result == []:
@@ -755,15 +1138,15 @@ class OdooShService:
         except Exception:
             pass
 
-        if not settings.odoosh_db_name:
+        if not self._db_name():
             return None
         probe = self._run_module_state_probe(module_name)
         match = re.search(r"MCP_MODULE_STATE=([^\s]+)", probe.stdout or "")
         return match.group(1) if match else None
 
     def _run_module_state_probe(self, module_name: str) -> CommandResult:
-        safe_db = shlex.quote(settings.odoosh_db_name or "")
-        odoo_path = shlex.quote(settings.odoosh_odoo_path)
+        safe_db = shlex.quote(self._db_name() or "")
+        odoo_path = shlex.quote(self._odoo_path())
         safe_addons = shlex.quote(self._addons_path())
         module_literal = repr(module_name)
         script = (
@@ -779,15 +1162,15 @@ class OdooShService:
 
     def _addons_path(self) -> str:
         return ",".join([
-            f"{settings.odoosh_odoo_path}/odoo/addons",
-            f"{settings.odoosh_odoo_path}/addons",
-            settings.odoosh_user_addons_path,
+            f"{self._odoo_path()}/odoo/addons",
+            f"{self._odoo_path()}/addons",
+            self._user_addons_path(),
         ])
 
     def _run_module_cli(self, module_name: str, flag: str, timeout_seconds: int) -> CommandResult:
         if flag not in {"-i", "-u"}:
             raise ValueError("flag must be -i or -u")
-        if not settings.odoosh_db_name:
+        if not self._db_name():
             return CommandResult(
                 command=["odoosh_module_cli", flag, module_name],
                 cwd="odoosh:ssh",
@@ -795,8 +1178,8 @@ class OdooShService:
                 stderr="ODOOSH_DB_NAME is not configured. Set the exact database name for the target build.",
             )
         safe_module = shlex.quote(module_name)
-        safe_db = shlex.quote(settings.odoosh_db_name)
-        odoo_path = shlex.quote(settings.odoosh_odoo_path)
+        safe_db = shlex.quote(self._db_name())
+        odoo_path = shlex.quote(self._odoo_path())
         safe_addons = shlex.quote(self._addons_path())
         script = (
             "set -e; "

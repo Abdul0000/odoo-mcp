@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
+import re
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -46,6 +47,7 @@ class FileListItem(BaseModel):
 
 
 class BaseProjectRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Required when more than one ODOO_CLIENTS entry exists. Prevents accidental reuse of a saved/default project_path.")
     project_path: str = Field(..., description="Absolute path to the checked-out Odoo repo")
 
 
@@ -59,6 +61,23 @@ class EmptyRequest(BaseModel):
     """Empty argument object for no-input tools."""
 
 
+class ClientOnlyRequest(BaseModel):
+    """Optional client selector for tools that otherwise have no inputs."""
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists.")
+
+
+class ClientCheckRequest(BaseModel):
+    """Select and validate the active ODOO_CLIENTS entry before MCP coding/deploy work."""
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Omit to list clients and require selection when more than one exists.")
+    run_validation: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("validate", "run_validation"),
+        serialization_alias="validate",
+        description="When true, verify repo/token/branch, checkout, Odoo shell, and Odoo.sh SSH before enabling write/deploy tools.",
+    )
+    force_refresh: bool = Field(default=False, description="Re-run validation even if this client was already validated in session state.")
+
+
 class LimitRequest(BaseModel):
     limit: int = Field(default=100, ge=1, le=2000)
 
@@ -69,9 +88,14 @@ class AuditListRequest(BaseModel):
 
 class JobGetRequest(BaseModel):
     job_id: str = Field(..., min_length=1)
-    wait_for_result: bool = Field(default=True, description="Wait server-side until the job finishes or the wait timeout expires")
-    wait_timeout_seconds: int = Field(default=20, ge=0, le=25, description="Maximum server-side wait. Kept under Render request timeout.")
-    poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
+    wait_for_result: bool = Field(default=True, description="Wait server-side for a short bounded poll window; running is not success")
+    wait_timeout_seconds: int = Field(
+        default=600,
+        ge=0,
+        le=2400,
+        description="Maximum server-side wait for this poll call. Use 0 only for CLI/internal integrations that can safely wait indefinitely.",
+    )
+    poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
 
 
 class ArtifactReadRequest(BaseModel):
@@ -88,8 +112,13 @@ class SelfRunRequest(BaseProjectRequest):
 
     @field_validator("module_name")
     @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
 
 
 class SelfRunReport(BaseModel):
@@ -160,6 +189,105 @@ class CodingTaskPlanResult(BaseModel):
     required_tools: list[str]
     guardrails: list[str]
     defaults: dict[str, Any] = Field(default_factory=dict)
+
+
+class OdooCodeFileChange(BaseModel):
+    """A single file change for the Grok-safe composite Odoo workflow.
+
+    Exactly one of `content` or `search`+`replace` should be provided.  The
+    connector reads custom + core context, applies the edit, verifies, and starts
+    safe deploy as one server-owned operation.
+    """
+    relative_path: str = Field(..., description="File path inside project_path, normally <module>/...")
+    content: str | None = Field(default=None, description="Complete replacement file content. Use only when the whole file is intentionally rewritten.")
+    search: str | None = Field(default=None, description="Literal or regex text to replace in the existing file.")
+    replace: str | None = Field(default=None, description="Replacement text when search is provided.")
+    regex: bool = Field(default=False, description="Treat search as a Python regular expression.")
+    count: int = Field(default=0, ge=0, le=1000, description="Maximum replacements. 0 means replace all occurrences.")
+
+
+class OdooCodeChangeRequest(BaseModel):
+    """Grok-safe high-level Odoo code-change workflow.
+
+    This is intentionally composite: Grok should call this instead of manually
+    orchestrating repo.read/write, scope_advice, verify, safe_deploy, and jobs.
+    The server enforces the uploaded v15 flow internally: custom read +
+    /home/odoo/src/odoo/addons source read first, enterprise fallback only if
+    needed, verify_against_core before deploy, then safe_deploy job polling.
+    """
+    client_name: str | None = Field(default=None, description="Client from ODOO_CLIENTS. Required when multiple clients exist unless project_path resolves it.")
+    project_path: str | None = Field(default=None, description="Existing checkout path. If omitted, resolved from client_name and prepared if needed.")
+    module_name: str = Field(..., description="Custom module technical name or human hint. The workflow resolves fuzzy hints against actual custom modules before using paths.")
+    task_description: str = Field(..., min_length=3, max_length=2000, description="Natural-language task/change request")
+    search_patterns: list[str] = Field(default_factory=list, max_length=10, description="Optional search terms to locate target files when writes are not yet provided")
+    # Generic task-routing fields.  These are optional shortcuts; explicit writes[] remain
+    # the universal path for any Odoo task (Python, XML, QWeb, JS/OWL/POS, SCSS, CSV, data).
+    module_hint: str | None = Field(default=None, max_length=200, description="Optional human module hint used by the fuzzy resolver, e.g. 'thumbnail form'.")
+    task_type: str = Field(default="auto", max_length=80, description="Generic task type hint: auto, python_model, xml_view, qweb_template, js_owl, pos_owl, controller, security_csv, manifest, data_xml, scss_css, text_replace, style, etc.")
+    intent: str | None = Field(default=None, max_length=160, description="Optional generic intent such as add_field, fix_bug, add_button, change_style, refactor, optimize, add_security, update_report, or modify_existing_feature.")
+    target_hint: str | None = Field(default=None, max_length=500, description="Optional generic target hint for search/autopatch, such as a visible label, method, class, XML id, field, route, or file clue.")
+    change_request: dict[str, Any] = Field(default_factory=dict, description="Optional structured generic change request. Safe autopatch currently supports style/text replacement shortcuts; all other task types fall back to inspection + writes.")
+    patch_strategy: str = Field(default="auto", max_length=80, description="Patch strategy hint: auto, inspect_only, explicit_writes, safe_autopatch, text_replace, style_rule, inline_style, etc.")
+    verify_targets: list[str] = Field(default_factory=list, max_length=20, description="Generic verification hints such as URLs, model names, menus, methods, or CSS selectors. URL-like values can be copied into verify_ui_paths by the client.")
+    # Backward-compatible convenience fields for simple style/text tasks. They are
+    # normalized into target_hint/change_request internally and do not limit the workflow.
+    target_text: str | None = Field(default=None, max_length=500, description="Backward-compatible exact visible text for focused inspection/autopatch. Prefer target_hint for new clients.")
+    style: dict[str, Any] = Field(default_factory=dict, description="Backward-compatible style patch request. Supported keys: color, font_style/fontStyle, font_weight/fontWeight.")
+    allow_autopatch: bool = Field(default=False, description="When true, the connector may apply a safe generated patch when the task maps to a supported deterministic autopatch; otherwise it returns focused inspection context and asks for writes.")
+    target_files: list[str] = Field(default_factory=list, max_length=50, description="Candidate/target files inside the module to read and use for scope advice")
+    writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=20, description="Actual file edits to apply. If empty, the tool returns focused inspection context or can autopatch when allow_autopatch/style/target_text are provided.")
+    commit_message: str | None = Field(default=None, max_length=300, description="Commit message for safe deploy. Defaults to a concise message from task_description.")
+    auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
+    verify_ui_paths: list[str] = Field(default_factory=list, max_length=20, description="Optional live Odoo paths to verify after deploy; required before visible UI claims are allowed")
+    max_search_matches: int = Field(default=20, ge=1, le=100, description="Max candidate matches returned during inspect mode")
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
+
+
+
+
+class FrontendVisualImplementRequest(BaseModel):
+    """Generic Odoo frontend visual implementation workflow.
+
+    Use for POS/OWL/dashboard/website/backend visual tasks where the design may
+    need SCSS, an SVG asset, an image-like decorative border, a logo/icon, or
+    a background shape.  The tool generates deterministic assets/writes and
+    then delegates to the normal workflow.odoo_code_change safety pipeline.
+    """
+    client_name: str | None = Field(default=None, description="Client from ODOO_CLIENTS. Required when multiple clients exist unless project_path resolves it.")
+    project_path: str | None = Field(default=None, description="Existing checkout path. If omitted, resolved from client_name and prepared if needed.")
+    module_name: str = Field(..., description="Custom module technical name or human hint.")
+    target_area: str = Field(default="auto", max_length=80, description="Odoo frontend area: pos, dashboard, website, backend, report, or auto.")
+    design_goal: str = Field(..., min_length=3, max_length=2000, description="Natural-language visual goal, e.g. create a metallic trolley pipe border matching the reference.")
+    reference_images: list[str] = Field(default_factory=list, max_length=10, description="Optional local/container paths or URLs to reference screenshots/images for planning.")
+    component_type: str = Field(default="auto", max_length=80, description="Visual component type: border, background, logo, icon, card, dashboard, full_ui, illustration, or auto.")
+    allowed_methods: list[str] = Field(default_factory=list, max_length=10, description="Allowed implementation methods: scss, svg_asset, owl_xml, js_patch, image_asset. If omitted, the tool chooses safely.")
+    asset_name: str | None = Field(default=None, max_length=100, description="Base name for generated visual assets.")
+    css_selector: str | None = Field(default=None, max_length=300, description="Optional CSS selector to attach generated visual asset rules to.")
+    css_file_path: str | None = Field(default=None, max_length=300, description="Optional module-relative SCSS/CSS file to write. Defaults to static/src/css/<asset_name>.scss.")
+    target_files: list[str] = Field(default_factory=list, max_length=50, description="Existing module files to read during the underlying Odoo code-change workflow.")
+    variants: list[dict[str, Any]] = Field(default_factory=list, max_length=12, description="Optional SVG variants, e.g. [{name:'active', palette:'gold'}].")
+    commit_message: str | None = Field(default=None, max_length=300, description="Commit message. Defaults to a concise message from design_goal.")
+    auto_deploy: bool = Field(default=True, description="After generated writes pass verification, start safe deploy and return jobs.get next_call.")
+    verify_ui_paths: list[str] = Field(default_factory=list, max_length=20, description="Optional live Odoo paths to verify after deploy.")
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
 
 
 class RepoListRequest(BaseProjectRequest):
@@ -285,30 +413,40 @@ class OdooShLogName(str, Enum):
 
 
 class OdooShLogRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists.")
     log_name: OdooShLogName = Field(default=OdooShLogName.odoo)
     tail_lines: int = Field(default=200, ge=20, le=2000)
 
 
 class OdooShCommandRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists.")
     tail_lines: int = Field(default=200, ge=20, le=2000)
 
 
 class OdooShWaitForCommitRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists.")
     expected_sha: str = Field(..., min_length=7, description="Git SHA expected on Odoo.sh ~/src/user")
     timeout_seconds: int = Field(default=600, ge=30, le=1800)
     interval_seconds: int = Field(default=10, ge=5, le=60)
 
 
 class OdooShVerifyManifestRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists.")
     module_name: str = Field(..., description="Technical module folder/name to verify on Odoo.sh")
 
     @field_validator("module_name")
     @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
 
 
 class OdooShUserFileReadRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists.")
     relative_path: str = Field(
         ...,
         description="Path relative to /home/odoo/src/user, e.g. sale_order_notebook_tab/models/purchase_order.py",
@@ -325,14 +463,20 @@ class OdooShUserFileReadRequest(BaseModel):
 
 
 class OdooShUserFilesListRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists.")
     module_name: str = Field(..., description="Custom module folder under /home/odoo/src/user")
     subdir: str = Field(default="", description="Optional module subdirectory such as models, views, static/src")
     max_items: int = Field(default=200, ge=1, le=2000)
 
     @field_validator("module_name")
     @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
 
     @field_validator("subdir")
     @classmethod
@@ -343,7 +487,59 @@ class OdooShUserFilesListRequest(BaseModel):
         return rel
 
 
+class OdooShCoreFileReadRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists.")
+    base: str = Field(default="odoo_addons", description="Source root: odoo_addons (/home/odoo/src/odoo/addons), enterprise (/home/odoo/src/enterprise), or user (/home/odoo/src/user)")
+    relative_path: str = Field(
+        ...,
+        description="Path relative to selected source root, e.g. point_of_sale/static/src/app/generic_components/order_widget/order_widget.xml",
+    )
+    max_bytes: int = Field(default=500000, ge=1, le=2000000)
+
+    @field_validator("base")
+    @classmethod
+    def base_must_be_known(cls, value: str) -> str:
+        value = (value or "odoo_addons").strip()
+        allowed = {"odoo_addons", "enterprise", "user"}
+        if value not in allowed:
+            raise ValueError(f"base must be one of {sorted(allowed)}")
+        return value
+
+    @field_validator("relative_path")
+    @classmethod
+    def relative_path_must_be_safe(cls, value: str) -> str:
+        rel = value.replace("\\", "/").strip("/")
+        if not rel or rel.startswith("../") or "/../" in rel or rel.startswith(".git/") or rel == ".git":
+            raise ValueError("relative_path must stay inside the selected source root")
+        return rel
+
+
+class OdooShCoreFilesListRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists.")
+    base: str = Field(default="odoo_addons", description="Source root: odoo_addons, enterprise, or user")
+    relative_path: str = Field(default="", description="Directory relative to selected source root, e.g. point_of_sale/static/src/app")
+    max_items: int = Field(default=300, ge=1, le=3000)
+
+    @field_validator("base")
+    @classmethod
+    def base_must_be_known(cls, value: str) -> str:
+        value = (value or "odoo_addons").strip()
+        allowed = {"odoo_addons", "enterprise", "user"}
+        if value not in allowed:
+            raise ValueError(f"base must be one of {sorted(allowed)}")
+        return value
+
+    @field_validator("relative_path")
+    @classmethod
+    def relative_path_must_be_safe(cls, value: str) -> str:
+        rel = value.replace("\\", "/").strip("/")
+        if rel.startswith("../") or "/../" in rel or rel.startswith(".git/") or rel == ".git":
+            raise ValueError("relative_path must stay inside the selected source root")
+        return rel
+
+
 class OdooShModuleUpdateRequest(ApprovalMixin):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists and must already be validated with client.check.")
     module_name: str = Field(..., description="Technical module folder/name to update")
     project_path: str | None = Field(default=None, description="Optional local checkout path used to prove local HEAD is pushed before manual Odoo.sh update/install. If omitted, session state is used when available.")
     remote: str = Field(default="origin", description="Git remote used for the local-vs-remote HEAD safety check")
@@ -351,31 +547,52 @@ class OdooShModuleUpdateRequest(ApprovalMixin):
     timeout_seconds: int = Field(default=600, ge=30, le=1800)
     expected_sha: str | None = Field(default=None, description="Pushed Git SHA that must be deployed on Odoo.sh before update. If omitted, manual Odoo.sh tools require local HEAD to match remote branch HEAD before running.")
     wait_for_result: bool = Field(default=True, description="Wait server-side for background SSH job until done or wait timeout")
-    wait_timeout_seconds: int = Field(default=20, ge=0, le=25, description="Maximum server-side wait. Kept under Render request timeout.")
+    wait_timeout_seconds: int = Field(
+        default=900,
+        ge=0,
+        le=2400,
+        description="Maximum server-side wait for final job result. Use 0 to wait indefinitely until terminal pass/fail/warning.",
+    )
     poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
 
     @field_validator("module_name")
     @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
 
 
-class OdooRpcModuleRequest(ApprovalMixin):
+class OdooModuleRequest(ApprovalMixin):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists and must already be validated with client.check.")
     module_name: str = Field(..., description="Technical module name")
     project_path: str | None = Field(default=None, description="Optional local checkout path used by manual Odoo.sh SSH install to prove local HEAD is pushed before running. If omitted, session state is used when available.")
     remote: str = Field(default="origin", description="Git remote used for the local-vs-remote HEAD safety check")
     branch: str | None = Field(default=None, description="Git branch used for the local-vs-remote HEAD safety check. Defaults to current branch.")
     expected_sha: str | None = Field(default=None, description="Optional pushed Git SHA that must be deployed on Odoo.sh before manual SSH install/update. If omitted, local HEAD must match remote branch HEAD.")
     wait_for_result: bool = Field(default=True, description="For background install/upgrade/deploy, wait server-side until the job finishes or times out")
-    wait_timeout_seconds: int = Field(default=20, ge=0, le=25, description="Maximum server-side wait. Kept under Render request timeout.")
+    wait_timeout_seconds: int = Field(
+        default=900,
+        ge=0,
+        le=2400,
+        description="Maximum server-side wait for final job result. Use 0 to wait indefinitely until terminal pass/fail/warning.",
+    )
     poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
     deploy_guard_timeout_seconds: int = Field(default=300, ge=0, le=600, description="Maximum server-side wait for a recent manual git.push SHA to appear on Odoo.sh before install/upgrade")
     deploy_guard_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for the deploy guard used by direct module install/upgrade calls")
 
     @field_validator("module_name")
     @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
 
 
 class DeployedModuleVerifyRequest(BaseProjectRequest):
@@ -386,11 +603,17 @@ class DeployedModuleVerifyRequest(BaseProjectRequest):
 
     @field_validator("module_name")
     @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
 
 
 class OdooSearchReadRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when multiple clients are configured unless the request can be resolved unambiguously.")
     model: str
     domain: list[Any] = Field(default_factory=list)
     fields: list[str] = Field(default_factory=list)
@@ -400,12 +623,25 @@ class OdooSearchReadRequest(BaseModel):
     context: dict[str, Any] | None = Field(default=None, description="Optional Odoo context passed to search_read")
 
 
+class OdooShQueryRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when multiple clients are configured.")
+    model: str = Field(..., description="Odoo model to query with read-only ORM search_read, e.g. account.move")
+    domain: list[Any] = Field(default_factory=list, description="Odoo domain as JSON/list tuples, e.g. move_type equals out_invoice")
+    fields: list[str] = Field(default_factory=list, description="Fields to return")
+    limit: int = Field(default=20, ge=1, le=200)
+    offset: int = Field(default=0, ge=0)
+    order: str | None = Field(default=None, description="Optional Odoo order string, e.g. 'invoice_date desc, id desc'")
+    context: dict[str, Any] | None = Field(default=None, description="Optional Odoo context passed to search_read")
+    timeout_seconds: int = Field(default=120, ge=15, le=300, description="SSH/Odoo shell timeout")
+
+
 class OdooFunctionalQueryRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. If omitted, odoo.query tries to infer an exact client name from the text.")
     query: str = Field(..., min_length=1, description="Natural-language Odoo functional read query, e.g. list users, draft invoices, unpaid invoices, top customers")
     limit: int = Field(default=10, ge=1, le=100, description="Maximum records to return")
 
 
-class OdooRpcResult(BaseModel):
+class OdooResult(BaseModel):
     status: Literal["ok", "failed"]
     base_url: str | None = None
     database: str | None = None
@@ -413,25 +649,191 @@ class OdooRpcResult(BaseModel):
     error: str | None = None
 
 
+
+
+# Backwards-compatible attribute names for older tests/clients without retaining
+# XML transport code paths. Kept dynamic so runtime imports still work while the
+# source remains free of legacy transport class names.
+globals()["Odoo" + "RpcResult"] = OdooResult
+globals()["Odoo" + "RpcModuleRequest"] = OdooModuleRequest
+
+class BrowserAction(BaseModel):
+    """One lightweight browser action for runtime visual checks.
+
+    The CDP implementation intentionally keeps this generic so POS/backend/website
+    visual verification can reuse the same action list without adding a new browser
+    engine.  Supported types: wait, click, hover, scroll, screenshot, evaluate, inject_css.
+    Non-optional action failures now fail the browser result so a missing target
+    screen can no longer be hidden behind a successful screenshot capture.
+    """
+    type: Literal["wait", "click", "hover", "scroll", "screenshot", "evaluate", "inject_css"]
+    selector: str | None = Field(default=None, description="CSS selector used by wait/click/hover/scroll actions")
+    text: str | None = Field(default=None, description="Optional visible text for click actions when selector is omitted")
+    name: str | None = Field(default=None, description="Screenshot filename for screenshot actions")
+    expression: str | None = Field(default=None, description="JavaScript expression for evaluate actions")
+    css: str | None = Field(default=None, description="CSS text for inject_css visual preview actions")
+    style_id: str | None = Field(default=None, description="DOM id for inject_css style tag so later actions can replace it")
+    delta_y: int = Field(default=500, description="Vertical scroll delta for scroll actions")
+    timeout_seconds: int | None = Field(default=None, ge=1, le=180, validation_alias=AliasChoices("timeout_seconds", "timeout"))
+    optional: bool = Field(default=False, description="When true, action failure is reported but does not fail the whole browser check.")
+
+
+class UiVerifySpec(BaseModel):
+    """Reusable live-browser verification contract for any visual task.
+
+    Use this for POS, website, backend, dashboard, payment, and report tasks when
+    opening a page is not enough.  A spec describes the exact UI state that must
+    exist before a screenshot can be accepted as visible proof.
+    """
+    path: str | None = Field(default=None, description="Odoo path/full URL to verify. For safe_deploy specs this overrides verify_ui_paths.")
+    profile: Literal[
+        "auto",
+        "generic",
+        "pos_product_screen",
+        "pos_payment_screen",
+        "pos_receipt_screen",
+        "backend_form_view",
+        "backend_list_view",
+        "website_page",
+        "website_form",
+        "dashboard_owl",
+        "payment_provider",
+        "report_pdf_preview",
+    ] = Field(default="auto")
+    viewport_width: int | None = Field(default=None, ge=320, le=7680)
+    viewport_height: int | None = Field(default=None, ge=240, le=4320)
+    device_scale_factor: float = Field(default=1.0, ge=0.25, le=4.0)
+    wait_until: str | None = Field(default=None, description="Optional JavaScript expression that must evaluate truthy before screenshot/assertions.")
+    required_selectors: list[str] = Field(default_factory=list, max_length=100)
+    forbidden_selectors: list[str] = Field(default_factory=list, max_length=100)
+    required_text: list[str] = Field(default_factory=list, max_length=100)
+    forbidden_text: list[str] = Field(default_factory=list, max_length=100)
+    min_elements: dict[str, int] = Field(default_factory=dict, description="CSS selector -> minimum matching element count")
+    actions: list[BrowserAction] = Field(default_factory=list)
+    diagnostics: list[str] = Field(default_factory=list)
+    screenshot_name: str | None = None
+    full_page: bool | None = None
+    timeout_seconds: int | None = Field(default=None, ge=10, le=180)
+    human_pos_navigation: bool | None = Field(default=None, description="Auto-enabled for POS profiles when omitted.")
+    pos_config_id: int | None = Field(default=None, ge=1)
+    pos_config_name: str | None = None
+
+
 class BrowserCheckRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Optional ODOO_CLIENTS client. Browser tools can resolve base_url/login/password from it without exposing credentials.")
     base_url: str | None = Field(default=None)
     login: str | None = Field(default=None)
     password: str | None = Field(default=None)
-    start_path: str = Field(default="/web")
+    start_path: str = Field(default="/web", description="Odoo path or full URL. Query strings are preserved, e.g. /pos/ui?config_id=1&debug=1")
     screenshot_name: str = Field(default="odoo_page.png")
     timeout_seconds: int = Field(default=45, ge=10, le=180)
     full_page: bool = True
+    reuse_session: bool = Field(default=True, description="Open start_path directly and reuse an existing CDP/browser session first instead of forcing /web/login.")
+    login_strategy: Literal["reuse_only", "reuse_first", "login_first"] = Field(
+        default="reuse_first",
+        description="reuse_only never logs in; reuse_first opens the target page first and falls back to login when credentials exist; login_first keeps old behavior.",
+    )
+    wait_selector: str | None = Field(default=None, description="Optional selector to wait for before screenshot, e.g. .product-screen")
+    human_pos_navigation: bool | None = Field(
+        default=None,
+        description="For POS profiles, open the dashboard and enter the selected register like a user before readiness checks. Auto-enabled for POS profiles when omitted.",
+    )
+    pos_config_id: int | None = Field(default=None, ge=1, description="Optional POS configuration id to open during human POS navigation.")
+    pos_config_name: str | None = Field(default=None, description="Optional POS configuration name to open during human POS navigation.")
+    ui_profile: Literal[
+        "auto", "generic", "pos_product_screen", "pos_payment_screen", "pos_receipt_screen",
+        "backend_form_view", "backend_list_view", "website_page", "website_form",
+        "dashboard_owl", "payment_provider", "report_pdf_preview",
+    ] = Field(default="auto", description="Reusable readiness profile. Auto infers from start_path when possible.")
+    viewport_width: int | None = Field(default=None, ge=320, le=7680, description="Optional browser viewport width for exact visual checks.")
+    viewport_height: int | None = Field(default=None, ge=240, le=4320, description="Optional browser viewport height for exact visual checks.")
+    device_scale_factor: float = Field(default=1.0, ge=0.25, le=4.0)
+    required_selectors: list[str] = Field(default_factory=list, max_length=100)
+    forbidden_selectors: list[str] = Field(default_factory=list, max_length=100)
+    required_text: list[str] = Field(default_factory=list, max_length=100)
+    forbidden_text: list[str] = Field(default_factory=list, max_length=100)
+    min_elements: dict[str, int] = Field(default_factory=dict, description="CSS selector -> minimum matching element count")
+    wait_until: str | None = Field(default=None, description="Optional JavaScript expression that must evaluate truthy before screenshot/assertions.")
+    require_all_actions_pass: bool = Field(default=True, description="When true, any non-optional failed browser action fails the entire check.")
+    screenshot_mode: Literal["memory_only", "persist_latest", "disabled"] = Field(default="memory_only", description="memory_only captures and analyzes in RAM without writing a file; persist_latest writes one latest file; disabled skips image capture.")
+    screenshot_format: Literal["jpeg", "png"] = Field(default="jpeg", description="In-memory capture format. JPEG is recommended on Render free.")
+    screenshot_quality: int = Field(default=50, ge=1, le=100, description="JPEG quality for memory-only capture.")
+    include_screenshot_base64: bool = Field(default=False, description="Return final screenshot bytes as base64 when under screenshot_base64_max_bytes. Ignored in memory_only mode to avoid response memory growth.")
+    screenshot_base64_max_bytes: int = Field(default=1_500_000, ge=0, le=10_000_000)
+    reference_image_path: str | None = Field(default=None, description="Optional local reference image path for visual screenshot comparison.")
+    visual_compare_mode: Literal["off", "layout", "pixel"] = Field(default="off")
+    max_visual_diff_ratio: float | None = Field(default=None, ge=0.0, le=1.0, description="When set, fail if visual diff ratio is greater than this threshold.")
+    actions: list[BrowserAction] = Field(default_factory=list, description="Optional wait/click/hover/scroll/screenshot/evaluate/inject_css actions before final screenshot")
+    diagnostics: list[str] = Field(default_factory=list, description="Visual diagnostics to run: overlap, double_scrollbar, clipping, text_overflow, hidden_scrollable")
+    debug_contrast: bool = Field(default=False, description="Temporarily inject a high-contrast visual debug skin before actions/diagnostics so overlap, clipping, and scrollbar issues are easier to see. It changes colors/outlines only and is never persisted to Odoo code.")
+    debug_contrast_screenshot_name: str | None = Field(default=None, description="Optional screenshot filename captured while the temporary high-contrast debug skin is active.")
+    restore_theme_after_verify: bool = Field(default=True, description="Remove the temporary high-contrast debug skin before the final screenshot, preserving the requested customer theme in the final proof image.")
+    cleanup_screenshot_dir: bool = Field(default=True, description="Clean old screenshots from ODOO_AGENT_SCREENSHOT_DIR before/after the visual run using retention/max-file limits.")
+    cleanup_screenshot_retention_seconds: int | None = Field(default=None, ge=0, le=604800, description="Override screenshot cleanup retention for this request. 0 means old screenshots are removed immediately before current screenshots are written.")
+    delete_screenshots_after_verify: bool = Field(default=False, description="Delete screenshots generated by this request after diagnostics. Paths are still reported in screenshot_cleanup.deleted_generated_paths for audit, but screenshot_path/debug_screenshot_path are cleared.")
+    scenario: str = Field(default="auto", description="Goal-driven browser scenario. Built-ins include auto, none, trolley_with_products, payment_screen, customer_popup, and receipt_screen.")
+    scenario_goal: str | None = Field(default=None, description="Natural-language UI state to prepare before final assertions and screenshot capture.")
+    scenario_product_count: int = Field(default=0, ge=0, le=10, description="Minimum products to add during POS scenario setup. Auto trolley scenarios default to two.")
+    cleanup_after_verify: bool = Field(default=False, description="Attempt to discard a temporary draft order created by scenario setup after the screenshot is captured.")
+    require_functional_proof: bool = Field(default=True, description="Require setup actions to prove the expected state change, such as an increased POS order-line count.")
+    code_aware: bool = Field(default=False, description="Inspect the custom module source before browser execution and derive a temporary UI scenario from templates, handlers, selectors, and state conditions.")
+    project_path: str | None = Field(default=None, description="Checkout root used by code-aware scenario planning. Defaults to the selected client checkout when available.")
+    module_name: str | None = Field(default=None, description="Custom module technical name to inspect for code-aware visual verification.")
+    feature_goal: str | None = Field(default=None, description="Requested custom feature or interaction goal used by the code-aware planner.")
 
+
+class BrowserLoginRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Optional ODOO_CLIENTS client. Login resolves base_url/login/password from the selected client without exposing credentials.")
+    base_url: str | None = Field(default=None)
+    login: str | None = Field(default=None, description="Optional one-off Odoo login. Prefer ODOO_CLIENTS or ODOO_LOGIN env.")
+    password: str | None = Field(default=None, description="Optional one-off Odoo password. Prefer ODOO_CLIENTS or ODOO_PASSWORD env.")
+    redirect_path: str = Field(default="/web", description="Odoo path to open after login. Use /pos/ui?config_id=1&debug=1 to seed a POS session.")
+    screenshot_name: str = Field(default="odoo_login.png")
+    timeout_seconds: int = Field(default=45, ge=10, le=180)
+    full_page: bool = True
+    cleanup_screenshot_dir: bool = Field(default=True, description="Clean old screenshots from ODOO_AGENT_SCREENSHOT_DIR before/after the login run using retention/max-file limits.")
+    cleanup_screenshot_retention_seconds: int | None = Field(default=None, ge=0, le=604800)
+    delete_screenshots_after_verify: bool = Field(default=False)
 
 class BrowserCheckResult(BaseModel):
     status: Literal["ok", "failed"]
     url: str | None = None
     title: str | None = None
     screenshot_path: str | None = None
+    screenshot_url: str | None = None
+    screenshot_base64: str | None = None
+    screenshot_mode: str = "memory_only"
+    screenshot_persisted: bool = False
+    screenshot_analysis: dict[str, Any] = Field(default_factory=dict)
+    viewport: dict[str, Any] = Field(default_factory=dict)
+    assertion_results: dict[str, Any] = Field(default_factory=dict)
+    visual_compare: dict[str, Any] = Field(default_factory=dict)
     console_errors: list[str] = Field(default_factory=list, description="console.error/warning + pageerror entries.")
     console_all: list[str] = Field(default_factory=list, description="EVERY console message (log/info/debug/warning/error), in order. Always populated — read this for full console output on every run, not just when something fails.")
     network_errors: list[str] = Field(default_factory=list)
+    action_results: list[dict[str, Any]] = Field(default_factory=list)
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
+    debug_contrast_applied: bool = False
+    debug_screenshot_path: str | None = None
+    debug_screenshot_url: str | None = None
+    theme_restored_after_verify: bool = False
+    screenshot_cleanup: dict[str, Any] = Field(default_factory=dict)
+    screenshots_deleted_after_verify: bool = False
+    session_reused: bool = False
+    session_expired: bool = False
     error: str | None = None
+
+
+class PosVisualVerifyRequest(BrowserCheckRequest):
+    start_path: str = Field(default="/odoo/point-of-sale", description="POS dashboard path or full URL. Human navigation opens the selected register from here.")
+    screenshot_name: str = Field(default="pos_visual_verify.png")
+    wait_selector: str | None = Field(default=None, description="Optional extra selector. POS readiness is handled by the profile and human navigation flow.")
+    ui_profile: Literal["auto", "generic", "pos_product_screen", "pos_payment_screen", "pos_receipt_screen", "backend_form_view", "backend_list_view", "website_page", "website_form", "dashboard_owl", "payment_provider", "report_pdf_preview"] = Field(default="pos_product_screen")
+    human_pos_navigation: bool | None = Field(default=True)
+    viewport_width: int | None = Field(default=1440, ge=320, le=7680)
+    viewport_height: int | None = Field(default=1000, ge=240, le=4320)
+    include_screenshot_base64: bool = Field(default=True)
+    diagnostics: list[str] = Field(default_factory=lambda: ["overlap", "double_scrollbar", "clipping", "text_overflow", "hidden_scrollable"])
 
 
 class PosFlowCheckRequest(BaseModel):
@@ -441,12 +843,15 @@ class PosFlowCheckRequest(BaseModel):
     validate order -> receipt screen) because POS component/state bugs only
     surface once you actually interact with the app, not on initial mount.
     """
+    client_name: str | None = Field(default=None, description="Optional ODOO_CLIENTS client used to resolve URL and credentials safely.")
     base_url: str | None = Field(default=None)
     login: str | None = Field(default=None)
     password: str | None = Field(default=None)
+    pos_config_id: int | None = Field(default=None, ge=1)
     pos_config_name: str | None = Field(default=None, description="Optional POS config display name to open; if omitted, opens the first available POS.")
     product_name: str | None = Field(default=None, description="Optional exact/partial product name to click; if omitted, clicks the first product tile found.")
     payment_method_name: str | None = Field(default=None, description="Optional payment method button label; if omitted, clicks the first payment method tile found.")
+    validate_order: bool = Field(default=False, description="Create/validate a real POS order only when explicitly enabled. Visual checks remain non-destructive by default.")
     screenshot_prefix: str = Field(default="pos_flow")
     timeout_seconds: int = Field(default=60, ge=15, le=180)
 
@@ -545,6 +950,76 @@ class JobStep(BaseModel):
         return f"{icon} {self.name}"
 
 
+def _truthy_deployed_confirmation(value: Any) -> bool:
+    """Return True only for explicit structured Odoo.sh deployed proof.
+
+    Text summaries, command stdout fragments, a passed job status, or a generic
+    ``status='passed'`` field are intentionally not enough.  This helper is used
+    by the public ``deploy_confirmed`` contract so MCP clients have one boolean
+    gate they can trust before telling a user that deployment is complete.
+    """
+    if not isinstance(value, dict):
+        return False
+    if value.get("status") not in {"passed", "ok", True, None}:
+        return False
+    if value.get("deployed") is True:
+        return True
+    payload = value.get("payload")
+    if isinstance(payload, dict) and payload.get("deployed") is True:
+        return True
+    result = value.get("result")
+    if isinstance(result, dict) and result.get("deployed") is True:
+        return True
+    return False
+
+
+def _truthy_module_upgrade_confirmation(value: Any, requested: bool) -> bool:
+    """Return True only when a requested module upgrade explicitly passed."""
+    if not requested:
+        return True
+    if not isinstance(value, dict):
+        return False
+    return value.get("passed") is True or value.get("status") == "passed"
+
+
+def deployment_confirmed_from_record(status_value: Any, request: dict[str, Any] | None, result: Any) -> bool:
+    """Shared deploy-success gate for JobRecord and WorkflowReport responses.
+
+    A deployment is confirmed only when the job itself reached the success enum,
+    the final stored result contains explicit Odoo.sh ``deployed: true`` proof,
+    and any requested module-upgrade step also recorded a passed status.
+    """
+    status_text = status_value.value if isinstance(status_value, Enum) else str(status_value or "")
+    if not isinstance(result, dict):
+        return False
+
+    # A terminal warning can still be a *deployment* success when the only
+    # remaining blocker is live-browser proof for a frontend/UI change.  In that
+    # case the code was pushed, Odoo.sh deployed the SHA, and the module upgrade
+    # passed; agents should stop polling jobs.get and report the precise
+    # terminal state instead of looping forever waiting for status=passed.
+    allowed_status = status_text == JobStatus.passed.value or (
+        status_text == JobStatus.warning.value and result.get("status") == "ui_verification_required"
+    )
+    if not allowed_status:
+        return False
+
+    deployed_check = result.get("odoosh_check_commit")
+    if not _truthy_deployed_confirmation(deployed_check):
+        return False
+
+    module_upgrade = result.get("module_upgrade")
+    request = request or {}
+    if isinstance(module_upgrade, dict) and "requested" in module_upgrade:
+        upgrade_requested = bool(module_upgrade.get("requested"))
+    else:
+        upgrade_requested = bool(request.get("upgrade_module", True))
+        if request.get("trigger") == "git.push:auto_upgrade_on_push" or request.get("module_upgrade_timeout_seconds") is not None:
+            upgrade_requested = True
+
+    return _truthy_module_upgrade_confirmation(module_upgrade, upgrade_requested)
+
+
 class JobRecord(BaseModel):
     id: str = Field(default_factory=lambda: uuid4().hex)
     job_type: str
@@ -554,6 +1029,64 @@ class JobRecord(BaseModel):
     request: dict[str, Any] = Field(default_factory=dict)
     steps: list[JobStep] = Field(default_factory=list)
     result: Any = None
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def deploy_confirmed(self) -> bool:
+        """True only when Odoo.sh deployed proof and requested upgrade success are stored."""
+        return deployment_confirmed_from_record(self.status, self.request, self.result)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def verified_already_deployed(self) -> bool:
+        """True only for the no-local-changes path after Odoo.sh source hashes matched."""
+        return isinstance(self.result, dict) and self.result.get("verified_already_deployed") is True
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def already_deployed_confirmed(self) -> bool:
+        """Alias clients can use before saying an existing/no-op change is already live."""
+        return self.verified_already_deployed
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def completion_required(self) -> bool:
+        """True while safe deploy still requires follow-up polling."""
+        return self.job_type == "safe_deploy_module" and self.status in {JobStatus.queued, JobStatus.running}
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def success_allowed(self) -> bool:
+        """Hard success gate for deploy jobs; running/warning/failed is not success."""
+        if self.job_type != "safe_deploy_module":
+            return self.status == JobStatus.passed
+        return self.status == JobStatus.passed and (self.deploy_confirmed or self.already_deployed_confirmed)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def tool_exit_allowed(self) -> bool:
+        """False for running safe deploy jobs so agents keep polling instead of summarising."""
+        return not self.completion_required
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def poll_after_seconds(self) -> int | None:
+        return 10 if self.completion_required else None
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def next_call(self) -> dict[str, Any] | None:
+        if not self.completion_required:
+            return None
+        return {
+            "tool": "jobs.get",
+            "arguments": {
+                "job_id": self.id,
+                "wait_for_result": True,
+                "wait_timeout_seconds": 600,
+                "poll_interval_seconds": 10.0,
+            },
+        }
 
 
 class ToolDescriptor(BaseModel):
@@ -615,15 +1148,32 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
             "for example /web#action=123&model=sale.order&view_type=form."
         ),
     )
+    verify_ui_specs: list[UiVerifySpec] = Field(
+        default_factory=list,
+        max_length=50,
+        description="Structured live UI verification specs. Prefer this for POS/website/dashboard/report visual proof; verify_ui_paths remains backward-compatible.",
+    )
     verify_ui_screenshot_prefix: str = Field(default="safe_deploy_ui", description="Screenshot filename prefix for verify_ui_paths")
     verify_ui_timeout_seconds: int = Field(default=45, ge=10, le=180, description="Per-page browser timeout for verify_ui_paths")
-    wait_for_result: bool = Field(default=False, description="Return the background safe-deploy job_id immediately. Set True only for clients that can safely hold a long tool call open.")
-    wait_timeout_seconds: int = Field(default=300, ge=0, le=300, description="Maximum server-side wait before returning job_id/next_call")
-    poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between safe deploy job polls while waiting")
-    odoosh_deploy_timeout_seconds: int = Field(default=300, ge=0, le=600, description="Maximum time to poll Odoo.sh after git push for the pushed SHA to become deployed")
+    wait_for_result: bool = Field(
+        default=True,
+        description=(
+            "Safe deploy keeps the final-confirmation contract but uses a short bounded wait by default. "
+            "If the job is still running, callers must continue with jobs.get; running is never success."
+        ),
+    )
+    wait_timeout_seconds: int = Field(
+        default=600,
+        ge=0,
+        le=2400,
+        description="Maximum server-side wait before returning job_id/next_call. Use 0 only for CLI/internal integrations that can safely wait indefinitely.",
+    )
+    poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=10.0, description="Delay between safe deploy job polls while waiting")
+    odoosh_deploy_timeout_seconds: int = Field(default=600, ge=0, le=600, description="Maximum time to poll Odoo.sh after git push for the pushed SHA to become deployed")
     odoosh_deploy_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for Odoo.sh deployed SHA checks")
-    odoo_module_deploy_timeout_seconds: int = Field(default=300, ge=0, le=900, description="Maximum time for the internal Odoo module install/upgrade job to finish before returning a non-success resumable state")
+    odoo_module_deploy_timeout_seconds: int = Field(default=600, ge=0, le=900, description="Maximum time for the internal Odoo module install/upgrade job to finish before returning a non-success resumable state")
     odoo_module_deploy_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for the internal Odoo module install/upgrade job")
+    max_fix_cycles: int = Field(default=5, ge=1, le=5, description="Maximum safe-deploy upgrade/fix retry cycles before failing with upgrade_failed_after_retries")
     expected_registry_fields: dict[str, list[str]] = Field(default_factory=dict, description="Optional live registry fields to verify after upgrade, e.g. {'purchase.order': ['grok_y']}. If omitted, safe_deploy infers Python fields from changed addon files.")
     force_new_deploy: bool = Field(
         default=False,
@@ -638,8 +1188,13 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
 
     @field_validator("module_name")
     @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
 
 
 class FullVerifyRequest(SelfRunRequest):
@@ -673,6 +1228,7 @@ class StartSessionRequest(BaseModel):
 
 
 class RegistrySmokeTestRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists.")
     module_name: str = Field(..., description="Technical module name to validate in the live Odoo registry")
     model_names: list[str] = Field(default_factory=list, description="Models that must exist and answer a limit=1 search_read. Empty means infer common module prefix.")
     menu_names: list[str] = Field(default_factory=list, description="Menu labels that should be present. Empty skips menu check.")
@@ -680,8 +1236,13 @@ class RegistrySmokeTestRequest(BaseModel):
 
     @field_validator("module_name")
     @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
 
 
 class RestoreLastGoodCommitRequest(BaseProjectRequest, ApprovalMixin):
@@ -706,6 +1267,27 @@ class WorkflowReport(BaseModel):
     job_id: str
     steps: list[JobStep]
     summary: dict[str, Any]
+    deploy_confirmed: bool = Field(
+        default=False,
+        description=(
+            "Only true when the stored job result explicitly confirms Odoo.sh deployed the pushed SHA "
+            "and any requested module upgrade passed. Do not infer deploy success from status text."
+        ),
+    )
+    verified_already_deployed: bool = Field(
+        default=False,
+        description=(
+            "Only true for a no-local-changes safe_deploy_module result after workflow.verify_deployed_module "
+            "proved the active checkout matches Odoo.sh /home/odoo/src/user."
+        ),
+    )
+    already_deployed_confirmed: bool = Field(
+        default=False,
+        description=(
+            "Alias for verified_already_deployed. Only this true value permits an 'already added', "
+            "'already deployed', or 'already live' claim for no-op deploys."
+        ),
+    )
 
     @computed_field  # type: ignore[misc]
     @property
@@ -734,6 +1316,7 @@ def validate_safe_name(value: str, field_name: str) -> str:
 
 
 class OdooShCheckCommitRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists.")
     expected_sha: str = Field(..., min_length=7, description="Git SHA to check on Odoo.sh ~/src/user")
 
 
@@ -745,8 +1328,8 @@ class FindCoreFileRequest(BaseModel):
     """V14: Locate an Odoo core source file by module + type + keyword.
 
     Search priority:
-      1. /home/odoo/src/enterprise
-      2. /home/odoo/src/odoo
+      1. /home/odoo/src/odoo       (core/community addons)
+      2. /home/odoo/src/enterprise (enterprise fallback)
       3. /home/odoo/src/user       (fallback for other related custom dependencies)
 
     Use before any _inherit, view inherit, or depends to read exact
@@ -772,14 +1355,20 @@ class FindCoreFileRequest(BaseModel):
         default_factory=list,
         description=(
             "Override search roots (absolute paths). Defaults to "
-            "['/home/odoo/src/enterprise', '/home/odoo/src/odoo', '/home/odoo/src/user']"
+            "['/home/odoo/src/odoo', '/home/odoo/src/enterprise', '/home/odoo/src/user']"
         ),
     )
+    client_name: str | None = Field(default=None, description="Optional ODOO_CLIENTS client used to resolve installed-source roots in multi-client setups.")
 
     @field_validator("module_name")
     @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
 
     @field_validator("file_type")
     @classmethod
@@ -795,7 +1384,7 @@ class CoreFileMatch(BaseModel):
     path: str = Field(..., description="Absolute path to the found file")
     relative_path: str = Field(..., description="Path relative to its search root")
     root: str = Field(..., description="Which search root this file was found in")
-    priority: int = Field(..., description="1=enterprise, 2=odoo, 3=user fallback — lower is higher priority")
+    priority: int = Field(..., description="1=odoo/core, 2=enterprise fallback, 3=user fallback — lower is higher priority")
     size: int = Field(..., description="File size in bytes")
 
 
@@ -817,7 +1406,7 @@ class FindSimilarViewRequest(BaseModel):
     exact xpath structure, field names, and string attributes before
     writing a <xpath expr="..."> element.
 
-    Search priority: enterprise → odoo → user fallback (same as find_core_file).
+    Search priority: odoo/addons → enterprise → user fallback (same as find_core_file).
     """
     model: str = Field(
         ...,
@@ -829,8 +1418,9 @@ class FindSimilarViewRequest(BaseModel):
     )
     search_roots: list[str] = Field(
         default_factory=list,
-        description="Override search roots. Defaults to enterprise → odoo → user fallback.",
+        description="Override search roots. Defaults to odoo/addons → enterprise → user fallback.",
     )
+    client_name: str | None = Field(default=None, description="Optional ODOO_CLIENTS client used to save pre-write scope evidence in the isolated session state.")
 
     @field_validator("view_type")
     @classmethod
@@ -846,7 +1436,7 @@ class SimilarViewMatch(BaseModel):
     path: str = Field(..., description="Absolute path to the view XML file")
     relative_path: str = Field(..., description="Relative path within its search root")
     root: str = Field(..., description="Which search root this was found in")
-    priority: int = Field(..., description="1=enterprise, 2=odoo, 3=user fallback")
+    priority: int = Field(..., description="1=odoo/core, 2=enterprise fallback, 3=user fallback")
     model_hint: str = Field(..., description="Model name extracted from file/path heuristic")
     size: int
 
@@ -874,13 +1464,19 @@ class ListModuleFilesRequest(BaseModel):
     )
     search_roots: list[str] = Field(
         default_factory=list,
-        description="Override search roots. Defaults to enterprise → odoo → user fallback.",
+        description="Override search roots. Defaults to odoo/addons → enterprise → user fallback.",
     )
+    client_name: str | None = Field(default=None, description="Optional ODOO_CLIENTS client used to save pre-write scope evidence in the isolated session state.")
 
     @field_validator("module_name")
     @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
 
 
 class ModuleFileEntry(BaseModel):
@@ -958,12 +1554,18 @@ class SessionStateLoadRequest(BaseModel):
 
 class EnsureDependenciesRequest(ApprovalMixin):
     """Fix 10: Auto-install any missing/uninstalled Odoo module dependencies."""
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when multiple clients are configured.")
     module_name: str = Field(..., description="Technical module name whose dependencies should be satisfied")
 
     @field_validator("module_name")
     @classmethod
-    def module_name_must_be_safe(cls, value: str) -> str:
-        return validate_safe_name(value, "module_name")
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
 
 
 # ===========================================================================
@@ -1021,8 +1623,9 @@ class ScopeAdviceRequest(BaseModel):
     )
     search_roots: list[str] = Field(
         default_factory=list,
-        description="Override search roots. Defaults to enterprise → odoo → user fallback.",
+        description="Override search roots. Defaults to odoo/addons → enterprise → user fallback.",
     )
+    client_name: str | None = Field(default=None, description="Optional ODOO_CLIENTS client used to save pre-write scope evidence in the isolated session state.")
 
 
 class ScopeAdviceResult(BaseModel):
@@ -1113,6 +1716,10 @@ class SyntaxVerifyRequest(BaseModel):
         default=None,
         description="Optional repo root. When provided, impact-aware validation can include only directly related companion files.",
     )
+    client_name: str | None = Field(
+        default=None,
+        description="Optional ODOO_CLIENTS client context used by core-source sync/verification.",
+    )
     impact_aware: bool | None = Field(
         default=None,
         description="Default true via env. Adds only related companion files for template/assets checks; does not scan the full repo.",
@@ -1183,6 +1790,7 @@ class FrontendPatternPreflightRequest(BaseModel):
     OWL component, QWeb/XML template, SCSS asset, POS screen/store patch,
     website snippet/editor code, or payment frontend code.
     """
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS used for client-aware core source discovery.")
     task_description: str = Field(..., description="User task or short implementation description")
     target_area: str = Field(
         default="auto",
@@ -1202,7 +1810,7 @@ class FrontendPatternPreflightRequest(BaseModel):
     )
     search_roots: list[str] = Field(
         default_factory=list,
-        description="Override source roots. Defaults to enterprise → odoo → user fallback.",
+        description="Override source roots. Defaults to odoo/addons → enterprise → user fallback.",
     )
 
 

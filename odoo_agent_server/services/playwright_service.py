@@ -305,7 +305,7 @@ class PlaywrightService:
             body_text = (await page.locator("body").inner_text(timeout=2000))[:5000]
         except Exception:
             body_text = ""
-        for token in ("Odoo Client Error", "RPC_ERROR", "UncaughtPromiseError", "Traceback", "Internal Server Error"):
+        for token in ("Odoo Client Error", "shell_ERROR", "UncaughtPromiseError", "Traceback", "Internal Server Error"):
             if token in body_text:
                 markers.append(f"odoo_ui_error_text:{token}")
         return markers

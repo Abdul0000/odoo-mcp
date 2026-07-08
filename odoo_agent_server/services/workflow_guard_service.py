@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..schemas import CommandResult, JobStatus, OdooRpcResult
+from ..config import settings
+from ..schemas import CommandResult, JobStatus, OdooResult
 from .store_service import JsonStore
 
 _RESUMABLE_SAFE_DEPLOY_RESULTS = {
@@ -63,6 +66,57 @@ def _job_result_status(job: Any) -> str | None:
     return None
 
 
+def _parse_epoch(value: Any) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
+def _job_last_activity_epoch(job: Any) -> float | None:
+    latest = _parse_epoch(getattr(job, "created_at", None))
+    for step in getattr(job, "steps", None) or []:
+        for key in ("finished_at", "started_at"):
+            parsed = _parse_epoch(getattr(step, key, None))
+            if parsed is not None and (latest is None or parsed > latest):
+                latest = parsed
+    return latest
+
+
+def mark_stale_safe_deploy_running_job(job: Any, store: JsonStore | None = None):
+    """Convert an orphaned running safe-deploy job into a resumable warning.
+
+    Safe deploy workers are in-process threads. After a process restart their
+    JobRecord can remain ``running`` forever. Only mark a job stale when no step
+    activity has been recorded within the configured threshold.
+    """
+    if getattr(job, "job_type", None) != "safe_deploy_module" or job.status not in {JobStatus.queued, JobStatus.running}:
+        return job
+    threshold = max(int(settings.safe_deploy_stale_running_seconds or 0), 0)
+    if threshold <= 0:
+        return job
+    last_activity = _job_last_activity_epoch(job)
+    if last_activity is None or time.time() - last_activity <= threshold:
+        return job
+    store = store or JsonStore()
+    request = job.request or {}
+    result = {
+        "status": "stale_running_job",
+        "message": (
+            "The safe_deploy_module job was left running without recent activity. "
+            "The background worker is presumed gone; resume the stored pipeline state."
+        ),
+        "module_name": request.get("module_name"),
+        "project_path": request.get("project_path"),
+        "last_activity_epoch": last_activity,
+        "stale_after_seconds": threshold,
+        "next_call": {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}},
+    }
+    return store.finish_job(job, JobStatus.warning, result)
+
+
 def find_blocking_safe_deploy(
     *,
     project_path: str | None = None,
@@ -93,6 +147,7 @@ def find_blocking_safe_deploy(
         if job.id in seen or job.job_type != "safe_deploy_module":
             continue
         seen.add(job.id)
+        job = mark_stale_safe_deploy_running_job(job, store)
         request = job.request or {}
         req_project = request.get("project_path") or state.get("project_path")
         req_module = request.get("module_name") or state.get("module_name")
@@ -108,18 +163,30 @@ def find_blocking_safe_deploy(
 
 def safe_deploy_block_payload(action: str, job: Any) -> dict[str, Any]:
     request = job.request or {}
+    job_status = getattr(job.status, "value", str(job.status))
+    active = job.status in {JobStatus.queued, JobStatus.running}
+    next_call = (
+        {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+        if active
+        else {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}}
+    )
+    recovery = "Use jobs.get to poll the active job" if active else "Use workflow.resume_job"
     return {
         "status": "safe_deploy_active",
         "message": (
             f"Manual {action} is blocked because workflow.safe_deploy_module already owns "
             "commit → push → Odoo.sh polling → module upgrade for this module. "
-            "Use workflow.resume_job or jobs.get; do not replay commit/push/update."
+            f"{recovery}; do not replay commit/push/update."
         ),
         "job_id": job.id,
-        "job_status": getattr(job.status, "value", str(job.status)),
+        "job_status": job_status,
         "module_name": request.get("module_name"),
         "project_path": request.get("project_path"),
-        "next_call": {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}},
+        "completion_required": active,
+        "success_allowed": False,
+        "tool_exit_allowed": not active,
+        "poll_after_seconds": 10 if active else None,
+        "next_call": next_call,
     }
 
 
@@ -217,11 +284,11 @@ def safe_deploy_command_block(
     return None
 
 
-def safe_deploy_rpc_block(action: str, *, module_name: str | None = None, project_path: str | None = None) -> OdooRpcResult | None:
+def safe_deploy_shell_block(action: str, *, module_name: str | None = None, project_path: str | None = None) -> OdooResult | None:
     job = find_blocking_safe_deploy(project_path=project_path, module_name=module_name)
     if job:
         payload = safe_deploy_block_payload(action, job)
-        return OdooRpcResult(
+        return OdooResult(
             status="failed",
             error=payload["message"],
             result=payload,
@@ -229,7 +296,7 @@ def safe_deploy_rpc_block(action: str, *, module_name: str | None = None, projec
     failed_job = find_latest_pre_push_failed_safe_deploy(project_path=project_path, module_name=module_name)
     if failed_job:
         payload = safe_deploy_pre_push_failure_payload(action, failed_job)
-        return OdooRpcResult(
+        return OdooResult(
             status="failed",
             error=payload["message"],
             result=payload,

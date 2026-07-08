@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import core_sync_service
+from .client_resolver_service import ClientResolverService
 from ..config import settings
 from .repo_index_service import RepoIndexService
 from ..schemas import (
@@ -50,8 +51,8 @@ _CLASS_IN_EXPR_RE  = re.compile(r'contains\(@class,\s*["\']([^"\']+)["\']\)|hasc
 
 # Search roots for installed-source reads: enterprise, community, then user fallback.
 _SRC_ROOTS = [
+    Path("/home/odoo/src/odoo/addons"),
     Path("/home/odoo/src/enterprise"),
-    Path("/home/odoo/src/odoo"),
     Path("/home/odoo/src/user"),
 ]
 
@@ -91,19 +92,19 @@ def _module_dir(root: Path, module_name: str) -> Path | None:
     return None
 
 
-def _iter_module_dirs(module_name: str) -> list[Path]:
+def _iter_module_dirs(module_name: str, client_name: str | None = None) -> list[Path]:
     dirs: list[Path] = []
     for root in _SRC_ROOTS:
         found = _module_dir(root, module_name)
         if not found:
-            core_sync_service.ensure_module_synced(str(root), module_name)
+            core_sync_service.ensure_module_synced(str(root), module_name, client_name=client_name)
             found = _module_dir(root, module_name)
         if found:
             dirs.append(found)
     return dirs
 
 
-def _core_source_available() -> bool:
+def _core_source_available(client_name: str | None = None) -> bool:
     """True if at least one of the Odoo core/enterprise/user source roots is
     actually reachable on this machine — either it already exists locally,
     or on-demand sync (core_sync_service, rsync over SSH to Odoo.sh) is
@@ -120,14 +121,28 @@ def _core_source_available() -> bool:
     """
     if any(root.exists() and any(root.iterdir()) for root in _SRC_ROOTS if root.exists()):
         return True
-    return bool(settings.core_sync_enabled and settings.odoosh_ssh_host)
+    if not settings.core_sync_enabled:
+        return False
+    if settings.odoosh_ssh_host:
+        return True
+    if client_name:
+        try:
+            client = ClientResolverService().resolve_client(client_name=client_name, require_complete=False)
+            return bool(client and client.odoosh_ssh_host)
+        except Exception:
+            return False
+    try:
+        client = ClientResolverService().resolve_client(require_complete=False)
+        return bool(client and client.odoosh_ssh_host)
+    except Exception:
+        return False
 
 
-def _find_core_model_content(model_name: str) -> str:
+def _find_core_model_content(model_name: str, client_name: str | None = None) -> str:
     """Return concatenated content of core model files for a given model."""
     module = model_name.split(".")[0]
     contents: list[str] = []
-    for module_dir in _iter_module_dirs(module):
+    for module_dir in _iter_module_dirs(module, client_name=client_name):
         models_dir = module_dir / "models"
         if not models_dir.exists():
             continue
@@ -148,14 +163,14 @@ def _extract_model_literals(raw: str) -> list[str]:
     return [m.group(1) for m in _MODEL_LITERAL_RE.finditer(raw)]
 
 
-def _find_core_view_content(model_name: str) -> str:
+def _find_core_view_content(model_name: str, client_name: str | None = None) -> str:
     """Return concatenated content of core view XML files for a model."""
     if not model_name:
         return ""
     module = model_name.split(".")[0]
     hints = [model_name.replace(".", "_"), model_name.split(".")[-1]]
     contents: list[str] = []
-    for module_dir in _iter_module_dirs(module):
+    for module_dir in _iter_module_dirs(module, client_name=client_name):
         views_dir = module_dir / "views"
         if not views_dir.exists():
             continue
@@ -166,9 +181,9 @@ def _find_core_view_content(model_name: str) -> str:
     return "\n".join(contents)
 
 
-def _module_exists_in_src(module_name: str) -> bool:
+def _module_exists_in_src(module_name: str, client_name: str | None = None) -> bool:
     """Check whether a module directory exists anywhere in src roots."""
-    return bool(_iter_module_dirs(module_name))
+    return bool(_iter_module_dirs(module_name, client_name=client_name))
 
 
 def _extract_all_template_names(xml_contents: dict[str, str]) -> set[str]:
@@ -178,7 +193,7 @@ def _extract_all_template_names(xml_contents: dict[str, str]) -> set[str]:
     return names
 
 
-def _find_template_content(template_name: str, local_xml_contents: dict[str, str] | None = None) -> str:
+def _find_template_content(template_name: str, local_xml_contents: dict[str, str] | None = None, client_name: str | None = None) -> str:
     """Find QWeb template source in written XML files or Odoo source roots."""
     if local_xml_contents:
         for content in local_xml_contents.values():
@@ -186,7 +201,7 @@ def _find_template_content(template_name: str, local_xml_contents: dict[str, str
                 return content
     # Try module prefix first for speed: web.SomeTemplate -> module web.
     module_hint = template_name.split(".", 1)[0] if "." in template_name else None
-    module_dirs = _iter_module_dirs(module_hint) if module_hint else []
+    module_dirs = _iter_module_dirs(module_hint, client_name=client_name) if module_hint else []
     search_dirs = module_dirs or [root for root in _SRC_ROOTS if root.exists()]
     for search_dir in search_dirs:
         for xml_file in search_dir.rglob("*.xml"):
@@ -196,14 +211,14 @@ def _find_template_content(template_name: str, local_xml_contents: dict[str, str
     return ""
 
 
-def _resolve_odoo_alias(import_path: str) -> list[Path]:
+def _resolve_odoo_alias(import_path: str, client_name: str | None = None) -> list[Path]:
     """Map @web/foo/bar imports to possible source files."""
     for alias, module in _ALIAS_MODULES.items():
         if not import_path.startswith(alias):
             continue
         tail = import_path[len(alias):]
         candidates: list[Path] = []
-        for module_dir in _iter_module_dirs(module):
+        for module_dir in _iter_module_dirs(module, client_name=client_name):
             base = module_dir / "static" / "src" / tail
             candidates.extend([base, base.with_suffix(".js"), base.with_suffix(".xml"), base / "index.js"])
         return candidates
@@ -254,7 +269,7 @@ class SyntaxVerifierService:
         xml_contents: dict[str, str] = {}
         js_contents: dict[str, str] = {}
 
-        if not _core_source_available():
+        if not _core_source_available(request.client_name):
             findings.append(VerifyFinding(
                 file=request.written_files[0] if request.written_files else "(no files)",
                 severity=VerifySeverity.INFO,
@@ -298,15 +313,15 @@ class SyntaxVerifierService:
         for file_path, content in file_contents.items():
             path = Path(file_path)
             if path.name == "__manifest__.py":
-                findings.extend(self._verify_manifest(file_path, content))
+                findings.extend(self._verify_manifest(file_path, content, request.client_name))
             elif path.suffix == ".py":
-                findings.extend(self._verify_python_model(file_path, content))
+                findings.extend(self._verify_python_model(file_path, content, request.client_name))
             elif path.suffix == ".xml":
-                findings.extend(self._verify_xml_view(file_path, content))
-                findings.extend(self._verify_qweb_template(file_path, content, xml_contents))
+                findings.extend(self._verify_xml_view(file_path, content, request.client_name))
+                findings.extend(self._verify_qweb_template(file_path, content, xml_contents, request.client_name))
             elif path.suffix == ".js":
                 findings.extend(self._verify_js_syntax_real(file_path, content))
-                findings.extend(self._verify_js_owl(file_path, content, template_names))
+                findings.extend(self._verify_js_owl(file_path, content, template_names, request.client_name))
             elif path.suffix == ".scss":
                 findings.extend(self._verify_scss_asset(file_path, content))
 
@@ -362,7 +377,7 @@ class SyntaxVerifierService:
     # Manifest verification
     # ------------------------------------------------------------------
 
-    def _verify_manifest(self, file_path: str, content: str) -> list[VerifyFinding]:
+    def _verify_manifest(self, file_path: str, content: str, client_name: str | None = None) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
         m = _MANIFEST_DEPS_RE.search(content)
         if m:
@@ -371,7 +386,7 @@ class SyntaxVerifierService:
             for dep in dep_names:
                 if dep in {"base", "web", "mail", "sale", "purchase", "account", "stock", "hr"}:
                     continue
-                if not _module_exists_in_src(dep):
+                if not _module_exists_in_src(dep, client_name=client_name):
                     source_available = _core_source_available()
                     findings.append(VerifyFinding(
                         file=file_path,
@@ -445,14 +460,14 @@ class SyntaxVerifierService:
     # Python model verification
     # ------------------------------------------------------------------
 
-    def _verify_python_model(self, file_path: str, content: str) -> list[VerifyFinding]:
+    def _verify_python_model(self, file_path: str, content: str, client_name: str | None = None) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
         inherit_models: list[str] = []
         for m in _INHERIT_RE.finditer(content):
             inherit_models.extend(_extract_model_literals(m.group(1)))
 
         for model_name in inherit_models:
-            core_content = _find_core_model_content(model_name)
+            core_content = _find_core_model_content(model_name, client_name=client_name)
             core_fields: set[str] = set()
             if not core_content:
                 findings.append(VerifyFinding(
@@ -485,7 +500,7 @@ class SyntaxVerifierService:
                 comodel = cm_m.group(1) or cm_m.group(2) or ""
                 if "." in comodel:
                     comodel_module = comodel.split(".")[0]
-                    if not _module_exists_in_src(comodel_module):
+                    if not _module_exists_in_src(comodel_module, client_name=client_name):
                         source_available = _core_source_available()
                         findings.append(VerifyFinding(
                             file=file_path,
@@ -540,7 +555,7 @@ class SyntaxVerifierService:
     # XML / QWeb verification
     # ------------------------------------------------------------------
 
-    def _verify_xml_view(self, file_path: str, content: str) -> list[VerifyFinding]:
+    def _verify_xml_view(self, file_path: str, content: str, client_name: str | None = None) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
         inherit_refs = [m.group(1) for m in _INHERIT_ID_RE.finditer(content)]
 
@@ -549,12 +564,12 @@ class SyntaxVerifierService:
             parts = ref.split(".")
             if len(parts) >= 2:
                 candidate = f"{parts[0]}.{parts[1]}"
-                core_content_test = _find_core_view_content(candidate)
+                core_content_test = _find_core_view_content(candidate, client_name=client_name)
                 if core_content_test:
                     model_name = candidate
                     break
 
-        core_view_content = _find_core_view_content(model_name) if model_name else ""
+        core_view_content = _find_core_view_content(model_name, client_name=client_name) if model_name else ""
         for xpath_m in _XPATH_EXPR_RE.finditer(content):
             expr = xpath_m.group(1)
             # QWeb template xpaths are verified by _verify_qweb_template.
@@ -592,7 +607,7 @@ class SyntaxVerifierService:
 
         if model_name and core_view_content:
             field_names_in_xml = {m.group(1) for m in _FIELD_NAME_XML_RE.finditer(content)}
-            core_model_content = _find_core_model_content(model_name)
+            core_model_content = _find_core_model_content(model_name, client_name=client_name)
             if core_model_content:
                 core_fields = _extract_core_field_names(core_model_content)
                 for field_name in field_names_in_xml:
@@ -609,7 +624,7 @@ class SyntaxVerifierService:
                         ))
         return findings
 
-    def _verify_qweb_template(self, file_path: str, content: str, xml_contents: dict[str, str]) -> list[VerifyFinding]:
+    def _verify_qweb_template(self, file_path: str, content: str, xml_contents: dict[str, str], client_name: str | None = None) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
         template_names = [m.group(1) for m in _T_NAME_RE.finditer(content)]
         inherit_names = [m.group(1) for m in _T_INHERIT_RE.finditer(content)]
@@ -625,7 +640,7 @@ class SyntaxVerifierService:
             ))
 
         for template in inherit_names + call_names:
-            source = _find_template_content(template, xml_contents)
+            source = _find_template_content(template, xml_contents, client_name=client_name)
             if not source:
                 findings.append(VerifyFinding(
                     file=file_path,
@@ -686,7 +701,7 @@ class SyntaxVerifierService:
     # JS/OWL/SCSS verification
     # ------------------------------------------------------------------
 
-    def _verify_js_owl(self, file_path: str, content: str, template_names: set[str]) -> list[VerifyFinding]:
+    def _verify_js_owl(self, file_path: str, content: str, template_names: set[str], client_name: str | None = None) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
         modern_signals = ("from \"@" in content or "from '@" in content or "import " in content or "registry.category" in content or "Component" in content)
 
@@ -724,7 +739,7 @@ class SyntaxVerifierService:
             if not import_path or import_path in _EXTERNAL_IMPORTS or import_path.startswith((".", "/")):
                 continue
             if import_path.startswith("@"):
-                candidates = _resolve_odoo_alias(import_path)
+                candidates = _resolve_odoo_alias(import_path, client_name=client_name)
                 if not candidates:
                     if _known_odoo_alias(import_path) and not _core_source_available():
                         findings.append(VerifyFinding(
@@ -770,7 +785,7 @@ class SyntaxVerifierService:
 
         used_templates = {m.group(1) for m in _JS_TEMPLATE_RE.finditer(content)}
         for template in used_templates:
-            if template not in template_names and not _find_template_content(template):
+            if template not in template_names and not _find_template_content(template, client_name=client_name):
                 findings.append(VerifyFinding(
                     file=file_path,
                     severity=VerifySeverity.WARNING,

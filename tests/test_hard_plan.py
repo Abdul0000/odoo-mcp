@@ -151,7 +151,30 @@ def test_mcp_initialize_list_and_call(tmp_path, monkeypatch):
 
     listed = client.post("/mcp", headers=_auth(), json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
     assert listed.status_code == 200
-    assert any(tool["name"] == "qa_self_run" for tool in listed.json()["result"]["tools"])
+    names = {tool["name"] for tool in listed.json()["result"]["tools"]}
+    assert names == {
+        "connector_health",
+        "client_check",
+        "workflow_agent_instructions",
+        "workflow_odoo_code_change",
+    "workflow_frontend_visual_implement",
+        "workflow_find_core_file",
+        "workflow_list_module_files",
+        "workflow_frontend_pattern_preflight",
+        "workflow_verify_pos_change",
+        "workflow_verify_against_core",
+        "odoosh_read_core_file",
+        "odoosh_list_core_files",
+        "artifacts_read",
+        "workflow_resume_job",
+        "jobs_list",
+        "jobs_get",
+        "odoosh_error_pack",
+        "browser_login",
+    "browser_screenshot",
+        "workflow_pos_visual_verify",
+        "jobs_status_compact",
+    }
 
     called = client.post(
         "/mcp",
@@ -160,16 +183,12 @@ def test_mcp_initialize_list_and_call(tmp_path, monkeypatch):
             "jsonrpc": "2.0",
             "id": 3,
             "method": "tools/call",
-            "params": {
-                # Dotted aliases remain accepted on call even though tools/list is strict.
-                "name": "qa.self_run",
-                "arguments": {"project_path": str(tmp_path), "module_name": "x_module", "run_pytest": False, "include_git_status": False},
-            },
+            "params": {"name": "connector_health", "arguments": {}},
         },
     )
     assert called.status_code == 200
     assert called.json()["result"]["isError"] is False
-    assert called.json()["result"]["structuredContent"]["status"] == "passed"
+    assert called.json()["result"]["structuredContent"]["status"] == "ok"
 
 
 def test_full_verify_failure_creates_failed_job_and_audit(tmp_path, monkeypatch):
