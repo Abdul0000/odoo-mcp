@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
@@ -62,7 +63,10 @@ def test_symlink_escape_is_rejected(tmp_path, monkeypatch):
     project.mkdir()
     outside = tmp_path / "outside.txt"
     outside.write_text("secret", encoding="utf-8")
-    (project / "link.txt").symlink_to(outside)
+    try:
+        (project / "link.txt").symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symlink privilege unavailable on this Windows host: {exc}")
     client = TestClient(app)
     response = client.post("/repo/read", headers=_auth(), json={"project_path": str(project), "relative_path": "link.txt"})
     assert response.status_code == 403
@@ -126,14 +130,14 @@ def test_protected_branch_push_requires_real_approved_git_push_approval_even_whe
 
 def test_tools_list_reflects_runtime_approval_policy(monkeypatch):
     monkeypatch.setattr(settings, "require_approval", True)
-    monkeypatch.setattr(settings, "approval_required_actions_raw", "git.push,repo.apply_patch")
+    monkeypatch.setattr(settings, "approval_required_actions_raw", "git.push,repo.apply_patch_atomic")
     client = TestClient(app)
     response = client.get("/tools/list", headers=_auth())
     assert response.status_code == 200
     by_name = {item["name"]: item for item in response.json()}
-    assert by_name["git.push"]["requires_approval"] is True
-    assert by_name["repo.apply_patch"]["requires_approval"] is True
-    assert by_name["repo.read"]["read_only"] is True
+    assert by_name["git_push"]["requires_approval"] is True
+    assert by_name["repo_apply_patch_atomic"]["requires_approval"] is True
+    assert by_name["repo_read"]["read_only"] is True
 
 
 def test_mcp_initialize_list_and_call(tmp_path, monkeypatch):
@@ -147,7 +151,7 @@ def test_mcp_initialize_list_and_call(tmp_path, monkeypatch):
 
     listed = client.post("/mcp", headers=_auth(), json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
     assert listed.status_code == 200
-    assert any(tool["name"] == "qa.self_run" for tool in listed.json()["result"]["tools"])
+    assert any(tool["name"] == "qa_self_run" for tool in listed.json()["result"]["tools"])
 
     called = client.post(
         "/mcp",
@@ -157,6 +161,7 @@ def test_mcp_initialize_list_and_call(tmp_path, monkeypatch):
             "id": 3,
             "method": "tools/call",
             "params": {
+                # Dotted aliases remain accepted on call even though tools/list is strict.
                 "name": "qa.self_run",
                 "arguments": {"project_path": str(tmp_path), "module_name": "x_module", "run_pytest": False, "include_git_status": False},
             },

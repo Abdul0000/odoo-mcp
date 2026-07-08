@@ -22,12 +22,12 @@ from .routers.workflow import router as workflow_router
 limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 
 app = FastAPI(
-    title="Odoo ChatGPT Direct Connector",
+    title="Odoo MCP Agent Connector",
     version="1.4.0",
     description=(
-        "V14 Self-Learning Agent connector for ChatGPT Odoo development automation: "
+        "V14 Self-Learning Agent connector for Odoo development automation over MCP/HTTP: "
         "core file discovery (find_core_file + find_similar_view), "
-        "repo patching, self QA, Git, Odoo.sh, Odoo RPC, Playwright screenshots, "
+        "repo patching, self QA, Git, Odoo.sh, Odoo RPC, CDP browser diagnostics, "
         "approvals, jobs/audit, full MCP conversion, OAuth 2.1/PKCE MCP auth, and tool-call bridge."
     ),
 )
@@ -35,13 +35,13 @@ app = FastAPI(
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "service": "odoo-chatgpt-direct-connector"}
+    return {"status": "ok", "service": "odoo-mcp-agent-connector"}
 
 
 @app.get("/agent-instructions")
 def agent_instructions() -> dict:
     """Full agent system prompt stored in connector.
-    ChatGPT Custom Instructions should contain ONLY:
+    MCP client system instructions can contain only:
     'Before any task, call workflow.agent_instructions first and follow exactly.'
     """
     from .config import settings, get_client_names
@@ -66,18 +66,25 @@ def agent_instructions() -> dict:
                 "Never edit src/odoo or src/enterprise core files — READ them only",
                 "Dummy data requests → add data.xml",
                 "Coding patterns: github.com/fhidalgodev/odoo-development-skill",
-                "Module reference priority: /home/odoo/src/user → /home/odoo/src/enterprise → /home/odoo/src/odoo",
+                "Module reference priority for installed-source reads: /home/odoo/src/enterprise, then /home/odoo/src/odoo, then /home/odoo/src/user only as fallback for other related custom dependencies. For editing, read the current custom module from the active checkout; for already-live/deployed/done proof, verify real /home/odoo/src/user with workflow.verify_deployed_module or odoosh.read_user_file.",
                 "Before install/upgrade: repo.read each file and verify imports against core modules",
-                "Long operations return job_id — poll jobs.get every 10s until passed/failed",
+                "Long operations return job_id and next_call — poll jobs.get every 10s until passed/failed/warning. Never treat status=running, deploy_running, module_upgrade_running, or job_status=running as complete.",
                 "Job/workflow responses include status_label and steps_summary fields (e.g. '✅ git.push') — show these directly to the user instead of writing your own status text",
                 "Tools that return a list (repo.list, repo.list_custom_modules, jobs.list, approvals.list, audit.list) come wrapped as {items: [...], count: N} — read result.items, not result directly",
                 "On error: diagnose first, fix, retry max 3x — never blind retry",
                 "Binary files (.png/.jpg/.ico/.woff/.ttf) cannot be read via repo.read — skip them (415 error expected)",
                 "For files >300KB pass max_bytes=500000 to repo.read",
-                "For simple field/view/notebook edits, use the small_patch_fast_path: reuse session state, read only targeted files, skip broad discovery/health/screenshots unless needed.",
-                "For hard UI/POS/website/view tasks, include exact post-upgrade Odoo paths in workflow.safe_deploy_module.verify_ui_paths so the deploy job opens each page and records screenshots, console/network errors, and Odoo UI breakage.",
+                "For simple field/view/notebook edits, use the small_patch_fast_path: reuse session state, read only targeted files, skip broad discovery/health/browser diagnostics unless needed.",
+                "Never say a custom module change is already live/deployed/done because repo.read/GitHub/local checkout shows it. First call workflow.verify_deployed_module or odoosh.read_user_file for the exact /home/odoo/src/user file.",
+                "For any code-changing request, do not stop after writing files and ask the user to run upgrade/tests. Continue through git.diff, qa_self_run, verify_against_core, and workflow.safe_deploy_module. Only ask the user when required information is missing or a real blocker remains after diagnostics.",
+                "If the deploy cycle breaks mid-flow, use workflow.resume_job. If job_id is missing, call it with client_name/project_path/module_name or no job_id to resume the latest saved safe-deploy job. Use override_step=push, install, or upgrade only when the user explicitly asks to continue from that point. Never call git.commit/git.push/odoosh.module_update after workflow.safe_deploy_module starts; these are blocked because safe_deploy owns the whole pipeline.",
+                "Never answer a code-changing request by printing JSON MCP tool calls or saying the client/user should execute them. You are connected to the MCP tools; call them yourself.",
+                "Never create module schema changes by direct ORM/Studio writes to ir.model.fields or ir.ui.view unless the user explicitly asks for a no-code Studio/database customization. For normal Odoo development, write Python/XML files in the custom module and deploy the module.",
+                "Never generate Pydantic models/imports inside Odoo addon code. Pydantic is only for this MCP server's API schemas; Odoo modules must use the normal Odoo ORM: models.Model, fields, api, and XML views.",
+                "For hard UI/POS/website/view tasks, include exact post-upgrade Odoo paths in workflow.safe_deploy_module.verify_ui_paths so the deploy job opens each page through CDP and records console/network errors plus Odoo UI breakage.",
                 "SMART ROUTER: for coding tasks, call workflow.smart_tool_router early to choose the fastest correct path. For pure data queries, use direct odoo.search_read and skip repo tools.",
                 "STRICT FRONTEND: before writing any Odoo JS/OWL/POS/website/payment/QWeb/XML/SCSS asset code, call workflow.frontend_pattern_preflight and read the mandatory pattern files it returns. Results are cached; do not guess framework syntax.",
+                "POS CONFIG RULE: never use legacy load_fields('pos.config', ...) / models.load_fields for pos.config. Read installed point_of_sale source and use the version's real loader/backend pattern.",
                 "FAST WRITE RULE: for multi-file edits use repo.write_many_smart first. It keeps lock+backup+rollback for small changes and automatically uses repo.write_many_atomic only when size/risk requires it. Never skip git.diff or impact-aware changed-files verification.",
                 "CACHE RULE: use workflow.repo_index for module/assets/template discovery instead of full repo scans. Reuse cache unless files changed or force_refresh is required.",
             ],
@@ -88,17 +95,25 @@ def agent_instructions() -> dict:
                     "1. session.load_state; if it has project_path/client_name, do not call workflow.start_session.",
                     "2. If no session exists, call workflow.start_session(include_odoo=false, include_odoosh=false) to avoid slow health probes.",
                     "3. repo.prepare once, then read only the target manifest/model/view files.",
-                    "4. Read core/enterprise only for the exact inherited model/view pattern that is not already clear from existing custom code.",
+                    "4. Read core/enterprise only for the exact inherited model/view pattern that is not already clear from existing custom code. If local code appears already changed and you plan to answer 'already done/live', call workflow.verify_deployed_module or odoosh.read_user_file first.",
+                    "4a. For field/view changes, use module files only. Do not create ir.model.fields or patch ir.ui.view records directly as a Studio shortcut.",
+                    "4b. For Odoo Python files, use Odoo ORM only. Do not import pydantic or create Pydantic BaseModel classes inside addons.",
                     "5. Patch with repo.apply_patch_atomic or repo.write_many_smart. Use repo.write_many_atomic only for large/risky refactors.",
                     "6. Run git.diff and qa.self_run(run_pytest=false) unless tests/shared logic are touched.",
-                    "7. workflow.verify_against_core only for changed files, then git.commit and git.push.",
-                    "8. Poll odoosh.check_commit for the pushed SHA, then odoo.module_deploy(wait_timeout_seconds=5).",
-                    "9. Verify exact field/model with odoo.search_read or registry_smoke_test; if UI proof was requested, pass exact paths in verify_ui_paths or call workflow.browser_menu_crawl once.",
+                    "7. workflow.verify_against_core only for changed files.",
+                    "8. Call workflow.safe_deploy_module with module_name, commit_message, changed paths, run_qa=false if qa.self_run already passed, wait_for_odoosh=true, upgrade_module=true, wait_for_result=true, expected_registry_fields for known new fields, and exact verify_ui_paths when UI proof is needed.",
+                    "9. If safe_deploy returns status=running, module_upgrade_running, or any next_call, call the returned next_call/jobs.get or workflow.resume_job. If Odoo.sh deploy polling times out, recent Odoo.sh logs show build/test failure, changed /home/odoo/src/user file hashes do not match, the Odoo module deploy is still running, or registry_field_verify fails, do not claim success. Do not repeat commit/push.",
+                    "10. If the client loses job_id mid-flow, call workflow.resume_job without job_id to use the latest saved safe-deploy job, or pass override_step=push/install/upgrade for an explicit user-requested continuation point.",
+                    "11. Finish only after safe deploy/resume reports passed, or report the exact blocker and next_call returned by the workflow.",
                 ],
                 "do_not": [
                     "Do not repeatedly look up the tool list after the first successful tool call.",
                     "Do not crawl all custom modules when the target module is already known.",
-                    "Do not run browser screenshots for a backend field unless the user asks for visible UI proof.",
+                    "Do not run browser diagnostics for a backend field unless the user asks for visible UI proof.",
+                    "Do not end with 'next steps', 'want to', or ask the user to run module upgrade after you have changed code. Use workflow.safe_deploy_module yourself.",
+                    "Do not print sample MCP JSON blocks for the user to execute. Call the MCP tools directly.",
+                    "Do not use Studio/ORM database schema mutations for normal module-code requests.",
+                    "Do not put Pydantic code in Odoo addons.",
                 ],
             },
             "mandatory_dual_read": {
@@ -130,9 +145,9 @@ def agent_instructions() -> dict:
                     "3. Add to depends[] only verified module names",
                 ],
                 "search_priority": [
-                    "1st: /home/odoo/src/user      (custom addons — highest priority)",
-                    "2nd: /home/odoo/src/enterprise",
-                    "3rd: /home/odoo/src/odoo",
+                    "1st: /home/odoo/src/enterprise",
+                    "2nd: /home/odoo/src/odoo",
+                    "3rd: /home/odoo/src/user      (fallback for other related custom dependencies only)",
                 ],
             },
             "strict_frontend_owl_js_xml_preflight": {
@@ -208,9 +223,9 @@ def agent_instructions() -> dict:
                 "9. workflow.verify_against_core(written_files, fix_cycle=0)",
                 "   → If push_blocked=True: fix CRITICAL findings → re-verify (max 3 cycles)",
                 "   → If push_blocked=False: proceed to git.commit",
-                "10. git.commit → git.push → save SHA",
-                "11. ADAPTIVE POLL odoosh.check_commit(SHA): attempts 0-2→wait 5s | 3-7→wait 10s | 8+→wait 15s | max 20x",
-                "12. odoo.ensure_dependencies → odoo.module_deploy → poll jobs.get every 10s",
+                "10. Prefer workflow.safe_deploy_module for commit → push → Odoo.sh verification → upgrade",
+                "11. Manual git.push is only safe when followed by Odoo.sh SHA/failure/hash verification",
+                "12. odoo.ensure_dependencies → odoo.module_deploy → poll jobs.get every 10s; direct module_deploy blocks itself if recent pushed code is not verified",
                 "    If Access Denied → SSH fallback auto-triggered inside module_deploy",
                 "13. If failed → odoosh.grep_errors → read traceback → fix → back to step 6 (max 3x)",
                 "14. For UI/POS/website/view tasks, open exact affected paths with verify_ui_paths or workflow.browser_menu_crawl; failed page load, Odoo error dialog, RPC_ERROR, traceback, console error, or 4xx/5xx network response means breakage.",
@@ -218,6 +233,7 @@ def agent_instructions() -> dict:
             ],
             "error_guide": {
                 "workflow.resume_job status=retry_later": "Odoo.sh not deployed yet — wait ~15s, call workflow.resume_job again with the same job_id. Non-blocking, safe to repeat up to 20x.",
+                "odoo.module_deploy blocks after git.push": "The DB upgrade was not run because Odoo.sh has not proven the pushed code is active. Use workflow.resume_job or workflow.safe_deploy_module; do not claim success.",
                 "path not found": "Call repo.prepare first",
                 "module not found": "Call odoo.ensure_dependencies then odoo.module_deploy",
                 "Access Denied": "SSH fallback auto-triggered — check jobs.get for result",
@@ -238,6 +254,9 @@ def agent_instructions() -> dict:
                 "workflow.list_module_files": "Browse all files in a module dir when keyword unknown. Use subdir to narrow (models/views/static/src).",
                 "workflow.scope_advice": "NEW V14+: Adaptive mandatory read plan — call after reading custom files, before writing code.",
                 "workflow.verify_against_core": "NEW V14+: Pre-push cross-check — call before every git.push. Blocks push on CRITICAL findings.",
+                "workflow.verify_deployed_module": "Compare active checkout files to real /home/odoo/src/user and live module status before claiming a change is already deployed.",
+                "odoosh.read_user_file": "Read exact deployed custom-source file from /home/odoo/src/user.",
+                "odoosh.list_user_files": "List exact deployed custom-source files from /home/odoo/src/user.",
                 "workflow.frontend_pattern_preflight": "NEW V15: Mandatory preflight for Odoo JS/OWL/POS/website/payment/QWeb/XML/SCSS asset work. Returns source patterns to read first.",
             },
             "multi_client": {
@@ -266,9 +285,9 @@ def agent_instructions() -> dict:
                 "branch": branch,
                 "project_path": path,
                 "odoo_src_roots": [
-                    "/home/odoo/src/user",
                     "/home/odoo/src/enterprise",
                     "/home/odoo/src/odoo",
+                    "/home/odoo/src/user (fallback for other related custom dependencies only)",
                 ],
             },
         },
@@ -278,13 +297,17 @@ def agent_instructions() -> dict:
 @app.get("/")
 def root() -> dict[str, object]:
     return {
-        "service": "Odoo ChatGPT Direct Connector",
+        "service": "Odoo MCP Agent Connector",
         "ui": "not_required",
         "docs": "/docs",
         "openapi": "/openapi.json",
         "tools": "/tools/list",
         "mcp": "/mcp",
-        "chatgpt_mcp": "/chatgpt/mcp",
+        "compatibility_mcp": {
+            "chatgpt": "/chatgpt/mcp",
+            "claude": "/claude/mcp",
+            "qwen": "/qwen/mcp",
+        },
         "workflow": ["/workflow/capability-check", "/workflow/full-verify", "/workflow/safe-deploy-module"],
     }
 

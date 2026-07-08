@@ -10,7 +10,7 @@ from odoo_agent_server.main import app
 from odoo_agent_server.routers import workflow
 from odoo_agent_server.services.lock_service import RepoLockService
 from odoo_agent_server.services.odoosh_service import OdooShService
-from odoo_agent_server.schemas import BrowserCheckResult, SafeDeployModuleRequest
+from odoo_agent_server.schemas import BrowserCheckResult, PosFlowCheckResult, PosFlowStepResult, SafeDeployModuleRequest
 from odoo_agent_server.services.validator_service import OdooModuleValidator
 from odoo_agent_server.schemas import Severity
 
@@ -32,11 +32,11 @@ def test_new_v8_tools_are_exposed():
     client = TestClient(app)
     response = client.get("/tools/list", headers=_auth())
     names = {item["name"] for item in response.json()}
-    assert "workflow.start_session" in names
-    assert "workflow.registry_smoke_test" in names
-    assert "workflow.restore_last_good_commit" in names
-    assert "workflow.browser_menu_crawl" in names
-    assert "odoosh.error_pack" in names
+    assert "workflow_start_session" in names
+    assert "workflow_registry_smoke_test" in names
+    assert "workflow_restore_last_good_commit" in names
+    assert "workflow_browser_menu_crawl" in names
+    assert "odoosh_error_pack" in names
 
 
 def test_safe_deploy_request_accepts_ui_paths(tmp_path):
@@ -50,8 +50,20 @@ def test_safe_deploy_request_accepts_ui_paths(tmp_path):
     assert payload.verify_ui_timeout_seconds == 45
 
 
+def test_pos_flow_result_preserves_console_all_fields():
+    result = PosFlowCheckResult(
+        status="ok",
+        console_all=["log: boot ok"],
+        steps=[PosFlowStepResult(step="open_pos", status="ok", console_all=["debug: ready"])],
+    )
+    payload = result.model_dump(mode="json")
+
+    assert payload["console_all"] == ["log: boot ok"]
+    assert payload["steps"][0]["console_all"] == ["debug: ready"]
+
+
 def test_browser_menu_crawl_fails_on_odoo_ui_breakage(monkeypatch):
-    class FakePlaywrightService:
+    class FakeCdpBrowserService:
         async def screenshot_odoo_page(self, *args, **kwargs):
             return BrowserCheckResult(
                 status="failed",
@@ -63,7 +75,7 @@ def test_browser_menu_crawl_fails_on_odoo_ui_breakage(monkeypatch):
                 error="odoo_ui_error_text:RPC_ERROR",
             )
 
-    monkeypatch.setattr(workflow, "PlaywrightService", FakePlaywrightService)
+    monkeypatch.setattr(workflow, "CdpBrowserService", FakeCdpBrowserService)
     client = TestClient(app)
     response = client.post(
         "/workflow/browser-menu-crawl",
@@ -78,6 +90,7 @@ def test_browser_menu_crawl_fails_on_odoo_ui_breakage(monkeypatch):
 
 def test_repo_lock_blocks_second_owner(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_git_repo(repo)

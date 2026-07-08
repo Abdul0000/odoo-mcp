@@ -5,12 +5,14 @@ import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
+from pydantic import ValidationError
 
 from ..auth import AuthDependency
 from ..config import settings
 from ..services.oauth_service import OAuthStore
 from ..services.qwen_token_service import QwenTokenService
-from .tools import _dispatch, internal_tool_name, list_tools, strict_safe_tool_name, tool_input_schema
+from ..services.store_service import JsonStore
+from .tools import _dispatch, format_tool_validation_error, internal_tool_name, list_tools, strict_safe_tool_name, tool_input_schema
 
 router = APIRouter(prefix="/mcp", tags=["mcp"], dependencies=[AuthDependency])
 qwen_router = APIRouter(prefix="/qwen", tags=["mcp-qwen"] )
@@ -60,7 +62,7 @@ def _to_structured_content(result: Any, tool_name: str) -> dict[str, Any]:
 
 
 def _cap_text(text: str, max_chars: int = 24000) -> str:
-    """Truncate an oversized tool-result text payload to keep ChatGPT's context
+    """Truncate an oversized tool-result text payload to keep agent context
     lean across long sessions. Keeps the head and tail (most relevant parts for
     errors/diffs/logs) and drops the middle with a clear marker.
     """
@@ -74,6 +76,100 @@ def _cap_text(text: str, max_chars: int = 24000) -> str:
         f"Full data is still available in structuredContent, or re-call with a narrower "
         f"scope, e.g. fewer tail_lines / max_bytes / a more specific file path]...\n\n{tail}"
     )
+
+
+def _preview_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    head_chars = max_chars // 2
+    tail_chars = max_chars - head_chars
+    return f"{text[:head_chars]}\n\n...[{len(text) - max_chars} chars omitted; use artifacts.read for exact content]...\n\n{text[-tail_chars:]}"
+
+
+def _artifact_next_call(artifact: dict[str, Any], max_chars: int = 12000) -> dict[str, Any]:
+    return {
+        "tool": "artifacts.read",
+        "arguments": {"artifact_id": artifact["artifact_id"], "offset": 0, "max_chars": max_chars},
+    }
+
+
+def _normalize_chatgpt_structured(value: Any, tool_name: str) -> dict[str, Any]:
+    """Keep strict compatibility-profile MCP payloads bounded, with full data available by artifact.
+
+    The visible content text was already capped, but several clients also load
+    structuredContent into their tool-call state. That can hang on large logs,
+    diffs, command output, or job records. This keeps high-signal previews in
+    place and stores exact full data for focused follow-up reads.
+    """
+    store = JsonStore()
+    full_json = json.dumps(value, ensure_ascii=False, default=str)
+    if len(full_json) <= 18000:
+        return value if isinstance(value, dict) else {"result": value}
+
+    def normalize(item: Any) -> Any:
+        if hasattr(item, "model_dump"):
+            item = item.model_dump(mode="json")
+        if isinstance(item, list):
+            normalized_items = [normalize(child) for child in item[:50]]
+            return {
+                "items": normalized_items,
+                "count": len(item),
+                "truncated": len(item) > 50,
+                "next_action": "Re-call the source tool with a narrower limit or filter if more items are needed.",
+            }
+        if not isinstance(item, dict):
+            text = str(item)
+            if len(text) <= 8000:
+                return item
+            artifact = store.create_artifact("text", tool_name, text)
+            return {
+                "preview": _preview_text(text, 8000),
+                "truncated": True,
+                "artifact": artifact,
+                "next_call": _artifact_next_call(artifact),
+            }
+
+        out: dict[str, Any] = {}
+        for key, child in item.items():
+            if key in {"stdout", "stderr", "content", "status"} and isinstance(child, str) and len(child) > 12000:
+                artifact = store.create_artifact(key, tool_name, child)
+                out[key] = _preview_text(child, 12000)
+                out[f"{key}_truncated"] = True
+                out[f"{key}_artifact"] = artifact
+                out[f"{key}_next_call"] = _artifact_next_call(artifact)
+            elif key == "result":
+                out[key] = normalize(child)
+            elif key == "steps" and isinstance(child, list):
+                out[key] = [normalize(step) for step in child[:25]]
+                if len(child) > 25:
+                    out["steps_truncated"] = True
+            else:
+                out[key] = normalize(child)
+        return out
+
+    normalized = normalize(value)
+    normalized_json = json.dumps(normalized, ensure_ascii=False, default=str)
+    if isinstance(normalized, dict) and len(normalized_json) <= 24000:
+        return normalized
+
+    artifact = store.create_artifact("structured", tool_name, value)
+    return {
+        "status": value.get("status", "ok") if isinstance(value, dict) else "ok",
+        "truncated": True,
+        "preview": _preview_text(full_json, 12000),
+        "artifact": artifact,
+        "next_call": _artifact_next_call(artifact),
+        "next_action": "Use artifacts.read for exact output, or repo.search/repo.read_range for focused code inspection.",
+    }
+
+
+def _arguments_for_profile(tool_name: str, arguments: dict[str, Any], profile: str | None) -> dict[str, Any]:
+    if profile != "chatgpt" or tool_name not in _CHATGPT_QUICK_WAIT_TOOLS:
+        return arguments
+    adjusted = dict(arguments)
+    adjusted["wait_for_result"] = False
+    adjusted["wait_timeout_seconds"] = min(int(adjusted.get("wait_timeout_seconds", 5) or 5), 5)
+    return adjusted
 
 
 def _humanize_tool_name(name: str) -> str:
@@ -98,11 +194,57 @@ _CLAUDE_TOOL_NAMES = {
     "odoo.module_status",
 }
 
+_CHATGPT_TOOL_NAMES = {
+    "connector.health",
+    "artifacts.read",
+    "workflow.agent_instructions",
+    "workflow.smart_tool_router",
+    "workflow.coding_task_plan",
+    "workflow.start_session",
+    "workflow.frontend_pattern_preflight",
+    "workflow.repo_index",
+    "workflow.find_core_file",
+    "workflow.find_similar_view",
+    "workflow.list_module_files",
+    "workflow.scope_advice",
+    "workflow.verify_against_core",
+    "workflow.verify_pos_change",
+    "workflow.safe_deploy_module",
+    "repo.prepare",
+    "repo.list_custom_modules",
+    "repo.read",
+    "repo.read_range",
+    "repo.search",
+    "repo.write_many_smart",
+    "repo.apply_patch_atomic",
+    "git.diff",
+    "qa.self_run",
+    "jobs.get",
+    "odoosh.error_pack",
+    "odoosh.check_commit",
+    "odoo.health",
+    "odoo.query",
+    "odoo.search_read",
+    "odoo.module_status",
+    "odoo.module_deploy",
+    "browser.screenshot",
+    "browser.pos_flow",
+}
+
+_CHATGPT_QUICK_WAIT_TOOLS = {
+    "jobs.get",
+    "odoo.module_deploy",
+    "odoo.module_install",
+    "odoo.module_update",
+    "odoosh.module_deploy_ssh",
+    "odoosh.module_update",
+}
+
 _REMOTE_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
 def _force_remote_tool_name(name: Any, fallback_index: int = 0) -> str:
-    """Final guard for ChatGPT/Claude/Qwen strict remote-MCP name validation.
+    """Final guard for strict remote-MCP name validation.
 
     Some clients reject the whole connection when even one returned tool name
     contains a dot or other punctuation. This function is intentionally used at
@@ -151,10 +293,12 @@ def _is_claude_request(request: Request | None) -> bool:
 def _tools_for_profile(profile: str | None = None) -> list[Any]:
     tools = list_tools(strict_names=False)
     if profile == "claude":
-        # Claude currently fails more easily on very large remote MCP tool lists
+        # Some compatibility clients fail more easily on very large remote MCP tool lists
         # and complex coding schemas. Keep the Claude profile tiny and functional
-        # by default; ChatGPT/Qwen still use the full tool list on /mcp and /qwen.
+        # by default; the standard /mcp endpoint still uses the full tool list.
         return [tool for tool in tools if tool.name in _CLAUDE_TOOL_NAMES]
+    if profile == "chatgpt":
+        return [tool for tool in tools if tool.name in _CHATGPT_TOOL_NAMES]
     return tools
 
 
@@ -204,7 +348,7 @@ def _claude_schema(schema: dict[str, Any]) -> dict[str, Any]:
 def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
     title = getattr(tool, "title", None) or _humanize_tool_name(tool.name)
     if profile in {"claude", "chatgpt"}:
-        # Claude and some ChatGPT remote-MCP builds are strict and can fail while
+        # Some remote-MCP builds are strict and can fail while
         # validating the initial tool list. Use the minimal MCP tool shape for
         # these compatibility profiles: strict-safe name, description, schema only.
         return {
@@ -258,7 +402,7 @@ async def _handle_rpc(payload: dict[str, Any], profile: str | None = None) -> di
             {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {"tools": {"listChanged": False}},
-                "serverInfo": {"name": "odoo-chatgpt-direct-connector", "version": "1.1.0"},
+                "serverInfo": {"name": "odoo-mcp-agent-connector", "version": "1.1.0"},
             },
         )
     if method == "tools/list":
@@ -271,20 +415,36 @@ async def _handle_rpc(payload: dict[str, Any], profile: str | None = None) -> di
             return _rpc_response(request_id, error={"code": -32602, "message": "tools/call requires params.name"})
         internal_name = _mcp_name_to_internal(name)
         try:
+            arguments = _arguments_for_profile(internal_name, arguments, profile)
             result = await _dispatch(internal_name, arguments)
             structured = _to_structured_content(result, tool_name=internal_name)
+            if profile == "chatgpt" and internal_name != "artifacts.read":
+                structured = _normalize_chatgpt_structured(structured, internal_name)
             text = json.dumps(structured, ensure_ascii=False, default=str)
             # Context-bloat guard: in long sessions, oversized tool outputs (large diffs,
             # logs, file reads) compound across many calls and slow down/derail the model.
-            # Cap the text view shown in chat; structuredContent below stays complete so
-            # the agent can still act on the full data programmatically if needed.
-            text = _cap_text(text, max_chars=24000)
+            # Compatibility profiles also receive bounded structuredContent with artifact refs.
+            text = _cap_text(text, max_chars=12000 if profile == "chatgpt" else 24000)
             return _rpc_response(
                 request_id,
                 {
                     "content": [{"type": "text", "text": text}],
                     "structuredContent": structured,
                     "isError": False,
+                },
+            )
+        except ValidationError as exc:
+            message = format_tool_validation_error(exc)
+            return _rpc_response(
+                request_id,
+                {
+                    "content": [{"type": "text", "text": message}],
+                    "structuredContent": {
+                        "status": "failed",
+                        "error": message,
+                        "error_type": "tool_input_invalid",
+                    },
+                    "isError": True,
                 },
             )
         except Exception as exc:  # noqa: BLE001
@@ -327,7 +487,7 @@ def chatgpt_mcp_health() -> dict[str, Any]:
 
 @chatgpt_router.get("/tools-debug")
 def chatgpt_tools_debug() -> dict[str, Any]:
-    tools_payload = _force_remote_tool_list([_tool_to_mcp(tool, profile="chatgpt") for tool in _tools_for_profile(None)])
+    tools_payload = _force_remote_tool_list([_tool_to_mcp(tool, profile="chatgpt") for tool in _tools_for_profile("chatgpt")])
     bad = [tool.get("name") for tool in tools_payload if not _REMOTE_TOOL_NAME_RE.match(str(tool.get("name", "")))]
     return {
         "status": "ok" if not bad else "bad_names",

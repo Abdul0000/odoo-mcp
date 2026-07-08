@@ -8,6 +8,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from threading import Lock
 from typing import Any
+from uuid import uuid4
 
 try:  # pragma: no cover - platform-specific import
     import fcntl  # type: ignore[import-not-found]
@@ -55,6 +56,7 @@ class JsonStore:
         self.approvals_file = self.root / "approvals.json"
         self.jobs_file = self.root / "jobs.json"
         self.audit_file = self.root / "audit.json"
+        self.artifacts_dir = self.root / "artifacts"
 
     def _read_list(self, path: Path) -> list[dict[str, Any]]:
         with self._lock:
@@ -188,6 +190,50 @@ class JsonStore:
     def list_audit(self, limit: int = 200) -> list[AuditEvent]:
         rows = self._read_list(self.audit_file)
         return [AuditEvent.model_validate(row) for row in rows[-limit:]][::-1]
+
+    def create_artifact(self, kind: str, source_tool: str, payload: Any) -> dict[str, Any]:
+        artifact_id = f"art_{uuid4().hex}"
+        self.artifacts_dir.mkdir(parents=True, exist_ok=True)
+        text = payload if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False, default=str)
+        record = {
+            "artifact_id": artifact_id,
+            "kind": kind,
+            "source_tool": source_tool,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "bytes": len(text.encode("utf-8")),
+            "text": text,
+        }
+        path = self.artifacts_dir / f"{artifact_id}.json"
+        with self._file_lock(path):
+            path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        self.log_audit("artifact.create", "ok", source_tool, {"artifact_id": artifact_id, "bytes": record["bytes"]})
+        return {key: record[key] for key in ("artifact_id", "kind", "source_tool", "created_at", "bytes")}
+
+    def read_artifact(self, artifact_id: str, offset: int = 0, max_chars: int = 12000) -> dict[str, Any]:
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", artifact_id)
+        if safe_id != artifact_id or not safe_id.startswith("art_"):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact_id")
+        path = self.artifacts_dir / f"{safe_id}.json"
+        if not path.exists():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Artifact is unreadable") from exc
+        text = str(record.get("text", ""))
+        start = min(max(offset, 0), len(text))
+        end = min(start + max(max_chars, 1), len(text))
+        return {
+            "artifact_id": safe_id,
+            "kind": record.get("kind"),
+            "source_tool": record.get("source_tool"),
+            "created_at": record.get("created_at"),
+            "bytes": record.get("bytes", len(text.encode("utf-8"))),
+            "offset": start,
+            "returned_chars": end - start,
+            "next_offset": end if end < len(text) else None,
+            "text": text[start:end],
+        }
 
     # ---------------------------------------------------------------------------
     # Fix 7: Session state persistence — survives Render/Koyeb restarts.

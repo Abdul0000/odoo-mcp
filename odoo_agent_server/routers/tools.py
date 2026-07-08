@@ -1,17 +1,23 @@
 from __future__ import annotations
 
 import re
+import time
+from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
+from pydantic import ValidationError
 
 from ..auth import AuthDependency
 from ..config import settings
 from ..schemas import (
     ApprovalCreateRequest,
     ApprovalDecisionRequest,
+    ArtifactReadRequest,
     AuditListRequest,
     BaseProjectRequest,
     BrowserCheckRequest,
+    DeployedModuleVerifyRequest,
+    PosFlowCheckRequest,
     StartSessionRequest,
     RegistrySmokeTestRequest,
     RestoreLastGoodCommitRequest,
@@ -26,12 +32,15 @@ from ..schemas import (
     JobGetRequest,
     LimitRequest,
     OdooRpcModuleRequest,
+    OdooRpcResult,
     OdooSearchReadRequest,
     OdooFunctionalQueryRequest,
     OdooShCheckCommitRequest,
     OdooShCommandRequest,
     OdooShLogRequest,
     OdooShModuleUpdateRequest,
+    OdooShUserFileReadRequest,
+    OdooShUserFilesListRequest,
     OdooShVerifyManifestRequest,
     OdooShWaitForCommitRequest,
     RepoAtomicPatchRequest,
@@ -41,7 +50,9 @@ from ..schemas import (
     RepoListRequest,
     RepoPatchRequest,
     RepoPrepareRequest,
+    RepoReadRangeRequest,
     RepoReadRequest,
+    RepoSearchRequest,
     RepoWriteManyAtomicRequest,
     RepoWriteManyFastSafeRequest,
     RepoWriteManySmartRequest,
@@ -63,6 +74,7 @@ from ..schemas import (
     ScopeAdviceRequest,
     # V14+: Pillar 3 — Pre-Push Syntax Verifier
     SyntaxVerifyRequest,
+    PosChangeVerifyRequest,
     # V15: Strict Odoo frontend/OWL/JS/XML preflight
     FrontendPatternPreflightRequest,
     # V16: fast/correct router and repo index
@@ -72,14 +84,14 @@ from ..schemas import (
 from ..services.git_service import GitService
 from ..services.odoo_rpc_service import OdooRpcService
 from ..services.odoosh_service import OdooShService
-from ..services.playwright_service import PlaywrightService
+from ..services.browser_cdp_service import CdpBrowserService
 from ..services.repo_service import RepoService
 from .qa import self_run
 from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_write_many_fast_safe, repo_write_many_smart, repo_apply_patch, repo_apply_patch_atomic, repo_clean_pyc, repo_prepare, repo_custom_modules
 from .git import git_commit, git_push
-from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy
+from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy, start_odoo_module_deploy_job
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
-from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, frontend_pattern_preflight, smart_tool_router, repo_index
+from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index, verify_deployed_module, _poll_odoosh_deployed, _pre_push_verify_files, _expected_user_file_hashes, _infer_registry_fields_from_python, _normalise_expected_registry_fields, _verify_registry_fields
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 
@@ -89,7 +101,7 @@ _STRICT_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
 def strict_safe_tool_name(name: str) -> str:
-    """Return a strict MCP/Claude/ChatGPT/Qwen-safe tool name.
+    """Return a strict MCP-client-safe tool name.
 
     Some frontends validate tool names with ^[a-zA-Z0-9_-]{1,64}$.
     Internal Odoo-agent tool names use dotted namespaces such as
@@ -114,7 +126,7 @@ def internal_tool_name(name: str) -> str:
 
 
 def _agent_priority(name: str) -> tuple[int, str]:
-    """Put functional Odoo query tools early so Claude/Qwen choose them first.
+    """Put functional Odoo query tools early so MCP agents choose them first.
 
     Functional questions like "list draft invoices" should call odoo_search_read
     directly and not enter the coding workflow.
@@ -157,6 +169,12 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="connector.health",
         title="Check connector health", description="Check connector service health", read_only=True),
     ToolDescriptor(
+        name="artifacts.read",
+        title="Read saved artifact",
+        description="Read an exact slice of a large log, diff, command output, or structured result saved from an earlier MCP response.",
+        read_only=True,
+    ),
+    ToolDescriptor(
         name="workflow.agent_instructions",
         title="Load agent instructions",
         description=(
@@ -169,7 +187,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.capability_check",
         title="Check connector capabilities", description="Check local connector capabilities and missing runtime configuration", read_only=True),
     ToolDescriptor(name="workflow.coding_task_plan",
-        title="Get coding workflow plan", description="Return the repo-first coding workflow guidance for ChatGPT MCP clients", read_only=True),
+        title="Get coding workflow plan", description="Return the repo-first coding workflow guidance for MCP agents", read_only=True),
     ToolDescriptor(
         name="workflow.smart_tool_router",
         title="Choose fastest safe workflow",
@@ -188,7 +206,16 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.full_verify",
         title="Run full verification", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module",
-        title="Deploy module (full pipeline)", description="Safely commit, push, wait for Odoo.sh deployment, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths", requires_approval=True),
+        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 5 minutes for the pushed SHA, reject recent Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths. Defaults to wait_for_result=true; status=running is not success and must be followed via next_call/jobs.get.", requires_approval=True),
+    ToolDescriptor(
+        name="workflow.verify_deployed_module",
+        title="Verify deployed source",
+        description=(
+            "Compare active checkout files to the real Odoo.sh /home/odoo/src/user files and optionally live module status. "
+            "Use before saying a local/GitHub change is already deployed, already live, or already done. repo.read alone is not proof."
+        ),
+        read_only=True,
+    ),
     ToolDescriptor(name="workflow.start_session",
         title="Start coding session", description="Bootstrap a coding session: capability check, repo.prepare, git status, module discovery, Odoo/Odoo.sh health", requires_approval=True),
     ToolDescriptor(name="workflow.registry_smoke_test",
@@ -196,7 +223,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.restore_last_good_commit",
         title="Restore last working commit", description="Emergency restore by reverting a bad commit and optionally pushing the revert", requires_approval=True),
     ToolDescriptor(name="workflow.browser_menu_crawl",
-        title="Crawl Odoo menus in browser", description="Open multiple Odoo paths and capture screenshot/console/network/Odoo UI errors", read_only=True),
+        title="Crawl Odoo menus in browser", description="Open multiple Odoo paths through CDP and capture console/network/Odoo UI errors", read_only=True),
     ToolDescriptor(
         name="workflow.frontend_pattern_preflight",
         title="Strict frontend/OWL preflight",
@@ -217,6 +244,18 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="repo.read",
         title="Read file contents", description="Read a UTF-8 file. Default max 300KB. For large files pass max_bytes=500000. Returns file content and line count.", read_only=True),
     ToolDescriptor(
+        name="repo.read_range",
+        title="Read file line range",
+        description="Read exact line-numbered slices from a UTF-8 file. Use after repo.search or when repo.read is too large.",
+        read_only=True,
+    ),
+    ToolDescriptor(
+        name="repo.search",
+        title="Search repository text",
+        description="Bounded text search inside a repo path with line numbers and small context. Use before reading large or unknown files.",
+        read_only=True,
+    ),
+    ToolDescriptor(
         name="repo.write",
         title="Write file contents",
         description=(
@@ -236,7 +275,8 @@ _TOOL_DESCRIPTORS = [
         description=(
             "PREFERRED for multi-file writes. Auto-selects fast-safe lock+backup+rollback for small related edits "
             "and falls back to git temp-worktree atomic for large/risky writes. Keeps quality high while avoiding "
-            "slow repo.write_many_atomic for normal OWL/POS/website/XML changes."
+            "slow repo.write_many_atomic for normal OWL/POS/website/XML changes. Each file should use "
+            "relative_path; path is also accepted as a compatibility alias."
         ),
         requires_approval=True,
     ),
@@ -274,7 +314,10 @@ _TOOL_DESCRIPTORS = [
         title="Install module via SSH",
         description=(
             "[LEGACY — odoo.module_deploy auto-falls-back to SSH on Access Denied, no need to call this directly] "
-            "Install a NEW module via Odoo.sh SSH using odoo-bin -i flag."
+            "Install a NEW module via Odoo.sh SSH using odoo-bin -i flag. "
+            "Do not call this directly after a fresh code change. Use workflow.safe_deploy_module instead, "
+            "which pushes code and verifies the remote HEAD before upgrading. This tool will refuse to run "
+            "if local commits are not yet pushed to the remote branch."
         ),
         deprecated=True,
     ),
@@ -286,10 +329,9 @@ _TOOL_DESCRIPTORS = [
         name="odoosh.check_commit",
         title="Check Odoo.sh deployment status",
         description=(
-            "NON-BLOCKING single check: returns immediately with deployed=true/false. "
-            "Use this in a polling loop after git.push: call once, read the 'deployed' field. "
-            "If false, wait 15 seconds then call again. Repeat max 20 times. "
-            "When deployed=true proceed to odoosh.module_update. Never use odoosh.wait_for_commit."
+            "NON-BLOCKING single source checkout check: returns immediately with deployed=true/false. "
+            "deployed=true only means ~/src/user has the SHA; safe_deploy_module also checks recent "
+            "Odoo.sh build/test failure evidence and changed /home/odoo/src/user file hashes before module upgrade. Never use odoosh.wait_for_commit."
         ),
         read_only=True,
     ),
@@ -297,23 +339,52 @@ _TOOL_DESCRIPTORS = [
         title="Wait for Odoo.sh deployment", description="[DEPRECATED - use odoosh.check_commit in a polling loop] Blocking wait for Odoo.sh deploy", read_only=True),
     ToolDescriptor(name="odoosh.verify_module_manifest",
         title="Verify module manifest", description="Verify a module manifest exists and is installable on Odoo.sh", read_only=True),
+    ToolDescriptor(
+        name="odoosh.read_user_file",
+        title="Read deployed user file",
+        description="Read the actual Odoo.sh /home/odoo/src/user file content. Use this when checking deployed custom module code; repo.read only reads the local/GitHub checkout.",
+        read_only=True,
+    ),
+    ToolDescriptor(
+        name="odoosh.list_user_files",
+        title="List deployed user files",
+        description="List actual Odoo.sh /home/odoo/src/user files for a custom module/subdirectory. Use before claiming code already exists on Odoo.sh.",
+        read_only=True,
+    ),
     ToolDescriptor(name="odoosh.log",
         title="Read Odoo.sh server log", description="Tail an Odoo.sh log", read_only=True),
     ToolDescriptor(name="odoosh.grep_errors",
         title="Search Odoo.sh error logs", description="Search Odoo.sh logs for errors", read_only=True),
     ToolDescriptor(name="odoosh.error_pack",
         title="Collect Odoo.sh error details", description="Return Odoo.sh tracebacks plus root-cause hints/files/XML/model names", read_only=True),
-    ToolDescriptor(name="odoosh.module_deploy_ssh",
-        title="Deploy module via SSH", description="SSH smart install/upgrade via Odoo.sh. Background job. Use only when you explicitly need SSH; odoo.module_deploy falls back to this automatically.", requires_approval=True),
-    ToolDescriptor(name="odoosh.module_update",
-        title="Update module on Odoo.sh", description="Run Odoo module update through Odoo.sh SSH", requires_approval=True),
+    ToolDescriptor(
+        name="odoosh.module_deploy_ssh",
+        title="Deploy module via SSH",
+        description=(
+            "SSH smart install/upgrade via Odoo.sh. Background job. Use only when you explicitly need SSH; "
+            "odoo.module_deploy falls back to this automatically. Do not call this directly after a fresh code change. "
+            "Use workflow.safe_deploy_module instead, which pushes code and verifies the remote HEAD before upgrading. "
+            "This tool will refuse to run if local commits are not yet pushed to the remote branch."
+        ),
+        requires_approval=True,
+    ),
+    ToolDescriptor(
+        name="odoosh.module_update",
+        title="Update module on Odoo.sh",
+        description=(
+            "Run Odoo module update through Odoo.sh SSH. Do not call this directly after a fresh code change. "
+            "Use workflow.safe_deploy_module instead, which pushes code and verifies the remote HEAD before upgrading. "
+            "This tool will refuse to run if local commits are not yet pushed to the remote branch."
+        ),
+        requires_approval=True,
+    ),
     ToolDescriptor(name="odoo.health",
         title="Check Odoo server health", description="Check Odoo XML-RPC health", read_only=True),
     ToolDescriptor(
         name="odoo.query",
         title="Smart Odoo functional query",
         description=(
-            "Best tool for simple functional Odoo questions in Claude/Qwen/ChatGPT: list users, employees, "
+            "Best tool for simple functional Odoo questions from any MCP client: list users, employees, "
             "draft invoices, unpaid invoices, customers, vendors, products, sale orders, purchase orders, or modules. "
             "Takes a natural-language query and returns parsed model/domain/fields plus live Odoo records."
         ),
@@ -326,6 +397,8 @@ _TOOL_DESCRIPTORS = [
         title="Install or upgrade module",
         description=(
             "SMART INSTALL/UPGRADE — always use this for ALL first-time installs and upgrades. "
+            "If a recent manual git.push was recorded, this tool first verifies the pushed SHA, recent "
+            "Odoo.sh failure logs, and changed /home/odoo/src/user file hashes before touching the DB. "
             "Runs XML-RPC when allowed; if update_list/buttons fail with Access Denied, "
             "it automatically falls back to Odoo.sh SSH in the same background job. "
             "Waits server-side by default; returns final result if quick, otherwise returns job_id for jobs.get which also waits."
@@ -339,7 +412,9 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="odoo.search_read",
         title="Query Odoo records", description="Run Odoo search_read via XML-RPC", read_only=True),
     ToolDescriptor(name="browser.screenshot",
-        title="Take browser screenshot", description="Capture Odoo page screenshot with console/network errors", read_only=True),
+        title="Check browser page", description="Navigate an Odoo page through external CDP browser and capture console/network errors; screenshot_path is optional", read_only=True),
+    ToolDescriptor(name="browser.pos_flow",
+        title="Run POS end-to-end flow", description="Login, open POS, click product, pay, validate order in one CDP browser session with console/network capture at every step. Use for any POS OWL change.", read_only=True),
     ToolDescriptor(name="approvals.list",
         title="List pending approvals", description="List pending/recent approval records", read_only=True),
     ToolDescriptor(name="approvals.request",
@@ -362,9 +437,11 @@ _TOOL_DESCRIPTORS = [
         title="Resume interrupted job",
         description=(
             "Fix 3 — Resume a failed safe_deploy_module or start_session pipeline from its last "
-            "successful step. Pass the job_id from the failed run. Instead of starting over from "
-            "step 1, the agent continues from where it left off. Optionally override the start "
-            "step with override_step (qa | commit | push | wait_odoosh | upgrade | smoke_test)."
+            "successful step. Pass job_id when available; if omitted, the connector resumes the "
+            "last saved safe-deploy job from session state or the latest matching job. Instead of "
+            "starting over from step 1, the agent continues from where it left off. Optionally "
+            "override the start step with override_step (qa | commit | push | wait_odoosh | "
+            "verify_deployed_code | install | upgrade | module_update | smoke_test)."
         ),
         requires_approval=True,
     ),
@@ -374,7 +451,7 @@ _TOOL_DESCRIPTORS = [
         title="Save session state",
         description=(
             "Fix 7 — Persist session context (last_sha, module_name, step_history, etc.) so a new "
-            "ChatGPT session after a Render restart can reload it with session.load_state instead "
+            "MCP agent session after a restart can reload it with session.load_state instead "
             "of rediscovering everything from scratch."
         ),
     ),
@@ -404,7 +481,8 @@ _TOOL_DESCRIPTORS = [
         description=(
             "V14 SELF-LEARNING: Locate an Odoo core source file by module + type + keyword. "
             "CALL THIS before any _inherit or depends addition to read the real field/method definitions. "
-            "Search priority: /home/odoo/src/user → /home/odoo/src/enterprise → /home/odoo/src/odoo. "
+            "Search priority: /home/odoo/src/enterprise → /home/odoo/src/odoo → /home/odoo/src/user fallback for other related custom dependencies. "
+            "Do not use this to read the current custom module; read that from the active checkout with repo.read. "
             "Returns best_match path — then call repo.read(best_match) to read the actual source. "
             "Example: module_name='sale', file_type='model', keyword='order' "
             "→ /home/odoo/src/odoo/addons/sale/models/sale_order.py"
@@ -417,7 +495,7 @@ _TOOL_DESCRIPTORS = [
         description=(
             "V14 SELF-LEARNING: Locate an Odoo core view XML file by model + view_type. "
             "CALL THIS before writing any <xpath expr='...'> to read the exact node structure. "
-            "Search priority: user → enterprise → odoo. "
+            "Search priority: enterprise → odoo → user fallback for other related custom dependencies. "
             "Returns best_match path — then call repo.read(best_match) to inspect real xpath/attrs. "
             "Example: model='sale.order', view_type='form' "
             "→ /home/odoo/src/enterprise/sale/views/sale_order_views.xml"
@@ -430,7 +508,7 @@ _TOOL_DESCRIPTORS = [
         description=(
             "Browse all files in a core or custom module directory when you don't know the "
             "exact filename/keyword yet. Use subdir='models'|'views'|'static/src' to narrow. "
-            "Search priority: user → enterprise → odoo. "
+            "Search priority: enterprise → odoo → user fallback for other related custom dependencies. "
             "Use this BEFORE find_core_file when unsure what files exist, or find_core_file "
             "directly when you already know module+type+keyword."
         ),
@@ -467,10 +545,23 @@ _TOOL_DESCRIPTORS = [
         ),
         read_only=True,
     ),
+    ToolDescriptor(
+        name="workflow.verify_pos_change",
+        title="Verify POS change (static + live browser)",
+        description=(
+            "V17 MANDATORY FOR POS CHANGES: Combines workflow.verify_against_core (static, incl. real node --check JS parse) "
+            "with a live browser.pos_flow run (login -> open POS -> click product -> payment -> validate) under ONE bounded "
+            "fix_cycle counter (max 3, same contract as verify_against_core). Only runs the live browser step if written_files "
+            "look POS-related AND static checks have zero CRITICAL findings. Use this instead of verify_against_core alone "
+            "whenever the task touches point_of_sale JS/XML/OWL — static checks cannot prove the POS UI actually still works."
+        ),
+        read_only=True,
+    ),
 ]
 
 _TOOL_INPUT_MODELS = {
     "connector.health": EmptyRequest,
+    "artifacts.read": ArtifactReadRequest,
     "workflow.agent_instructions": EmptyRequest,
     "workflow.capability_check": EmptyRequest,
     "workflow.coding_task_plan": CodingTaskPlanRequest,
@@ -478,6 +569,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.repo_index": RepoIndexRequest,
     "workflow.full_verify": FullVerifyRequest,
     "workflow.safe_deploy_module": SafeDeployModuleRequest,
+    "workflow.verify_deployed_module": DeployedModuleVerifyRequest,
     "workflow.start_session": StartSessionRequest,
     "workflow.registry_smoke_test": RegistrySmokeTestRequest,
     "workflow.restore_last_good_commit": RestoreLastGoodCommitRequest,
@@ -488,6 +580,8 @@ _TOOL_INPUT_MODELS = {
     "repo.list_custom_modules": RepoCustomModulesRequest,
     "repo.list": RepoListRequest,
     "repo.read": RepoReadRequest,
+    "repo.read_range": RepoReadRangeRequest,
+    "repo.search": RepoSearchRequest,
     "repo.write": RepoWriteRequest,
     "repo.write_many_smart": RepoWriteManySmartRequest,
     "repo.write_many_fast_safe": RepoWriteManyFastSafeRequest,
@@ -507,6 +601,8 @@ _TOOL_INPUT_MODELS = {
     "odoosh.check_commit": OdooShCheckCommitRequest,
     "odoosh.wait_for_commit": OdooShWaitForCommitRequest,
     "odoosh.verify_module_manifest": OdooShVerifyManifestRequest,
+    "odoosh.read_user_file": OdooShUserFileReadRequest,
+    "odoosh.list_user_files": OdooShUserFilesListRequest,
     "odoosh.log": OdooShLogRequest,
     "odoosh.grep_errors": OdooShCommandRequest,
     "odoosh.error_pack": OdooShCommandRequest,
@@ -520,6 +616,7 @@ _TOOL_INPUT_MODELS = {
     "odoo.module_update": OdooRpcModuleRequest,
     "odoo.search_read": OdooSearchReadRequest,
     "browser.screenshot": BrowserCheckRequest,
+    "browser.pos_flow": PosFlowCheckRequest,
     "approvals.list": LimitRequest,
     "approvals.request": ApprovalCreateRequest,
     "jobs.list": LimitRequest,
@@ -536,6 +633,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.list_module_files": ListModuleFilesRequest,
     "workflow.scope_advice": ScopeAdviceRequest,
     "workflow.verify_against_core": SyntaxVerifyRequest,
+    "workflow.verify_pos_change": PosChangeVerifyRequest,
 }
 
 
@@ -572,8 +670,21 @@ async def call_tool(payload: ToolCallRequest) -> ToolCallResult:
         return ToolCallResult(name=external_name, status="ok", result=result)
     except HTTPException as exc:
         return ToolCallResult(name=external_name, status="failed", error=str(exc.detail))
+    except ValidationError as exc:
+        return ToolCallResult(name=external_name, status="failed", error=format_tool_validation_error(exc))
     except Exception as exc:  # noqa: BLE001
         return ToolCallResult(name=external_name, status="failed", error=str(exc))
+
+
+def format_tool_validation_error(exc: ValidationError) -> str:
+    """Return concise agent-facing validation text without Pydantic internals."""
+    parts: list[str] = []
+    for error in exc.errors(include_url=False):
+        loc = ".".join(str(part) for part in error.get("loc", ())) or "arguments"
+        message = str(error.get("msg", "invalid value"))
+        parts.append(f"{loc}: {message}")
+    details = "; ".join(parts) if parts else str(exc)
+    return f"Tool input invalid: {details}"
 
 
 
@@ -581,7 +692,7 @@ async def call_tool(payload: ToolCallRequest) -> ToolCallResult:
 def _odoo_functional_query(req: OdooFunctionalQueryRequest) -> object:
     """Map common functional Odoo questions to safe search_read calls.
 
-    This is intentionally read-only and conservative. It gives Claude/Qwen a
+    This is intentionally read-only and conservative. It gives MCP clients a
     tiny, reliable functional tool so prompts like "List users" do not need to
     inspect the larger coding toolset or manually construct a model/domain.
     """
@@ -704,14 +815,15 @@ def _odoo_functional_query(req: OdooFunctionalQueryRequest) -> object:
 async def _dispatch(name: str, args: dict) -> object:
     if name == "connector.health":
         EmptyRequest.model_validate(args)
-        return {"status": "ok", "service": "odoo-chatgpt-direct-connector"}
+        return {"status": "ok", "service": "odoo-mcp-agent-connector"}
+    if name == "artifacts.read":
+        req = ArtifactReadRequest.model_validate(args)
+        return JsonStore().read_artifact(req.artifact_id, req.offset, req.max_chars)
     if name == "workflow.agent_instructions":
-        import httpx, asyncio
-        from ..config import settings
-        base = settings.public_base_url or "http://localhost:8080"
         try:
-            resp = httpx.get(f"{base}/agent-instructions", timeout=5)
-            return resp.json()
+            from ..main import agent_instructions
+
+            return agent_instructions()
         except Exception as exc:
             return {"error": str(exc), "fallback": "Call workflow.coding_task_plan for workflow guidance"}
     if name == "workflow.capability_check":
@@ -727,6 +839,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return await full_verify(FullVerifyRequest.model_validate(args))
     if name == "workflow.safe_deploy_module":
         return safe_deploy_module(SafeDeployModuleRequest.model_validate(args))
+    if name == "workflow.verify_deployed_module":
+        return verify_deployed_module(DeployedModuleVerifyRequest.model_validate(args))
     if name == "workflow.start_session":
         return start_session(StartSessionRequest.model_validate(args))
     if name == "workflow.registry_smoke_test":
@@ -749,6 +863,12 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "repo.read":
         req = RepoReadRequest.model_validate(args)
         return RepoService().read_file(req.project_path, req.relative_path, req.max_bytes)
+    if name == "repo.read_range":
+        req = RepoReadRangeRequest.model_validate(args)
+        return RepoService().read_range(req.project_path, req.relative_path, req.start_line, req.max_lines)
+    if name == "repo.search":
+        req = RepoSearchRequest.model_validate(args)
+        return RepoService().search(req.project_path, req.pattern, req.relative_path, req.max_matches, req.context_lines, req.regex)
     if name == "repo.write":
         return repo_write(RepoWriteRequest.model_validate(args))
     if name == "repo.write_many_smart":
@@ -791,6 +911,12 @@ async def _dispatch(name: str, args: dict) -> object:
         return odoosh_wait_for_commit(OdooShWaitForCommitRequest.model_validate(args))
     if name == "odoosh.verify_module_manifest":
         return odoosh_verify_module_manifest(OdooShVerifyManifestRequest.model_validate(args))
+    if name == "odoosh.read_user_file":
+        req = OdooShUserFileReadRequest.model_validate(args)
+        return OdooShService().read_user_file(req.relative_path, req.max_bytes)
+    if name == "odoosh.list_user_files":
+        req = OdooShUserFilesListRequest.model_validate(args)
+        return OdooShService().list_user_files(req.module_name, req.subdir, req.max_items)
     if name == "odoosh.log":
         req = OdooShLogRequest.model_validate(args)
         return OdooShService().tail_log(req.log_name, req.tail_lines)
@@ -820,9 +946,12 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "odoo.search_read":
         req = OdooSearchReadRequest.model_validate(args)
         return OdooRpcService().search_read(req.model, req.domain, req.fields, req.limit, req.offset, req.order, req.context)
+    if name == "browser.pos_flow":
+        req = PosFlowCheckRequest.model_validate(args)
+        return await CdpBrowserService().run_pos_flow(req)
     if name == "browser.screenshot":
         req = BrowserCheckRequest.model_validate(args)
-        return await PlaywrightService().screenshot_odoo_page(
+        return await CdpBrowserService().screenshot_odoo_page(
             req.base_url,
             req.login,
             req.password,
@@ -876,6 +1005,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return scope_advice(ScopeAdviceRequest.model_validate(args))
     if name == "workflow.verify_against_core":
         return verify_against_core(SyntaxVerifyRequest.model_validate(args))
+    if name == "workflow.verify_pos_change":
+        return await verify_pos_change(PosChangeVerifyRequest.model_validate(args))
     raise HTTPException(status_code=404, detail=f"Unknown tool: {name}")
 
 
@@ -883,7 +1014,124 @@ async def _dispatch(name: str, args: dict) -> object:
 # Fix 3: Resume job implementation
 # ---------------------------------------------------------------------------
 
-_SAFE_DEPLOY_STEPS = ["qa", "commit", "push", "wait_odoosh", "upgrade", "smoke_test"]
+_SAFE_DEPLOY_STEPS = [
+    "qa_self_run",
+    "git_configure_identity",
+    "git_validate_target",
+    "git_commit",
+    "git_head_sha",
+    "git_push",
+    "odoosh_check_commit",
+    "odoosh_user_file_verify",
+    "odoosh_verify_module_manifest",
+    "odoo_module_deploy",
+    "odoo_module_status",
+    "registry_field_verify",
+    "registry_smoke_test",
+    "browser_ui_verify",
+]
+_SAFE_DEPLOY_STEP_ALIASES = {
+    "qa": "qa_self_run",
+    "commit": "git_commit",
+    "push": "git_push",
+    "wait_odoosh": "odoosh_check_commit",
+    "odoosh": "odoosh_check_commit",
+    "verify_deployed_code": "odoosh_user_file_verify",
+    "verify_user_files": "odoosh_user_file_verify",
+    "install": "odoo_module_deploy",
+    "upgrade": "odoo_module_deploy",
+    "module_install": "odoo_module_deploy",
+    "module_update": "odoo_module_deploy",
+    "module_upgrade": "odoo_module_deploy",
+    "deploy": "odoo_module_deploy",
+    "field_verify": "registry_field_verify",
+    "registry_fields": "registry_field_verify",
+    "smoke_test": "registry_smoke_test",
+}
+_RESUME_COMPLETED_STATUSES = {"ok", "passed", "skipped"}
+
+
+def _step_payload(result: object) -> object:
+    return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+
+
+def _extract_sha_from_steps(job) -> str | None:
+    for step in reversed(job.steps or []):
+        result = step.result
+        if hasattr(result, "model_dump"):
+            result = result.model_dump(mode="json")
+        if not isinstance(result, dict):
+            continue
+        for key in ("sha", "last_sha"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        stdout = str(result.get("stdout") or "")
+        match = re.search(r"(?:^|\n)sha=([0-9a-fA-F]{7,40})(?:\n|$)", stdout)
+        if match:
+            return match.group(1)
+        if step.name == "git_head_sha":
+            value = stdout.strip()
+            if re.fullmatch(r"[0-9a-fA-F]{7,40}", value):
+                return value
+    return None
+
+
+
+def _start_and_wait_module_deploy_for_resume(original_request: dict, module_name: str) -> OdooRpcResult:
+    started = start_odoo_module_deploy_job(OdooRpcModuleRequest(
+        module_name=module_name,
+        wait_for_result=False,
+        wait_timeout_seconds=0,
+        poll_interval_seconds=1.0,
+    ))
+    started_payload = started.model_dump(mode="json") if hasattr(started, "model_dump") else started
+    result_payload = started_payload.get("result") if isinstance(started_payload, dict) and isinstance(started_payload.get("result"), dict) else {}
+    if result_payload.get("finished") or not result_payload.get("job_id"):
+        return started
+
+    nested_job_id = result_payload.get("job_id")
+    timeout_seconds = int(original_request.get("odoo_module_deploy_timeout_seconds", 300))
+    poll_interval = float(original_request.get("odoo_module_deploy_poll_interval_seconds", 10.0))
+    waited = JsonStore().wait_job(str(nested_job_id), timeout_seconds, poll_interval)
+    data = waited.model_dump(mode="json")
+    if waited.status == JobStatus.passed:
+        return OdooRpcResult(status="ok", result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data})
+    if waited.status in {JobStatus.failed, JobStatus.warning}:
+        result_error = waited.result.get("error") if isinstance(waited.result, dict) else None
+        return OdooRpcResult(
+            status="failed" if waited.status == JobStatus.failed else "ok",
+            error=result_error or f"Odoo module deploy job finished with status={waited.status.value}",
+            result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data},
+        )
+    return OdooRpcResult(
+        status="ok",
+        result={
+            "job_id": waited.id,
+            "job_status": waited.status.value,
+            "finished": False,
+            "message": f"Odoo module deploy is still running after {timeout_seconds}s. Safe deploy is not complete and final success is blocked.",
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": waited.id, "wait_for_result": True}},
+        },
+    )
+
+
+def _latest_safe_deploy_job_id(req: "ResumeJobRequest", store: JsonStore) -> str | None:
+    state = store.load_session_state(req.client_name)
+    saved_job_id = state.get("last_safe_deploy_job_id")
+    if isinstance(saved_job_id, str) and saved_job_id.strip():
+        return saved_job_id.strip()
+
+    for job in store.list_jobs(limit=100):
+        if job.job_type != "safe_deploy_module":
+            continue
+        request = job.request or {}
+        if req.project_path and request.get("project_path") != req.project_path:
+            continue
+        if req.module_name and request.get("module_name") != req.module_name:
+            continue
+        return job.id
+    return None
 
 
 async def _resume_job(req: "ResumeJobRequest") -> dict:
@@ -894,23 +1142,30 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
     stored in job.request is used to rebuild the context.
     """
     store = JsonStore()
+    job_id = req.job_id or _latest_safe_deploy_job_id(req, store)
+    if not job_id:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "No resumable safe_deploy_module job found. Pass job_id, or provide client_name/project_path/module_name "
+                "matching a previous safe deploy."
+            ),
+        )
     try:
-        job = store.get_job(req.job_id)
+        job = store.get_job(job_id)
     except Exception:
-        raise HTTPException(status_code=404, detail=f"Job {req.job_id} not found")
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
-    # Find last successful step name
-    completed_steps = [
-        s.name for s in (job.steps or []) if s.status in ("ok", "passed", "skipped")
-    ]
+    completed_steps = [s.name for s in (job.steps or []) if s.status in _RESUME_COMPLETED_STATUSES]
     # Determine resume point
     if req.override_step:
-        if req.override_step not in _SAFE_DEPLOY_STEPS:
+        override_step = _SAFE_DEPLOY_STEP_ALIASES.get(req.override_step, req.override_step)
+        if override_step not in _SAFE_DEPLOY_STEPS:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unknown override_step '{req.override_step}'. Valid: {_SAFE_DEPLOY_STEPS}",
             )
-        start_from = req.override_step
+        start_from = override_step
     else:
         # Find the first step NOT in completed_steps
         start_from = None
@@ -919,7 +1174,7 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                 start_from = step_name
                 break
         if start_from is None:
-            return {"status": "already_complete", "message": "All pipeline steps already completed.", "job_id": req.job_id}
+            return {"status": "already_complete", "message": "All pipeline steps already completed.", "job_id": job_id}
 
     # Recover original request payload
     original_request = job.request or {}
@@ -928,18 +1183,47 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
     if not module_name or not project_path:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot resume: job {req.job_id} is missing module_name or project_path in its request payload.",
+            detail=f"Cannot resume: job {job_id} is missing module_name or project_path in its request payload.",
         )
+
+    remote = original_request.get("remote", "origin")
+    branch = original_request.get("branch") or settings.target_git_branch
+    pushed_sha = original_request.get("last_sha") or _extract_sha_from_steps(job)
+    expected_user_hashes = original_request.get("expected_user_file_hashes") or {}
+    candidate_files: list[str] = []
+    if not expected_user_hashes:
+        try:
+            candidate_files = _pre_push_verify_files(Path(project_path), module_name, original_request.get("paths") or [], "")
+            expected_user_hashes = _expected_user_file_hashes(Path(project_path), candidate_files)
+            if expected_user_hashes:
+                job.request["expected_user_file_hashes"] = expected_user_hashes
+                store.update_job(job)
+        except Exception:
+            expected_user_hashes = {}
+    expected_registry_fields = _normalise_expected_registry_fields(original_request.get("expected_registry_fields") or {})
+    if not expected_registry_fields:
+        try:
+            if not candidate_files:
+                candidate_files = _pre_push_verify_files(Path(project_path), module_name, original_request.get("paths") or [], "")
+            expected_registry_fields = _infer_registry_fields_from_python(Path(project_path), module_name, candidate_files)
+            if expected_registry_fields:
+                job.request["expected_registry_fields"] = expected_registry_fields
+                store.update_job(job)
+        except Exception:
+            expected_registry_fields = {}
+    git = GitService()
+    odoosh = OdooShService()
+    odoo = OdooRpcService()
 
     # Re-run from start_from step
     store.log_audit(
         "workflow.resume_job",
         "running",
-        f"Resuming job {req.job_id} from step '{start_from}' (completed: {completed_steps})",
+        f"Resuming job {job_id} from step '{start_from}' (completed: {completed_steps})",
     )
     resume_results: dict = {
         "resumed_from": start_from,
-        "original_job_id": req.job_id,
+        "original_job_id": job_id,
         "completed_steps": completed_steps,
         "steps_run": {},
     }
@@ -948,65 +1232,179 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
 
     for step_name in step_order:
         try:
-            if step_name == "qa":
-                qa_req = SelfRunRequest(project_path=project_path)
+            if step_name == "qa_self_run":
+                if not original_request.get("run_qa", True):
+                    resume_results["steps_run"][step_name] = {"status": "skipped"}
+                    continue
+                qa_req = SelfRunRequest(project_path=project_path, module_name=module_name)
                 result = self_run(qa_req)
-                resume_results["steps_run"]["qa"] = {"status": "ok", "passed": result.passed if hasattr(result, "passed") else True}
+                resume_results["steps_run"][step_name] = {"status": result.status, "result": _step_payload(result)}
+                if result.status == "failed":
+                    resume_results["status"] = "failed"
+                    resume_results["error"] = f"qa_self_run failed: {getattr(result, 'summary', '')}"
+                    return resume_results
 
-            elif step_name == "commit":
+            elif step_name == "git_configure_identity":
+                result = git.configure_identity(project_path)
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "result": _step_payload(result)}
+                if result.exit_code != 0:
+                    resume_results["status"] = "failed"
+                    resume_results["error"] = f"git identity configuration failed: {result.stderr}"
+                    return resume_results
+
+            elif step_name == "git_validate_target":
+                result = git.validate_target(project_path, branch, remote)
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "result": _step_payload(result)}
+                if result.exit_code != 0:
+                    resume_results["status"] = "failed"
+                    resume_results["error"] = f"git target validation failed: {result.stderr}"
+                    return resume_results
+
+            elif step_name == "git_commit":
                 commit_msg = original_request.get("commit_message", f"Resume: update {module_name}")
                 paths = original_request.get("paths", [])
-                result = GitService().commit(project_path, commit_msg, paths, timeout_seconds=60)
-                resume_results["steps_run"]["commit"] = {"status": "ok" if result.exit_code == 0 else "failed", "sha": result.stdout.strip()}
+                result = git.commit(project_path, commit_msg, paths, timeout_seconds=60)
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "result": _step_payload(result)}
                 if result.exit_code != 0:
+                    resume_results["status"] = "failed"
                     resume_results["error"] = f"git commit failed: {result.stderr}"
                     return resume_results
 
-            elif step_name == "push":
-                remote = original_request.get("remote", "origin")
-                branch = original_request.get("branch")
-                result = GitService().push(project_path, remote, branch, timeout_seconds=60)
-                resume_results["steps_run"]["push"] = {"status": "ok" if result.exit_code == 0 else "failed"}
+            elif step_name == "git_head_sha":
+                result = git.head_sha(project_path)
+                if result.exit_code == 0:
+                    pushed_sha = result.stdout.strip()
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "sha": pushed_sha, "result": _step_payload(result)}
                 if result.exit_code != 0:
+                    resume_results["status"] = "failed"
+                    resume_results["error"] = f"git head SHA lookup failed: {result.stderr}"
+                    return resume_results
+
+            elif step_name == "git_push":
+                push_started_epoch = int(time.time())
+                result = git.push(project_path, remote, branch, timeout_seconds=60)
+                if result.exit_code == 0:
+                    pushed_sha = _extract_sha_from_steps(job) or pushed_sha or git.head_sha(project_path).stdout.strip()
+                    match = re.search(r"(?:^|\n)sha=([0-9a-fA-F]{7,40})(?:\n|$)", result.stdout or "")
+                    if match:
+                        pushed_sha = match.group(1)
+                    job.request["push_started_epoch"] = push_started_epoch
+                    if expected_user_hashes:
+                        job.request["expected_user_file_hashes"] = expected_user_hashes
+                    store.update_job(job)
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "sha": pushed_sha, "result": _step_payload(result)}
+                if result.exit_code != 0:
+                    resume_results["status"] = "failed"
                     resume_results["error"] = f"git push failed: {result.stderr}"
                     return resume_results
 
-            elif step_name == "wait_odoosh":
-                # NON-BLOCKING single check — mirrors odoosh.check_commit behaviour.
-                # Resuming a job must return fast; the event loop must never block here.
-                # If not yet deployed, the agent should call workflow.resume_job again
-                # after a short wait, exactly like polling odoosh.check_commit directly.
-                odoosh = OdooShService()
-                check = odoosh.check_commit_deployed(
-                    original_request.get("last_sha", "HEAD")
+            elif step_name == "odoosh_check_commit":
+                pushed_sha = pushed_sha or git.head_sha(project_path).stdout.strip()
+                check = _poll_odoosh_deployed(
+                    odoosh,
+                    pushed_sha,
+                    int(original_request.get("odoosh_deploy_timeout_seconds", 300)),
+                    float(original_request.get("odoosh_deploy_poll_interval_seconds", 10.0)),
                 )
-                deployed = check.exit_code == 0 and "true" in check.stdout.lower()
-                resume_results["steps_run"]["wait_odoosh"] = {"deployed": deployed}
+                deployed = check.exit_code == 0 and '"deployed": true' in (check.stdout or "").lower()
+                resume_results["steps_run"][step_name] = {"status": "ok" if deployed else "warning", "sha": pushed_sha, "deployed": deployed, "result": _step_payload(check)}
                 if not deployed:
-                    resume_results["error"] = (
-                        "Not deployed yet. This is not a failure — wait ~15s and call "
-                        "workflow.resume_job again with the same job_id to re-check."
-                    )
-                    resume_results["status"] = "retry_later"
+                    resume_results["status"] = "deploy_failed_or_timeout"
+                    resume_results["message"] = "Odoo.sh did not report the pushed commit as deployed within the polling window. Completed commit/push steps will not be replayed."
+                    resume_results["next_call"] = {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}}
+                    return resume_results
+                failure_guard = getattr(odoosh, "recent_build_failure", None)
+                if callable(failure_guard):
+                    since_epoch = int(original_request.get("push_started_epoch") or 0)
+                    failure = failure_guard(since_epoch)
+                    resume_results["steps_run"]["odoosh_build_failure_guard"] = {"status": "failed" if failure.exit_code == 1 else "ok" if failure.exit_code == 0 else "warning", "result": _step_payload(failure)}
+                    if failure.exit_code == 1:
+                        resume_results["status"] = "deploy_failed"
+                        resume_results["message"] = "Odoo.sh reported failure evidence after the push. Module upgrade was not attempted."
+                        resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
+                        return resume_results
+
+            elif step_name == "odoosh_user_file_verify":
+                if not expected_user_hashes:
+                    resume_results["steps_run"][step_name] = {"status": "skipped", "message": "No changed user files were available for hash verification."}
+                    continue
+                result = odoosh.verify_user_file_hashes(expected_user_hashes)
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "verified_files": sorted(expected_user_hashes), "result": _step_payload(result)}
+                if result.exit_code != 0:
+                    resume_results["status"] = "deploy_code_mismatch"
+                    resume_results["message"] = "Odoo.sh source checkout did not match the changed local/GitHub files. Module upgrade was not attempted."
+                    resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
                     return resume_results
 
-            elif step_name == "upgrade":
-                result = OdooRpcService().module_deploy(module_name)
-                resume_results["steps_run"]["upgrade"] = {"status": result.status, "error": result.error}
+            elif step_name == "odoosh_verify_module_manifest":
+                result = odoosh.verify_module_manifest(module_name)
+                resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "result": _step_payload(result)}
+                if result.exit_code != 0:
+                    resume_results["status"] = "failed"
+                    resume_results["error"] = f"manifest verification failed: {result.stderr}"
+                    return resume_results
+
+            elif step_name == "odoo_module_deploy":
+                if not original_request.get("upgrade_module", True):
+                    resume_results["steps_run"][step_name] = {"status": "skipped"}
+                    continue
+                result = _start_and_wait_module_deploy_for_resume(original_request, module_name)
+                payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+                nested = payload.get("result") if isinstance(payload, dict) and isinstance(payload.get("result"), dict) else {}
+                finished = bool(nested.get("finished"))
+                running = result.status == "ok" and not finished
+                resume_results["steps_run"][step_name] = {"status": "running" if running else result.status, "result": payload}
+                if running:
+                    resume_results["status"] = "module_upgrade_running"
+                    resume_results["message"] = "Odoo module deploy/update is still running. Safe deploy is not complete; do not claim success."
+                    resume_results["next_call"] = nested.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": nested.get("job_id"), "wait_for_result": True}}
+                    return resume_results
                 if result.status != "ok":
-                    resume_results["error"] = f"upgrade failed: {result.error}"
+                    resume_results["status"] = "failed"
+                    resume_results["error"] = f"module deploy failed: {result.error}"
                     return resume_results
 
-            elif step_name == "smoke_test":
-                result = OdooRpcService().registry_smoke_test(module_name)
-                resume_results["steps_run"]["smoke_test"] = {"status": result.status}
+            elif step_name == "odoo_module_status":
+                result = odoo.module_status(module_name)
+                resume_results["steps_run"][step_name] = {"status": result.status, "result": _step_payload(result)}
+
+            elif step_name == "registry_field_verify":
+                if not expected_registry_fields:
+                    resume_results["steps_run"][step_name] = {"status": "skipped", "message": "No expected Python field additions were inferred or provided."}
+                    continue
+                result = _verify_registry_fields(expected_registry_fields)
+                resume_results["steps_run"][step_name] = {"status": result.status, "expected_registry_fields": expected_registry_fields, "result": _step_payload(result)}
+                if result.status != "ok":
+                    resume_results["status"] = "registry_field_missing"
+                    resume_results["message"] = "Module upgrade finished but the live Odoo registry is missing expected fields. Do not claim success."
+                    resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
+                    return resume_results
+
+            elif step_name == "registry_smoke_test":
+                result = odoo.registry_smoke_test(module_name, [], [], strict=False)
+                resume_results["steps_run"][step_name] = {"status": result.status, "result": _step_payload(result)}
+
+            elif step_name == "browser_ui_verify":
+                verify_paths = original_request.get("verify_ui_paths") or []
+                if not verify_paths:
+                    resume_results["steps_run"][step_name] = {"status": "skipped"}
+                    continue
+                browser_results = []
+                browser = CdpBrowserService()
+                for index, path in enumerate(verify_paths, start=1):
+                    browser_results.append(_step_payload(await browser.screenshot_odoo_page(
+                        start_path=path,
+                        screenshot_name=f"{module_name}_resume_ui_{index}.png",
+                    )))
+                resume_results["steps_run"][step_name] = {"status": "ok", "result": browser_results}
 
         except Exception as exc:
             resume_results["steps_run"][step_name] = {"status": "error", "error": str(exc)}
+            resume_results["status"] = "failed"
             resume_results["error"] = f"Step '{step_name}' raised exception: {exc}"
             return resume_results
 
     resume_results["status"] = "ok"
     resume_results["message"] = f"Pipeline resumed and completed from step '{start_from}'"
-    store.log_audit("workflow.resume_job", "ok", f"Completed resume of job {req.job_id}")
+    store.log_audit("workflow.resume_job", "ok", f"Completed resume of job {job_id}")
     return resume_results

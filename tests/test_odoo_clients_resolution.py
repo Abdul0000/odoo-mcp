@@ -220,7 +220,19 @@ def test_coding_task_plan_uses_fast_path_for_small_field_change(monkeypatch, tmp
     assert result.defaults["small_patch_fast_path"] is True
     assert "repo.list_custom_modules" not in result.required_tools
     assert "odoo.search_read" in result.required_tools
+    assert "workflow.safe_deploy_module" in result.required_tools
+    assert "workflow.resume_job" in result.required_tools
+    assert "repo.write_many_smart" in result.required_tools
+    assert "repo.write_many_atomic" not in result.required_tools
+    assert "git.commit" not in result.required_tools
+    assert "git.push" not in result.required_tools
+    assert "odoo.module_deploy" not in result.required_tools
     assert "small-patch path" in result.ordered_steps[0]
+    plan_text = "\n".join(result.ordered_steps + result.guardrails)
+    assert "ir.model.fields" in plan_text
+    assert "ir.ui.view" in plan_text
+    assert "Pydantic" in plan_text
+    assert "printing MCP JSON blocks" in plan_text
 
 
 def test_start_session_saves_safe_client_metadata(monkeypatch, tmp_path):

@@ -26,14 +26,14 @@ ODOOSH_WAIT_TIMEOUT_SECONDS=600
 ODOOSH_WAIT_INTERVAL_SECONDS=10
 ```
 
-Use `workflow.safe_deploy_module` for normal changes. It waits for Odoo.sh to deploy the pushed commit before running module upgrade.
+Use `workflow.safe_deploy_module` for normal changes. It checks Odoo.sh once after push; if the pushed SHA is not deployed yet it returns a pollable `retry_later` state with `next_call=workflow.resume_job` instead of blocking the request.
 
 ## Important OAuth persistence setting
 
-Set a stable secret so ChatGPT OAuth sessions survive Koyeb redeploys:
+Set a stable secret so MCP OAuth sessions survive Koyeb redeploys:
 
 ```env
 ODOO_AGENT_OAUTH_TOKEN_SECRET=<long-random-stable-secret>
 ```
 
-If omitted, the connector falls back to `ODOO_AGENT_API_TOKEN`. Keep that value stable across redeploys too. After deploying this build, reconnect the ChatGPT MCP once so it receives the new stateless refresh token format.
+If omitted, the connector falls back to `ODOO_AGENT_API_TOKEN`. Keep that value stable across redeploys too. After deploying this build, reconnect the MCP client once so it receives the new stateless refresh token format.

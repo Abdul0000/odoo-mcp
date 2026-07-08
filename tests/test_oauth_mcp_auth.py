@@ -141,4 +141,4 @@ def test_legacy_bearer_api_token_still_works_after_oauth_upgrade():
     client = TestClient(app)
     response = client.get("/tools/list", headers=_api_auth())
     assert response.status_code == 200
-    assert any(tool["name"] == "connector.health" for tool in response.json())
+    assert any(tool["name"] == "connector_health" for tool in response.json())
