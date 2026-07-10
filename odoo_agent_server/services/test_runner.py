@@ -35,13 +35,6 @@ class TestRunner:
                 stderr=(exc.stderr or "")[-12000:] if isinstance(exc.stderr, str) else "",
                 timed_out=True,
             )
-        except OSError as exc:
-            return CommandResult(
-                command=command,
-                cwd=str(cwd),
-                exit_code=127,
-                stderr=f"Command could not start in cwd {cwd}: {exc}",
-            )
 
     def git_status(self, cwd: Path, timeout_seconds: int = 20) -> CommandResult:
         return self.run(["git", "status", "--short", "--branch"], cwd, timeout_seconds)

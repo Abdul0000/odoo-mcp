@@ -154,7 +154,7 @@ class FrontendPatternService:
             for module, subdir, reason in plan:
                 explorer_calls.append({"tool": "workflow.list_module_files", "module_name": module, "subdir": subdir})
                 try:
-                    result = finder.list_module_files(module, subdir, request.search_roots or None, client_name=request.client_name)
+                    result = finder.list_module_files(module, subdir, request.search_roots or None)
                 except Exception:  # noqa: BLE001 - preflight must never crash the agent session
                     result = None
 
@@ -221,8 +221,8 @@ class FrontendPatternService:
     def _source_fingerprint(request: FrontendPatternPreflightRequest) -> dict[str, object]:
         paths = list(request.custom_file_paths or []) + list(request.planned_file_paths or [])
         roots = request.search_roots or [
-            "/home/odoo/src/odoo",
             "/home/odoo/src/enterprise",
+            "/home/odoo/src/odoo",
             "/home/odoo/src/user",
         ]
         stats: dict[str, int | None] = {}

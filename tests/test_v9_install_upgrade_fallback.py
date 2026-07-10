@@ -5,10 +5,10 @@ from fastapi.testclient import TestClient
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
 from odoo_agent_server.routers.odoo import start_odoo_module_deploy_job
-from odoo_agent_server.schemas import CommandResult, OdooResult
-from odoo_agent_server.schemas import OdooModuleRequest
+from odoo_agent_server.schemas import CommandResult, OdooRpcResult
+from odoo_agent_server.schemas import OdooRpcModuleRequest
 from odoo_agent_server.services.approval_service import ApprovalService
-from odoo_agent_server.services.odoo_service import OdooService
+from odoo_agent_server.services.odoo_rpc_service import OdooRpcService
 from odoo_agent_server.services.odoosh_service import OdooShService
 from odoo_agent_server.services.store_service import JsonStore
 
@@ -39,15 +39,15 @@ def test_module_deploy_falls_back_to_ssh_when_update_list_access_denied(monkeypa
     def fake_execute_kw(self, model, method, args=None, kwargs=None, superuser=False):
         assert model == "ir.module.module"
         assert method == "update_list"
-        return OdooResult(status="failed", error="<Fault 3: 'Access Denied'>")
+        return OdooRpcResult(status="failed", error="<Fault 3: 'Access Denied'>")
 
     def fake_ssh_deploy(self, module_name, timeout_seconds=600):
         return CommandResult(command=["odoosh.module_deploy_ssh", module_name], cwd="odoosh:ssh", exit_code=0, stdout="SSH_OK")
 
-    monkeypatch.setattr(OdooService, "execute_kw", fake_execute_kw)
+    monkeypatch.setattr(OdooRpcService, "execute_kw", fake_execute_kw)
     monkeypatch.setattr(OdooShService, "module_deploy_ssh", fake_ssh_deploy)
 
-    result = OdooService().module_deploy("karachi_school_management")
+    result = OdooRpcService().module_deploy("karachi_school_management")
 
     assert result.status == "ok"
     assert result.result["fallback"] == "odoosh"
@@ -58,18 +58,18 @@ def test_module_deploy_falls_back_to_ssh_when_update_list_access_denied(monkeypa
 def test_module_deploy_falls_back_to_ssh_when_module_missing_after_update_list(monkeypatch):
     def fake_execute_kw(self, model, method, args=None, kwargs=None, superuser=False):
         if model == "ir.module.module" and method == "update_list":
-            return OdooResult(status="ok", result=True)
+            return OdooRpcResult(status="ok", result=True)
         if model == "ir.module.module" and method == "search_read":
-            return OdooResult(status="ok", result=[])
-        raise AssertionError(f"unexpected Odoo shell call: {model}.{method}")
+            return OdooRpcResult(status="ok", result=[])
+        raise AssertionError(f"unexpected XML-RPC call: {model}.{method}")
 
     def fake_ssh_deploy(self, module_name, timeout_seconds=600):
         return CommandResult(command=["odoosh.module_deploy_ssh", module_name], cwd="odoosh:ssh", exit_code=0, stdout="SSH_DEPLOY_OK")
 
-    monkeypatch.setattr(OdooService, "execute_kw", fake_execute_kw)
+    monkeypatch.setattr(OdooRpcService, "execute_kw", fake_execute_kw)
     monkeypatch.setattr(OdooShService, "module_deploy_ssh", fake_ssh_deploy)
 
-    result = OdooService().module_deploy("new_custom_module")
+    result = OdooRpcService().module_deploy("new_custom_module")
 
     assert result.status == "ok"
     assert result.result["fallback"] == "odoosh"
@@ -84,11 +84,11 @@ def test_internal_module_deploy_job_does_not_require_second_approval(monkeypatch
     monkeypatch.setattr(settings, "approval_required_actions_raw", "odoo.module_deploy")
 
     def fake_module_deploy(self, module_name):
-        return OdooResult(status="ok", result={"module_name": module_name})
+        return OdooRpcResult(status="ok", result={"module_name": module_name})
 
-    monkeypatch.setattr(OdooService, "module_deploy", fake_module_deploy)
+    monkeypatch.setattr(OdooRpcService, "module_deploy", fake_module_deploy)
 
-    result = start_odoo_module_deploy_job(OdooModuleRequest(
+    result = start_odoo_module_deploy_job(OdooRpcModuleRequest(
         module_name="karachi_school_management",
         wait_timeout_seconds=2,
         poll_interval_seconds=0.25,
@@ -118,10 +118,10 @@ def test_public_module_deploy_blocks_after_manual_push_until_sha_deployed(monkey
         raise AssertionError("module_deploy must not run before Odoo.sh deploy guard passes")
 
     monkeypatch.setattr(OdooShService, "check_commit_deployed", fake_check)
-    monkeypatch.setattr(OdooService, "module_deploy", fake_module_deploy)
+    monkeypatch.setattr(OdooRpcService, "module_deploy", fake_module_deploy)
 
     result = start_odoo_module_deploy_job(
-        OdooModuleRequest(
+        OdooRpcModuleRequest(
             module_name="x_module",
             wait_timeout_seconds=2,
             poll_interval_seconds=0.25,
@@ -164,10 +164,10 @@ def test_public_module_deploy_blocks_when_manual_push_hash_mismatches(monkeypatc
     monkeypatch.setattr(OdooShService, "check_commit_deployed", fake_check)
     monkeypatch.setattr(OdooShService, "recent_build_failure", fake_recent)
     monkeypatch.setattr(OdooShService, "verify_user_file_hashes", fake_hashes)
-    monkeypatch.setattr(OdooService, "module_deploy", fake_module_deploy)
+    monkeypatch.setattr(OdooRpcService, "module_deploy", fake_module_deploy)
 
     result = start_odoo_module_deploy_job(
-        OdooModuleRequest(
+        OdooRpcModuleRequest(
             module_name="x_module",
             wait_timeout_seconds=2,
             poll_interval_seconds=0.25,
@@ -208,15 +208,15 @@ def test_public_module_deploy_runs_after_manual_push_guard_passes(monkeypatch, t
 
     def fake_module_deploy(self, module_name):
         calls["deploy"] += 1
-        return OdooResult(status="ok", result={"module_name": module_name})
+        return OdooRpcResult(status="ok", result={"module_name": module_name})
 
     monkeypatch.setattr(OdooShService, "check_commit_deployed", fake_check)
     monkeypatch.setattr(OdooShService, "recent_build_failure", fake_recent)
     monkeypatch.setattr(OdooShService, "verify_user_file_hashes", fake_hashes)
-    monkeypatch.setattr(OdooService, "module_deploy", fake_module_deploy)
+    monkeypatch.setattr(OdooRpcService, "module_deploy", fake_module_deploy)
 
     result = start_odoo_module_deploy_job(
-        OdooModuleRequest(
+        OdooRpcModuleRequest(
             module_name="x_module",
             wait_timeout_seconds=2,
             poll_interval_seconds=0.25,
@@ -234,7 +234,7 @@ def test_public_module_deploy_runs_after_manual_push_guard_passes(monkeypatch, t
 
 def test_odoosh_module_deploy_ssh_uses_upgrade_for_installed_module(monkeypatch):
     def fake_module_status(self, module_name):
-        return OdooResult(status="ok", result=[{"name": module_name, "state": "installed"}])
+        return OdooRpcResult(status="ok", result=[{"name": module_name, "state": "installed"}])
 
     called = {}
 
@@ -243,7 +243,7 @@ def test_odoosh_module_deploy_ssh_uses_upgrade_for_installed_module(monkeypatch)
         called["flag"] = flag
         return CommandResult(command=["odoo-bin", flag, module_name], cwd="odoosh:ssh", exit_code=0, stdout="OK")
 
-    monkeypatch.setattr(OdooService, "module_status", fake_module_status)
+    monkeypatch.setattr(OdooRpcService, "module_status", fake_module_status)
     monkeypatch.setattr(OdooShService, "_dependency_guard", lambda self, module_name: None)
     monkeypatch.setattr(OdooShService, "_run_module_cli", fake_run_module_cli)
 
@@ -256,7 +256,7 @@ def test_odoosh_module_deploy_ssh_uses_upgrade_for_installed_module(monkeypatch)
 
 def test_odoosh_module_deploy_ssh_uses_install_for_uninstalled_module(monkeypatch):
     def fake_module_status(self, module_name):
-        return OdooResult(status="ok", result=[{"name": module_name, "state": "uninstalled"}])
+        return OdooRpcResult(status="ok", result=[{"name": module_name, "state": "uninstalled"}])
 
     called = {}
 
@@ -264,7 +264,7 @@ def test_odoosh_module_deploy_ssh_uses_install_for_uninstalled_module(monkeypatc
         called["flag"] = flag
         return CommandResult(command=["odoo-bin", flag, module_name], cwd="odoosh:ssh", exit_code=0, stdout="OK")
 
-    monkeypatch.setattr(OdooService, "module_status", fake_module_status)
+    monkeypatch.setattr(OdooRpcService, "module_status", fake_module_status)
     monkeypatch.setattr(OdooShService, "_dependency_guard", lambda self, module_name: None)
     monkeypatch.setattr(OdooShService, "_run_module_cli", fake_run_module_cli)
 

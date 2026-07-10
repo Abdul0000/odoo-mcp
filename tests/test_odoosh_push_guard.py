@@ -5,7 +5,7 @@ import json
 import pytest
 
 from odoo_agent_server.config import settings
-from odoo_agent_server.schemas import CommandResult, JobRecord, JobStatus, OdooModuleRequest, OdooShModuleUpdateRequest
+from odoo_agent_server.schemas import CommandResult, JobRecord, JobStatus, OdooRpcModuleRequest, OdooShModuleUpdateRequest
 from odoo_agent_server.services.store_service import JsonStore
 from odoo_agent_server.routers import odoosh
 
@@ -91,7 +91,7 @@ def _run_background_inline(monkeypatch):
         ),
         (
             "odoosh.module_install_ssh",
-            lambda project: OdooModuleRequest(module_name="x_module", project_path=str(project), wait_for_result=True),
+            lambda project: OdooRpcModuleRequest(module_name="x_module", project_path=str(project), wait_for_result=True),
             odoosh.odoosh_module_install_ssh,
             "module_install_ssh",
         ),
@@ -117,7 +117,7 @@ def test_manual_odoosh_tools_refuse_when_local_head_is_not_pushed(tool_name, req
     [
         (lambda project: OdooShModuleUpdateRequest(module_name="x_module", project_path=str(project), wait_for_result=True), odoosh.odoosh_module_deploy_ssh, "module_deploy_ssh"),
         (lambda project: OdooShModuleUpdateRequest(module_name="x_module", project_path=str(project), wait_for_result=True), odoosh.odoosh_module_update, "module_update"),
-        (lambda project: OdooModuleRequest(module_name="x_module", project_path=str(project), wait_for_result=True), odoosh.odoosh_module_install_ssh, "module_install_ssh"),
+        (lambda project: OdooRpcModuleRequest(module_name="x_module", project_path=str(project), wait_for_result=True), odoosh.odoosh_module_install_ssh, "module_install_ssh"),
     ],
 )
 def test_manual_odoosh_tools_allow_when_local_head_matches_remote(request_factory, call_function, service_call, project, monkeypatch):
@@ -137,7 +137,7 @@ def test_manual_odoosh_tools_allow_when_local_head_matches_remote(request_factor
     [
         (lambda project: OdooShModuleUpdateRequest(module_name="x_module", project_path=str(project), wait_for_result=True), odoosh.odoosh_module_deploy_ssh, "module_deploy_ssh"),
         (lambda project: OdooShModuleUpdateRequest(module_name="x_module", project_path=str(project), wait_for_result=True), odoosh.odoosh_module_update, "module_update"),
-        (lambda project: OdooModuleRequest(module_name="x_module", project_path=str(project), wait_for_result=True), odoosh.odoosh_module_install_ssh, "module_install_ssh"),
+        (lambda project: OdooRpcModuleRequest(module_name="x_module", project_path=str(project), wait_for_result=True), odoosh.odoosh_module_install_ssh, "module_install_ssh"),
     ],
 )
 def test_manual_odoosh_tools_block_after_safe_deploy_failed_before_push(request_factory, call_function, service_call, project, monkeypatch):

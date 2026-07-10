@@ -16,19 +16,11 @@ from ..services.approval_service import ApprovalService
 from ..services.background_executor import submit_background
 from ..services.git_service import GitService
 from ..services.odoosh_service import OdooShService
-from ..services.client_resolver_service import ClientResolverService
 from ..services.store_service import JsonStore
 from ..services.workflow_guard_service import safe_deploy_command_block
-from ..services.client_gate_service import ClientGateService
 
 router = APIRouter(prefix="/git", tags=["git"], dependencies=[AuthDependency])
 logger = logging.getLogger(__name__)
-
-
-
-def _require_explicit_client_when_multiclient(payload: object, action: str) -> None:
-    """Require client.check validation before git tools in multi-client mode."""
-    ClientGateService().require_validated_client(getattr(payload, "client_name", None), action)
 
 
 def _normalise_branch(branch: str | None) -> str | None:
@@ -122,7 +114,7 @@ def _json_payload(stdout: str | None) -> dict:
         return {}
 
 
-def _start_auto_odoosh_upgrade_job(project_path: str, module_name: str, expected_sha: str, timeout_seconds: int, client_name: str | None = None) -> str:
+def _start_auto_odoosh_upgrade_job(project_path: str, module_name: str, expected_sha: str, timeout_seconds: int) -> str:
     """Start the non-blocking post-push Odoo.sh deploy+upgrade job.
 
     This job is the follow-through for raw ``git.push``: it waits until Odoo.sh
@@ -139,7 +131,6 @@ def _start_auto_odoosh_upgrade_job(project_path: str, module_name: str, expected
         "deploy_timeout_seconds": AUTO_UPGRADE_DEPLOY_TIMEOUT_SECONDS,
         "module_upgrade_timeout_seconds": timeout_seconds,
         "trigger": "git.push:auto_upgrade_on_push",
-        "client_name": client_name,
     }
     job = store.create_job(JobRecord(job_type="post_push_auto_upgrade", status=JobStatus.running, request=request))
 
@@ -162,9 +153,7 @@ def _start_auto_odoosh_upgrade_job(project_path: str, module_name: str, expected
 
     def _bg() -> None:
         try:
-            resolver = ClientResolverService()
-            client = resolver.resolve_client(client_name=client_name, project_path=project_path, require_complete=False)
-            service = OdooShService(client) if client else OdooShService()
+            service = OdooShService()
 
             def _poll_progress(attempt_payload: dict[str, object]) -> None:
                 _step("odoosh_check_commit_poll", "passed" if attempt_payload.get("deployed") else "running", attempt_payload)
@@ -201,8 +190,7 @@ def _start_auto_odoosh_upgrade_job(project_path: str, module_name: str, expected
                     "module_name": module_name,
                     "project_path": str(Path(project_path).resolve()),
                     "safe_deploy_status": "deploy_failed_or_timeout",
-                    "client_name": client.name if client else client_name,
-                }, client_name=client.name if client else client_name)
+                })
                 store.log_audit(
                     "git.push.auto_odoosh_upgrade",
                     "deploy_failed_or_timeout",
@@ -243,8 +231,7 @@ def _start_auto_odoosh_upgrade_job(project_path: str, module_name: str, expected
                 "module_name": module_name,
                 "project_path": str(Path(project_path).resolve()),
                 "safe_deploy_status": "post_push_auto_upgrade_passed" if upgrade_passed else "module_upgrade_failed",
-                "client_name": client.name if client else client_name,
-            }, client_name=client.name if client else client_name)
+            })
             store.log_audit(
                 "git.push.auto_odoosh_upgrade",
                 "ok" if upgrade_passed else "failed",
@@ -267,35 +254,11 @@ def _start_auto_odoosh_upgrade_job(project_path: str, module_name: str, expected
 
 
 def _append_auto_upgrade_note(result: CommandResult, module_name: str, job_id: str) -> CommandResult:
-    note = (
-        f"Detected module {module_name} in this push — Odoo.sh upgrade job started, job_id={job_id}. "
-        "This is NOT deployed/upgraded yet. Poll with jobs.get until terminal passed/failed. Do not report success from git.push."
-    )
-    payload = {
-        "status": "running",
-        "follow_up_job_id": job_id,
-        "job_id": job_id,
-        "module_name": module_name,
-        "completion_required": True,
-        "success_allowed": False,
-        "tool_exit_allowed": False,
-        "poll_after_seconds": 5,
-        "message": note,
-        "next_call": {
-            "tool": "jobs.get",
-            "arguments": {
-                "job_id": job_id,
-                "wait_for_result": True,
-                "wait_timeout_seconds": 20,
-                "poll_interval_seconds": 2.0,
-            },
-        },
-    }
+    note = f"Detected module {module_name} in this push — auto-triggered Odoo.sh upgrade, job_id={job_id}. Poll with jobs.get."
+    payload = {"follow_up_job_id": job_id, "module_name": module_name, "message": note}
     stdout = (result.stdout or "").rstrip()
     stdout = f"{stdout}\n{note}\nAUTO_UPGRADE_ON_PUSH={json.dumps(payload, sort_keys=True)}\n" if stdout else f"{note}\nAUTO_UPGRADE_ON_PUSH={json.dumps(payload, sort_keys=True)}\n"
-    # Push itself succeeded, but the requested deploy/upgrade is not complete.
-    # Non-zero exit_code prevents MCP agents from summarising git.push as a full deploy success.
-    return result.model_copy(update={"stdout": stdout, "exit_code": 2})
+    return result.model_copy(update={"stdout": stdout})
 
 
 def _ensure_protected_branch_approval(branch: str | None, approval_id: str | None) -> bool:
@@ -324,7 +287,6 @@ def _ensure_protected_branch_approval(branch: str | None, approval_id: str | Non
 
 @router.post("/status", response_model=CommandResult)
 def git_status(payload: BaseProjectRequest) -> CommandResult:
-    _require_explicit_client_when_multiclient(payload, "git.status")
     result = GitService().status(payload.project_path)
     JsonStore().log_audit("git.status", "ok" if result.exit_code == 0 else "failed", payload.project_path)
     return result
@@ -332,13 +294,11 @@ def git_status(payload: BaseProjectRequest) -> CommandResult:
 
 @router.post("/current-branch", response_model=CommandResult)
 def git_current_branch(payload: BaseProjectRequest) -> CommandResult:
-    _require_explicit_client_when_multiclient(payload, "git.current_branch")
     return GitService().current_branch(payload.project_path)
 
 
 @router.post("/diff", response_model=CommandResult)
 def git_diff(payload: GitDiffRequest) -> CommandResult:
-    _require_explicit_client_when_multiclient(payload, "git.diff")
     result = GitService().diff(payload.project_path, payload.staged, payload.timeout_seconds)
     JsonStore().log_audit("git.diff", "ok" if result.exit_code == 0 else "failed", payload.project_path, {"staged": payload.staged})
     return result
@@ -346,7 +306,6 @@ def git_diff(payload: GitDiffRequest) -> CommandResult:
 
 @router.post("/commit", response_model=CommandResult)
 def git_commit(payload: GitCommitRequest) -> CommandResult:
-    _require_explicit_client_when_multiclient(payload, "git.commit")
     blocked = safe_deploy_command_block("git.commit", project_path=payload.project_path)
     if blocked:
         return blocked
@@ -360,7 +319,6 @@ def git_commit(payload: GitCommitRequest) -> CommandResult:
 
 @router.post("/push", response_model=CommandResult)
 def git_push(payload: GitPushRequest) -> CommandResult:
-    _require_explicit_client_when_multiclient(payload, "git.push")
     blocked = safe_deploy_command_block("git.push", project_path=payload.project_path)
     if blocked:
         return blocked
@@ -399,12 +357,12 @@ def git_push(payload: GitPushRequest) -> CommandResult:
             },
             "last_sha": pushed_sha,
             "safe_deploy_status": "manual_push_pending_deploy_verification",
-        }, client_name=payload.client_name)
+        })
         if settings.auto_upgrade_on_push and pushed_sha:
             try:
                 module_name = detect_module_from_paths(payload.project_path, changed_paths)
                 if module_name:
-                    job_id = _start_auto_odoosh_upgrade_job(payload.project_path, module_name, pushed_sha, payload.timeout_seconds, payload.client_name)
+                    job_id = _start_auto_odoosh_upgrade_job(payload.project_path, module_name, pushed_sha, payload.timeout_seconds)
                     result = _append_auto_upgrade_note(result, module_name, job_id)
                     safe_deploy_status = "manual_push_auto_upgrade_triggered"
                     try:
@@ -431,8 +389,7 @@ def git_push(payload: GitPushRequest) -> CommandResult:
                         },
                         "last_sha": pushed_sha,
                         "safe_deploy_status": safe_deploy_status,
-                        "client_name": payload.client_name,
-                    }, client_name=payload.client_name)
+                    })
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Failed to auto-trigger Odoo.sh upgrade after successful git.push")
                 try:

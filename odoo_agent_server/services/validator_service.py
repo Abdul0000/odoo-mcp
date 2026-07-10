@@ -29,18 +29,6 @@ INHERIT_DEPENDS = {
     "calendar.": "calendar",
 }
 
-# Lightweight transitive dependency hints used only to reduce noisy static
-# warnings.  Odoo validates real dependencies during module install/upgrade;
-# these hints stop style-only tasks from being polluted by warnings such as
-# ``website_sale`` not directly depending on ``sale``.
-TRANSITIVE_DEPENDS_HINTS = {
-    "website_sale": {"website", "sale", "product"},
-    "sale_management": {"sale", "product"},
-    "stock_account": {"stock", "account", "product"},
-    "mrp": {"stock", "product"},
-    "website_payment": {"website", "payment"},
-}
-
 
 @dataclass
 class ParsedModel:
@@ -265,14 +253,11 @@ class OdooModuleValidator:
 
     def _validate_manifest_dependency_hints(self, module_path: Path, manifest: dict, parsed_models: dict[str, ParsedModel]) -> list[Finding]:
         depends = set(manifest.get("depends") or []) if isinstance(manifest.get("depends") or [], list) else set()
-        effective_depends = set(depends)
-        for dep in list(depends):
-            effective_depends.update(TRANSITIVE_DEPENDS_HINTS.get(dep, set()))
         findings: list[Finding] = []
         inherited = {model.inherited_model for model in parsed_models.values() if model.inherited_model}
         for inherited_model in inherited:
             for prefix, dep in INHERIT_DEPENDS.items():
-                if inherited_model and inherited_model.startswith(prefix) and dep not in effective_depends:
+                if inherited_model and inherited_model.startswith(prefix) and dep not in depends:
                     findings.append(Finding(severity=Severity.warning, code="MANIFEST_DEPENDENCY_MISSING_STATIC", message=f"Model inherits {inherited_model} but manifest does not depend on {dep}.", file=str(module_path / "__manifest__.py"), hint=f"Add '{dep}' to manifest depends if this inheritance is active."))
         return findings
 

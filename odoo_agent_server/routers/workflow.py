@@ -5,7 +5,6 @@ import ast
 import hashlib
 import json
 import os
-import re
 import shutil
 import time
 from datetime import datetime, timezone
@@ -16,7 +15,7 @@ from threading import Lock
 from fastapi import APIRouter, HTTPException, status
 
 from ..auth import AuthDependency
-from ..config import settings, mask_repo_url
+from ..config import settings, get_client_names, mask_repo_url
 from ..schemas import (
     CapabilityCheckResult,
     CodingTaskPlanRequest,
@@ -35,8 +34,8 @@ from ..schemas import (
     WorkflowReport,
     SafeDeployModuleRequest,
     SelfRunRequest,
-    OdooModuleRequest,
-    OdooResult,
+    OdooRpcModuleRequest,
+    OdooRpcResult,
     # V14: Self-Learning Agent — Core Discovery
     FindCoreFileRequest,
     FindCoreFileResult,
@@ -54,9 +53,6 @@ from ..schemas import (
     PosChangeVerifyRequest,
     PosChangeVerifyResult,
     PosFlowCheckRequest,
-    BrowserCheckRequest,
-    PosVisualVerifyRequest,
-    UiVerifySpec,
     # V15: Strict Odoo frontend/OWL/JS/XML preflight
     FrontendPatternPreflightRequest,
     FrontendPatternPreflightResult,
@@ -69,9 +65,8 @@ from ..schemas import (
 )
 from ..services.approval_service import ApprovalService
 from ..services.client_resolver_service import ClientResolverService
-from ..services.client_gate_service import ClientGateService
 from ..services.git_service import GitService
-from ..services.odoo_service import OdooService
+from ..services.odoo_rpc_service import OdooRpcService
 from ..services.odoosh_service import OdooShService
 from ..services.path_service import resolve_allowed_path
 from ..services.browser_cdp_service import CdpBrowserService
@@ -79,7 +74,6 @@ from ..services.repo_service import RepoService
 from ..services.store_service import JsonStore
 from ..services.background_executor import submit_background
 from ..services.core_finder_service import CoreFinderService          # V14
-from ..services.prewrite_gate_service import PreWriteGateService
 from ..services.syntax_verifier_service import SyntaxVerifierService  # V14+
 from ..services.frontend_pattern_service import FrontendPatternService  # V15
 from ..services.repo_index_service import RepoIndexService  # V16
@@ -89,7 +83,6 @@ from ..services.workflow_guard_service import (
     find_blocking_safe_deploy,
     safe_deploy_block_payload,
 )
-from ..services.checkout_guard_service import ensure_module_exists_or_sync, maybe_ensure_known_module_current
 from .qa import self_run
 from .odoo import start_odoo_module_deploy_job
 
@@ -100,27 +93,6 @@ router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDepe
 # first JobRecord is persisted. JsonStore still provides the durable state; this
 # lock closes the in-process check/create window.
 _SAFE_DEPLOY_ENTRY_LOCK = Lock()
-
-
-def _odoosh_service_for_client(client=None):
-    """Instantiate OdooShService with per-client config while keeping tests/fakes compatible."""
-    if client is not None:
-        try:
-            return OdooShService(client)
-        except TypeError:
-            return OdooShService()
-    return OdooShService()
-
-
-def _odoo_service_for_client(client=None):
-    """Instantiate OdooService with per-client config while keeping tests/fakes compatible."""
-    if client is not None:
-        try:
-            return OdooService(client)
-        except TypeError:
-            return OdooService()
-    return OdooService()
-
 
 
 def _looks_like_small_patch(task: str) -> bool:
@@ -140,42 +112,6 @@ def _looks_like_frontend_task(task: str) -> bool:
     return any(term in value for term in frontend_terms)
 
 
-_UI_PROOF_EXTENSIONS = {".xml", ".css", ".scss", ".js"}
-_UI_PROOF_DIR_HINTS = {"views", "templates", "static"}
-_UI_PROOF_STRICT_SKIP_HINTS = {"models", "controllers", "security", "wizard", "report", "data", "migrations", "tests"}
-
-
-def _frontend_ui_files_requiring_live_proof(module_name: str, paths: list[str]) -> list[str]:
-    """Return changed frontend/template/style files where deploy success is not visual proof.
-
-    Odoo.sh deploy + module upgrade can pass while a website/asset/QWeb change is
-    still not visibly correct because of asset bundles, selectors, inherited views,
-    conditions, website cache, or wrong page path.  These files require browser/UI
-    proof before an MCP agent may claim that the visible page changed.
-    """
-    result: list[str] = []
-    module_prefix = f"{module_name.strip('/')}/" if module_name else ""
-    for raw in paths or []:
-        rel = str(raw or "").replace("\\", "/").strip().lstrip("./")
-        if not rel or "\x00" in rel:
-            continue
-        if module_prefix and not rel.startswith(module_prefix):
-            continue
-        suffix = Path(rel).suffix.lower()
-        if suffix not in _UI_PROOF_EXTENSIONS:
-            continue
-        parts = {p for p in rel.split("/") if p}
-        if parts & _UI_PROOF_STRICT_SKIP_HINTS:
-            continue
-        if suffix in {".css", ".scss", ".js"}:
-            if "static" in parts:
-                result.append(rel)
-            continue
-        if suffix == ".xml" and (parts & _UI_PROOF_DIR_HINTS):
-            result.append(rel)
-    return list(dict.fromkeys(result))
-
-
 @router.post("/coding-task-plan", response_model=CodingTaskPlanResult)
 def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
     """Return the canonical repo-first coding workflow for MCP agents."""
@@ -188,19 +124,6 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
     branch = payload.branch or (client.branch if client else None) or settings.target_git_branch or "<target_branch>"
     project_path = payload.project_path or (client.path if client else None) or settings.target_project_path or f"{settings.workspace_root.rstrip('/')}/<repo_name>"
     module_name = payload.module_name or "<custom_module>"
-    checkout_guard = None
-    if payload.module_name and project_path and "<" not in str(project_path):
-        checkout_guard = maybe_ensure_known_module_current(
-            project_path=project_path,
-            module_name=payload.module_name,
-            branch=branch,
-            client_name=client.name if client else payload.client_name,
-            remote="origin",
-            timeout_seconds=120,
-            require_prior_success=True,
-        )
-        if checkout_guard and not checkout_guard.get("ok"):
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=checkout_guard.get("error") or "Checkout/module guard failed")
     small_patch = _looks_like_small_patch(payload.task)
     if small_patch:
         steps = [
@@ -287,7 +210,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Do not answer by printing MCP JSON blocks for the user/client to execute; call the MCP tools yourself.",
             "Do not create fields/views by direct ir.model.fields or ir.ui.view database writes for normal module-code requests.",
             "For small patches, avoid repeated tool discovery, broad source reads, full health checks, and browser diagnostics unless they are needed to prove the requested change.",
-            "Live screenshot verification is disabled by default; rely on static/core verification, Odoo.sh deployment proof, module upgrade, and registry smoke tests.",
+            "For hard UI/POS/website/accounting view tasks, verify exact affected views in a browser after upgrade using verify_ui_paths or workflow.browser_menu_crawl.",
             "For JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, frontend_pattern_preflight is blocking: do not write code until real framework source patterns are read.",
         ],
         defaults={
@@ -298,7 +221,6 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "module_name": module_name,
             "task": payload.task,
             "small_patch_fast_path": small_patch,
-            **({"checkout_guard": checkout_guard} if checkout_guard and checkout_guard.get("sync_attempted") else {}),
         },
     )
 
@@ -309,7 +231,7 @@ def capability_check() -> CapabilityCheckResult:
     checks["allowed_roots"] = {"ok": bool(settings.allowed_roots), "value": [str(p) for p in settings.allowed_roots]}
     checks["git"] = {"ok": shutil.which("git") is not None, "path": shutil.which("git")}
     checks["ssh"] = {"ok": shutil.which("ssh") is not None, "path": shutil.which("ssh")}
-    checks["odoo_shell_config"] = {"ok": all([
+    checks["odoo_rpc_config"] = {"ok": all([
         os.environ.get("ODOO_BASE_URL") or settings.odoo_base_url,
         os.environ.get("ODOO_DB_NAME") or settings.odoo_db_name,
         os.environ.get("ODOO_LOGIN") or settings.odoo_login,
@@ -353,6 +275,7 @@ def start_session(payload: StartSessionRequest) -> WorkflowReport:
         project_path=settings.target_project_path,
         require_complete=False,
     )
+    resolver.apply_odoo_env(client)
     if client:
         payload = payload.model_copy(update={
             "client_name": client.name,
@@ -398,7 +321,7 @@ def start_session(payload: StartSessionRequest) -> WorkflowReport:
 
     if payload.include_odoo:
         try:
-            odoo_health = _odoo_service_for_client(client).health()
+            odoo_health = OdooRpcService().health()
             step("odoo_health", "passed" if odoo_health.status == "ok" else "warning", odoo_health)
             if odoo_health.status != "ok":
                 flags.append("warning")
@@ -408,7 +331,7 @@ def start_session(payload: StartSessionRequest) -> WorkflowReport:
 
     if payload.include_odoosh:
         try:
-            sh_health = _odoosh_service_for_client(client).health()
+            sh_health = OdooShService().health()
             step("odoosh_health", "passed" if sh_health.exit_code == 0 else "warning", sh_health)
             if sh_health.exit_code != 0:
                 flags.append("warning")
@@ -435,11 +358,9 @@ def start_session(payload: StartSessionRequest) -> WorkflowReport:
     return WorkflowReport(status=final, job_id=job.id, steps=finished.steps, summary={"status": final, "project_path": prepared.project_path if prepared else None, "sha": prepared.sha if prepared else None})
 
 
-@router.post("/registry-smoke-test", response_model=OdooResult)
-def registry_smoke_test(payload: RegistrySmokeTestRequest) -> OdooResult:
-    ClientGateService().require_validated_client(payload.client_name, "workflow.registry_smoke_test")
-    client = ClientResolverService().resolve_client(client_name=payload.client_name, require_complete=True) if payload.client_name else ClientResolverService().resolve_client(require_complete=False)
-    return OdooService(client).registry_smoke_test(payload.module_name, payload.model_names, payload.menu_names, payload.strict)
+@router.post("/registry-smoke-test", response_model=OdooRpcResult)
+def registry_smoke_test(payload: RegistrySmokeTestRequest) -> OdooRpcResult:
+    return OdooRpcService().registry_smoke_test(payload.module_name, payload.model_names, payload.menu_names, payload.strict)
 
 
 @router.post("/restore-last-good-commit", response_model=WorkflowReport)
@@ -499,114 +420,6 @@ async def browser_menu_crawl(payload: MenuCrawlerRequest) -> WorkflowReport:
     return WorkflowReport(status=final, job_id=job.id, steps=finished.steps, summary={"status": final, "paths": payload.paths})
 
 
-@router.post("/pos-visual-verify", response_model=WorkflowReport)
-async def pos_visual_verify(payload: PosVisualVerifyRequest) -> WorkflowReport:
-    """Open an exact POS/runtime URL and run visual verification when enabled.
-
-    The flow is disabled by default because browser screenshot preparation is
-    not dependable enough to fail or block coding/deployment jobs.
-    """
-    ClientGateService().require_validated_client(payload.client_name, "workflow.pos_visual_verify")
-    if not settings.visual_screenshot_flow_enabled:
-        store = JsonStore()
-        request = payload.model_dump(mode="json")
-        job = store.create_job(JobRecord(job_type="pos_visual_verify", status=JobStatus.running, request=request))
-        skipped = {
-            "status": "skipped",
-            "reason": "visual_screenshot_flow_disabled",
-            "message": (
-                "POS screenshot/visual verification is disabled by configuration and was safely skipped. "
-                "This result does not affect code, push, deploy, upgrade, static QA, or registry verification."
-            ),
-            "enabled_by": "ODOO_AGENT_VISUAL_SCREENSHOT_FLOW_ENABLED=true",
-        }
-        store.add_step(
-            store.get_job(job.id),
-            JobStep(
-                name="pos_visual_verify",
-                status="skipped",
-                finished_at=datetime.now(timezone.utc).isoformat(),
-                result=skipped,
-            ),
-        )
-        finished = store.finish_job(store.get_job(job.id), JobStatus.passed, skipped)
-        return WorkflowReport(status="passed", job_id=job.id, steps=finished.steps, summary=skipped)
-    client = ClientResolverService().resolve_client(client_name=payload.client_name, require_complete=False) if payload.client_name else ClientResolverService().resolve_client(require_complete=False)
-    store = JsonStore()
-    job = store.create_job(JobRecord(job_type="pos_visual_verify", status=JobStatus.running, request=payload.model_dump(mode="json")))
-    result = await CdpBrowserService().screenshot_odoo_page(
-        payload.base_url or (client.odoo_url if client else None),
-        payload.login or (client.odoo_login if client else None),
-        payload.password or (client.odoo_password if client else None),
-        payload.start_path,
-        payload.screenshot_name,
-        payload.timeout_seconds,
-        payload.full_page,
-        client_name=client.name if client else payload.client_name,
-        reuse_session=payload.reuse_session,
-        login_strategy=payload.login_strategy,
-        wait_selector=payload.wait_selector,
-        actions=payload.actions,
-        diagnostics=payload.diagnostics,
-        debug_contrast=payload.debug_contrast,
-        debug_contrast_screenshot_name=payload.debug_contrast_screenshot_name,
-        restore_theme_after_verify=payload.restore_theme_after_verify,
-        cleanup_screenshot_dir=payload.cleanup_screenshot_dir,
-        cleanup_screenshot_retention_seconds=payload.cleanup_screenshot_retention_seconds,
-        delete_screenshots_after_verify=payload.delete_screenshots_after_verify,
-        ui_profile=payload.ui_profile,
-        viewport_width=payload.viewport_width,
-        viewport_height=payload.viewport_height,
-        device_scale_factor=payload.device_scale_factor,
-        required_selectors=payload.required_selectors,
-        forbidden_selectors=payload.forbidden_selectors,
-        required_text=payload.required_text,
-        forbidden_text=payload.forbidden_text,
-        min_elements=payload.min_elements,
-        wait_until=payload.wait_until,
-        require_all_actions_pass=payload.require_all_actions_pass,
-        screenshot_mode=payload.screenshot_mode,
-        screenshot_format=payload.screenshot_format,
-        screenshot_quality=payload.screenshot_quality,
-        include_screenshot_base64=payload.include_screenshot_base64,
-        screenshot_base64_max_bytes=payload.screenshot_base64_max_bytes,
-        reference_image_path=payload.reference_image_path,
-        visual_compare_mode=payload.visual_compare_mode,
-        max_visual_diff_ratio=payload.max_visual_diff_ratio,
-        human_pos_navigation=payload.human_pos_navigation,
-        pos_config_id=payload.pos_config_id,
-        pos_config_name=payload.pos_config_name,
-        scenario=payload.scenario,
-        scenario_goal=payload.scenario_goal,
-        scenario_product_count=payload.scenario_product_count,
-        cleanup_after_verify=payload.cleanup_after_verify,
-        require_functional_proof=payload.require_functional_proof,
-        code_aware=payload.code_aware,
-        project_path=payload.project_path,
-        module_name=payload.module_name,
-        feature_goal=payload.feature_goal,
-    )
-    status_ = "passed" if result.status == "ok" and not result.console_errors and not result.network_errors else "failed" if result.status == "failed" else "warning"
-    store.add_step(store.get_job(job.id), JobStep(name="pos_visual_verify", status=status_, finished_at=datetime.now(timezone.utc).isoformat(), result=result.model_dump(mode="json")))
-    final_status = "failed" if status_ == "failed" else "warning" if status_ == "warning" else "passed"
-    final_job_status = JobStatus.failed if final_status == "failed" else JobStatus.warning if final_status == "warning" else JobStatus.passed
-    finished = store.finish_job(store.get_job(job.id), final_job_status, {
-        "status": final_status,
-        "url": result.url,
-        "screenshot_path": result.screenshot_path,
-        "screenshot_mode": result.screenshot_mode,
-        "screenshot_persisted": result.screenshot_persisted,
-        "screenshot_analysis": result.screenshot_analysis,
-        "debug_screenshot_path": result.debug_screenshot_path,
-        "debug_contrast_applied": result.debug_contrast_applied,
-        "theme_restored_after_verify": result.theme_restored_after_verify,
-        "diagnostics": result.diagnostics,
-        "session_reused": result.session_reused,
-        "session_expired": result.session_expired,
-    })
-    return WorkflowReport(status=final_status, job_id=job.id, steps=finished.steps, summary=finished.result or {})
-
-
 @router.post("/full-verify", response_model=WorkflowReport)
 async def full_verify(payload: FullVerifyRequest) -> WorkflowReport:
     store = JsonStore()
@@ -659,8 +472,7 @@ async def full_verify(payload: FullVerifyRequest) -> WorkflowReport:
 
     if payload.include_odoosh_errors:
         try:
-            client = ClientResolverService().resolve_client(client_name=payload.client_name, project_path=payload.project_path, require_complete=False)
-            err_result = _odoosh_service_for_client(client).grep_errors(tail_lines=300)
+            err_result = OdooShService().grep_errors(tail_lines=300)
             status_ = "passed" if err_result.exit_code == 0 else "warning"
             step("odoosh_grep_errors", status_, err_result)
             if "Traceback" in err_result.stdout or "ERROR" in err_result.stdout:
@@ -670,24 +482,20 @@ async def full_verify(payload: FullVerifyRequest) -> WorkflowReport:
             status_flags.append("warning")
 
     if payload.include_odoo_module_status:
-        client = ClientResolverService().resolve_client(client_name=payload.client_name, project_path=payload.project_path, require_complete=False)
-        result = _odoo_service_for_client(client).module_status(payload.module_name)
+        result = OdooRpcService().module_status(payload.module_name)
         step("odoo_module_status", "passed" if result.status == "ok" else "warning", result)
         if result.status != "ok":
             status_flags.append("warning")
 
     if payload.take_browser_screenshot:
         result = await CdpBrowserService().screenshot_odoo_page(
-            client.odoo_url if client else None,
-            client.odoo_login if client else None,
-            client.odoo_password if client else None,
+            None,
+            None,
+            None,
             payload.browser_start_path,
             payload.screenshot_name,
             timeout_seconds=45,
             full_page=True,
-            client_name=client.name if client else payload.client_name,
-            reuse_session=True,
-            login_strategy="reuse_first",
         )
         step("browser_screenshot", "passed" if result.status == "ok" else "warning", result)
         if result.status != "ok" or result.console_errors or result.network_errors:
@@ -714,34 +522,8 @@ async def full_verify(payload: FullVerifyRequest) -> WorkflowReport:
     )
 
 
-def _wait_workflow_job_until_terminal(store: JsonStore, job_id: str, poll_interval_seconds: float, timeout_seconds: int | None = None) -> JobRecord:
-    """Block a wait_for_result safe-deploy call until the owning job is final.
-
-    The safe-deploy worker contains its own bounded deploy/upgrade/fix loop. A
-    caller that explicitly asks for `wait_for_result=true` should receive the
-    terminal outcome of that loop, not an intermediate "running" message that
-    shifts confirmation back to the user.
-    """
-    interval = max(min(float(poll_interval_seconds or 2.0), 10.0), 0.25)
-    # timeout_seconds=0 is an explicit hard-wait request: do not return an
-    # intermediate running snapshot; wait until pass/fail/warning is recorded.
-    deadline = None if timeout_seconds is None or int(timeout_seconds) <= 0 else time.monotonic() + int(timeout_seconds)
-    while True:
-        current = store.get_job(job_id)
-        if current.status not in {JobStatus.queued, JobStatus.running}:
-            return current
-        if deadline is not None and time.monotonic() >= deadline:
-            return current
-        if deadline is None:
-            time.sleep(interval)
-        else:
-            time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
-
-
 @router.post("/safe-deploy-module", response_model=WorkflowReport)
 async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport:
-    ClientGateService().require_validated_client(payload.client_name, "workflow.safe_deploy_module")
-
     """Start the single owner deploy pipeline for one project/module.
 
     This entry point is intentionally idempotent for the same
@@ -760,26 +542,15 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
         job_status = getattr(job.status, "value", str(job.status))
         block_payload = safe_deploy_block_payload("safe_deploy_module", job)
 
-        if job.status in {JobStatus.queued, JobStatus.running}:
+        if job.status in _ACTIVE_JOB_STATUSES:
             report_status = "already_in_progress"
             message = (
                 "A workflow.safe_deploy_module job is already in progress for this "
                 "project_path + module_name. No new deploy thread was started; "
-                "poll the existing job instead of replaying commit/push/upgrade or resume."
+                "poll the existing job instead of replaying commit/push/upgrade."
             )
-            next_call = {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+            next_call = {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True}}
             blocking_reason = "active_job"
-        elif job.status == JobStatus.warning:
-            report_status = "resumable_existing_job"
-            message = (
-                "A previous workflow.safe_deploy_module job for this project_path + "
-                "module_name stopped in a warning/resumable state. No new deploy "
-                "thread was started; resume the existing job, or call "
-                "safe_deploy_module with force_new_deploy=true if a fresh deploy "
-                "is genuinely required."
-            )
-            next_call = {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}}
-            blocking_reason = "resumable_job"
         elif result_status in _RESUMABLE_SAFE_DEPLOY_RESULTS:
             report_status = "resumable_existing_job"
             message = (
@@ -795,16 +566,13 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             # Defensive fallback; find_blocking_safe_deploy should only return
             # active/resumable safe deploy jobs.
             message = block_payload.get("message") or "Existing safe deploy job found."
-            next_call = block_payload.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+            next_call = block_payload.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": job.id}}
             blocking_reason = "existing_job"
 
         return WorkflowReport(
             status=report_status,
             job_id=job.id,
             steps=job.steps,
-            deploy_confirmed=job.deploy_confirmed,
-            verified_already_deployed=job.verified_already_deployed,
-            already_deployed_confirmed=job.already_deployed_confirmed,
             summary={
                 **block_payload,
                 **result,
@@ -817,10 +585,6 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                 "module_name": request.get("module_name") or payload.module_name,
                 "project_path": request.get("project_path") or payload.project_path,
                 "force_new_deploy": False,
-                "completion_required": job.status in {JobStatus.queued, JobStatus.running},
-                "success_allowed": bool(job.deploy_confirmed or job.already_deployed_confirmed),
-                "tool_exit_allowed": job.status not in {JobStatus.queued, JobStatus.running},
-                "poll_after_seconds": 10 if job.status in {JobStatus.queued, JobStatus.running} else None,
                 "next_call": next_call,
             },
         )
@@ -883,9 +647,6 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                     error=str(exc),
                 )
             ],
-                deploy_confirmed=False,
-                verified_already_deployed=False,
-                already_deployed_confirmed=False,
             summary={
                 "message": "Safe deploy could not start. No commit or push was attempted.",
                 "error": str(exc),
@@ -894,68 +655,32 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
         )
 
     if payload.wait_for_result:
-        waited = _wait_workflow_job_until_terminal(store, job.id, payload.poll_interval_seconds, payload.wait_timeout_seconds)
-        if waited.status in {JobStatus.queued, JobStatus.running}:
+        waited = store.wait_job(job.id, payload.wait_timeout_seconds, payload.poll_interval_seconds)
+        if waited.status not in {JobStatus.queued, JobStatus.running}:
+            final_status: Literal["passed", "failed", "warning", "running"] = "passed" if waited.status == JobStatus.passed else "failed" if waited.status == JobStatus.failed else "warning"
+            result = waited.result if isinstance(waited.result, dict) else {"result": waited.result}
             return WorkflowReport(
-                status="running",
+                status=final_status,
                 job_id=job.id,
                 steps=waited.steps,
-                deploy_confirmed=False,
-                verified_already_deployed=False,
-                already_deployed_confirmed=False,
                 summary={
-                    "status": "running",
-                    "message": (
-                        f"Safe deploy is still running after waiting {payload.wait_timeout_seconds}s. "
-                        "This is not a final result. The agent/provider must continue with jobs.get "
-                        "until status is passed/failed/warning and deploy_confirmed or already_deployed_confirmed is true for success."
-                    ),
-                    "completion_required": True,
-                    "success_allowed": False,
-                    "tool_exit_allowed": False,
-                    "poll_after_seconds": 10,
+                    **result,
                     "job_id": job.id,
                     "module_name": payload.module_name,
-                    "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
+                    "message": result.get("message") or f"Safe deploy job finished with status {waited.status.value}.",
                 },
             )
-        final_status: Literal["passed", "failed", "warning", "running"] = "passed" if waited.status == JobStatus.passed else "failed" if waited.status == JobStatus.failed else "warning"
-        result = waited.result if isinstance(waited.result, dict) else {"result": waited.result}
-        return WorkflowReport(
-            status=final_status,
-            job_id=job.id,
-            steps=waited.steps,
-            deploy_confirmed=waited.deploy_confirmed,
-            verified_already_deployed=waited.verified_already_deployed,
-            already_deployed_confirmed=waited.already_deployed_confirmed,
-            summary={
-                **result,
-                "job_id": job.id,
-                "module_name": payload.module_name,
-                "completion_required": False,
-                "success_allowed": bool(waited.deploy_confirmed or waited.already_deployed_confirmed),
-                "tool_exit_allowed": True,
-                "message": result.get("message") or f"Safe deploy job finished with status {waited.status.value}.",
-            },
-        )
 
     return WorkflowReport(
         status="running",
         job_id=job.id,
         steps=[],
-        deploy_confirmed=False,
-        verified_already_deployed=False,
-        already_deployed_confirmed=False,
         summary={
             "status": "running",
-            "message": "Safe deploy is still running. This is not a final result; the agent/provider must continue with jobs.get until terminal confirmation. Do not report success from this response.",
-            "completion_required": True,
-            "success_allowed": False,
-            "tool_exit_allowed": False,
-            "poll_after_seconds": 10,
+            "message": "Safe deploy is still running. Do not tell the user it is complete yet; call jobs.get with this job_id until status is passed, failed, or warning with next_call.",
             "job_id": job.id,
             "module_name": payload.module_name,
-            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True}},
         },
     )
 
@@ -1050,8 +775,7 @@ def verify_deployed_module(payload: DeployedModuleVerifyRequest) -> dict:
     project = resolve_allowed_path(payload.project_path)
     compare_files = _deployed_compare_files(project, payload.module_name, payload.paths, payload.max_files)
     expected_hashes = _expected_user_file_hashes(project, compare_files)
-    client = ClientResolverService().resolve_client(client_name=payload.client_name, project_path=payload.project_path, require_complete=False)
-    odoosh = _odoosh_service_for_client(client)
+    odoosh = OdooShService()
     list_result = odoosh.list_user_files(payload.module_name, max_items=min(payload.max_files, 2000))
     if expected_hashes:
         hash_result = odoosh.verify_user_file_hashes(expected_hashes)
@@ -1066,7 +790,7 @@ def verify_deployed_module(payload: DeployedModuleVerifyRequest) -> dict:
         source_status = "no_local_files"
     module_status = None
     if payload.include_module_status:
-        module_status = _odoo_service_for_client(client).module_status(payload.module_name).model_dump(mode="json")
+        module_status = OdooRpcService().module_status(payload.module_name).model_dump(mode="json")
     return {
         "status": "passed" if source_status == "matched" else "failed",
         "source_status": source_status,
@@ -1149,13 +873,13 @@ def _normalise_expected_registry_fields(fields_by_model: dict[str, list[str]] | 
     return normalised
 
 
-def _verify_registry_fields(fields_by_model: dict[str, list[str]], client=None) -> OdooResult:
-    shell = _odoo_service_for_client(client)
+def _verify_registry_fields(fields_by_model: dict[str, list[str]]) -> OdooRpcResult:
+    rpc = OdooRpcService()
     missing: dict[str, list[str]] = {}
     found: dict[str, list[str]] = {}
     raw_results: dict[str, object] = {}
     for model, field_names in sorted(fields_by_model.items()):
-        result = shell.search_read(
+        result = rpc.search_read(
             "ir.model.fields",
             [("model", "=", model), ("name", "in", field_names)],
             ["model", "name", "ttype", "field_description"],
@@ -1166,7 +890,7 @@ def _verify_registry_fields(fields_by_model: dict[str, list[str]], client=None) 
         )
         raw_results[model] = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
         if result.status != "ok":
-            return OdooResult(status="failed", error=f"Could not verify registry fields for {model}: {result.error}", result={"raw_results": raw_results})
+            return OdooRpcResult(status="failed", error=f"Could not verify registry fields for {model}: {result.error}", result={"raw_results": raw_results})
         records = result.result or []
         present = sorted({record.get("name") for record in records if isinstance(record, dict) and record.get("name")})
         found[model] = present
@@ -1174,12 +898,12 @@ def _verify_registry_fields(fields_by_model: dict[str, list[str]], client=None) 
         if absent:
             missing[model] = absent
     if missing:
-        return OdooResult(
+        return OdooRpcResult(
             status="failed",
             error="Live Odoo registry is missing expected fields after module upgrade.",
             result={"expected": fields_by_model, "found": found, "missing": missing, "raw_results": raw_results},
         )
-    return OdooResult(status="ok", result={"expected": fields_by_model, "found": found, "raw_results": raw_results})
+    return OdooRpcResult(status="ok", result={"expected": fields_by_model, "found": found, "raw_results": raw_results})
 
 
 
@@ -1247,58 +971,6 @@ def _paths_touch_changed_files(deploy_paths: list[str], changed_files: set[str])
     return False
 
 
-def _deploy_request_has_module_changes(module_name: str, deploy_paths: list[str], changed_files: set[str]) -> bool:
-    """Return True when the safe-deploy request has local changes for this module scope.
-
-    Empty ``paths`` means the caller did not name a specific file, not that a
-    README-only diff should be treated as a module deploy. In that case, require
-    at least one changed file under ``module_name`` before commit/push.
-    """
-    if deploy_paths:
-        return _paths_touch_changed_files(deploy_paths, changed_files)
-    module_prefix = module_name.rstrip("/") + "/"
-    return any(rel == module_name or rel.startswith(module_prefix) for rel in changed_files)
-
-
-def _safe_deploy_already_deployed_result(
-    *,
-    project_path: Path,
-    module_name: str,
-    deploy_paths: list[str],
-    changed_files: set[str],
-    verify_result: dict[str, object],
-) -> dict[str, object]:
-    source_status = str(verify_result.get("source_status") or "unknown")
-    matched = source_status == "matched"
-    return {
-        "status": "already_deployed_confirmed" if matched else "already_deployed_not_confirmed",
-        "message": (
-            f"No local changes to push. Verified against Odoo.sh: {source_status}. "
-            "Do not claim already deployed/already added/already live unless "
-            "verified_already_deployed is true."
-        ),
-        "module_name": module_name,
-        "project_path": str(project_path),
-        "deploy_paths": deploy_paths,
-        "changed_files": sorted(changed_files),
-        "no_changes_detected": True,
-        "source_pushed": False,
-        "source_on_odoosh": matched,
-        "source_deployed": matched,
-        "module_upgraded": False,
-        "ui_checked": False,
-        "visible_change_confirmed": False,
-        "deploy_confirmed": False,
-        "verified_already_deployed": matched,
-        "already_deployed_confirmed": matched,
-        "verify_deployed_module": verify_result,
-        "next_call": None if matched else {
-            "tool": "workflow.verify_deployed_module",
-            "arguments": {"project_path": str(project_path), "module_name": module_name, "paths": deploy_paths},
-        },
-    }
-
-
 def _assert_head_commit_contains_paths(git: GitService, project_path: Path, deploy_paths: list[str]) -> CommandResult:
     if not hasattr(git, "head_changed_files"):
         return CommandResult(command=["git", "head-commit-path-gate", "legacy-fake"], cwd=str(project_path), exit_code=0, stdout="Skipped only because GitService test double has no head_changed_files().\n")
@@ -1321,83 +993,46 @@ def _assert_head_commit_contains_paths(git: GitService, project_path: Path, depl
         )
     return CommandResult(command=["git", "head-commit-path-gate"], cwd=str(project_path), exit_code=0, stdout="HEAD commit contains expected deploy files.\n")
 
-def _wait_nested_module_job(
-    store: JsonStore,
-    nested_job_id: str,
-    timeout_seconds: int,
-    poll_interval_seconds: float,
-) -> JobRecord | None:
-    """Poll a nested odoo.module_deploy job until terminal or hard timeout.
-
-    The safe-deploy worker must not report an intermediate module-upgrade state
-    as a completed deploy. A timeout is therefore returned as a failed upgrade
-    attempt so the bounded error-pack/fix/retry loop can continue in the same
-    safe-deploy job.
-    """
-    timeout = max(int(timeout_seconds or 0), 0)
-    interval = max(min(float(poll_interval_seconds or 10.0), 60.0), 0.25)
-    deadline = time.monotonic() + timeout
-    while True:
-        waited = store.get_job(nested_job_id)
-        if waited.status not in {JobStatus.queued, JobStatus.running}:
-            return waited
-        if time.monotonic() >= deadline:
-            return None
-        sleep_for = min(interval, max(deadline - time.monotonic(), 0.0))
-        time.sleep(max(sleep_for, 0.25))
-
-
-def _start_and_wait_module_deploy(payload: SafeDeployModuleRequest) -> OdooResult:
-    started = start_odoo_module_deploy_job(OdooModuleRequest(
-        client_name=payload.client_name,
+def _start_and_wait_module_deploy(payload: SafeDeployModuleRequest) -> OdooRpcResult:
+    started = start_odoo_module_deploy_job(OdooRpcModuleRequest(
         module_name=payload.module_name,
-        wait_for_result=True,
-        wait_timeout_seconds=min(max(int(payload.odoo_module_deploy_timeout_seconds or 1), 1), 25),
-        poll_interval_seconds=max(min(float(payload.odoo_module_deploy_poll_interval_seconds or 10.0), 10.0), 0.25),
+        wait_for_result=False,
+        wait_timeout_seconds=0,
+        poll_interval_seconds=1.0,
     ))
     started_payload = started.model_dump(mode="json") if hasattr(started, "model_dump") else started
     result_payload = started_payload.get("result") if isinstance(started_payload, dict) and isinstance(started_payload.get("result"), dict) else {}
-    if result_payload.get("finished") is True or not result_payload.get("job_id"):
+    if result_payload.get("finished") or not result_payload.get("job_id"):
         return started
 
-    nested_job_id = str(result_payload.get("job_id"))
-    waited = _wait_nested_module_job(
-        JsonStore(),
-        nested_job_id,
+    nested_job_id = result_payload.get("job_id")
+    waited = JsonStore().wait_job(
+        str(nested_job_id),
         payload.odoo_module_deploy_timeout_seconds,
         payload.odoo_module_deploy_poll_interval_seconds,
     )
-    if waited is None:
-        return OdooResult(
-            status="failed",
-            error=(
-                f"Odoo module deploy did not reach a terminal pass/fail state within "
-                f"{payload.odoo_module_deploy_timeout_seconds}s while wait_for_result=true."
-            ),
-            result={
-                "job_id": nested_job_id,
-                "job_status": "timeout",
-                "finished": True,
-                "status": "module_upgrade_timeout",
-            },
-        )
-
     data = waited.model_dump(mode="json")
     if waited.status == JobStatus.passed:
-        return OdooResult(status="ok", result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data})
+        return OdooRpcResult(status="ok", result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data})
     if waited.status in {JobStatus.failed, JobStatus.warning}:
         result_error = waited.result.get("error") if isinstance(waited.result, dict) else None
-        if not result_error and isinstance(waited.result, dict):
-            result_error = waited.result.get("message")
-        return OdooResult(
+        return OdooRpcResult(
             status="failed" if waited.status == JobStatus.failed else "ok",
             error=result_error or f"Odoo module deploy job finished with status={waited.status.value}",
             result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data},
         )
-    return OdooResult(
-        status="failed",
-        error=f"Odoo module deploy returned unexpected non-terminal job status={waited.status.value}",
-        result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data},
+    return OdooRpcResult(
+        status="ok",
+        result={
+            "job_id": waited.id,
+            "job_status": waited.status.value,
+            "finished": False,
+            "message": (
+                f"Odoo module deploy is still running after {payload.odoo_module_deploy_timeout_seconds}s. "
+                "Safe deploy is not complete and final success is blocked."
+            ),
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": waited.id, "wait_for_result": True}},
+        },
     )
 
 
@@ -1407,26 +1042,16 @@ def _poll_odoosh_deployed(
     timeout_seconds: int,
     interval_seconds: float,
     progress_cb=None,
-    failure_check_since_epoch: int | None = None,
 ) -> CommandResult:
     """Compatibility wrapper around the shared Odoo.sh commit polling loop."""
     poller = getattr(odoosh, "poll_deployed_commit", None)
     if callable(poller):
-        try:
-            return poller(
-                expected_sha=pushed_sha,
-                timeout_seconds=timeout_seconds,
-                interval_seconds=interval_seconds,
-                progress_cb=progress_cb,
-                failure_check_since_epoch=failure_check_since_epoch,
-            )
-        except TypeError:
-            return poller(
-                expected_sha=pushed_sha,
-                timeout_seconds=timeout_seconds,
-                interval_seconds=interval_seconds,
-                progress_cb=progress_cb,
-            )
+        return poller(
+            expected_sha=pushed_sha,
+            timeout_seconds=timeout_seconds,
+            interval_seconds=interval_seconds,
+            progress_cb=progress_cb,
+        )
     # Test fakes and older service-like adapters may only implement
     # check_commit_deployed(); still exercise the same shared loop.
     from ..services.odoosh_service import OdooShService as SharedOdooShService
@@ -1437,303 +1062,16 @@ def _poll_odoosh_deployed(
         timeout_seconds=timeout_seconds,
         interval_seconds=interval_seconds,
         progress_cb=progress_cb,
-        failure_check_since_epoch=failure_check_since_epoch,
     )
-
-
-
-def _browser_cdp_unavailable(value) -> bool:
-    """True when live UI verification could not start because CDP/Chrome is unavailable.
-
-    This is infrastructure-unavailable, not proof that the deployed Odoo build is
-    broken. Safe deploy must not rollback a successfully upgraded module for this.
-    """
-    payload = value.model_dump(mode="json") if hasattr(value, "model_dump") else value
-    if not isinstance(payload, dict):
-        return False
-    text = " ".join(str(payload.get(key) or "") for key in ("error", "stderr", "message")).lower()
-    return any(token in text for token in (
-        "could not open cdp browser tab",
-        "connection refused",
-        "odoo_agent_cdp_url",
-        "chrome devtools",
-        "cdp browser",
-        "remote debugging",
-    ))
-
-
-
-def _ui_profile_for_path(path: str) -> str:
-    value = str(path or "").lower()
-    if "/pos/ui" in value or "/pos/web" in value:
-        return "pos_product_screen"
-    if "/shop" in value or "/website" in value:
-        return "website_page"
-    if "/web" in value or "/odoo" in value:
-        if "view_type=list" in value:
-            return "backend_list_view"
-        return "backend_form_view"
-    return "generic"
-
-
-def _verify_ui_specs_for_payload(payload: SafeDeployModuleRequest) -> list[UiVerifySpec]:
-    # Live screenshot/visual verification is disabled by default because it is
-    # not reliable enough to gate otherwise successful Odoo deployments.
-    # It can be explicitly re-enabled by an operator through the environment.
-    if not settings.visual_screenshot_flow_enabled:
-        return []
-    specs: list[UiVerifySpec] = []
-    if payload.verify_ui_specs:
-        specs.extend(payload.verify_ui_specs)
-    else:
-        for path in payload.verify_ui_paths:
-            specs.append(UiVerifySpec(path=path, profile=_ui_profile_for_path(path)))
-    return specs
-
-
-def _ui_spec_path(spec: UiVerifySpec, fallback_path: str | None = None) -> str:
-    return str(spec.path or fallback_path or "/web")
-
-
-def _browser_request_kwargs_from_spec(spec: UiVerifySpec, payload: SafeDeployModuleRequest, index: int) -> dict[str, object]:
-    profile = spec.profile if spec.profile != "auto" else _ui_profile_for_path(_ui_spec_path(spec))
-    return {
-        "screenshot_name": spec.screenshot_name or f"{payload.verify_ui_screenshot_prefix}_{index}.png",
-        "timeout_seconds": spec.timeout_seconds or payload.verify_ui_timeout_seconds,
-        "full_page": payload_force_bool(spec.full_page, True),
-        "ui_profile": profile,
-        "viewport_width": spec.viewport_width,
-        "viewport_height": spec.viewport_height,
-        "device_scale_factor": spec.device_scale_factor,
-        "required_selectors": spec.required_selectors,
-        "forbidden_selectors": spec.forbidden_selectors,
-        "required_text": spec.required_text,
-        "forbidden_text": spec.forbidden_text,
-        "min_elements": spec.min_elements,
-        "wait_until": spec.wait_until,
-        "actions": spec.actions,
-        "diagnostics": spec.diagnostics,
-        "human_pos_navigation": spec.human_pos_navigation,
-        "pos_config_id": spec.pos_config_id,
-        "pos_config_name": spec.pos_config_name,
-    }
-
-
-def payload_force_bool(value: bool | None, default: bool) -> bool:
-    return default if value is None else bool(value)
-
-
-def _ui_result_passed(result) -> bool:
-    return bool(result.status == "ok" and not result.console_errors and not result.network_errors and not (result.assertion_results or {}).get("failures"))
-
-
-def _odoosh_poll_payload(result: CommandResult) -> dict[str, object]:
-    try:
-        payload = json.loads(result.stdout or "{}")
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
-
-
-def _odoosh_poll_probably_dropped(result: CommandResult) -> bool:
-    payload = _odoosh_poll_payload(result)
-    return bool(
-        payload.get("probable_dropped")
-        or payload.get("status") in {"timeout_probable_dropped", "odoosh_build_failed_or_dropped"}
-        or result.exit_code == 2
-    )
-
-
-
-def _safe_deploy_payload(value) -> dict[str, object]:
-    """Return a plain dict for Pydantic/model-like command results."""
-    if hasattr(value, "model_dump"):
-        dumped = value.model_dump(mode="json")
-        return dumped if isinstance(dumped, dict) else {"value": dumped}
-    return value if isinstance(value, dict) else {"value": value}
-
-
-def _module_upgrade_success(value) -> bool:
-    """True only for explicit finished/success module-upgrade proof."""
-    payload = _safe_deploy_payload(value)
-    if payload.get("status") != "ok":
-        return False
-    nested = payload.get("result")
-    if not isinstance(nested, dict):
-        return False
-    if nested.get("finished") is not True:
-        return False
-    job_status = nested.get("job_status")
-    if job_status is not None and str(job_status) not in {JobStatus.passed.value, "ok", "passed"}:
-        return False
-    nested_job = nested.get("job")
-    if isinstance(nested_job, dict):
-        nested_status = nested_job.get("status")
-        if nested_status is not None and str(nested_status) != JobStatus.passed.value:
-            return False
-    return True
-
-
-def _module_upgrade_running(value) -> bool:
-    payload = _safe_deploy_payload(value)
-    nested = payload.get("result")
-    if not isinstance(nested, dict):
-        return False
-    if nested.get("finished") is False:
-        return True
-    return str(nested.get("job_status") or "") in {JobStatus.running.value, JobStatus.queued.value}
-
-
-def _extract_error_pack_json(error_pack: CommandResult | None) -> dict[str, object]:
-    if error_pack is None:
-        return {}
-    stdout = error_pack.stdout or ""
-    marker = "MCP_ERROR_PACK"
-    if marker not in stdout:
-        return {}
-    after_marker = stdout.split(marker, 1)[1]
-    json_part = after_marker.split("TRACEBACK_BLOCKS", 1)[0].strip()
-    if not json_part:
-        return {}
-    try:
-        parsed = json.loads(json_part)
-        return parsed if isinstance(parsed, dict) else {}
-    except Exception:
-        return {}
-
-
-def _safe_deploy_error_text(deploy_result=None, error_pack: CommandResult | None = None) -> str:
-    parts: list[str] = []
-    if deploy_result is not None:
-        payload = _safe_deploy_payload(deploy_result)
-        for key in ("error", "message"):
-            value = payload.get(key)
-            if value:
-                parts.append(str(value))
-        nested = payload.get("result")
-        if isinstance(nested, dict):
-            nested_job = nested.get("job")
-            if isinstance(nested_job, dict):
-                nested_result = nested_job.get("result")
-                if isinstance(nested_result, dict):
-                    for key in ("error", "message"):
-                        value = nested_result.get(key)
-                        if value:
-                            parts.append(str(value))
-                elif nested_result:
-                    parts.append(str(nested_result))
-            for key in ("error", "message"):
-                value = nested.get(key)
-                if value:
-                    parts.append(str(value))
-    if error_pack is not None:
-        pack_json = _extract_error_pack_json(error_pack)
-        if pack_json:
-            hints = pack_json.get("hints")
-            files = pack_json.get("files")
-            xml_locations = pack_json.get("xml_locations")
-            parts.append(
-                "odoosh.error_pack: "
-                f"hints={hints or []}; files={files or []}; xml_locations={xml_locations or []}"
-            )
-        text = "\n".join(value for value in (error_pack.stdout, error_pack.stderr) if value)
-        if text:
-            parts.append(text[-4000:])
-    clean: list[str] = []
-    seen: set[str] = set()
-    for part in parts:
-        value = str(part).strip()
-        if value and value not in seen:
-            seen.add(value)
-            clean.append(value)
-    return "\n\n".join(clean) or "Module upgrade failed; odoosh.error_pack returned no additional detail."
-
-
-def _error_pack_implicated_files(
-    *,
-    project_path: Path,
-    module_name: str,
-    error_pack: CommandResult | None,
-    fallback_files: list[str],
-) -> list[str]:
-    """Map Odoo.sh traceback file paths back to local module files for verification."""
-    allowed_suffixes = (".py", ".xml", ".js", ".scss", "__manifest__.py")
-    raw_candidates: list[str] = []
-    pack_json = _extract_error_pack_json(error_pack)
-    for value in pack_json.get("files") or []:
-        raw_candidates.append(str(value))
-    for value in pack_json.get("xml_locations") or []:
-        raw_candidates.append(str(value).split(":", 1)[0])
-
-    text = "\n".join(value for value in ((error_pack.stdout if error_pack else ""), (error_pack.stderr if error_pack else "")) if value)
-    raw_candidates.extend(re.findall(r'File "([^"]+)"', text))
-    raw_candidates.extend(match[0] for match in re.findall(r"while parsing\s+([^:\n]+):(\d+)", text, flags=re.I))
-    raw_candidates.extend(
-        re.findall(
-            rf"((?:/home/odoo/src/user/)?(?:[^\s:'\"<>]+/)*{re.escape(module_name)}/[^\s:'\"<>]+)",
-            text,
-        )
-    )
-
-    local_files: list[str] = []
-    seen: set[str] = set()
-
-    def add_local(raw: str) -> None:
-        value = raw.strip().strip("'\"`.,;)")
-        if not value:
-            return
-        value = value.replace("\\", "/")
-        if ":" in value and not value.startswith("/"):
-            value = value.split(":", 1)[0]
-        rel: str | None = None
-        user_prefix = "/home/odoo/src/user/"
-        if value.startswith(user_prefix):
-            rel = value[len(user_prefix):]
-        elif value.startswith(f"{module_name}/") or value == f"{module_name}/__manifest__.py":
-            rel = value
-        else:
-            marker = f"/{module_name}/"
-            if marker in value:
-                rel = f"{module_name}/" + value.split(marker, 1)[1]
-        if not rel or not (rel == f"{module_name}/__manifest__.py" or rel.startswith(f"{module_name}/")):
-            return
-        path = (project_path / rel).resolve()
-        if not (path.is_file() and (path == project_path or project_path in path.parents)):
-            return
-        if not path.as_posix().endswith(allowed_suffixes):
-            return
-        key = str(path)
-        if key not in seen:
-            seen.add(key)
-            local_files.append(key)
-
-    for candidate in raw_candidates:
-        add_local(candidate)
-    for fallback in fallback_files:
-        add_local(str(Path(fallback).resolve() if Path(fallback).is_absolute() else fallback))
-        if Path(fallback).is_absolute():
-            path = Path(fallback).resolve()
-            if path.is_file() and (path == project_path or project_path in path.parents) and path.as_posix().endswith(allowed_suffixes):
-                key = str(path)
-                if key not in seen:
-                    seen.add(key)
-                    local_files.append(key)
-    return local_files
 
 
 def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     """Background worker — runs the full commit→push→wait→upgrade pipeline."""
     store = JsonStore()
     git = GitService()
-    odoosh = None
+    odoosh = OdooShService()
     approval = ApprovalService()
     pushed_sha: str | None = None
-    odoosh_deploy_confirmation: dict[str, object] | None = None
-    module_upgrade_confirmation: dict[str, object] = {
-        "requested": bool(payload.upgrade_module),
-        "status": "pending" if payload.upgrade_module else "skipped",
-        "passed": None if payload.upgrade_module else True,
-    }
     rollback_attempted = False
 
     def _step(name: str, status_: str, result=None, error: str | None = None) -> None:
@@ -1748,22 +1086,6 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 error=error,
             ),
         )
-
-    def _save_state(status_text: str, extra: dict[str, object] | None = None) -> None:
-        state = {
-            "last_safe_deploy_job_id": job_id,
-            "last_sha": pushed_sha,
-            "module_name": payload.module_name,
-            "project_path": str(project_path),  # type: ignore[name-defined]
-            "branch": branch,  # type: ignore[name-defined]
-            "client_name": client.name if client else payload.client_name,  # type: ignore[name-defined]
-            "safe_deploy_status": status_text,
-        }
-        if client:  # type: ignore[name-defined]
-            state["client"] = client.public  # type: ignore[name-defined]
-        if extra:
-            state.update(extra)
-        store.save_session_state(state, client_name=client.name if client else payload.client_name or None)  # type: ignore[name-defined]
 
     def _rollback_after_failure(reason: str) -> None:
         nonlocal rollback_attempted
@@ -1781,7 +1103,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
 
     def _fail(name: str, result=None, error: str | None = None) -> None:
         _step(name, "failed", result, error)
-        if name in {"odoosh_verify_module_manifest", "odoo_module_deploy", "odoo_module_status", "registry_field_verify"}:
+        if name in {"odoosh_verify_module_manifest", "odoo_module_deploy", "odoo_module_status", "registry_field_verify", "browser_ui_verify"}:
             _rollback_after_failure(name)
         job = store.get_job(job_id)
         store.finish_job(job, JobStatus.failed, {"failed_step": name, "module_name": payload.module_name, "rollback_attempted": rollback_attempted})
@@ -1794,43 +1116,15 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             project_path=payload.project_path,
             require_complete=False,
         )
-        odoosh = _odoosh_service_for_client(client)
+        resolver.apply_odoo_env(client)
         project_path = resolve_allowed_path(client.path if client else payload.project_path)
     except Exception as exc:
         _fail("resolve_project", error=str(exc))
         return
 
-    branch = payload.branch or (client.branch if client else None) or settings.target_git_branch
     module_path = project_path / payload.module_name
-    checkout_guard = ensure_module_exists_or_sync(
-        project_path=project_path,
-        module_name=payload.module_name,
-        branch=branch,
-        remote=payload.remote,
-        git=git,
-        timeout_seconds=min(payload.timeout_seconds, 300),
-    )
-    if checkout_guard.get("sync_attempted"):
-        _step(
-            "ensure_checkout_current",
-            "passed" if checkout_guard.get("ok") else "failed",
-            checkout_guard,
-            None if checkout_guard.get("ok") else str(checkout_guard.get("error") or "Checkout/module guard failed"),
-        )
-    if not checkout_guard.get("ok"):
-        job = store.get_job(job_id)
-        result = {
-            "status": "checkout_stale_or_missing",
-            "message": checkout_guard.get("error") or "Checkout/module guard failed",
-            "error": checkout_guard.get("error") or "Checkout/module guard failed",
-            "module_name": payload.module_name,
-            "project_path": str(project_path),
-            "branch": branch,
-            "checkout_guard": checkout_guard,
-        }
-        store.finish_job(job, JobStatus.failed, result)
-        _save_state("checkout_stale_or_missing", {"checkout_error": result["error"]})
-        approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module checkout/module guard failed")
+    if not module_path.exists():
+        _fail("resolve_project", error=f"Module path not found: {module_path}")
         return
     try:
         deploy_paths = _normalise_safe_deploy_paths(project_path, payload.module_name, payload.paths)
@@ -1861,180 +1155,37 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         return
     changed_files = _changed_file_set(changed_files_result)
     _step("git_changed_files", "passed", changed_files_result)
-    no_changes_detected = not _deploy_request_has_module_changes(payload.module_name, deploy_paths, changed_files)
-    if no_changes_detected:
-        try:
-            verify_result = verify_deployed_module(DeployedModuleVerifyRequest(
-                project_path=str(project_path),
-                module_name=payload.module_name,
-                paths=deploy_paths,
-                include_module_status=False,
-                client_name=client.name if client else payload.client_name,
-            ))
-        except Exception as exc:  # noqa: BLE001
-            verify_result = {
-                "status": "failed",
-                "source_status": "verification_error",
-                "message": f"workflow.verify_deployed_module failed: {exc}. Do not claim already deployed/already live.",
-                "module_name": payload.module_name,
-                "project_path": str(project_path),
-                "compared_files": [],
-                "error": str(exc),
-            }
-        verified = verify_result.get("source_status") == "matched"
-        _step("verify_deployed_module_no_changes", "passed" if verified else "failed", verify_result)
-        previous_state = store.load_session_state(client_name=client.name if client else payload.client_name or None)
-        pending_statuses = {
-            "deploy_failed",
-            "deploy_code_mismatch",
-            "deploy_failed_or_timeout",
-            "module_upgrade_running",
-            "module_upgrade_timeout",
-            "upgrade_failed_after_retries",
-        }
-        pending_upgrade = (
-            verified
-            and payload.upgrade_module
-            and previous_state.get("module_name") == payload.module_name
-            and str(previous_state.get("safe_deploy_status") or "") in pending_statuses
-        )
-        if pending_upgrade:
-            _step("no_changes_resume_upgrade", "passed", {
-                "message": "No local diff, but source matches Odoo.sh and the previous safe-deploy state did not confirm module upgrade; continuing with module upgrade.",
-                "previous_status": previous_state.get("safe_deploy_status"),
-            })
-            head_sha_result = git.head_sha(str(project_path))
-            pushed_sha = str(previous_state.get("last_sha") or (head_sha_result.stdout or "").strip() or "")
-            if head_sha_result.exit_code == 0:
-                _step("git_head_sha", "passed", head_sha_result)
-            odoosh_deploy_confirmation = {
-                "status": "passed",
-                "deployed": True,
-                "source_status": "matched",
-                "message": "Odoo.sh source hash already matched active checkout; resumed from pending upgrade.",
-                "verify_deployed_module": verify_result,
-            }
-            manifest_result = odoosh.verify_module_manifest(payload.module_name)
-            _step("odoosh_verify_module_manifest", "passed" if manifest_result.exit_code == 0 else "failed", manifest_result)
-            if manifest_result.exit_code != 0:
-                _fail("odoosh_verify_module_manifest", manifest_result)
-                return
-            deploy_result = _start_and_wait_module_deploy(payload)
-            deploy_passed = _module_upgrade_success(deploy_result)
-            _step("odoo_module_deploy", "passed" if deploy_passed else "failed", deploy_result)
-            if not deploy_passed:
-                error_pack = odoosh.error_pack(1200)
-                _step("upgrade_error_pack_1", "passed" if error_pack.exit_code == 0 else "warning", error_pack)
-                result = {
-                    "status": "upgrade_failed_after_source_resume",
-                    "message": _safe_deploy_error_text(deploy_result, error_pack),
-                    "module_name": payload.module_name,
-                    "sha": pushed_sha,
-                    "source_pushed": False,
-                    "source_on_odoosh": True,
-                    "source_deployed": True,
-                    "module_upgraded": False,
-                    "ui_checked": False,
-                    "visible_change_confirmed": False,
-                    "deploy_confirmed": False,
-                    "success_allowed": False,
-                    "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
-                }
-                job = store.get_job(job_id)
-                store.finish_job(job, JobStatus.failed, result)
-                _save_state("upgrade_failed_after_source_resume", {"module_upgrade_pending": True})
-                approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module resumed source deployment but module upgrade failed")
-                return
-            module_upgrade_confirmation = {
-                "requested": True,
-                "status": "passed",
-                "passed": True,
-                "attempt": 1,
-                "attempts": 1,
-                "message": "Upgrade confirmed successful after resuming from already-deployed source.",
-                "result": _safe_deploy_payload(deploy_result),
-            }
-            module_status = _odoo_service_for_client(client).module_status(payload.module_name)
-            _step("odoo_module_status", "passed" if module_status.status == "ok" else "warning", module_status)
-            smoke = _odoo_service_for_client(client).registry_smoke_test(payload.module_name, [], [], strict=False)
-            _step("registry_smoke_test", "passed" if smoke.status == "ok" else "warning", smoke)
-            ui_specs = _verify_ui_specs_for_payload(payload)
-            ui_results = []
-            ui_failed = False
-            for index, spec in enumerate(ui_specs, start=1):
-                path = _ui_spec_path(spec)
-                browser_kwargs = _browser_request_kwargs_from_spec(spec, payload, index)
-                ui_result = asyncio.run(CdpBrowserService().screenshot_odoo_page(
-                    client.odoo_url if client else None,
-                    client.odoo_login if client else None,
-                    client.odoo_password if client else None,
-                    path,
-                    str(browser_kwargs.pop("screenshot_name")),
-                    int(browser_kwargs.pop("timeout_seconds")),
-                    full_page=bool(browser_kwargs.pop("full_page")),
-                    client_name=client.name if client else payload.client_name,
-                    reuse_session=True,
-                    login_strategy="reuse_first",
-                    **browser_kwargs,
-                ))
-                ui_results.append({"path": path, "spec": spec.model_dump(mode="json"), "result": ui_result.model_dump(mode="json")})
-                status_ = "passed" if _ui_result_passed(ui_result) else "failed" if ui_result.status == "failed" else "warning"
-                _step(f"browser_ui_path:{path}", status_, ui_result)
-                ui_failed = ui_failed or status_ == "failed"
-            final_result = {
-                "status": "passed" if not ui_failed else "ui_verification_failed",
-                "message": module_upgrade_confirmation["message"],
-                "module_name": payload.module_name,
-                "sha": pushed_sha,
-                "verify_ui_paths": payload.verify_ui_paths,
-                "verify_ui_specs": [spec.model_dump(mode="json") for spec in ui_specs],
-                "odoosh_check_commit": odoosh_deploy_confirmation,
-                "module_upgrade": module_upgrade_confirmation,
-                "browser_ui_verify": ui_results,
-                "source_pushed": False,
-                "source_on_odoosh": True,
-                "source_deployed": True,
-                "module_upgraded": True,
-                "ui_checked": bool(ui_specs),
-                "visible_change_confirmed": bool(ui_specs) and not ui_failed,
-                "deploy_confirmed": not ui_failed,
-                "success_allowed": not ui_failed,
-            }
-            job = store.get_job(job_id)
-            store.finish_job(job, JobStatus.passed if not ui_failed else JobStatus.failed, final_result)
-            _save_state("passed" if not ui_failed else "ui_verification_failed", {"module_upgrade_pending": False})
-            if not ui_failed:
-                approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module resumed and upgraded already-deployed source")
-            else:
-                approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module resumed but UI verification failed")
-            return
-
-        final_result = _safe_deploy_already_deployed_result(
-            project_path=project_path,
-            module_name=payload.module_name,
-            deploy_paths=deploy_paths,
-            changed_files=changed_files,
-            verify_result=verify_result,
-        )
-        job = store.get_job(job_id)
-        store.finish_job(job, JobStatus.passed if verified else JobStatus.failed, final_result)
-        store.save_session_state({
-            "last_safe_deploy_job_id": job_id,
-            "module_name": payload.module_name,
-            "project_path": str(project_path),
-            "client_name": client.name if client else payload.client_name,
-            "safe_deploy_status": final_result["status"],
-            "verified_already_deployed": verified,
-            "module_upgrade_pending": False,
-        }, client_name=client.name if client else payload.client_name or None)
-        if verified:
-            approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module verified already deployed")
-        else:
-            approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module found no local changes but Odoo.sh source did not match")
-        return
-
     idempotent_clean_retry = False
     idempotent_head_path_gate: CommandResult | None = None
+    if not _paths_touch_changed_files(deploy_paths, changed_files):
+        # Defense-in-depth: duplicate safe_deploy invocations may arrive after a
+        # previous request already committed the expected files but before the
+        # client observed the job_id. In that case the working tree is clean for
+        # the requested paths. Do not create a second commit/push; prove HEAD
+        # already contains those paths and continue to Odoo.sh polling with HEAD.
+        idempotent_head_path_gate = _assert_head_commit_contains_paths(git, project_path, deploy_paths)
+        if idempotent_head_path_gate.exit_code == 0:
+            idempotent_clean_retry = True
+            _step(
+                "idempotent_commit_push_skip",
+                "passed",
+                {
+                    "message": "No working-tree changes matched deploy paths; HEAD already contains the requested paths. Skipping duplicate commit/push and continuing with HEAD SHA.",
+                    "deploy_paths": deploy_paths,
+                    "changed_files": sorted(changed_files),
+                },
+            )
+        else:
+            _fail(
+                "deploy_dirty_path_gate",
+                changed_files_result,
+                (
+                    "No changed files in the selected project_path match the requested deploy paths, and HEAD did not prove an already-committed retry. "
+                    "Refusing commit/push because the edits may be in another checkout. "
+                    f"project_path={project_path}; deploy_paths={deploy_paths}; changed_files={sorted(changed_files)}"
+                ),
+            )
+            return
 
     if payload.run_qa:
         qa_report = self_run(SelfRunRequest(
@@ -2055,7 +1206,6 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             written_files=verify_files,
             fix_cycle=0,
             project_path=str(project_path),
-            client_name=client.name if client else payload.client_name,
         ))
         _step("verify_against_core_pre_push", "failed" if verify_result.push_blocked else "passed", verify_result)
         if verify_result.push_blocked:
@@ -2081,6 +1231,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         return
     _step("git_configure_identity", "passed", identity_result)
 
+    branch = payload.branch or (client.branch if client else None) or settings.target_git_branch
     target_result = git.validate_target(str(project_path), branch, payload.remote)
     if target_result.exit_code != 0:
         _fail("git_validate_target", target_result)
@@ -2129,7 +1280,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     if hasattr(git, "remote_head_sha"):
         remote_head = git.remote_head_sha(str(project_path), payload.remote, branch, 60)
     else:
-        remote_ok = "PUSH_OK" in (push_result.stdout or "") and f"sha={pushed_sha}" in (push_result.stdout or "")  # type: ignore[possibly-undefined]
+        remote_ok = "PUSH_OK" in (push_result.stdout or "") and f"sha={pushed_sha}" in (push_result.stdout or "")
         remote_head = CommandResult(
             command=["git", "remote-head-sha", "legacy-fake"],
             cwd=str(project_path),
@@ -2149,76 +1300,50 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
 
     pushed_job = store.get_job(job_id)
     pushed_job.request["push_started_epoch"] = push_started_epoch
-    pushed_job.request["last_sha"] = pushed_sha
-    pushed_job.request["branch"] = branch
-    pushed_job.request["client_name"] = client.name if client else payload.client_name
-    if client:
-        pushed_job.request["client"] = client.public
     pushed_job.request["expected_user_file_hashes"] = expected_user_hashes
     pushed_job.request["expected_registry_fields"] = expected_registry_fields
     store.update_job(pushed_job)
 
-    def _wait_for_odoosh_deployment(step_prefix: str = "") -> bool:
-        nonlocal odoosh_deploy_confirmation, push_started_epoch
-        if not payload.wait_for_odoosh:
-            return True
-
+    if payload.wait_for_odoosh:
         def _odoosh_poll_progress(attempt_payload: dict[str, object]) -> None:
-            _step(f"{step_prefix}odoosh_check_commit_poll", "passed" if attempt_payload.get("deployed") else "running", attempt_payload)
+            _step("odoosh_check_commit_poll", "passed" if attempt_payload.get("deployed") else "running", attempt_payload)
 
         check_result = _poll_odoosh_deployed(
             odoosh,
-            pushed_sha or "",
+            pushed_sha,
             payload.odoosh_deploy_timeout_seconds,
             payload.odoosh_deploy_poll_interval_seconds,
             progress_cb=_odoosh_poll_progress,
-            failure_check_since_epoch=push_started_epoch,
         )
         deployed = check_result.exit_code == 0 and '"deployed": true' in (check_result.stdout or "").lower()
-        _step(f"{step_prefix}odoosh_check_commit", "passed" if deployed else "failed", check_result)
+        _step("odoosh_check_commit", "passed" if deployed else "failed", check_result)
         if not deployed:
             job = store.get_job(job_id)
-            poll_payload = _odoosh_poll_payload(check_result)
-            probably_dropped = _odoosh_poll_probably_dropped(check_result)
             result = {
-                "status": "deploy_failed_or_dropped" if probably_dropped else "deploy_failed_or_timeout",
-                "message": (
-                    "Odoo.sh appears to have failed/dropped the pushed commit before it became active. Module upgrade was not attempted. Fix the code and push a new commit; do not keep resuming this SHA."
-                    if probably_dropped
-                    else "Odoo.sh did not report the pushed commit as deployed within the polling window. Module upgrade was not attempted."
-                ),
+                "status": "deploy_failed_or_timeout",
+                "message": "Odoo.sh did not report the pushed commit as deployed within the polling window. Module upgrade was not attempted.",
                 "module_name": payload.module_name,
                 "sha": pushed_sha,
-                "current_sha": poll_payload.get("current_sha"),
-                "probable_dropped": probably_dropped,
                 "poll_timeout_seconds": payload.odoosh_deploy_timeout_seconds,
                 "poll_interval_seconds": payload.odoosh_deploy_poll_interval_seconds,
-                "next_call": (
-                    {"tool": "odoosh.error_pack", "arguments": {"client_name": client.name if client else payload.client_name, "tail_lines": 1200}}
-                    if probably_dropped
-                    else {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}}
-                ),
+                "next_call": {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}},
             }
             store.finish_job(job, JobStatus.failed, result)
-            _save_state("deploy_failed_or_dropped" if probably_dropped else "deploy_failed_or_timeout", result)
-            return False
-        try:
-            raw_payload = json.loads(check_result.stdout or "{}")
-            check_payload = raw_payload if isinstance(raw_payload, dict) else {}
-        except Exception:
-            check_payload = {}
-        odoosh_deploy_confirmation = {
-            "status": "passed",
-            "deployed": True,
-            "expected_sha": pushed_sha,
-            "payload": check_payload,
-            "command_result": check_result.model_dump(mode="json"),
-        }
+            store.save_session_state({
+                "last_safe_deploy_job_id": job_id,
+                "last_sha": pushed_sha,
+                "module_name": payload.module_name,
+                "project_path": str(project_path),
+                "branch": branch,
+                "client_name": client.name if client else payload.client_name,
+                "safe_deploy_status": "deploy_failed_or_timeout",
+            }, client_name=client.name if client else payload.client_name or None)
+            return
         failure_guard = getattr(odoosh, "recent_build_failure", None)
         if callable(failure_guard):
             failure_result = failure_guard(push_started_epoch)
             failure_status = "failed" if failure_result.exit_code == 1 else "passed" if failure_result.exit_code == 0 else "warning"
-            _step(f"{step_prefix}odoosh_build_failure_guard", failure_status, failure_result)
+            _step("odoosh_build_failure_guard", failure_status, failure_result)
             if failure_result.exit_code == 1:
                 job = store.get_job(job_id)
                 result = {
@@ -2229,29 +1354,41 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                     "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
                 }
                 store.finish_job(job, JobStatus.failed, result)
-                _save_state("deploy_failed")
-                return False
-        return True
+                store.save_session_state({
+                    "last_safe_deploy_job_id": job_id,
+                    "last_sha": pushed_sha,
+                    "module_name": payload.module_name,
+                    "project_path": str(project_path),
+                    "branch": branch,
+                    "client_name": client.name if client else payload.client_name,
+                    "safe_deploy_status": "deploy_failed",
+                }, client_name=client.name if client else payload.client_name or None)
+                return
 
-    if not _wait_for_odoosh_deployment():
-        return
-
-    if payload.wait_for_odoosh and expected_user_hashes:
-        code_verify = odoosh.verify_user_file_hashes(expected_user_hashes)
-        _step("odoosh_user_file_verify", "passed" if code_verify.exit_code == 0 else "failed", code_verify)
-        if code_verify.exit_code != 0:
-            job = store.get_job(job_id)
-            result = {
-                "status": "deploy_code_mismatch",
-                "message": "Odoo.sh source checkout did not match the changed local/GitHub files. Module upgrade was not attempted.",
-                "module_name": payload.module_name,
-                "sha": pushed_sha,
-                "verified_files": sorted(expected_user_hashes),
-                "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
-            }
-            store.finish_job(job, JobStatus.failed, result)
-            _save_state("deploy_code_mismatch")
-            return
+        if expected_user_hashes:
+            code_verify = odoosh.verify_user_file_hashes(expected_user_hashes)
+            _step("odoosh_user_file_verify", "passed" if code_verify.exit_code == 0 else "failed", code_verify)
+            if code_verify.exit_code != 0:
+                job = store.get_job(job_id)
+                result = {
+                    "status": "deploy_code_mismatch",
+                    "message": "Odoo.sh source checkout did not match the changed local/GitHub files. Module upgrade was not attempted.",
+                    "module_name": payload.module_name,
+                    "sha": pushed_sha,
+                    "verified_files": sorted(expected_user_hashes),
+                    "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+                }
+                store.finish_job(job, JobStatus.failed, result)
+                store.save_session_state({
+                    "last_safe_deploy_job_id": job_id,
+                    "last_sha": pushed_sha,
+                    "module_name": payload.module_name,
+                    "project_path": str(project_path),
+                    "branch": branch,
+                    "client_name": client.name if client else payload.client_name,
+                    "safe_deploy_status": "deploy_code_mismatch",
+                }, client_name=client.name if client else payload.client_name or None)
+                return
 
     manifest_result = odoosh.verify_module_manifest(payload.module_name)
     if manifest_result.exit_code != 0:
@@ -2259,231 +1396,45 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         return
     _step("odoosh_verify_module_manifest", "passed", manifest_result)
 
-    def _fetch_upgrade_error_pack(attempt: int, deploy_result) -> CommandResult:
-        try:
-            error_pack = odoosh.error_pack(1200)
-        except Exception as exc:  # noqa: BLE001
-            error_pack = CommandResult(
-                command=["odoosh.error_pack", "1200"],
-                cwd="odoosh:ssh",
-                exit_code=1,
-                stderr=f"odoosh.error_pack failed: {exc}",
-            )
-        _step(
-            f"upgrade_error_pack_{attempt}",
-            "passed" if error_pack.exit_code == 0 else "warning",
-            error_pack,
-            None if error_pack.exit_code == 0 else error_pack.stderr,
-        )
-        return error_pack
-
-    fix_cycle_blocked_by_verifier = False
-
-    def _run_fix_cycle(attempt: int, deploy_result, error_pack: CommandResult) -> bool:
-        nonlocal verify_files, expected_user_hashes, expected_registry_fields, pushed_sha, push_started_epoch, fix_cycle_blocked_by_verifier
-        fix_cycle_blocked_by_verifier = False
-        implicated_files = _error_pack_implicated_files(
-            project_path=project_path,
-            module_name=payload.module_name,
-            error_pack=error_pack,
-            fallback_files=verify_files,
-        )
-        verifier_payload = None
-        verifier_blocked = False
-        verifier_error = None
-        if implicated_files:
-            try:
-                verifier_payload = SyntaxVerifierService().verify(SyntaxVerifyRequest(
-                    written_files=implicated_files,
-                    fix_cycle=attempt,
-                    project_path=str(project_path),
-                ))
-                verifier_blocked = bool(verifier_payload.push_blocked)
-            except Exception as exc:  # noqa: BLE001
-                verifier_error = str(exc)
-                verifier_blocked = True
-        else:
-            verifier_error = "No local .py/.xml/.js/.scss/__manifest__.py file could be mapped from odoosh.error_pack."
-            verifier_blocked = True
-
-        fix_result = {
-            "attempt": attempt,
-            "implicated_files": implicated_files,
-            "upgrade_error": _safe_deploy_error_text(deploy_result, error_pack),
-            "verifier": verifier_payload.model_dump(mode="json") if hasattr(verifier_payload, "model_dump") else verifier_payload,
-            "verifier_error": verifier_error,
-            "message": (
-                "Verifier-guided fix cycle completed; recommitting and repushing before retry."
-                if not verifier_blocked else
-                "Verifier still blocks the implicated files; no retry commit was attempted for this cycle."
-            ),
-        }
-        _step(f"fix_cycle_{attempt}", "failed" if verifier_blocked else "passed", fix_result, verifier_error)
-        if verifier_blocked:
-            # Blocked either because the verifier rejected mappable files, OR because
-            # no local file could be mapped from the error at all. Both mean this
-            # fix cycle cannot make a different attempt with the current inputs —
-            # looping again would just re-push identical code and repeat the same
-            # failure. Stop the outer loop in either case.
-            fix_cycle_blocked_by_verifier = True
-            return False
-
-        retry_paths: list[str]
-        if implicated_files:
-            retry_paths = [Path(path).resolve().relative_to(project_path).as_posix() for path in implicated_files]
-        else:
-            retry_paths = deploy_paths
-        retry_paths = list(dict.fromkeys(retry_paths or deploy_paths))
-
-        commit_result = git.commit(
-            str(project_path),
-            f"{payload.commit_message} [safe-deploy fix cycle {attempt}]",
-            retry_paths,
-            min(payload.timeout_seconds, 300),
-        )
-        _step(f"fix_cycle_{attempt}_git_commit", "passed" if commit_result.exit_code == 0 else "failed", commit_result)
-        if commit_result.exit_code != 0:
-            return False
-
-        head_path_gate = _assert_head_commit_contains_paths(git, project_path, retry_paths)
-        _step(f"fix_cycle_{attempt}_git_head_commit_path_gate", "passed" if head_path_gate.exit_code == 0 else "failed", head_path_gate)
-        if head_path_gate.exit_code != 0:
-            return False
-
-        sha_result = git.head_sha(str(project_path))
-        _step(f"fix_cycle_{attempt}_git_head_sha", "passed" if sha_result.exit_code == 0 else "failed", sha_result)
-        if sha_result.exit_code != 0:
-            return False
-        pushed_sha = sha_result.stdout.strip()
-        push_started_epoch = int(time.time())
-
-        push_result = git.push(str(project_path), payload.remote, branch, True, min(payload.timeout_seconds, 600))
-        _step(f"fix_cycle_{attempt}_git_push", "passed" if push_result.exit_code == 0 else "failed", push_result)
-        if push_result.exit_code != 0:
-            return False
-
-        if hasattr(git, "remote_head_sha"):
-            remote_head = git.remote_head_sha(str(project_path), payload.remote, branch, 60)
-        else:
-            remote_ok = "PUSH_OK" in (push_result.stdout or "") and f"sha={pushed_sha}" in (push_result.stdout or "")
-            remote_head = CommandResult(
-                command=["git", "remote-head-sha", "legacy-fake"],
-                cwd=str(project_path),
-                exit_code=0 if remote_ok else 1,
-                stdout=(pushed_sha + "\n") if remote_ok else "",
-                stderr="GitService test double has no remote_head_sha()." if not remote_ok else "",
-            )
-        remote_sha = (remote_head.stdout or "").strip()
-        _step(
-            f"fix_cycle_{attempt}_git_remote_head_verify",
-            "passed" if remote_head.exit_code == 0 and remote_sha == pushed_sha else "failed",
-            remote_head,
-            None if remote_head.exit_code == 0 and remote_sha == pushed_sha else f"expected_sha={pushed_sha}; remote_sha={remote_sha or '<missing>'}",
-        )
-        if remote_head.exit_code != 0 or remote_sha != pushed_sha:
-            return False
-
-        verify_files = _pre_push_verify_files(project_path, payload.module_name, retry_paths, git.status(str(project_path)).stdout if hasattr(git, "status") else "") or implicated_files
-        expected_user_hashes = _expected_user_file_hashes(project_path, verify_files)
-        expected_registry_fields = _normalise_expected_registry_fields(payload.expected_registry_fields) or _infer_registry_fields_from_python(project_path, payload.module_name, verify_files)
-        job = store.get_job(job_id)
-        job.request["push_started_epoch"] = push_started_epoch
-        job.request["last_sha"] = pushed_sha
-        job.request["branch"] = branch
-        job.request["expected_user_file_hashes"] = expected_user_hashes
-        job.request["expected_registry_fields"] = expected_registry_fields
-        store.update_job(job)
-
-        if not _wait_for_odoosh_deployment(f"fix_cycle_{attempt}_"):
-            return False
-        if payload.wait_for_odoosh and expected_user_hashes:
-            code_verify = odoosh.verify_user_file_hashes(expected_user_hashes)
-            _step(f"fix_cycle_{attempt}_odoosh_user_file_verify", "passed" if code_verify.exit_code == 0 else "failed", code_verify)
-            if code_verify.exit_code != 0:
-                return False
-        manifest_result = odoosh.verify_module_manifest(payload.module_name)
-        _step(f"fix_cycle_{attempt}_odoosh_verify_module_manifest", "passed" if manifest_result.exit_code == 0 else "failed", manifest_result)
-        return manifest_result.exit_code == 0
-
     if payload.upgrade_module:
         _step("db_rollback_checkpoint", "warning", {"note": "Code rollback is automatic, but database schema/data rollback requires an Odoo.sh backup or duplicate staging before upgrade. Create/confirm backup before destructive migrations."})
-        max_fix_cycles = max(1, int(payload.max_fix_cycles or 5))
-        last_deploy_result = None
-        last_error_pack: CommandResult | None = None
-        last_real_error = ""
-        attempts_made = 0
-        upgrade_passed = False
-        for attempt in range(1, max_fix_cycles + 1):
-            attempts_made = attempt
-            _save_state("running", {"upgrade_attempt": attempt, "max_fix_cycles": max_fix_cycles})
-            deploy_result = _start_and_wait_module_deploy(payload)
-            last_deploy_result = deploy_result
-            deploy_payload = _safe_deploy_payload(deploy_result)
-            deploy_passed = _module_upgrade_success(deploy_result)
-            # A wait-for-result safe deploy cannot complete in an intermediate
-            # nested upgrade state. Treat any non-success, including a nested
-            # timeout/non-terminal result, as a failed upgrade attempt and keep
-            # the bounded error-pack/fix/retry loop inside this same job.
-            attempt_status = "passed" if deploy_passed else "failed"
-            _step(f"upgrade_attempt_{attempt}", attempt_status, deploy_result)
-            if attempt == 1:
-                _step("odoo_module_deploy", attempt_status, deploy_result)
-            if deploy_passed:
-                module_upgrade_confirmation = {
-                    "requested": True,
-                    "status": "passed",
-                    "passed": True,
-                    "attempt": attempt,
-                    "attempts": attempt,
-                    "message": f"Upgrade confirmed successful after {attempt} attempt(s).",
-                    "result": deploy_payload,
-                }
-                upgrade_passed = True
-                break
-
-            last_error_pack = _fetch_upgrade_error_pack(attempt, deploy_result)
-            last_real_error = _safe_deploy_error_text(deploy_result, last_error_pack)
-            if attempt >= max_fix_cycles:
-                break
-            fixed = _run_fix_cycle(attempt, deploy_result, last_error_pack)
-            if not fixed:
-                if fix_cycle_blocked_by_verifier:
-                    break
-                continue
-
-        if not upgrade_passed:
+        deploy_result = _start_and_wait_module_deploy(payload)
+        deploy_payload = deploy_result.model_dump(mode="json") if hasattr(deploy_result, "model_dump") else deploy_result
+        deploy_finished = bool(isinstance(deploy_payload.get("result"), dict) and deploy_payload["result"].get("finished"))
+        deploy_running = deploy_result.status == "ok" and not deploy_finished
+        _step("odoo_module_deploy", "failed" if deploy_running else "passed" if deploy_result.status == "ok" else "failed", deploy_result)
+        if deploy_running:
             job = store.get_job(job_id)
-            attempts_text = f"{attempts_made} attempt" if attempts_made == 1 else f"{attempts_made} attempts"
+            nested_result = deploy_payload.get("result") if isinstance(deploy_payload.get("result"), dict) else {}
             result = {
-                "status": "upgrade_failed_after_retries",
-                "message": f"Upgrade failed after {attempts_text}, last error: {last_real_error or _safe_deploy_error_text(last_deploy_result, last_error_pack)}",
+                "status": "module_upgrade_running",
+                "message": "Odoo module deploy/update is still running. Safe deploy is not complete; do not claim success. Resume or poll the nested job.",
                 "module_name": payload.module_name,
                 "sha": pushed_sha,
-                "attempts": attempts_made,
-                "max_fix_cycles": max_fix_cycles,
-                "last_real_error": last_real_error or _safe_deploy_error_text(last_deploy_result, last_error_pack),
-                "last_upgrade_result": _safe_deploy_payload(last_deploy_result) if last_deploy_result is not None else None,
-                "last_error_pack": last_error_pack.model_dump(mode="json") if hasattr(last_error_pack, "model_dump") else None,
-                "module_upgrade": {
-                    "requested": True,
-                    "status": "failed",
-                    "passed": False,
-                    "attempts": attempts_made,
-                },
-                "odoosh_check_commit": odoosh_deploy_confirmation,
-                "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+                "odoo_module_deploy": nested_result,
+                "next_call": nested_result.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": nested_result.get("job_id"), "wait_for_result": True}},
             }
             store.finish_job(job, JobStatus.failed, result)
-            _save_state("upgrade_failed_after_retries", {"last_upgrade_error": result["last_real_error"]})
-            approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module module upgrade failed after retries")
+            store.save_session_state({
+                "last_safe_deploy_job_id": job_id,
+                "last_sha": pushed_sha,
+                "module_name": payload.module_name,
+                "project_path": str(project_path),
+                "branch": branch,
+                "client_name": client.name if client else payload.client_name,
+                "safe_deploy_status": "module_upgrade_running",
+            }, client_name=client.name if client else payload.client_name or None)
+            return
+        if deploy_result.status != "ok":
+            _fail("odoo_module_deploy", deploy_result)
             return
 
-    module_status = _odoo_service_for_client(client).module_status(payload.module_name)
+    module_status = OdooRpcService().module_status(payload.module_name)
     status_ = "passed" if module_status.status == "ok" else "warning"
     _step("odoo_module_status", status_, module_status)
 
     if expected_registry_fields:
-        field_verify = _verify_registry_fields(expected_registry_fields, client)
+        field_verify = _verify_registry_fields(expected_registry_fields)
         _step("registry_field_verify", "passed" if field_verify.status == "ok" else "failed", field_verify)
         if field_verify.status != "ok":
             job = store.get_job(job_id)
@@ -2497,160 +1448,59 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
             }
             store.finish_job(job, JobStatus.failed, result)
-            _save_state("registry_field_missing")
+            store.save_session_state({
+                "last_safe_deploy_job_id": job_id,
+                "last_sha": pushed_sha,
+                "module_name": payload.module_name,
+                "project_path": str(project_path),
+                "branch": branch,
+                "client_name": client.name if client else payload.client_name,
+                "safe_deploy_status": "registry_field_missing",
+            }, client_name=client.name if client else payload.client_name or None)
             return
     else:
         _step("registry_field_verify", "skipped", {"message": "No expected Python field additions were inferred or provided."})
 
-    smoke = _odoo_service_for_client(client).registry_smoke_test(payload.module_name, [], [], strict=False)
+    smoke = OdooRpcService().registry_smoke_test(payload.module_name, [], [], strict=False)
     _step("registry_smoke_test", "passed" if smoke.status == "ok" else "warning", smoke)
 
-    ui_verification_confirmed = False
-    ui_verification_unavailable = False
-    ui_specs = _verify_ui_specs_for_payload(payload)
-    if ui_specs:
+    if payload.verify_ui_paths:
         ui_results = []
-        failed_non_cdp_paths = []
-        warning_paths = []
-        unavailable_paths = []
-        for index, spec in enumerate(ui_specs, start=1):
-            path = _ui_spec_path(spec)
-            browser_kwargs = _browser_request_kwargs_from_spec(spec, payload, index)
+        for index, path in enumerate(payload.verify_ui_paths, start=1):
             result = asyncio.run(CdpBrowserService().screenshot_odoo_page(
-                client.odoo_url if client else None,
-                client.odoo_login if client else None,
-                client.odoo_password if client else None,
+                None,
+                None,
+                None,
                 path,
-                str(browser_kwargs.pop("screenshot_name")),
-                int(browser_kwargs.pop("timeout_seconds")),
-                full_page=bool(browser_kwargs.pop("full_page")),
-                client_name=client.name if client else payload.client_name,
-                reuse_session=True,
-                login_strategy="reuse_first",
-                **browser_kwargs,
+                f"{payload.verify_ui_screenshot_prefix}_{index}.png",
+                payload.verify_ui_timeout_seconds,
+                full_page=True,
             ))
-            dumped = result.model_dump(mode="json")
-            ui_results.append({"path": path, "spec": spec.model_dump(mode="json"), "result": dumped})
-            if _ui_result_passed(result):
-                status_ = "passed"
-            elif result.status == "failed" and _browser_cdp_unavailable(result):
-                status_ = "warning"
-                unavailable_paths.append(path)
-            elif result.status == "failed":
-                status_ = "failed"
-                failed_non_cdp_paths.append(path)
-            else:
-                status_ = "warning"
-                warning_paths.append(path)
+            ui_results.append({"path": path, "result": result.model_dump(mode="json")})
+            status_ = "passed" if result.status == "ok" and not result.console_errors and not result.network_errors else "failed" if result.status == "failed" else "warning"
             _step(f"browser_ui_path:{path}", status_, result)
-        if failed_non_cdp_paths:
-            _fail("browser_ui_verify", {"failed_paths": failed_non_cdp_paths, "results": ui_results})
-            return
-        if unavailable_paths:
-            ui_verification_unavailable = True
-            _step("browser_ui_verify", "warning", {
-                "status": "browser_unavailable",
-                "message": "CDP/Chrome browser verification is unavailable; deploy and module upgrade remain confirmed, but visible UI proof is not confirmed.",
-                "paths": payload.verify_ui_paths,
-                "specs": [spec.model_dump(mode="json") for spec in ui_specs],
-                "unavailable_paths": unavailable_paths,
-                "results": ui_results,
-            })
-        elif warning_paths or any(item["result"]["console_errors"] or item["result"]["network_errors"] for item in ui_results):
-            _step("browser_ui_verify", "warning", {"paths": payload.verify_ui_paths, "specs": [spec.model_dump(mode="json") for spec in ui_specs], "results": ui_results})
+            if status_ == "failed":
+                _fail("browser_ui_verify", {"failed_path": path, "result": result.model_dump(mode="json")})
+                return
+        if any(item["result"]["console_errors"] or item["result"]["network_errors"] for item in ui_results):
+            _step("browser_ui_verify", "warning", {"paths": payload.verify_ui_paths, "results": ui_results})
         else:
-            ui_verification_confirmed = True
-            _step("browser_ui_verify", "passed", {"paths": payload.verify_ui_paths, "specs": [spec.model_dump(mode="json") for spec in ui_specs], "results": ui_results})
-
-    ui_proof_required_files = _frontend_ui_files_requiring_live_proof(payload.module_name, verify_files or deploy_paths)
-    if ui_proof_required_files and not settings.visual_screenshot_flow_enabled:
-        _step(
-            "browser_ui_verify",
-            "skipped",
-            {
-                "status": "skipped",
-                "reason": "visual_screenshot_flow_disabled",
-                "message": "Live screenshot verification is disabled and does not gate deployment success.",
-                "frontend_files": ui_proof_required_files,
-            },
-        )
-    if ui_proof_required_files and not ui_specs and settings.visual_screenshot_flow_enabled:
-        _step(
-            "browser_ui_verify",
-            "warning",
-            {
-                "status": "ui_verification_required",
-                "message": (
-                    "Frontend/template/style files changed, and Odoo.sh deploy + module upgrade passed, "
-                    "but no live browser path was provided. Do not claim the visible UI/page changed until "
-                    "a browser/UI verification is run."
-                ),
-                "frontend_files": ui_proof_required_files,
-                "required_action": "Rerun workflow.safe_deploy_module with verify_ui_paths, or call an explicit browser/UI verification tool for the affected page.",
-            },
-        )
-        fresh_job = store.get_job(job_id)
-        final_result = {
-            "status": "ui_verification_required",
-            "message": (
-                "Code push, Odoo.sh deploy, and module upgrade were confirmed, but the frontend/UI change was not live-browser verified. "
-                "Do not say the checkout/page now reflects the change until verify_ui_paths/browser proof passes."
-            ),
-            "module_name": payload.module_name,
-            "sha": pushed_sha,
-            "verify_ui_paths": payload.verify_ui_paths,
-            "frontend_files_requiring_live_proof": ui_proof_required_files,
-            "expected_registry_fields": expected_registry_fields,
-            "odoosh_check_commit": odoosh_deploy_confirmation,
-            "module_upgrade": module_upgrade_confirmation,
-            "success_allowed": False,
-            "claim_allowed": "code_pushed_deployed_and_module_upgraded_only",
-            "claim_blocked": "visible UI/page changed",
-            "next_call": {
-                "tool": "workflow.safe_deploy_module",
-                "arguments": {
-                    "module_name": payload.module_name,
-                    "project_path": str(project_path),
-                    "client_name": client.name if client else payload.client_name,
-                    "paths": deploy_paths,
-                    "commit_message": payload.commit_message,
-                    "run_qa": False,
-                    "wait_for_odoosh": True,
-                    "upgrade_module": False,
-                    "verify_ui_paths": ["<affected Odoo/web path, e.g. /shop/cart or /shop/checkout>"],
-                },
-            },
-        }
-        store.finish_job(fresh_job, JobStatus.warning, final_result)
-        approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module requires browser/UI verification before visible-change success claim")
-        _save_state("ui_verification_required", {"frontend_files_requiring_live_proof": ui_proof_required_files})
-        return
+            _step("browser_ui_verify", "passed", {"paths": payload.verify_ui_paths, "results": ui_results})
 
     fresh_job = store.get_job(job_id)
-    ui_checked = bool(ui_specs) and not ui_verification_unavailable
-    final_result = {
-        "status": "passed",
-        "message": module_upgrade_confirmation.get("message") if payload.upgrade_module else "Safe deploy finished without module upgrade because upgrade_module=false.",
-        "module_name": payload.module_name,
-        "sha": pushed_sha,
-        "verify_ui_paths": payload.verify_ui_paths,
-        "verify_ui_specs": [spec.model_dump(mode="json") for spec in ui_specs],
-        "expected_registry_fields": expected_registry_fields,
-        "odoosh_check_commit": odoosh_deploy_confirmation,
-        "module_upgrade": module_upgrade_confirmation,
-        "source_pushed": True,
-        "source_on_odoosh": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")),
-        "source_deployed": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")),
-        "module_upgraded": bool(module_upgrade_confirmation.get("passed")),
-        "ui_checked": ui_checked,
-        "ui_verification_unavailable": ui_verification_unavailable,
-        "visible_change_confirmed": ui_verification_confirmed,
-        "deploy_confirmed": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")) and bool(module_upgrade_confirmation.get("passed")),
-        "success_allowed": True,
-    }
-    store.finish_job(fresh_job, JobStatus.passed, final_result)
+    store.finish_job(fresh_job, JobStatus.passed, {"module_name": payload.module_name, "sha": pushed_sha, "verify_ui_paths": payload.verify_ui_paths, "expected_registry_fields": expected_registry_fields})
     approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module succeeded")
-    _save_state("passed")
+    # Fix 7: persist milestone so resume_job and future sessions know where we are
+    store.save_session_state({
+        "last_safe_deploy_job_id": job_id,
+        "last_sha": pushed_sha,
+        "module_name": payload.module_name,
+        "project_path": str(project_path),
+        "branch": branch,
+        "client_name": client.name if client else payload.client_name,
+        "client": client.public if client else None,
+        "safe_deploy_status": "passed",
+    }, client_name=client.name if client else payload.client_name or None)
 
 
 # ---------------------------------------------------------------------------
@@ -2679,7 +1529,6 @@ def find_core_file(payload: FindCoreFileRequest) -> FindCoreFileResult:
         file_type=payload.file_type,
         keyword=payload.keyword,
         search_roots=payload.search_roots or None,
-        client_name=payload.client_name,
     )
 
 
@@ -2691,7 +1540,7 @@ def find_similar_view(payload: FindSimilarViewRequest) -> FindSimilarViewResult:
     reads the exact attribute names, field references, and node structure
     from the real source file rather than guessing.
 
-    Search priority: odoo/addons → enterprise → user fallback (same as find_core_file).
+    Search priority: enterprise → odoo → user fallback (same as find_core_file).
 
     Example:
         model="sale.order", view_type="form"
@@ -2701,7 +1550,6 @@ def find_similar_view(payload: FindSimilarViewRequest) -> FindSimilarViewResult:
         model=payload.model,
         view_type=payload.view_type,
         search_roots=payload.search_roots or None,
-        client_name=payload.client_name,
     )
 
 
@@ -2713,7 +1561,7 @@ def list_module_files(payload: ListModuleFilesRequest) -> ListModuleFilesResult:
     browse what exists first, then call find_core_file with a keyword, or
     repo.read directly on a file you spot here.
 
-    Search priority: odoo/addons → enterprise → user fallback (same as find_core_file).
+    Search priority: enterprise → odoo → user fallback (same as find_core_file).
 
     Example:
         module_name="sale", subdir="models"
@@ -2723,7 +1571,6 @@ def list_module_files(payload: ListModuleFilesRequest) -> ListModuleFilesResult:
         module_name=payload.module_name,
         subdir=payload.subdir,
         search_roots=payload.search_roots or None,
-        client_name=payload.client_name,
     )
 
 
@@ -2764,15 +1611,12 @@ def scope_advice(payload: ScopeAdviceRequest) -> ScopeAdviceResult:
         custom_file_paths=['/workspace/repos/repo/my_sale_ext/models/sale_order.py'],
         task_description='Add custom field to sale.order'
     """
-    result = CoreFinderService().scope_advice(
+    return CoreFinderService().scope_advice(
         custom_module_name=payload.custom_module_name,
         custom_file_paths=payload.custom_file_paths,
         task_description=payload.task_description,
         search_roots=payload.search_roots or None,
-        client_name=payload.client_name,
     )
-    PreWriteGateService().record_scope_advice(result, payload)
-    return result
 
 
 # ===========================================================================

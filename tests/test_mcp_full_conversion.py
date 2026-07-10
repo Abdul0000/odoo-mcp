@@ -1,117 +1,175 @@
+from __future__ import annotations
+
 from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
-from odoo_agent_server.routers.tools import strict_safe_tool_name, list_tools
+from odoo_agent_server.routers.tools import list_tools
 
 
-def _auth():
+def _auth() -> dict[str, str]:
     return {"Authorization": f"Bearer {settings.api_token}"}
 
 
-def _mcp(method, params=None, request_id=1):
-    return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
+EXPECTED_OPERATIONAL_MCP_TOOLS = {tool.name for tool in list_tools()}
 
 
-_PROVIDER_TOOLS = {
-    "connector_health",
-    "client_check",
-    "workflow_agent_instructions",
-    "workflow_odoo_code_change",
-    "workflow_frontend_visual_implement",
-    "workflow_find_core_file",
-    "workflow_list_module_files",
-    "workflow_frontend_pattern_preflight",
-    "workflow_verify_pos_change",
-    "workflow_verify_against_core",
-    "odoosh_read_core_file",
-    "odoosh_list_core_files",
-    "artifacts_read",
-    "workflow_resume_job",
-    "jobs_list",
-    "jobs_get",
-    "odoosh_error_pack",
-    "browser_login",
-    "browser_screenshot",
-    "workflow_pos_visual_verify",
-    "jobs_status_compact",
-}
-
-
-
-def test_mcp_initialize_and_core_read_tools_list():
+def test_mcp_tools_list_exposes_every_operational_api_tool():
     client = TestClient(app)
-    initialized = client.post("/mcp", headers=_auth(), json=_mcp("initialize"))
+    initialized = client.post("/mcp", headers=_auth(), json={"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}})
     assert initialized.status_code == 200
-    assert initialized.json()["result"]["protocolVersion"]
+    assert initialized.json()["result"]["serverInfo"]["name"] == "odoo-mcp-agent-connector"
 
-    response = client.post("/mcp", headers=_auth(), json=_mcp("tools/list", request_id=2))
+    response = client.post("/mcp", headers=_auth(), json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
     assert response.status_code == 200
     tools = response.json()["result"]["tools"]
-    assert {tool["name"] for tool in tools} == _PROVIDER_TOOLS
-    assert all("inputSchema" in tool for tool in tools)
+    names = {tool["name"] for tool in tools}
+    assert names == EXPECTED_OPERATIONAL_MCP_TOOLS
+    assert len(tools) == len(EXPECTED_OPERATIONAL_MCP_TOOLS)
+    assert "qa_self_run" in names
+    assert "repo_apply_patch_atomic" in names
+    assert "git_push" in names
+    assert "odoo_module_deploy" in names
+    assert "approvals_approve" not in names
+    assert all("." not in name for name in names)
+    for tool in tools:
+        assert tool["inputSchema"]["type"] == "object"
+        assert "description" in tool
+        assert "annotations" in tool
 
 
-def test_rest_tools_keep_full_admin_surface_but_mcp_is_curated():
+def test_rest_tools_and_mcp_tools_have_same_surface():
     client = TestClient(app)
     rest = client.get("/tools/list", headers=_auth())
     assert rest.status_code == 200
-    rest_names = {strict_safe_tool_name(tool["name"]) for tool in rest.json()}
-    assert "repo_read" in rest_names
-    assert "workflow_safe_deploy_module" in rest_names
+    rest_names = {tool["name"] for tool in rest.json()}
 
-    mcp = client.post("/mcp", headers=_auth(), json=_mcp("tools/list"))
+    mcp = client.post("/mcp", headers=_auth(), json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
     assert mcp.status_code == 200
     mcp_names = {tool["name"] for tool in mcp.json()["result"]["tools"]}
-    assert mcp_names == _PROVIDER_TOOLS
-    assert mcp_names < rest_names
+    assert mcp_names == rest_names == EXPECTED_OPERATIONAL_MCP_TOOLS
 
 
-def test_provider_tool_call_dispatches_composite_tool(monkeypatch):
-    captured = {}
-
-    async def fake_dispatch(name, arguments):
-        captured["name"] = name
-        captured["arguments"] = arguments
-        return {"status": "needs_writes", "success_allowed": False}
-
-    monkeypatch.setattr("odoo_agent_server.routers.mcp._dispatch", fake_dispatch)
+def test_mcp_supports_health_approval_job_and_audit_tools(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     client = TestClient(app)
+
+    health = client.post(
+        "/mcp",
+        headers=_auth(),
+        json={"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "connector.health", "arguments": {}}},
+    )
+    assert health.status_code == 200
+    assert health.json()["result"]["structuredContent"]["status"] == "ok"
+    assert health.json()["result"]["structuredContent"]["service"] == "odoo-mcp-agent-connector"
+
+    requested = client.post(
+        "/mcp",
+        headers=_auth(),
+        json={
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "approvals.request",
+                "arguments": {"action": "repo.write", "summary": "test approval", "payload_preview": {"file": "a.txt"}},
+            },
+        },
+    )
+    assert requested.status_code == 200
+    approval = requested.json()["result"]["structuredContent"]
+    assert approval["action"] == "repo.write"
+    assert approval["status"] == "pending"
+
+    listed_approvals = client.post(
+        "/mcp",
+        headers=_auth(),
+        json={"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "approvals.list", "arguments": {"limit": 10}}},
+    )
+    assert listed_approvals.status_code == 200
+    approvals_payload = listed_approvals.json()["result"]["structuredContent"]
+    assert any(item["id"] == approval["id"] for item in approvals_payload["items"])
+
+    audit = client.post(
+        "/mcp",
+        headers=_auth(),
+        json={"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "audit.list", "arguments": {"limit": 20}}},
+    )
+    assert audit.status_code == 200
+    audit_payload = audit.json()["result"]["structuredContent"]
+    assert any(event["action"].startswith("approval.") for event in audit_payload["items"])
+
+
+def test_mcp_repo_write_many_smart_accepts_path_alias(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    project.mkdir()
+    client = TestClient(app)
+
     response = client.post(
         "/mcp",
         headers=_auth(),
-        json=_mcp(
-            "tools/call",
-            {
-                "name": "workflow_odoo_code_change",
+        json={
+            "jsonrpc": "2.0",
+            "id": 70,
+            "method": "tools/call",
+            "params": {
+                "name": "repo_write_many_smart",
                 "arguments": {
-                    "project_path": "/tmp/repo",
-                    "module_name": "x_module",
-                    "task_description": "inspect change",
+                    "project_path": str(project),
+                    "files": [
+                        {"path": "sale_order_notebook_tab/models/sale_order.py", "content": "from odoo import fields, models\n"}
+                    ],
                 },
             },
-        ),
+        },
     )
+
     assert response.status_code == 200
-    assert captured["name"] == "workflow.odoo_code_change"
-    assert response.json()["result"]["structuredContent"]["status"] == "needs_writes"
+    payload = response.json()["result"]
+    assert payload["isError"] is False
+    assert payload["structuredContent"]["exit_code"] == 0
+    assert "Pydantic" not in payload["content"][0]["text"]
+    assert (project / "sale_order_notebook_tab" / "models" / "sale_order.py").read_text(encoding="utf-8") == "from odoo import fields, models\n"
 
 
-def test_provider_validation_errors_are_agent_friendly():
+def test_mcp_validation_errors_are_agent_friendly(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    project.mkdir()
     client = TestClient(app)
+
     response = client.post(
         "/mcp",
         headers=_auth(),
-        json=_mcp("tools/call", {"name": "workflow_odoo_code_change", "arguments": {"module_name": "bad name", "task_description": "x"}}),
+        json={
+            "jsonrpc": "2.0",
+            "id": 71,
+            "method": "tools/call",
+            "params": {
+                "name": "repo_write_many_smart",
+                "arguments": {"project_path": str(project), "files": [{"path": "x.py"}]},
+            },
+        },
     )
+
     assert response.status_code == 200
     payload = response.json()["result"]
     assert payload["isError"] is True
     assert payload["structuredContent"]["error_type"] == "tool_input_invalid"
+    assert "Tool input invalid" in payload["content"][0]["text"]
+    assert "pydantic.dev" not in payload["content"][0]["text"]
 
 
-def test_all_rest_tool_names_still_have_safe_mcp_aliases():
-    for tool in list_tools(strict_names=False):
-        safe = strict_safe_tool_name(tool.name)
-        assert safe
-        assert len(safe) <= 64
+def test_mcp_workflow_capability_check_tool():
+    client = TestClient(app)
+    response = client.post(
+        "/mcp",
+        headers=_auth(),
+        json={"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "workflow.capability_check", "arguments": {}}},
+    )
+    assert response.status_code == 200
+    payload = response.json()["result"]
+    assert payload["isError"] is False
+    assert payload["structuredContent"]["status"] in {"ready", "partial", "failed"}
+    assert "checks" in payload["structuredContent"]

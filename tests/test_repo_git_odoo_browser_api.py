@@ -116,7 +116,7 @@ def test_odoo_health_without_config_returns_failed(monkeypatch):
     response = client.post("/odoo/health", headers=_auth())
     assert response.status_code == 200
     assert response.json()["status"] == "failed"
-    assert "ODOOSH_DB_NAME" in response.json()["error"]
+    assert "ODOO_BASE_URL" in response.json()["error"]
 
 
 def test_browser_requires_auth():

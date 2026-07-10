@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter
 
 from ..auth import AuthDependency
 from ..schemas import (
@@ -28,17 +28,8 @@ from ..schemas import (
 from ..services.approval_service import ApprovalService
 from ..services.repo_service import RepoService
 from ..services.store_service import JsonStore
-from ..services.client_resolver_service import ClientResolverService
-from ..services.checkout_guard_service import maybe_ensure_known_module_current, module_name_from_relative_path
-from ..services.client_gate_service import ClientGateService
-from ..services.prewrite_gate_service import PreWriteGateService
 
 router = APIRouter(prefix="/repo", tags=["repo"], dependencies=[AuthDependency])
-
-
-def _require_explicit_client_when_multiclient(payload: object, action: str) -> None:
-    """Require client.check validation before repo tools in multi-client mode."""
-    ClientGateService().require_validated_client(getattr(payload, "client_name", None), action)
 
 
 def _preview(payload: object) -> dict[str, object]:
@@ -61,31 +52,8 @@ def _preview(payload: object) -> dict[str, object]:
     return data
 
 
-def _ensure_known_relative_module_current(project_path: str, relative_path: str) -> None:
-    module_name = module_name_from_relative_path(relative_path)
-    if not module_name:
-        return
-    resolver = ClientResolverService()
-    client = resolver.resolve_client(project_path=project_path, require_complete=False)
-    branch = client.branch if client else None
-    guard = maybe_ensure_known_module_current(
-        project_path=project_path,
-        module_name=module_name,
-        branch=branch,
-        client_name=client.name if client else None,
-        remote="origin",
-        timeout_seconds=120,
-        require_prior_success=True,
-    )
-    if guard and not guard.get("ok"):
-        from fastapi import HTTPException, status
-
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=guard.get("error") or "Checkout/module guard failed")
-
-
 @router.post("/prepare", response_model=RepoPrepareResult)
 def repo_prepare(payload: RepoPrepareRequest) -> RepoPrepareResult:
-    _require_explicit_client_when_multiclient(payload, "repo.prepare")
     approval = ApprovalService()
     approval.ensure_allowed("repo.prepare", payload.approval_id, _preview(payload))
     try:
@@ -109,55 +77,36 @@ def repo_prepare(payload: RepoPrepareRequest) -> RepoPrepareResult:
 
 @router.post("/custom-modules", response_model=list[CustomModuleItem])
 def repo_custom_modules(payload: RepoCustomModulesRequest) -> list[CustomModuleItem]:
-    _require_explicit_client_when_multiclient(payload, "repo.list_custom_modules")
     JsonStore().log_audit("repo.list_custom_modules", "ok", payload.project_path, _preview(payload))
     return RepoService().list_custom_modules(payload.project_path, payload.max_depth, payload.include_uninstallable)
 
 
 @router.post("/list", response_model=list[FileListItem])
 def repo_list(payload: RepoListRequest) -> list[FileListItem]:
-    _require_explicit_client_when_multiclient(payload, "repo.list")
-    _ensure_known_relative_module_current(payload.project_path, payload.relative_path)
     JsonStore().log_audit("repo.list", "ok", payload.relative_path, _preview(payload))
-    result = RepoService().list_files(payload.project_path, payload.relative_path, payload.max_depth, payload.max_items)
-    PreWriteGateService().record_repo_inspection(project_path=payload.project_path, relative_path=payload.relative_path, client_name=payload.client_name, action="repo.list", is_content_read=False)
-    return result
+    return RepoService().list_files(payload.project_path, payload.relative_path, payload.max_depth, payload.max_items)
 
 
 @router.post("/read", response_model=FileContent)
 def repo_read(payload: RepoReadRequest) -> FileContent:
-    _require_explicit_client_when_multiclient(payload, "repo.read")
-    _ensure_known_relative_module_current(payload.project_path, payload.relative_path)
     JsonStore().log_audit("repo.read", "ok", payload.relative_path, _preview(payload))
-    result = RepoService().read_file(payload.project_path, payload.relative_path, payload.max_bytes)
-    PreWriteGateService().record_repo_inspection(project_path=payload.project_path, relative_path=payload.relative_path, client_name=payload.client_name, action="repo.read", is_content_read=True)
-    return result
+    return RepoService().read_file(payload.project_path, payload.relative_path, payload.max_bytes)
 
 
 @router.post("/read-range", response_model=dict)
 def repo_read_range(payload: RepoReadRangeRequest) -> dict:
-    _require_explicit_client_when_multiclient(payload, "repo.read_range")
-    _ensure_known_relative_module_current(payload.project_path, payload.relative_path)
     JsonStore().log_audit("repo.read_range", "ok", payload.relative_path, _preview(payload))
-    result = RepoService().read_range(payload.project_path, payload.relative_path, payload.start_line, payload.max_lines)
-    PreWriteGateService().record_repo_inspection(project_path=payload.project_path, relative_path=payload.relative_path, client_name=payload.client_name, action="repo.read_range", is_content_read=True)
-    return result
+    return RepoService().read_range(payload.project_path, payload.relative_path, payload.start_line, payload.max_lines)
 
 
 @router.post("/search", response_model=dict)
 def repo_search(payload: RepoSearchRequest) -> dict:
-    _require_explicit_client_when_multiclient(payload, "repo.search")
-    _ensure_known_relative_module_current(payload.project_path, payload.relative_path)
     JsonStore().log_audit("repo.search", "ok", payload.pattern, _preview(payload))
-    result = RepoService().search(payload.project_path, payload.pattern, payload.relative_path, payload.max_matches, payload.context_lines, payload.regex)
-    PreWriteGateService().record_repo_inspection(project_path=payload.project_path, relative_path=payload.relative_path, client_name=payload.client_name, action="repo.search", is_content_read=False)
-    return result
+    return RepoService().search(payload.project_path, payload.pattern, payload.relative_path, payload.max_matches, payload.context_lines, payload.regex)
 
 
 @router.post("/write", response_model=FileContent)
 def repo_write(payload: RepoWriteRequest) -> FileContent:
-    _require_explicit_client_when_multiclient(payload, "repo.write")
-    PreWriteGateService().ensure_repo_write_allowed(project_path=payload.project_path, relative_paths=[payload.relative_path], client_name=payload.client_name, action="repo.write")
     approval = ApprovalService()
     approval.ensure_allowed("repo.write", payload.approval_id, _preview(payload))
     try:
@@ -172,7 +121,6 @@ def repo_write(payload: RepoWriteRequest) -> FileContent:
 
 @router.post("/delete", response_model=dict[str, str])
 def repo_delete(payload: RepoDeleteRequest) -> dict[str, str]:
-    _require_explicit_client_when_multiclient(payload, "repo.delete")
     approval = ApprovalService()
     approval.ensure_allowed("repo.delete", payload.approval_id, _preview(payload))
     try:
@@ -187,10 +135,6 @@ def repo_delete(payload: RepoDeleteRequest) -> dict[str, str]:
 
 @router.post("/apply-patch", response_model=CommandResult)
 def repo_apply_patch(payload: RepoPatchRequest) -> CommandResult:
-    _require_explicit_client_when_multiclient(payload, "repo.apply_patch")
-    gate = PreWriteGateService()
-    patch_paths = gate.paths_from_patch(payload.patch)
-    gate.ensure_repo_write_allowed(project_path=payload.project_path, relative_paths=patch_paths, client_name=payload.client_name, action="repo.apply_patch", check_only=payload.check_only)
     approval = ApprovalService()
     if not payload.check_only:
         approval.ensure_allowed("repo.apply_patch", payload.approval_id, _preview(payload))
@@ -207,8 +151,6 @@ def repo_apply_patch(payload: RepoPatchRequest) -> CommandResult:
 
 @router.post("/write-many-fast-safe", response_model=CommandResult)
 def repo_write_many_fast_safe(payload: RepoWriteManyFastSafeRequest) -> CommandResult:
-    _require_explicit_client_when_multiclient(payload, "repo.write_many_fast_safe")
-    PreWriteGateService().ensure_repo_write_allowed(project_path=payload.project_path, relative_paths=[item.relative_path for item in payload.files], client_name=payload.client_name, action="repo.write_many_fast_safe", check_only=payload.check_only)
     approval = ApprovalService()
     if not payload.check_only:
         approval.ensure_allowed("repo.write_many_fast_safe", payload.approval_id, _preview(payload))
@@ -221,8 +163,6 @@ def repo_write_many_fast_safe(payload: RepoWriteManyFastSafeRequest) -> CommandR
 
 @router.post("/write-many-smart", response_model=CommandResult)
 def repo_write_many_smart(payload: RepoWriteManySmartRequest) -> CommandResult:
-    _require_explicit_client_when_multiclient(payload, "repo.write_many_smart")
-    PreWriteGateService().ensure_repo_write_allowed(project_path=payload.project_path, relative_paths=[item.relative_path for item in payload.files], client_name=payload.client_name, action="repo.write_many_smart", check_only=payload.check_only)
     approval = ApprovalService()
     if not payload.check_only:
         approval.ensure_allowed("repo.write_many_smart", payload.approval_id, _preview(payload))
@@ -235,8 +175,6 @@ def repo_write_many_smart(payload: RepoWriteManySmartRequest) -> CommandResult:
 
 @router.post("/write-many-atomic", response_model=CommandResult)
 def repo_write_many_atomic(payload: RepoWriteManyAtomicRequest) -> CommandResult:
-    _require_explicit_client_when_multiclient(payload, "repo.write_many_atomic")
-    PreWriteGateService().ensure_repo_write_allowed(project_path=payload.project_path, relative_paths=[item.relative_path for item in payload.files], client_name=payload.client_name, action="repo.write_many_atomic", check_only=payload.check_only)
     approval = ApprovalService()
     if not payload.check_only:
         approval.ensure_allowed("repo.write_many_atomic", payload.approval_id, _preview(payload))
@@ -249,10 +187,6 @@ def repo_write_many_atomic(payload: RepoWriteManyAtomicRequest) -> CommandResult
 
 @router.post("/apply-patch-atomic", response_model=CommandResult)
 def repo_apply_patch_atomic(payload: RepoAtomicPatchRequest) -> CommandResult:
-    _require_explicit_client_when_multiclient(payload, "repo.apply_patch_atomic")
-    gate = PreWriteGateService()
-    patch_paths = gate.paths_from_patch(payload.patch)
-    gate.ensure_repo_write_allowed(project_path=payload.project_path, relative_paths=patch_paths, client_name=payload.client_name, action="repo.apply_patch_atomic", check_only=payload.check_only)
     approval = ApprovalService()
     if not payload.check_only:
         approval.ensure_allowed("repo.apply_patch_atomic", payload.approval_id, _preview(payload))
@@ -265,7 +199,6 @@ def repo_apply_patch_atomic(payload: RepoAtomicPatchRequest) -> CommandResult:
 
 @router.post("/clean-pyc", response_model=RepoCleanPycResult)
 def repo_clean_pyc(payload: RepoCleanPycRequest) -> RepoCleanPycResult:
-    _require_explicit_client_when_multiclient(payload, "repo.clean_pyc")
     approval = ApprovalService()
     approval.ensure_allowed("repo.clean_pyc", payload.approval_id, _preview(payload))
     try:

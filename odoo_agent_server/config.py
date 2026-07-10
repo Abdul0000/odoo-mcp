@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import base64
-import hashlib
 import os
 from pathlib import Path
 from typing import List
@@ -19,12 +18,6 @@ class Settings(BaseSettings):
     allowed_roots_raw: str = Field(default="/workspace/repos,/tmp,/home/odoo/src", alias="ODOO_AGENT_ALLOWED_ROOTS")
     state_dir: str = Field(default="/tmp/odoo_agent_state", alias="ODOO_AGENT_STATE_DIR")
     screenshot_dir: str = Field(default="/tmp/odoo_agent_screenshots", alias="ODOO_AGENT_SCREENSHOT_DIR")
-    screenshot_auto_clean: bool = Field(default=True, alias="ODOO_AGENT_SCREENSHOT_AUTO_CLEAN")
-    screenshot_retention_seconds: int = Field(default=3600, alias="ODOO_AGENT_SCREENSHOT_RETENTION_SECONDS")
-    screenshot_max_files: int = Field(default=1, alias="ODOO_AGENT_SCREENSHOT_MAX_FILES")
-    screenshot_keep_latest_only: bool = Field(default=True, alias="ODOO_AGENT_SCREENSHOT_KEEP_LATEST_ONLY")
-    screenshot_public_base_url: str | None = Field(default=None, alias="ODOO_AGENT_SCREENSHOT_PUBLIC_BASE_URL")
-    visual_screenshot_flow_enabled: bool = Field(default=False, alias="ODOO_AGENT_VISUAL_SCREENSHOT_FLOW_ENABLED")
     cdp_url: str | None = Field(default=None, alias="ODOO_AGENT_CDP_URL")
 
     # Approval gating is disabled in this build so MCP tools can write, commit, push, and deploy directly.
@@ -83,19 +76,16 @@ class Settings(BaseSettings):
 
     # Best-effort deploy follow-through for raw git.push fallback paths.
     auto_upgrade_on_push: bool = Field(default=True, alias="ODOO_AGENT_AUTO_UPGRADE_ON_PUSH")
-    safe_deploy_stale_running_seconds: int = Field(default=7200, alias="ODOO_AGENT_SAFE_DEPLOY_STALE_RUNNING_SECONDS")
 
     # Qwen URL-token fallback hardening. Qwen app may not pass headers, so the
     # server can mint a short-lived URL token that maps to the real API/OAuth token.
     qwen_short_token_ttl_seconds: int = Field(default=3600, alias="ODOO_AGENT_QWEN_SHORT_TOKEN_TTL_SECONDS")
 
-    # Odoo shell defaults.
+    # Odoo RPC defaults.
     odoo_base_url: str | None = Field(default=None, alias="ODOO_BASE_URL")
     odoo_db_name: str | None = Field(default=None, alias="ODOO_DB_NAME")
     odoo_login: str | None = Field(default=None, alias="ODOO_LOGIN")
     odoo_password: str | None = Field(default=None, alias="ODOO_PASSWORD")
-    odoo_https_verify_ssl: bool = Field(default=True, alias="ODOO_HTTPS_VERIFY_SSL")
-
 
     # Odoo.sh SSH connector settings. Use a development/staging build host.
     odoosh_ssh_host: str | None = Field(default=None, alias="ODOOSH_SSH_HOST")
@@ -162,8 +152,7 @@ class Settings(BaseSettings):
             return None
         key_dir = self.state_path / "keys"
         key_dir.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256(self.odoosh_ssh_private_key_b64.encode("ascii")).hexdigest()[:16]
-        key_path = key_dir / f"odoosh_key_{digest}"
+        key_path = key_dir / "odoosh_key"
         if not key_path.exists():
             raw = base64.b64decode(self.odoosh_ssh_private_key_b64.encode("ascii"))
             key_path.write_bytes(raw)
@@ -192,11 +181,7 @@ def get_odoo_clients() -> list[dict]:
 
     Each client dict should have:
       name, repo, branch, path, token,
-      odoo_url, odoo_db, odoo_login, odoo_password, odoo_verify_ssl,
-      optional per-client Odoo.sh keys:
-      odoosh_db_name, odoosh_ssh_host, odoosh_ssh_port,
-      odoosh_ssh_user, odoosh_ssh_key_path, odoosh_ssh_private_key_b64,
-      odoosh_odoo_path, odoosh_user_addons_path
+      odoo_url, odoo_db, odoo_login, odoo_password
     """
     raw = _os.getenv("ODOO_CLIENTS", "[]")
     for candidate in _odoo_client_json_candidates(raw):
@@ -235,40 +220,8 @@ def _odoo_client_json_candidates(raw: str) -> list[str]:
 
 
 def normalise_client(client: dict) -> dict:
-    """Return a string-normalized client dict without changing secret values.
-
-    Browser login credentials may be supplied with older/common aliases in
-    ODOO_CLIENTS.  Normalize them into odoo_login/odoo_password so every
-    browser workflow and login tool uses the same credential fields without
-    exposing secrets in public client metadata.
-    """
+    """Return a string-normalized client dict without changing secret values."""
     normalized: dict[str, str] = {}
-    aliases: dict[str, tuple[str, ...]] = {
-        "odoo_login": (
-            "odoo_login",
-            "browser_login",
-            "login",
-            "email",
-            "odoo_email",
-            "browser_email",
-            "username",
-            "user",
-        ),
-        "odoo_password": (
-            "odoo_password",
-            "browser_password",
-            "password",
-            "odoo_pass",
-            "browser_pass",
-            "pass",
-        ),
-    }
-    for canonical, keys in aliases.items():
-        for key in keys:
-            value = client.get(key)
-            if value not in (None, ""):
-                normalized[canonical] = str(value).strip()
-                break
     for key in (
         "name",
         "repo",
@@ -277,15 +230,8 @@ def normalise_client(client: dict) -> dict:
         "token",
         "odoo_url",
         "odoo_db",
-        "odoo_verify_ssl",
-        "odoosh_db_name",
-        "odoosh_ssh_host",
-        "odoosh_ssh_port",
-        "odoosh_ssh_user",
-        "odoosh_ssh_key_path",
-        "odoosh_ssh_private_key_b64",
-        "odoosh_odoo_path",
-        "odoosh_user_addons_path",
+        "odoo_login",
+        "odoo_password",
     ):
         value = client.get(key)
         if value is not None:
@@ -303,15 +249,6 @@ def safe_client_public(client: dict) -> dict:
         "path": normalized.get("path"),
         "odoo_url": normalized.get("odoo_url"),
         "odoo_db": normalized.get("odoo_db"),
-        "odoo_verify_ssl": normalized.get("odoo_verify_ssl"),
-        "browser_login_configured": bool(normalized.get("odoo_login")),
-        "browser_password_configured": bool(normalized.get("odoo_password")),
-        "odoosh_db_name": normalized.get("odoosh_db_name"),
-        "odoosh_ssh_host": normalized.get("odoosh_ssh_host"),
-        "odoosh_ssh_port": normalized.get("odoosh_ssh_port"),
-        "odoosh_ssh_user": normalized.get("odoosh_ssh_user"),
-        "odoosh_odoo_path": normalized.get("odoosh_odoo_path"),
-        "odoosh_user_addons_path": normalized.get("odoosh_user_addons_path"),
     }
 
 

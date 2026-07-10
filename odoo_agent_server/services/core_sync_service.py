@@ -32,7 +32,6 @@ from pathlib import Path
 from threading import Lock
 
 from ..config import settings
-from .client_resolver_service import ClientResolverService, ResolvedClient
 
 _registry_lock = Lock()
 _module_locks: dict[str, Lock] = {}
@@ -57,14 +56,14 @@ def _safe_name(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", value)
 
 
-def _deployed_sha(client: ResolvedClient | None = None) -> str | None:
+def _deployed_sha() -> str | None:
     """Best-effort fetch of the currently deployed commit sha on Odoo.sh.
 
     Cached briefly so a burst of ensure_module_synced() calls in one
     scope_advice/verify_against_core pass doesn't open a new SSH connection
     per module.
     """
-    host = (client.odoosh_ssh_host if client else None) or settings.odoosh_ssh_host or ""
+    host = settings.odoosh_ssh_host or ""
     now = time.time()
     cached = _sha_cache.get(host)
     if cached and (now - cached[1]) < _SHA_CACHE_TTL:
@@ -73,7 +72,7 @@ def _deployed_sha(client: ResolvedClient | None = None) -> str | None:
     try:
         from .odoosh_service import OdooShService
 
-        result = OdooShService(client).deployed_sha()
+        result = OdooShService().deployed_sha()
         if result.exit_code == 0 and result.stdout:
             lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
             sha = lines[-1] if lines else None
@@ -83,49 +82,7 @@ def _deployed_sha(client: ResolvedClient | None = None) -> str | None:
     return sha
 
 
-
-def _resolve_client_for_sync(client_name: str | None = None, client: ResolvedClient | None = None) -> ResolvedClient | None:
-    """Return the selected ODOO_CLIENTS entry for core sync.
-
-    In multi-client mode the SSH settings live on the selected client, not on
-    process-wide settings.  This helper keeps core sync isolated per client and
-    falls back to global settings only for legacy single-client deployments.
-    """
-    if client is not None:
-        return client
-    try:
-        return ClientResolverService().resolve_client(client_name=client_name, require_complete=False)
-    except Exception:  # noqa: BLE001 - sync is best-effort and must never break callers
-        return None
-
-
-def _target_for_sync(client: ResolvedClient | None):
-    try:
-        from .odoosh_service import OdooShService
-
-        return OdooShService(client)._target()  # reuse client-aware SSH/key resolution
-    except Exception:  # noqa: BLE001 - caller treats None as sync unavailable
-        return None
-
-
-def _normalise_root(remote_root: str, client: ResolvedClient | None) -> str:
-    """Normalize source roots to real Odoo.sh addon directories.
-
-    Community addons are under /home/odoo/src/odoo/addons.  Older callers pass
-    /home/odoo/src/odoo, which caused rsync to look for /home/odoo/src/odoo/<module>
-    and miss every native addon.  Keep compatibility by mapping the Odoo source
-    root to its addons subdirectory.
-    """
-    root = str(remote_root or "").rstrip("/")
-    odoo_root = (client.odoosh_odoo_path if client else None) or "/home/odoo/src/odoo"
-    odoo_root = str(odoo_root).rstrip("/")
-    if root == odoo_root:
-        return f"{odoo_root}/addons"
-    if root.endswith("/odoo"):
-        return f"{root}/addons"
-    return root
-
-def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: int = 45, *, client_name: str | None = None, client: ResolvedClient | None = None) -> bool:
+def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: int = 45) -> bool:
     """Best-effort: make sure {remote_root}/{module_name} exists and is fresh locally.
 
     remote_root must be one of the existing hardcoded roots
@@ -137,18 +94,14 @@ def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: in
     """
     if not settings.core_sync_enabled:
         return False
+    if not settings.odoosh_ssh_host:
+        return False
     if not module_name or "/" in module_name or module_name.startswith("."):
         return False
 
-    selected_client = _resolve_client_for_sync(client_name=client_name, client=client)
-    target = _target_for_sync(selected_client)
-    if target is None:
-        return False
-
-    source_root = _normalise_root(remote_root, selected_client)
-    local_dir = Path(source_root) / module_name
+    local_dir = Path(remote_root) / module_name
     marker = local_dir / ".synced_sha"
-    sha = _deployed_sha(selected_client)
+    sha = _deployed_sha()
 
     with _module_lock(remote_root, module_name):
         if local_dir.exists() and local_dir.is_dir():
@@ -179,11 +132,12 @@ def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: in
         ssh_opts = [
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", "ConnectTimeout=10",
-            "-p", str(target.port),
+            "-p", str(settings.odoosh_ssh_port),
         ]
-        if target.key_path:
-            ssh_opts += ["-i", str(target.key_path), "-o", "IdentitiesOnly=yes"]
-        remote = f"{target.user}@{target.host}:{source_root}/{module_name}/"
+        key_path = settings.effective_odoosh_ssh_key_path
+        if key_path:
+            ssh_opts += ["-i", str(key_path)]
+        remote = f"{settings.odoosh_ssh_user}@{settings.odoosh_ssh_host}:{remote_root}/{module_name}/"
         cmd = [
             "rsync", "-az", "--delete", "--timeout", str(timeout_seconds),
             "-e", "ssh " + " ".join(ssh_opts),

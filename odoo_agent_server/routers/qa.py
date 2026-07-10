@@ -24,21 +24,8 @@ def self_run(payload: SelfRunRequest) -> SelfRunReport:
     validator = OdooModuleValidator()
     findings.extend(validator.validate(module_path))
 
-    project_path_valid = project_path.exists() and project_path.is_dir()
-    if not project_path_valid:
-        reason = "Project path is missing." if not project_path.exists() else "Project path is not a directory."
-        findings.insert(
-            0,
-            Finding(
-                severity=Severity.error,
-                code="PROJECT_PATH_NOT_FOUND",
-                message=f"{reason} Cannot run QA commands: {project_path}",
-                hint="Verify project_path before running qa.self_run or workflow.safe_deploy_module.",
-            ),
-        )
-
     runner = TestRunner()
-    if project_path_valid and payload.include_git_status:
+    if payload.include_git_status:
         git_result = runner.git_status(project_path)
         commands.append(git_result)
         if git_result.exit_code not in (0, 128):
@@ -51,7 +38,7 @@ def self_run(payload: SelfRunRequest) -> SelfRunReport:
                 )
             )
 
-    if project_path_valid and payload.run_pytest:
+    if payload.run_pytest:
         has_tests = (module_path / "tests").exists() or (project_path / "tests").exists()
         if has_tests:
             pytest_result = runner.pytest(project_path, timeout_seconds=payload.timeout_seconds)
@@ -90,6 +77,5 @@ def self_run(payload: SelfRunRequest) -> SelfRunReport:
             "warnings": warning_count,
             "infos": sum(1 for item in findings if item.severity == Severity.info),
             "commands_run": len(commands),
-            "project_path_valid": project_path_valid,
         },
     )

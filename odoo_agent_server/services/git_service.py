@@ -146,36 +146,6 @@ class GitService:
             )
         return CommandResult(command=["git", "validate-target"], cwd=str(project), exit_code=0, stdout="Target git remote/branch validated.\n")
 
-
-    def fetch_reset_hard(self, project_path: str, remote: str = "origin", branch: str | None = None, timeout_seconds: int = 120) -> CommandResult:
-        """Force the local checkout to match origin/<branch>.
-
-        Used by workflow checkout guards when a module was known to exist from a
-        prior deploy but the local working tree no longer contains it, which can
-        happen after an ephemeral workspace reset or when a different checkout
-        instance pushed the module earlier.
-        """
-        project = self._project(project_path)
-        if not branch:
-            branch_result = self.current_branch(str(project))
-            if branch_result.exit_code != 0:
-                return branch_result
-            branch = branch_result.stdout.strip()
-        if branch in {"", "HEAD", None}:
-            return CommandResult(
-                command=["git", "fetch", remote, "&&", "git", "reset", "--hard", f"{remote}/<branch>"],
-                cwd=str(project),
-                exit_code=2,
-                stderr="Cannot sync checkout without an explicit branch.",
-            )
-        remote_result = self._run(["git", "remote", "get-url", remote], project, 20)
-        if remote_result.exit_code != 0:
-            return remote_result
-        fetch = self._run(["git", "fetch", remote], project, timeout_seconds)
-        if fetch.exit_code != 0:
-            return fetch
-        return self._run(["git", "reset", "--hard", f"{remote}/{branch}"], project, timeout_seconds)
-
     def pull_rebase(self, project_path: str, remote: str = "origin", branch: str | None = None, timeout_seconds: int = 120) -> CommandResult:
         project = self._project(project_path)
         if not branch:
