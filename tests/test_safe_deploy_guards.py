@@ -2144,3 +2144,49 @@ def test_safe_deploy_wait_for_result_response_never_uses_progress_wording(tmp_pa
     assert "may take a few minutes" not in failure_text
     assert "check back" not in failure_text
     assert "in progress" not in failure_text
+
+
+def test_module_upgrade_success_accepts_inline_odoosh_ssh_fallback():
+    result = OdooResult(
+        status="ok",
+        result={
+            "operation": "deploy",
+            "ssh": {
+                "command": ["odoosh.module_deploy_ssh", "x_module", "-u"],
+                "cwd": "odoosh:ssh",
+                "exit_code": 0,
+                "stdout": "MCP_SSH_DEPLOY mode=upgrade state=installed module=x_module\n",
+                "stderr": "INFO odoo.modules.loading: Modules loaded.\nINFO odoo.modules.registry: Registry loaded in 3.0s\n",
+                "timed_out": False,
+            },
+            "fallback": "odoosh",
+        },
+    )
+
+    assert workflow._module_upgrade_success(result) is True
+
+
+def test_module_upgrade_success_rejects_failed_inline_odoosh_ssh_fallback():
+    result = OdooResult(
+        status="ok",
+        result={
+            "operation": "deploy",
+            "ssh": {
+                "command": ["odoosh.module_deploy_ssh", "x_module", "-u"],
+                "exit_code": 3,
+                "stdout": "MCP_SSH_DEPLOY mode=upgrade state=installed module=x_module\n",
+                "stderr": "MCP_CLASSIFIED_FAILURE: ParseError",
+            },
+        },
+    )
+
+    assert workflow._module_upgrade_success(result) is False
+
+
+def test_unknown_upgrade_result_is_inconclusive_not_permanent():
+    transient, classification = workflow._classify_upgrade_failure(
+        "Module upgrade failed; odoosh.error_pack returned no additional detail."
+    )
+
+    assert transient is False
+    assert classification == "inconclusive:no_explicit_failure"

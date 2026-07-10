@@ -1344,24 +1344,63 @@ def _safe_deploy_payload(value) -> dict[str, object]:
 
 
 def _module_upgrade_success(value) -> bool:
-    """True only for explicit finished/success module-upgrade proof."""
+    """Return True only when the upgrade has explicit terminal success proof.
+
+    Two valid result shapes exist:
+
+    * background-job results: ``finished=True`` with a passed job status;
+    * the synchronous Odoo.sh SSH fallback: ``status=ok`` and an embedded
+      ``ssh`` command result with ``exit_code=0``.
+
+    The previous implementation understood only the first shape, so every
+    successful SSH fallback was misclassified as failed and then reverted.
+    """
     payload = _safe_deploy_payload(value)
     if payload.get("status") != "ok":
         return False
+
     nested = payload.get("result")
     if not isinstance(nested, dict):
         return False
-    if nested.get("finished") is not True:
-        return False
-    job_status = nested.get("job_status")
-    if job_status is not None and str(job_status) not in {JobStatus.passed.value, "ok", "passed"}:
-        return False
-    nested_job = nested.get("job")
-    if isinstance(nested_job, dict):
-        nested_status = nested_job.get("status")
-        if nested_status is not None and str(nested_status) != JobStatus.passed.value:
+
+    # Public/background deploy contract. A non-terminal child job must never be
+    # accepted as success.
+    if "finished" in nested:
+        if nested.get("finished") is not True:
             return False
-    return True
+        job_status = nested.get("job_status")
+        if job_status is not None and str(job_status) not in {JobStatus.passed.value, "ok", "passed"}:
+            return False
+        nested_job = nested.get("job")
+        if isinstance(nested_job, dict):
+            nested_status = nested_job.get("status")
+            if nested_status is not None and str(nested_status) != JobStatus.passed.value:
+                return False
+        return True
+
+    # Inline Odoo.sh SSH fallback contract produced by
+    # OdooService._command_result(). The outer status is derived from the same
+    # command exit code, but require the embedded proof as well so an arbitrary
+    # ``status=ok`` payload cannot be treated as an upgrade confirmation.
+    operation = str(nested.get("operation") or "").strip().lower()
+    ssh_result = nested.get("ssh")
+    if operation in {"deploy", "module_deploy", "module_update", "module_install"} and isinstance(ssh_result, dict):
+        try:
+            exit_code = int(ssh_result.get("exit_code"))
+        except (TypeError, ValueError):
+            return False
+        if exit_code != 0:
+            return False
+        command = ssh_result.get("command")
+        command_text = " ".join(str(part) for part in command) if isinstance(command, list) else str(command or "")
+        stdout = str(ssh_result.get("stdout") or "")
+        return (
+            "odoosh.module_deploy_ssh" in command_text
+            or "MCP_SSH_DEPLOY" in stdout
+            or operation in {"module_update", "module_install"}
+        )
+
+    return False
 
 
 def _extract_error_pack_json(error_pack: CommandResult | None) -> dict[str, object]:
@@ -1459,7 +1498,7 @@ def _classify_upgrade_failure(text: str) -> tuple[bool, str]:
     transient = _TRANSIENT_UPGRADE_ERROR_RE.search(value)
     if transient:
         return True, f"transient:{transient.group(0).strip()[:120]}"
-    return False, "non_retryable:unclassified_failure"
+    return False, "inconclusive:no_explicit_failure"
 
 
 def _error_pack_implicated_files(
@@ -2211,7 +2250,25 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 time.sleep(delay)
 
         if not upgrade_passed:
-            _rollback_after_failure("odoo_module_deploy")
+            # Revert only when Odoo produced a proven permanent code/schema
+            # failure. Transport failures and inconclusive result shapes must
+            # preserve the pushed commit so a parser/availability issue cannot
+            # silently undo valid user work.
+            proven_permanent_failure = bool(
+                last_classification.startswith("non_retryable:")
+                and last_classification != "non_retryable:unclassified_failure"
+            )
+            if proven_permanent_failure:
+                _rollback_after_failure("odoo_module_deploy")
+            else:
+                _step(
+                    "rollback_skipped_unproven_failure",
+                    "passed",
+                    {
+                        "classification": last_classification or "inconclusive:no_explicit_failure",
+                        "reason": "No proven permanent upgrade error; preserving pushed commit.",
+                    },
+                )
             job = store.get_job(job_id)
             attempts_text = f"{attempts_made} attempt" if attempts_made == 1 else f"{attempts_made} attempts"
             final_status = (
