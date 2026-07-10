@@ -1030,7 +1030,8 @@ def _resolve_code_change_project(payload: OdooCodeChangeRequest) -> tuple[str | 
     project_path = payload.project_path or (client.path if client else None)
     if not project_path:
         raise HTTPException(status_code=400, detail="project_path or client_name is required for workflow.odoo_code_change")
-    return (client.name if client else payload.client_name), project_path
+    resolved_client_name = client.name if client else payload.client_name
+    return resolved_client_name, str(project_path)
 
 
 def _safe_module_relative(module_name: str, relative_path: str) -> str:
@@ -1466,7 +1467,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     provider calls this one tool, the connector performs the v15 custom+core read,
     applies explicit edits, verifies, starts safe deploy, and returns a job_id for jobs.get.
     """
-    client_name, project_path = _resolve_code_change_project(payload)
+    resolved_client_name, project_path = _resolve_code_change_project(payload)
+    client_name = resolved_client_name or payload.client_name
     repo = RepoService()
     gate = PreWriteGateService()
     steps: list[dict[str, Any]] = []
