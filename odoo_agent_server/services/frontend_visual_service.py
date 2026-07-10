@@ -70,19 +70,87 @@ class FrontendVisualService:
             "component_type": component_type,
             "asset_name": asset_name,
             "css_file": css_file,
-            "reason": "SCSS-only selected because SVG asset generation was not requested and the task appears to be normal layout/card styling.",
+            "reason": "SCSS selected at runtime because the visual is layout-driven or must follow live component dimensions; fixed SVG geometry is not required.",
         }
         return writes, plan
 
+
+    def _choose_css_target(
+        self,
+        payload: FrontendVisualImplementRequest,
+        module_name: str,
+        asset_name: str,
+        design_text: str,
+    ) -> tuple[str, str]:
+        """Resolve one module-owned stylesheet and preserve its current content."""
+        requested = payload.css_file_path or f"{module_name}/static/src/css/{asset_name}.scss"
+        relative_path = self._module_rel(module_name, requested)
+        existing = ""
+        if payload.project_path:
+            target = (Path(payload.project_path).resolve() / relative_path).resolve()
+            project = Path(payload.project_path).resolve()
+            try:
+                target.relative_to(project)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Visual CSS target escapes project checkout") from exc
+            if target.exists():
+                if not target.is_file():
+                    raise HTTPException(status_code=400, detail="Visual CSS target is not a file")
+                existing = target.read_text(encoding="utf-8")
+        return relative_path, existing
+
+    def _merge_generated_css(self, existing: str, asset_name: str, generated: str) -> str:
+        """Replace this generator's previous block without duplicating rules."""
+        start = f"/* BEGIN frontend_visual:{asset_name} */"
+        end = f"/* END frontend_visual:{asset_name} */"
+        block = f"{start}\n{generated.rstrip()}\n{end}"
+        pattern = re.compile(re.escape(start) + r".*?" + re.escape(end), re.DOTALL)
+        if pattern.search(existing):
+            return pattern.sub(block, existing, count=1).rstrip() + "\n"
+        prefix = existing.rstrip()
+        return f"{prefix}\n\n{block}\n" if prefix else f"{block}\n"
+
     def _select_strategy(self, payload: FrontendVisualImplementRequest, design_text: str) -> str:
+        """Choose the implementation at runtime from behavior, not keywords alone.
+
+        ``allowed_methods`` is a strict allow-list. Dynamic or expandable visuals
+        always prefer SCSS because their geometry must follow the live DOM size.
+        SVG is reserved for fixed artwork and is never selected merely because
+        the request contains words such as ``pipe`` or ``border``.
+        """
         allowed = {self._normalise(item) for item in (payload.allowed_methods or []) if item}
-        if "svg_asset" in allowed or "svg" in allowed:
+        if allowed:
+            supports_scss = bool({"scss", "css"} & allowed)
+            supports_svg = bool({"svg", "svg_asset"} & allowed)
+        else:
+            supports_scss = supports_svg = True
+
+        dynamic_tokens = (
+            "dynamic", "expandable", "expandable", "responsive", "auto height",
+            "variable height", "variable width", "follow height", "follow width",
+            "stretch", "grows", "shrinks", "runtime size", "content height",
+        )
+        fixed_art_tokens = (
+            "fixed artwork", "logo", "illustration", "static icon",
+            "fixed decorative shape", "exact vector", "non-scaling artwork",
+        )
+        is_dynamic = any(token in design_text for token in dynamic_tokens)
+        is_fixed_art = any(token in design_text for token in fixed_art_tokens)
+
+        if is_dynamic:
+            if not supports_scss:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Dynamic/expandable visual requires SCSS, but SCSS is not allowed by allowed_methods.",
+                )
+            return "scss"
+        if is_fixed_art and supports_svg:
             return "svg_asset"
-        if any(token in design_text for token in ("svg", "pipe", "elbow", "logo", "icon", "illustration", "special border", "decorative border", "background shape", "glass border")):
+        if supports_scss:
+            return "scss"
+        if supports_svg:
             return "svg_asset"
-        if self._normalise(payload.component_type or "") in {"border", "background", "logo", "icon", "illustration"}:
-            return "svg_asset"
-        return "scss"
+        raise HTTPException(status_code=400, detail="No supported frontend visual implementation method is allowed.")
 
     def _default_asset_name(self, component_type: str, design_text: str) -> str:
         if "pipe" in design_text or "elbow" in design_text or "trolley" in design_text:

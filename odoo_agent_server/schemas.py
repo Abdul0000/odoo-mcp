@@ -228,7 +228,7 @@ class OdooCodeChangeRequest(BaseModel):
     target_hint: str | None = Field(default=None, max_length=500, description="Optional generic target hint for search/autopatch, such as a visible label, method, class, XML id, field, route, or file clue.")
     change_request: dict[str, Any] = Field(default_factory=dict, description="Optional structured generic change request. Safe autopatch currently supports style/text replacement shortcuts; all other task types fall back to inspection + writes.")
     patch_strategy: str = Field(default="auto", max_length=80, description="Patch strategy hint: auto, inspect_only, explicit_writes, safe_autopatch, text_replace, style_rule, inline_style, etc.")
-    verify_targets: list[str] = Field(default_factory=list, max_length=20, description="Generic verification hints such as URLs, model names, menus, methods, or CSS selectors. URL-like values can be copied into verify_ui_paths by the client.")
+    verify_targets: list[str] = Field(default_factory=list, max_length=20, description="Generic verification hints such as model names, menus, methods, or CSS selectors.")
     # Backward-compatible convenience fields for simple style/text tasks. They are
     # normalized into target_hint/change_request internally and do not limit the workflow.
     target_text: str | None = Field(default=None, max_length=500, description="Backward-compatible exact visible text for focused inspection/autopatch. Prefer target_hint for new clients.")
@@ -238,7 +238,6 @@ class OdooCodeChangeRequest(BaseModel):
     writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=20, description="Actual file edits to apply. If empty, the tool returns focused inspection context or can autopatch when allow_autopatch/style/target_text are provided.")
     commit_message: str | None = Field(default=None, max_length=300, description="Commit message for safe deploy. Defaults to a concise message from task_description.")
     auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
-    verify_ui_paths: list[str] = Field(default_factory=list, max_length=20, description="Optional live Odoo paths to verify after deploy; required before visible UI claims are allowed")
     max_search_matches: int = Field(default=20, ge=1, le=100, description="Max candidate matches returned during inspect mode")
 
     @field_validator("module_name")
@@ -277,7 +276,6 @@ class FrontendVisualImplementRequest(BaseModel):
     variants: list[dict[str, Any]] = Field(default_factory=list, max_length=12, description="Optional SVG variants, e.g. [{name:'active', palette:'gold'}].")
     commit_message: str | None = Field(default=None, max_length=300, description="Commit message. Defaults to a concise message from design_goal.")
     auto_deploy: bool = Field(default=True, description="After generated writes pass verification, start safe deploy and return jobs.get next_call.")
-    verify_ui_paths: list[str] = Field(default_factory=list, max_length=20, description="Optional live Odoo paths to verify after deploy.")
 
     @field_validator("module_name")
     @classmethod
@@ -979,16 +977,6 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     run_qa: bool = Field(default=True, description="Run qa.self_run by default so deploy failures surface before long Odoo.sh polling. Set False only for an explicit, intentional bypass.")
     wait_for_odoosh: bool = Field(default=True)
     upgrade_module: bool = Field(default=True)
-    verify_ui_paths: list[str] = Field(
-        default_factory=list,
-        max_length=50,
-        description=(
-            "Optional Odoo web paths to open after upgrade for live UI breakage checks, "
-            "for example /web#action=123&model=sale.order&view_type=form."
-        ),
-    )
-    verify_ui_screenshot_prefix: str = Field(default="safe_deploy_ui", description="Screenshot filename prefix for verify_ui_paths")
-    verify_ui_timeout_seconds: int = Field(default=45, ge=10, le=180, description="Per-page browser timeout for verify_ui_paths")
     wait_for_result: bool = Field(
         default=True,
         description=(

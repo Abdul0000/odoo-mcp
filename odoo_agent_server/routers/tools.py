@@ -264,7 +264,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.full_verify",
         title="Run full verification", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module",
-        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 10 minutes for the pushed SHA, reject recent Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths. For MCP clients this starts/resumes a background safe-deploy job and returns job_id/next_call immediately; status=running is not success and must be followed via jobs.get. Only treat the deployment as complete when response.deploy_confirmed == true. A finished job without this field set to true means the deploy did not fully complete — do not report success to the user. If git diff shows no changes for this module, safe_deploy_module automatically runs Odoo.sh source verification and returns verified_already_deployed/already_deployed_confirmed; read this field before telling the user anything is 'already added' or 'already live'. Do not make that claim from memory of a previous turn.", requires_approval=True),
+        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 10 minutes for the pushed SHA, reject recent Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, upgrade an Odoo module, For MCP clients this starts/resumes a background safe-deploy job and returns job_id/next_call immediately; status=running is not success and must be followed via jobs.get. Only treat the deployment as complete when response.deploy_confirmed == true. A finished job without this field set to true means the deploy did not fully complete — do not report success to the user. If git diff shows no changes for this module, safe_deploy_module automatically runs Odoo.sh source verification and returns verified_already_deployed/already_deployed_confirmed; read this field before telling the user anything is 'already added' or 'already live'. Do not make that claim from memory of a previous turn.", requires_approval=True),
     ToolDescriptor(
         name="workflow.verify_deployed_module",
         title="Verify deployed source",
@@ -1754,7 +1754,6 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         wait_for_result=False,
         wait_timeout_seconds=0,
         upgrade_module=True,
-        verify_ui_paths=payload.verify_ui_paths,
     )
     try:
         deploy = await safe_deploy_module(deploy_payload)
@@ -1782,7 +1781,6 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         }
     job_id = deploy_struct.get("job_id") if isinstance(deploy_struct, dict) else None
     frontend_touched = any(str(p).endswith((".xml", ".scss", ".css", ".js")) for p in written_files_abs)
-    visible_claim_allowed = bool(payload.verify_ui_paths and deploy_struct.get("deploy_confirmed") is True)
     return {
         "status": "deploy_started" if deploy_struct.get("status") in {"running", "already_running", "already_in_progress", "resumable_existing_job"} else deploy_struct.get("status", "deploy_started"),
         "message": "Code change workflow completed through verify phase; safe deploy is server-owned. Poll jobs.get until terminal result before final answer.",
@@ -1809,8 +1807,6 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "source_deployed": False,
         "module_upgraded": False,
         "core_verified": not verify.push_blocked,
-        "ui_verified": False,
-        "visible_claim_allowed": visible_claim_allowed,
         "frontend_touched": frontend_touched,
         "allowed_summary": "Code was written and verified; deploy is running. Do not claim pushed/deployed/upgraded until jobs.get returns terminal passed with deploy_confirmed=true.",
         "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}} if job_id else None,
@@ -1853,7 +1849,6 @@ async def _workflow_frontend_visual_implement(payload: FrontendVisualImplementRe
         writes=writes,
         commit_message=payload.commit_message or f"Implement frontend visual {visual_plan.get('asset_name', 'asset')}",
         auto_deploy=payload.auto_deploy,
-        verify_ui_paths=payload.verify_ui_paths,
     )
     result = await _workflow_odoo_code_change(change_payload)
     if isinstance(result, dict):
@@ -1861,7 +1856,7 @@ async def _workflow_frontend_visual_implement(payload: FrontendVisualImplementRe
         result.setdefault("generated_visual_writes", [w.model_dump(mode="json") for w in writes])
         result.setdefault(
             "visual_implementation_note",
-            "For exact borders/logos/backgrounds, the generated SVG assets should be referenced from bundled SCSS instead of approximating with CSS borders.",
+            "The implementation method was selected at runtime from the component behavior. Dynamic dimensions use SCSS; SVG is reserved for fixed artwork.",
         )
     return result
 
@@ -2127,7 +2122,6 @@ _SAFE_DEPLOY_STEPS = [
     "odoo_module_status",
     "registry_field_verify",
     "registry_smoke_test",
-    "browser_ui_verify",
 ]
 _SAFE_DEPLOY_STEP_ALIASES = {
     "qa": "qa_self_run",
@@ -2710,32 +2704,6 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                 result = odoo.registry_smoke_test(module_name, [], [], strict=False)
                 resume_results["steps_run"][step_name] = {"status": result.status, "result": _step_payload(result)}
 
-            elif step_name == "browser_ui_verify":
-                verify_paths = original_request.get("verify_ui_paths") or []
-                if not verify_paths:
-                    resume_results["steps_run"][step_name] = {"status": "skipped"}
-                    continue
-                browser_results = []
-                browser = CdpBrowserService()
-                failed_paths = []
-                warning_paths = []
-                for index, path in enumerate(verify_paths, start=1):
-                    result = await browser.screenshot_odoo_page(
-                        start_path=path,
-                        screenshot_name=f"{module_name}_resume_ui_{index}.png",
-                    )
-                    payload_result = _step_payload(result)
-                    browser_results.append({"path": path, "result": payload_result})
-                    if result.status == "failed":
-                        failed_paths.append(path)
-                    elif result.console_errors or result.network_errors:
-                        warning_paths.append(path)
-                status_value = "failed" if failed_paths else "warning" if warning_paths else "ok"
-                resume_results["steps_run"][step_name] = {"status": status_value, "result": browser_results}
-                if failed_paths:
-                    resume_results["status"] = "failed"
-                    resume_results["message"] = f"Browser UI verification failed for: {failed_paths}"
-                    return _persist_resume_result(store, job, resume_results, original_request)
 
         except Exception as exc:
             resume_results["steps_run"][step_name] = {"status": "error", "error": str(exc)}

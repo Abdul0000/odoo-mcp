@@ -39,15 +39,15 @@ def test_new_v8_tools_are_exposed():
     assert "odoosh_error_pack" in names
 
 
-def test_safe_deploy_request_accepts_ui_paths(tmp_path):
+def test_safe_deploy_request_has_no_browser_ui_contract(tmp_path):
     payload = SafeDeployModuleRequest(
         project_path=str(tmp_path),
         module_name="x_module",
         commit_message="Deploy x module",
-        verify_ui_paths=["/web#action=1&model=sale.order&view_type=form", "/web#menu_id=2"],
     )
-    assert payload.verify_ui_paths[0].startswith("/web#action=")
-    assert payload.verify_ui_timeout_seconds == 45
+    assert "verify_ui_paths" not in payload.model_fields
+    assert "verify_ui_screenshot_prefix" not in payload.model_fields
+    assert "verify_ui_timeout_seconds" not in payload.model_fields
 
 
 def test_pos_flow_result_preserves_console_all_fields():

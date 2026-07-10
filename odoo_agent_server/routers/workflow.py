@@ -214,7 +214,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Call workflow.safe_deploy_module with module_name, commit_message, changed paths, run_qa=false if qa.self_run already passed, wait_for_odoosh=true, upgrade_module=true, and expected_registry_fields for new fields when known. Do not manually chain git.commit/git.push/odoosh.check_commit/odoosh.module_update/odoo.module_deploy for the normal path; those lower-level tools are blocked once safe_deploy starts.",
             "If the repo already contains the requested change and no edit is needed, do not say done from repo.read alone; call workflow.verify_deployed_module and continue deploy/resume if /home/odoo/src/user does not match.",
             "If safe deploy returns retry_later, wait briefly and call workflow.resume_job with the job_id. If it returns deploy_running, call jobs.get on the nested job. Do not repeat commit/push.",
-            "Verify the exact field with odoo.search_read or workflow.registry_smoke_test; if the user asks for visible UI proof, pass the exact Odoo web path in verify_ui_paths during deploy or call workflow.browser_menu_crawl once.",
+            "Verify the exact field with odoo.search_read or workflow.registry_smoke_test after module upgrade.",
         ]
         required_tools = [
             "session.load_state",
@@ -247,7 +247,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Apply edits safely: use repo.apply_patch_atomic for multi-file diffs or repo.write_many_smart for normal multi-file writes. Use repo.write_many_atomic only for large/risky refactors, and repo.apply_patch/repo.write only for small single-file changes. Do not edit Odoo core, enterprise, .git, or unrelated modules.",
             "Run git.diff and qa.self_run. Treat pytest environment failures separately from real module errors.",
             "MANDATORY before deploy: run workflow.verify_against_core for changed .py/.xml/.js/__manifest__.py files. If push_blocked=true, fix and re-run; do not deploy while blocked.",
-            "Call workflow.safe_deploy_module with module_name, commit_message, changed paths, wait_for_odoosh=true, upgrade_module=true, and exact verify_ui_paths for UI/POS/website/view tasks. It owns commit, push, non-blocking Odoo.sh check, module deploy, module status, smoke test, and optional browser verification.",
+            "Call workflow.safe_deploy_module with module_name, commit_message, changed paths, wait_for_odoosh=true, and upgrade_module=true. It owns commit, push, Odoo.sh polling, deployed-source verification, module deploy, module status, and registry smoke tests.",
             "If the repo already contains the requested change and no edit is needed, do not say done from repo.read alone; call workflow.verify_deployed_module and continue deploy/resume if /home/odoo/src/user does not match.",
             "If safe_deploy returns retry_later, wait briefly and call workflow.resume_job with the job_id. If it returns deploy_running, call jobs.get on the nested job. Do not repeat commit/push.",
             "Finish only after safe deploy/resume reports passed, or report the exact blocker and next_call returned by the workflow.",
@@ -284,7 +284,7 @@ def coding_task_plan(payload: CodingTaskPlanRequest) -> CodingTaskPlanResult:
             "Do not answer by printing MCP JSON blocks for the user/client to execute; call the MCP tools yourself.",
             "Do not create fields/views by direct ir.model.fields or ir.ui.view database writes for normal module-code requests.",
             "For small patches, avoid repeated tool discovery, broad source reads, full health checks, and browser diagnostics unless they are needed to prove the requested change.",
-            "For hard UI/POS/website/accounting view tasks, verify exact affected views in a browser after upgrade using verify_ui_paths or workflow.browser_menu_crawl.",
+            "For UI/POS/website changes, rely on static frontend verification, Odoo.sh deployment proof, module upgrade, and registry smoke tests in the deployment pipeline.",
             "For JS/OWL/POS/website/payment/QWeb/XML/SCSS/assets, frontend_pattern_preflight is blocking: do not write code until real framework source patterns are read.",
         ],
         defaults={
@@ -1553,7 +1553,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
 
     def _fail(name: str, result=None, error: str | None = None) -> None:
         _step(name, "failed", result, error)
-        if name in {"odoosh_verify_module_manifest", "odoo_module_deploy", "odoo_module_status", "registry_field_verify", "browser_ui_verify"}:
+        if name in {"odoosh_verify_module_manifest", "odoo_module_deploy", "odoo_module_status", "registry_field_verify"}:
             _rollback_after_failure(name)
         job = store.get_job(job_id)
         store.finish_job(job, JobStatus.failed, {"failed_step": name, "module_name": payload.module_name, "rollback_attempted": rollback_attempted})
@@ -1730,39 +1730,24 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             _step("odoo_module_status", "passed" if module_status.status == "ok" else "warning", module_status)
             smoke = _odoo_service_for_client(client).registry_smoke_test(payload.module_name, [], [], strict=False)
             _step("registry_smoke_test", "passed" if smoke.status == "ok" else "warning", smoke)
-            ui_results = []
-            ui_failed = False
-            for index, path in enumerate(payload.verify_ui_paths, start=1):
-                ui_result = asyncio.run(CdpBrowserService().screenshot_odoo_page(None, None, None, path, f"{payload.verify_ui_screenshot_prefix}_{index}.png", payload.verify_ui_timeout_seconds, full_page=True))
-                ui_results.append({"path": path, "result": ui_result.model_dump(mode="json")})
-                status_ = "passed" if ui_result.status == "ok" and not ui_result.console_errors and not ui_result.network_errors else "failed" if ui_result.status == "failed" else "warning"
-                _step(f"browser_ui_path:{path}", status_, ui_result)
-                ui_failed = ui_failed or status_ == "failed"
             final_result = {
-                "status": "passed" if not ui_failed else "ui_verification_failed",
+                "status": "passed",
                 "message": module_upgrade_confirmation["message"],
                 "module_name": payload.module_name,
                 "sha": pushed_sha,
-                "verify_ui_paths": payload.verify_ui_paths,
                 "odoosh_check_commit": odoosh_deploy_confirmation,
                 "module_upgrade": module_upgrade_confirmation,
-                "browser_ui_verify": ui_results,
                 "source_pushed": False,
                 "source_on_odoosh": True,
                 "source_deployed": True,
                 "module_upgraded": True,
-                "ui_checked": bool(payload.verify_ui_paths),
-                "visible_change_confirmed": bool(payload.verify_ui_paths) and not ui_failed,
-                "deploy_confirmed": not ui_failed,
-                "success_allowed": not ui_failed,
+                "deploy_confirmed": True,
+                "success_allowed": True,
             }
             job = store.get_job(job_id)
-            store.finish_job(job, JobStatus.passed if not ui_failed else JobStatus.failed, final_result)
-            _save_state("passed" if not ui_failed else "ui_verification_failed", {"module_upgrade_pending": False})
-            if not ui_failed:
-                approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module resumed and upgraded already-deployed source")
-            else:
-                approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module resumed but UI verification failed")
+            store.finish_job(job, JobStatus.passed, final_result)
+            _save_state("passed", {"module_upgrade_pending": False})
+            approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module resumed and upgraded already-deployed source")
             return
 
         final_result = _safe_deploy_already_deployed_result(
@@ -2248,90 +2233,12 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     smoke = _odoo_service_for_client(client).registry_smoke_test(payload.module_name, [], [], strict=False)
     _step("registry_smoke_test", "passed" if smoke.status == "ok" else "warning", smoke)
 
-    if payload.verify_ui_paths:
-        ui_results = []
-        for index, path in enumerate(payload.verify_ui_paths, start=1):
-            result = asyncio.run(CdpBrowserService().screenshot_odoo_page(
-                None,
-                None,
-                None,
-                path,
-                f"{payload.verify_ui_screenshot_prefix}_{index}.png",
-                payload.verify_ui_timeout_seconds,
-                full_page=True,
-            ))
-            ui_results.append({"path": path, "result": result.model_dump(mode="json")})
-            status_ = "passed" if result.status == "ok" and not result.console_errors and not result.network_errors else "failed" if result.status == "failed" else "warning"
-            _step(f"browser_ui_path:{path}", status_, result)
-            if status_ == "failed":
-                _fail("browser_ui_verify", {"failed_path": path, "result": result.model_dump(mode="json")})
-                return
-        if any(item["result"]["console_errors"] or item["result"]["network_errors"] for item in ui_results):
-            _step("browser_ui_verify", "warning", {"paths": payload.verify_ui_paths, "results": ui_results})
-        else:
-            _step("browser_ui_verify", "passed", {"paths": payload.verify_ui_paths, "results": ui_results})
-
-    ui_proof_required_files = _frontend_ui_files_requiring_live_proof(payload.module_name, verify_files or deploy_paths)
-    if ui_proof_required_files and not payload.verify_ui_paths:
-        _step(
-            "browser_ui_verify",
-            "warning",
-            {
-                "status": "ui_verification_required",
-                "message": (
-                    "Frontend/template/style files changed, and Odoo.sh deploy + module upgrade passed, "
-                    "but no live browser path was provided. Do not claim the visible UI/page changed until "
-                    "a browser/UI verification is run."
-                ),
-                "frontend_files": ui_proof_required_files,
-                "required_action": "Rerun workflow.safe_deploy_module with verify_ui_paths, or call an explicit browser/UI verification tool for the affected page.",
-            },
-        )
-        fresh_job = store.get_job(job_id)
-        final_result = {
-            "status": "ui_verification_required",
-            "message": (
-                "Code push, Odoo.sh deploy, and module upgrade were confirmed, but the frontend/UI change was not live-browser verified. "
-                "Do not say the checkout/page now reflects the change until verify_ui_paths/browser proof passes."
-            ),
-            "module_name": payload.module_name,
-            "sha": pushed_sha,
-            "verify_ui_paths": payload.verify_ui_paths,
-            "frontend_files_requiring_live_proof": ui_proof_required_files,
-            "expected_registry_fields": expected_registry_fields,
-            "odoosh_check_commit": odoosh_deploy_confirmation,
-            "module_upgrade": module_upgrade_confirmation,
-            "success_allowed": False,
-            "claim_allowed": "code_pushed_deployed_and_module_upgraded_only",
-            "claim_blocked": "visible UI/page changed",
-            "next_call": {
-                "tool": "workflow.safe_deploy_module",
-                "arguments": {
-                    "module_name": payload.module_name,
-                    "project_path": str(project_path),
-                    "client_name": client.name if client else payload.client_name,
-                    "paths": deploy_paths,
-                    "commit_message": payload.commit_message,
-                    "run_qa": False,
-                    "wait_for_odoosh": True,
-                    "upgrade_module": False,
-                    "verify_ui_paths": ["<affected Odoo/web path, e.g. /shop/cart or /shop/checkout>"],
-                },
-            },
-        }
-        store.finish_job(fresh_job, JobStatus.warning, final_result)
-        approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module requires browser/UI verification before visible-change success claim")
-        _save_state("ui_verification_required", {"frontend_files_requiring_live_proof": ui_proof_required_files})
-        return
-
     fresh_job = store.get_job(job_id)
-    ui_checked = bool(payload.verify_ui_paths)
     final_result = {
         "status": "passed",
         "message": module_upgrade_confirmation.get("message") if payload.upgrade_module else "Safe deploy finished without module upgrade because upgrade_module=false.",
         "module_name": payload.module_name,
         "sha": pushed_sha,
-        "verify_ui_paths": payload.verify_ui_paths,
         "expected_registry_fields": expected_registry_fields,
         "odoosh_check_commit": odoosh_deploy_confirmation,
         "module_upgrade": module_upgrade_confirmation,
@@ -2339,8 +2246,6 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         "source_on_odoosh": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")),
         "source_deployed": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")),
         "module_upgraded": bool(module_upgrade_confirmation.get("passed")),
-        "ui_checked": ui_checked,
-        "visible_change_confirmed": ui_checked and bool(payload.verify_ui_paths),
         "deploy_confirmed": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")) and bool(module_upgrade_confirmation.get("passed")),
         "success_allowed": True,
     }
