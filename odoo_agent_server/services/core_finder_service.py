@@ -8,8 +8,8 @@ Mandatory dual source read:
   /home/odoo/src/user.
 
 Search priority for installed-source reads:
-  1. /home/odoo/src/enterprise (priority 1)
-  2. /home/odoo/src/odoo       (priority 2)
+  1. /home/odoo/src/odoo/addons (priority 1 — community/core addons)
+  2. /home/odoo/src/enterprise (priority 2 — fallback for enterprise-specific addons)
   3. /home/odoo/src/user       (priority 3 — fallback for other related custom addons)
 
 Adaptive scope levels:
@@ -21,6 +21,7 @@ Adaptive scope levels:
 """
 from __future__ import annotations
 
+import ast
 import os
 import re
 from pathlib import Path
@@ -33,7 +34,6 @@ from ..schemas import (
     FindCoreFileResult,
     FindSimilarViewResult,
     SimilarViewMatch,
-    ScopeAdviceRequest,
     ScopeAdviceResult,
     ScopeLevel,
     ScopeReadInstruction,
@@ -43,8 +43,8 @@ from ..schemas import (
 # Default search roots ordered by priority
 # ---------------------------------------------------------------------------
 _DEFAULT_ROOTS: list[tuple[int, str]] = [
-    (1, "/home/odoo/src/enterprise"),
-    (2, "/home/odoo/src/odoo"),
+    (1, "/home/odoo/src/odoo/addons"),
+    (2, "/home/odoo/src/enterprise"),
     (3, "/home/odoo/src/user"),
 ]
 
@@ -105,6 +105,11 @@ _IRMODEL_DETECT_RE  = re.compile(r'ir\.model|env\[.+\]\.fields_get\(')
 _CROSSMOD_DETECT_RE = re.compile(
     r'(?:comodel_name\s*=\s*["\']([^"\']+)["\']|fields\.(?:Many2many|One2many|Many2one)\s*\(\s*["\']([^"\']+)["\'])'
 )
+_XML_REF_RE = re.compile(r'ref=["\']([A-Za-z0-9_]+)\.([A-Za-z0-9_.-]+)["\']')
+_XML_INHERIT_FIELD_RE = re.compile(
+    r'<field[^>]+name=["\']inherit_id["\'][^>]+ref=["\']([A-Za-z0-9_]+)\.([A-Za-z0-9_.-]+)["\']',
+    re.IGNORECASE,
+)
 
 
 def _extract_model_literals(raw: str) -> list[str]:
@@ -135,25 +140,27 @@ class CoreFinderService:
         file_type: str,
         keyword: str,
         search_roots: Sequence[str] | None = None,
+        client_name: str | None = None,
     ) -> FindCoreFileResult:
         """Locate files matching module+type+keyword across priority roots."""
-        roots = self._resolve_roots(search_roots)
+        roots = self._resolve_roots(search_roots, client_name=client_name)
         subdirs = _FILETYPE_SUBDIRS.get(file_type, [])
         kw_lower = keyword.lower()
         all_matches: list[CoreFileMatch] = []
 
         for priority, root in roots:
             root_path = Path(root)
-            module_dir = self._module_dir_with_sync(root_path, root, module_name)
+            module_dir = self._module_dir_with_sync(root_path, root, module_name, client_name=client_name)
             if not module_dir:
                 continue
 
             candidates = self._walk_module(module_dir, subdirs)
             for abs_path in candidates:
                 name_lower = abs_path.name.lower()
-                if kw_lower not in name_lower:
-                    continue
-                if file_type == "manifest" and abs_path.name != "__manifest__.py":
+                if file_type == "manifest":
+                    if abs_path.name != "__manifest__.py":
+                        continue
+                elif kw_lower not in name_lower:
                     continue
                 if file_type != "manifest" and not self._extension_matches(abs_path, file_type):
                     continue
@@ -191,9 +198,10 @@ class CoreFinderService:
         model: str,
         view_type: str,
         search_roots: Sequence[str] | None = None,
+        client_name: str | None = None,
     ) -> FindSimilarViewResult:
         """Locate view XML files for a model+view_type across priority roots."""
-        roots = self._resolve_roots(search_roots)
+        roots = self._resolve_roots(search_roots, client_name=client_name)
         model_hints = _model_to_filename_hints(model)
         module_candidate = model.split(".")[0]
         type_patterns = _VIEWTYPE_PATTERNS.get(view_type, [])
@@ -201,7 +209,7 @@ class CoreFinderService:
 
         for priority, root in roots:
             root_path = Path(root)
-            module_dir = self._module_dir_with_sync(root_path, root, module_candidate)
+            module_dir = self._module_dir_with_sync(root_path, root, module_candidate, client_name=client_name)
             search_dirs: list[Path] = []
             if module_dir:
                 search_dirs.append(module_dir)
@@ -272,6 +280,7 @@ class CoreFinderService:
         custom_file_paths: list[str],
         task_description: str,
         search_roots: Sequence[str] | None = None,
+        client_name: str | None = None,
     ) -> ScopeAdviceResult:
         """Analyse custom module files and return adaptive mandatory read instructions.
 
@@ -286,22 +295,53 @@ class CoreFinderService:
           L3 -- computed/relational fields or ir.model: scan full models/ dir
           L4 -- cross-module comodel: read that module's manifest + model
         """
-        roots = self._resolve_roots(search_roots)
+        roots = self._resolve_roots(search_roots, client_name=client_name)
         instructions: list[ScopeReadInstruction] = []
         reached_level = ScopeLevel.L0
         cross_modules: set[str] = set()
+        related_modules: set[str] = set()
+        related_xmlids: set[tuple[str, str]] = set()
+        added_instruction_paths: set[str] = set()
 
-        # Scan provided custom Python files for patterns
+        def add_instruction(item: ScopeReadInstruction) -> None:
+            key = item.path
+            if key in added_instruction_paths:
+                return
+            added_instruction_paths.add(key)
+            instructions.append(item)
+
+        # Scan provided custom files for manifest dependencies, XML inherit refs,
+        # and Python model patterns.  Mandatory dual-read applies to XML/CSS/SCSS
+        # edits too, so manifest dependencies are used to find the related core
+        # installed-source layer even when no Python file changes.
         inherit_models: list[str] = []
         has_mixin = False
         has_computed_or_relational = False
         has_irmodel = False
 
         for fpath in custom_file_paths:
-            if not fpath.endswith(".py"):
-                continue
-            content = self._safe_read(fpath)
+            content = self._safe_read(fpath, max_bytes=300000)
             if not content:
+                continue
+
+            if fpath.endswith("__manifest__.py") or fpath.endswith("__openerp__.py"):
+                for dep in self._extract_manifest_dependencies(content):
+                    if dep and dep != custom_module_name:
+                        related_modules.add(dep)
+
+            if fpath.endswith(".xml"):
+                for module, xmlid in _XML_INHERIT_FIELD_RE.findall(content):
+                    if module and module != custom_module_name:
+                        related_modules.add(module)
+                        related_xmlids.add((module, xmlid))
+                for module, xmlid in _XML_REF_RE.findall(content):
+                    if module and module != custom_module_name:
+                        related_modules.add(module)
+                        # Only read target XML files for likely inherited templates/views.
+                        if "view" in xmlid or "template" in xmlid or "inherit" in xmlid:
+                            related_xmlids.add((module, xmlid))
+
+            if not fpath.endswith(".py"):
                 continue
 
             # L1: detect _inherit
@@ -325,6 +365,33 @@ class CoreFinderService:
                 mod = comodel.split(".", 1)[0] if "." in comodel else ""
                 if mod and mod != custom_module_name:
                     cross_modules.add(mod)
+                    related_modules.add(mod)
+
+        # L0/L1 baseline: read related module manifests discovered from the
+        # current custom module manifest and XML refs.  Search priority is core
+        # /home/odoo/src/odoo/addons first, then enterprise fallback, then user.
+        for dep_module in sorted(related_modules):
+            result = self.find_core_file(dep_module, "manifest", dep_module, search_roots, client_name=client_name)
+            if result.best_match:
+                add_instruction(ScopeReadInstruction(
+                    level=ScopeLevel.L0,
+                    reason=f"Related module '{dep_module}' detected from manifest/XML -- read installed-source manifest before writing",
+                    read_type="related_module_manifest",
+                    path=result.best_match,
+                    mandatory=True,
+                ))
+
+        for module, xmlid in sorted(related_xmlids):
+            match = self._find_xmlid_file(module, xmlid, roots)
+            if match:
+                add_instruction(ScopeReadInstruction(
+                    level=ScopeLevel.L1,
+                    reason=f"XML inheritance/reference '{module}.{xmlid}' detected -- read the related core XML before writing xpath/template changes",
+                    read_type="related_xml_view",
+                    path=match,
+                    mandatory=True,
+                ))
+                reached_level = max(reached_level, ScopeLevel.L1, key=lambda value: value.value)
 
         # L1: add parent model reads
         if inherit_models:
@@ -332,9 +399,9 @@ class CoreFinderService:
             for model in sorted(set(inherit_models)):
                 core_module = model.split(".")[0]
                 keyword = model.split(".")[-1] if "." in model else model
-                result = self.find_core_file(core_module, "model", keyword, search_roots)
+                result = self.find_core_file(core_module, "model", keyword, search_roots, client_name=client_name)
                 if result.best_match:
-                    instructions.append(ScopeReadInstruction(
+                    add_instruction(ScopeReadInstruction(
                         level=ScopeLevel.L1,
                         reason=f"_inherit '{model}' detected -- MUST read parent core model before writing fields",
                         read_type="core_model",
@@ -342,7 +409,7 @@ class CoreFinderService:
                         mandatory=True,
                     ))
                 else:
-                    instructions.append(ScopeReadInstruction(
+                    add_instruction(ScopeReadInstruction(
                         level=ScopeLevel.L1,
                         reason=f"_inherit '{model}' detected but not found in src roots -- check manually",
                         read_type="core_model_missing",
@@ -354,9 +421,9 @@ class CoreFinderService:
         if has_mixin:
             reached_level = ScopeLevel.L2
             for mixin_module, mixin_type, mixin_kw in _KNOWN_MIXINS:
-                result = self.find_core_file(mixin_module, mixin_type, mixin_kw, search_roots)
+                result = self.find_core_file(mixin_module, mixin_type, mixin_kw, search_roots, client_name=client_name)
                 if result.best_match:
-                    instructions.append(ScopeReadInstruction(
+                    add_instruction(ScopeReadInstruction(
                         level=ScopeLevel.L2,
                         reason=f"Mixin/abstract detected -- read {mixin_module}.{mixin_kw} source for correct method signatures",
                         read_type="core_mixin",
@@ -372,11 +439,14 @@ class CoreFinderService:
                 root_path = Path(root)
                 module_dir = self._find_module_dir(root_path, target_module)
                 if not module_dir:
-                    core_sync_service.ensure_module_synced(root, target_module)
+                    try:
+                        core_sync_service.ensure_module_synced(root, target_module, client_name=client_name)
+                    except TypeError:
+                        core_sync_service.ensure_module_synced(root, target_module)
                     module_dir = self._find_module_dir(root_path, target_module)
                 models_dir = module_dir / "models" if module_dir else root_path / target_module / "models"
                 if models_dir.exists():
-                    instructions.append(ScopeReadInstruction(
+                    add_instruction(ScopeReadInstruction(
                         level=ScopeLevel.L3,
                         reason=(
                             "Computed/relational fields or ir.model detected -- "
@@ -392,9 +462,9 @@ class CoreFinderService:
         if cross_modules:
             reached_level = ScopeLevel.L4
             for dep_module in sorted(cross_modules):
-                result = self.find_core_file(dep_module, "manifest", dep_module, search_roots)
+                result = self.find_core_file(dep_module, "manifest", dep_module, search_roots, client_name=client_name)
                 if result.best_match:
-                    instructions.append(ScopeReadInstruction(
+                    add_instruction(ScopeReadInstruction(
                         level=ScopeLevel.L4,
                         reason=f"Cross-module comodel ref to '{dep_module}' -- verify exact module technical name",
                         read_type="cross_module_manifest",
@@ -423,6 +493,7 @@ class CoreFinderService:
         module_name: str,
         subdir: str = "",
         search_roots: Sequence[str] | None = None,
+        client_name: str | None = None,
     ) -> "ListModuleFilesResult":
         """List all files in a module directory (or subdir) across priority roots.
 
@@ -431,10 +502,10 @@ class CoreFinderService:
         """
         from ..schemas import ListModuleFilesResult, ModuleFileEntry
 
-        roots = self._resolve_roots(search_roots)
+        roots = self._resolve_roots(search_roots, client_name=client_name)
         for priority, root in roots:
             root_path = Path(root)
-            module_dir = self._module_dir_with_sync(root_path, root, module_name)
+            module_dir = self._module_dir_with_sync(root_path, root, module_name, client_name=client_name)
             if not module_dir:
                 continue
 
@@ -496,19 +567,25 @@ class CoreFinderService:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _resolve_roots(search_roots: Sequence[str] | None) -> list[tuple[int, str]]:
+    def _resolve_roots(search_roots: Sequence[str] | None, client_name: str | None = None) -> list[tuple[int, str]]:
         if search_roots:
             return [(i + 1, r) for i, r in enumerate(search_roots)]
-        client = ClientResolverService().resolve_client(require_complete=False)
+        resolver = ClientResolverService()
+        client = resolver.resolve_client(client_name=client_name, require_complete=False) if client_name else resolver.resolve_client(require_complete=False)
         if client:
-            return [(i + 1, root) for i, root in enumerate(ClientResolverService().search_roots(client))]
+            return [(i + 1, root) for i, root in enumerate(resolver.search_roots(client))]
         return _DEFAULT_ROOTS
 
-    def _module_dir_with_sync(self, root_path: Path, root: str, module_name: str) -> Path | None:
+    def _module_dir_with_sync(self, root_path: Path, root: str, module_name: str, client_name: str | None = None) -> Path | None:
         module_dir = self._find_module_dir(root_path, module_name) if root_path.exists() else None
         if module_dir:
             return module_dir
-        core_sync_service.ensure_module_synced(root, module_name)
+        try:
+            core_sync_service.ensure_module_synced(root, module_name, client_name=client_name)
+        except TypeError:
+            # Backward compatibility for tests/extensions monkeypatching the old
+            # two-argument ensure_module_synced(root, module_name) signature.
+            core_sync_service.ensure_module_synced(root, module_name)
         return self._find_module_dir(root_path, module_name) if root_path.exists() else None
 
     @staticmethod
@@ -566,6 +643,59 @@ class CoreFinderService:
             return any(p.search(chunk) for p in patterns)
         except OSError:
             return False
+
+    @staticmethod
+    def _extract_manifest_dependencies(content: str) -> list[str]:
+        """Best-effort parse of __manifest__.py depends without executing code."""
+        try:
+            tree = ast.parse(content)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Dict):
+                    for key, value in zip(node.keys, node.values):
+                        if isinstance(key, ast.Constant) and key.value == "depends":
+                            try:
+                                deps = ast.literal_eval(value)
+                            except Exception:
+                                return []
+                            if isinstance(deps, (list, tuple)):
+                                return [str(dep) for dep in deps if isinstance(dep, str) and dep]
+        except Exception:
+            pass
+        # Fallback for simple textual manifests.
+        match = re.search(r'["\']depends["\']\s*:\s*(\[[^\]]*\])', content, re.S)
+        if not match:
+            return []
+        try:
+            deps = ast.literal_eval(match.group(1))
+        except Exception:
+            return []
+        return [str(dep) for dep in deps if isinstance(dep, str) and dep]
+
+    def _find_xmlid_file(self, module_name: str, xmlid: str, roots: Sequence[tuple[int, str]]) -> str | None:
+        """Find the XML file that defines or references an xmlid in a related module."""
+        xmlid_patterns = (
+            f'id="{xmlid}"',
+            f"id='{xmlid}'",
+            f'name="{xmlid}"',
+            f"name='{xmlid}'",
+            f'ref="{module_name}.{xmlid}"',
+            f"ref='{module_name}.{xmlid}'",
+        )
+        for _priority, root in roots:
+            root_path = Path(root)
+            module_dir = self._module_dir_with_sync(root_path, root, module_name, client_name=client_name)
+            if not module_dir:
+                continue
+            for current, dirs, files in os.walk(module_dir):
+                dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"__pycache__", ".git", "node_modules", "static"}]
+                for fname in files:
+                    if not fname.endswith(".xml"):
+                        continue
+                    path = Path(current) / fname
+                    content = self._safe_read(str(path), max_bytes=200000)
+                    if content and any(pattern in content for pattern in xmlid_patterns):
+                        return str(path)
+        return None
 
     @staticmethod
     def _safe_read(path: str, max_bytes: int = 65536) -> str:

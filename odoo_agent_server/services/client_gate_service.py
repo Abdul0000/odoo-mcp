@@ -1,0 +1,541 @@
+from __future__ import annotations
+
+import re
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from fastapi import HTTPException, status
+
+from ..config import get_odoo_clients, normalise_client, safe_client_public, settings
+from .client_resolver_service import ClientResolverService, ResolvedClient
+from .odoo_service import OdooService
+from .odoosh_service import OdooShService
+from .repo_service import RepoService
+from .store_service import JsonStore
+
+
+PLACEHOLDER_RE = re.compile(r"^(CHANGE_ME|YOUR_|CLIENT_2_|ODOO_|ODOOSH_|GITHUB_|PRIVATE_KEY|TOKEN|PASSWORD)|example\.com|client-2", re.I)
+
+
+class ClientGateService:
+    """Client selection and validation gate for multi-client MCP deployments."""
+
+    VALIDATION_TTL_SECONDS = 1800
+    SESSION_VALIDATED_KEY = "client_validated"
+    SESSION_ACTIVE_KEY = "active_client_name"
+
+    def __init__(self, store: JsonStore | None = None) -> None:
+        self.store = store or JsonStore()
+        self.resolver = ClientResolverService()
+
+    def check(self, client_name: str | None = None, validate: bool = False, force_refresh: bool = False) -> dict[str, Any]:
+        clients = [normalise_client(item) for item in get_odoo_clients()]
+        public_clients = [safe_client_public(item) for item in clients]
+        names = [item.get("name") or f"ODOO_CLIENTS[{idx}]" for idx, item in enumerate(clients)]
+
+        if not clients:
+            return {
+                "ok": True,
+                "requires_client_selection": False,
+                "requires_validation": False,
+                "mode": "legacy_env",
+                "summary": "No ODOO_CLIENTS entries configured; using legacy single-client environment fallback.",
+                "clients": [],
+                "next_call": {"tool": "workflow.agent_instructions", "arguments": {}},
+            }
+
+        if not client_name:
+            if len(clients) == 1:
+                selected = clients[0]
+                selected_name = selected.get("name") or "ODOO_CLIENTS[0]"
+                if validate:
+                    return self._validate_and_save(selected_name, force_refresh=force_refresh)
+                existing = self.validation_state(selected_name)
+                return {
+                    "ok": bool(existing.get("validated")),
+                    "requires_client_selection": False,
+                    "requires_validation": not bool(existing.get("validated")),
+                    "client_name": selected_name,
+                    "client": safe_client_public(selected),
+                    "summary": (
+                        "Single client is already validated."
+                        if existing.get("validated")
+                        else "Single client found. Run client.check with validate=true to validate before coding/deploying."
+                    ),
+                    "validation": existing,
+                    "next_call": {"tool": "workflow.agent_instructions", "arguments": {}} if existing.get("validated") else None,
+                }
+            return {
+                "ok": False,
+                "requires_client_selection": True,
+                "requires_validation": True,
+                "summary": "Multiple clients configured. Ask the user which client_name to use, then run client.check(client_name=..., validate=true).",
+                "message": "Multiple clients configured. Please select client_name before continuing.",
+                "clients": public_clients,
+                "available_client_names": names,
+            }
+
+        resolved = self.resolver.resolve_client(client_name=client_name, require_complete=True)
+        if not resolved:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Client not found or incomplete: {client_name}")
+
+        if validate:
+            return self._validate_and_save(resolved.name, force_refresh=force_refresh)
+
+        existing = self.validation_state(resolved.name)
+        return {
+            "ok": bool(existing.get("validated")),
+            "requires_client_selection": False,
+            "requires_validation": not bool(existing.get("validated")),
+            "client_name": resolved.name,
+            "client": resolved.public,
+            "summary": "Client is validated." if existing.get("validated") else "Client selected but not validated. Run client.check(validate=true).",
+            "validation": existing,
+            "next_call": {"tool": "workflow.agent_instructions", "arguments": {}} if existing.get("validated") else None,
+        }
+
+    def validation_state(self, client_name: str | None) -> dict[str, Any]:
+        if not client_name:
+            return {"validated": False, "summary": "No client_name selected."}
+        state = self.store.load_session_state(client_name=client_name)
+        validation = state.get("client_validation") if isinstance(state, dict) else None
+        if not isinstance(validation, dict):
+            return {"validated": False, "summary": "Client has not been validated in this MCP session."}
+        return validation
+
+    def require_validated_client(self, client_name: str | None, action: str) -> None:
+        clients = [normalise_client(item) for item in get_odoo_clients()]
+        names = [item.get("name") or f"ODOO_CLIENTS[{idx}]" for idx, item in enumerate(clients)]
+
+        resolved_name = client_name
+        if not resolved_name:
+            if len(clients) == 1:
+                resolved_name = clients[0].get("name") or "ODOO_CLIENTS[0]"
+            elif len(clients) == 0:
+                self._require_legacy_checkout_exists(action)
+                return
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "requires_client_selection": True,
+                        "requires_validation": True,
+                        "message": f"Multiple ODOO_CLIENTS entries are configured. Before {action}, ask which client/repo to work on, then run client.check(client_name=..., validate=true).",
+                        "available_client_names": names,
+                        "clients": [safe_client_public(item) for item in clients],
+                    },
+                )
+
+        validation = self.validation_state(resolved_name)
+        requirement = self._requirement_for_action(action)
+        if self._validation_satisfies(validation, requirement):
+            project_path = self._validated_project_path(resolved_name, validation)
+            stale_reason = self._validation_stale_reason(validation, project_path)
+            if stale_reason:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "requires_client_selection": False,
+                        "requires_validation": True,
+                        "client_name": resolved_name,
+                        "required_capability": requirement,
+                        "project_path": project_path,
+                        "message": (
+                            f"Client '{resolved_name}' was previously validated, but that validation is stale: "
+                            f"{stale_reason}. Run client.check(client_name='{resolved_name}', "
+                            f"validate=true, force_refresh=true) before {action}."
+                        ),
+                        "validation": validation,
+                    },
+                )
+            return
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "requires_client_selection": False,
+                "requires_validation": True,
+                "client_name": resolved_name,
+                "required_capability": requirement,
+                "message": (
+                    f"Client '{resolved_name}' has not passed {requirement} validation for this session. "
+                    f"Run client.check(client_name='{resolved_name}', validate=true) before {action}."
+                ),
+                "validation": validation,
+            },
+        )
+
+    def _require_legacy_checkout_exists(self, action: str) -> None:
+        if action == "repo.prepare":
+            return
+        project_path = settings.target_project_path
+        if project_path and not Path(project_path).expanduser().is_dir():
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "requires_client_selection": False,
+                    "requires_validation": True,
+                    "client_name": None,
+                    "project_path": project_path,
+                    "message": (
+                        f"Legacy single-environment repo checkout no longer exists at {project_path}. "
+                        f"Run repo.prepare for the configured TARGET_GIT_REPO/TARGET_GIT_BRANCH before {action}, "
+                        "or configure ODOO_CLIENTS and run client.check(validate=true, force_refresh=true)."
+                    ),
+                },
+            )
+
+    def _validated_project_path(self, client_name: str | None, validation: dict[str, Any]) -> str | None:
+        project_path = validation.get("project_path")
+        if project_path:
+            return str(project_path)
+        if not client_name:
+            return None
+        resolved = self.resolver.resolve_client(client_name=client_name, require_complete=False)
+        return resolved.path if resolved else None
+
+    def _validation_stale_reason(self, validation: dict[str, Any], project_path: str | None) -> str | None:
+        if project_path and not Path(project_path).expanduser().is_dir():
+            return f"repo checkout no longer exists at {project_path}"
+        age_seconds = self._validation_age_seconds(validation)
+        if age_seconds is not None and age_seconds > self.VALIDATION_TTL_SECONDS:
+            minutes = self.VALIDATION_TTL_SECONDS // 60
+            return f"validation is older than {minutes} minutes"
+        return None
+
+    @staticmethod
+    def _validation_age_seconds(validation: dict[str, Any]) -> float | None:
+        validated_at = validation.get("validated_at")
+        if not validated_at:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(validated_at).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - parsed).total_seconds()
+        except Exception:
+            return None
+
+    def _requirement_for_action(self, action: str) -> str:
+        if action.startswith("odoosh."):
+            return "ssh_ready"
+        if action in {"workflow.safe_deploy_module", "workflow.resume_job"}:
+            return "deploy_ready"
+        if action.startswith("odoo.module"):
+            return "deploy_ready"
+        if action == "git.push" and settings.auto_upgrade_on_push:
+            return "deploy_ready"
+        if action.startswith("repo.") or action.startswith("git.") or action == "workflow.start_session":
+            return "coding_ready"
+        return "validated"
+
+    def _validation_satisfies(self, validation: dict[str, Any], requirement: str) -> bool:
+        # Backward compatibility with sessions saved by earlier builds.
+        if requirement not in validation and validation.get("validated") is True:
+            return True
+        return bool(validation.get(requirement))
+
+    def any_validated_client(self) -> dict[str, Any] | None:
+        for item in get_odoo_clients():
+            name = normalise_client(item).get("name")
+            if not name:
+                continue
+            state = self.validation_state(name)
+            if state.get("validated") is True:
+                return {"client_name": name, "validation": state}
+        return None
+
+    def _validate_and_save(self, client_name: str, force_refresh: bool = False) -> dict[str, Any]:
+        resolved = self.resolver.resolve_client(client_name=client_name, require_complete=True)
+        if not resolved:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Client not found or incomplete: {client_name}")
+
+        existing = self.validation_state(resolved.name)
+        if existing.get("validated") and not force_refresh:
+            cached_path = self._validated_project_path(resolved.name, existing)
+            if self._validation_stale_reason(existing, cached_path):
+                force_refresh = True
+            else:
+                return {
+                    "ok": True,
+                    "validated": True,
+                    "requires_client_selection": False,
+                    "requires_validation": False,
+                    "client_name": resolved.name,
+                    "client": resolved.public,
+                    "summary": "Client already validated.",
+                    "checks": existing.get("checks", {}),
+                    "validation_log": existing.get("validation_log", []),
+                    "next_call": {"tool": "workflow.agent_instructions", "arguments": {}},
+                }
+
+        self.resolver.apply_odoo_env(resolved)
+        checks: dict[str, str] = {}
+        log: list[str] = []
+        base_ok = True
+        coding_ready = False
+        shell_ok = False
+        ssh_ok = False
+        error_type: str | None = None
+
+        def fail(check: str, message: str, kind: str) -> None:
+            nonlocal base_ok, error_type
+            base_ok = False
+            error_type = error_type or kind
+            checks[check] = "failed"
+            log.append(message)
+
+        def pass_check(check: str, message: str) -> None:
+            checks[check] = "ok"
+            log.append(message)
+
+        config_errors = self._config_errors(resolved)
+        if config_errors:
+            checks["config"] = "failed"
+            base_ok = False
+            error_type = "config_error"
+            log.extend(config_errors)
+        else:
+            pass_check("config", "Required client coding settings are present and do not look like placeholders.")
+
+        if base_ok:
+            repo_result = self._check_repo_branch(resolved)
+            checks["github"] = repo_result["status"]
+            checks["branch"] = repo_result["status"] if repo_result.get("branch_ok") else ("failed" if repo_result["status"] == "failed" else "skipped")
+            log.extend(repo_result["log"])
+            if repo_result["status"] != "ok":
+                base_ok = False
+                error_type = repo_result.get("error_type") or "github_error"
+
+        if base_ok:
+            checkout_result = self._check_checkout(resolved)
+            checks["checkout"] = checkout_result["status"]
+            log.extend(checkout_result["log"])
+            if checkout_result["status"] != "ok":
+                base_ok = False
+                error_type = checkout_result.get("error_type") or "checkout_error"
+
+        coding_ready = bool(base_ok)
+
+        # Odoo shell is useful for data/model operations, but it is not required
+        # for coding work. It runs through the selected client's Odoo.sh SSH
+        # settings; no process-wide environment is mutated.
+        if coding_ready:
+            if self._has_shell_config(resolved):
+                odoo_result = self._check_odoo_shell(resolved)
+                checks["odoo_shell"] = odoo_result["status"]
+                log.extend(odoo_result["log"])
+                shell_ok = odoo_result["status"] == "ok"
+            else:
+                checks["odoo_shell"] = "skipped"
+                log.append("Odoo shell skipped: Odoo.sh SSH/db/path settings are missing or placeholders.")
+
+        if coding_ready:
+            if self._has_odoosh_config(resolved):
+                ssh_result = self._check_odoosh(resolved)
+                checks["odoosh_ssh"] = ssh_result["status"]
+                checks["addons_path"] = ssh_result.get("addons_path_status", "skipped")
+                log.extend(ssh_result["log"])
+                ssh_ok = ssh_result["status"] == "ok"
+            else:
+                checks["odoosh_ssh"] = "skipped"
+                checks["addons_path"] = "skipped"
+                log.append("Odoo.sh SSH skipped: SSH host/user/key/db/path settings are missing or placeholders.")
+
+        # Safe deploy/module upgrade needs Odoo.sh SSH because the pipeline must
+        # verify the pushed SHA, check /home/odoo/src/user file hashes, read
+        # Odoo.sh error packs, and run the module upgrade. HTTPS JSON-RPC can
+        # make data queries work, but it is not enough to prove source deploy.
+        deploy_ready = bool(coding_ready and ssh_ok)
+        data_query_ready = bool(shell_ok or ssh_ok)
+        full_validation_passed = bool(coding_ready and shell_ok and ssh_ok)
+        now = datetime.now(timezone.utc).isoformat()
+
+        if full_validation_passed:
+            summary = "Client fully validated successfully."
+            final_error_type = None
+        elif coding_ready and ssh_ok and not shell_ok:
+            summary = "Client validated for coding and deploy/query via Odoo.sh SSH fallback; Odoo shell login failed or is not configured."
+            final_error_type = "odoo_login_error" if checks.get("odoo_shell") == "failed" else None
+        elif coding_ready and shell_ok and not ssh_ok:
+            summary = "Client validated for coding and data queries, but deploy is blocked because Odoo.sh SSH is unavailable."
+            final_error_type = "odoosh_ssh_error" if checks.get("odoosh_ssh") == "failed" else None
+        elif coding_ready:
+            summary = "Client validated for coding only; Odoo shell and Odoo.sh SSH are unavailable."
+            final_error_type = "odoo_connection_unavailable"
+        else:
+            summary = "Client validation failed."
+            final_error_type = error_type or "client_validation_error"
+
+        validation = {
+            "validated": coding_ready,
+            "coding_ready": coding_ready,
+            "deploy_ready": deploy_ready,
+            "data_query_ready": data_query_ready,
+            "shell_ready": shell_ok,
+            "ssh_ready": ssh_ok,
+            "full_validation_passed": full_validation_passed,
+            "read_only_ssh_available": ssh_ok,
+            "deploy_blocker": None if deploy_ready else ("Odoo.sh SSH is required for safe deploy/source verification/module upgrade." if coding_ready else None),
+            "client_name": resolved.name,
+            "project_path": str(resolved.path),
+            "validated_at": now,
+            "checks": checks,
+            "summary": summary,
+            "error_type": final_error_type,
+            "validation_log": log[-30:],
+            "client": resolved.public,
+        }
+        self.store.save_session_state(
+            {
+                self.SESSION_ACTIVE_KEY: resolved.name if coding_ready else None,
+                self.SESSION_VALIDATED_KEY: coding_ready,
+                "client_name": resolved.name,
+                "project_path": str(resolved.path),
+                "repo_url": resolved.repo,
+                "branch": resolved.branch,
+                "client_validation": validation,
+            },
+            client_name=resolved.name,
+        )
+        return {
+            "ok": coding_ready,
+            "validated": coding_ready,
+            "coding_ready": coding_ready,
+            "deploy_ready": deploy_ready,
+            "data_query_ready": data_query_ready,
+            "shell_ready": shell_ok,
+            "ssh_ready": ssh_ok,
+            "full_validation_passed": full_validation_passed,
+            "requires_client_selection": False,
+            "requires_validation": not coding_ready,
+            "client_name": resolved.name,
+            "client": resolved.public,
+            "summary": summary,
+            "error_type": final_error_type,
+            "read_only_ssh_available": ssh_ok,
+            "deploy_blocker": None if deploy_ready else ("Odoo.sh SSH is required for safe deploy/source verification/module upgrade." if coding_ready else None),
+            "checks": checks,
+            "validation_log": log[-30:],
+            "next_call": {"tool": "workflow.agent_instructions", "arguments": {}} if coding_ready else None,
+        }
+
+    def _config_errors(self, client: ResolvedClient) -> list[str]:
+        """Validate only the minimum settings needed to choose a coding target.
+
+        Odoo shell credentials and Odoo.sh SSH settings are intentionally optional
+        here. They are checked separately and surfaced as shell_ready/ssh_ready so
+        coding tools are not blocked just because the database login is missing.
+        """
+        errors: list[str] = []
+        required = {
+            "repo": client.repo,
+            "branch": client.branch,
+            "path": client.path,
+        }
+        for key, value in required.items():
+            if value is None or str(value).strip() == "":
+                errors.append(f"Missing required client setting: {key}.")
+            elif PLACEHOLDER_RE.search(str(value).strip()):
+                errors.append(f"Placeholder value detected for {key}; replace it in ODOO_CLIENTS.")
+        return errors
+
+    def _has_shell_config(self, client: ResolvedClient) -> bool:
+        https_values = [
+            client.odoo_url,
+            client.odoo_db,
+            client.odoo_login,
+            client.odoo_password,
+        ]
+        return all(self._usable(value) for value in https_values) or self._has_odoosh_config(client)
+
+    def _has_odoosh_config(self, client: ResolvedClient) -> bool:
+        values = [
+            client.odoosh_db_name or client.odoo_db,
+            client.odoosh_ssh_host,
+            client.odoosh_ssh_user,
+            client.odoosh_ssh_private_key_b64 or client.odoosh_ssh_key_path,
+            client.odoosh_odoo_path,
+            client.odoosh_user_addons_path,
+        ]
+        return all(self._usable(value) for value in values)
+
+    @staticmethod
+    def _usable(value: object) -> bool:
+        if value is None:
+            return False
+        text = str(value).strip()
+        if not text:
+            return False
+        return PLACEHOLDER_RE.search(text) is None
+
+    def _check_repo_branch(self, client: ResolvedClient) -> dict[str, Any]:
+        command = ["git", "ls-remote", "--heads", client.authenticated_repo, client.branch]
+        try:
+            completed = subprocess.run(command, capture_output=True, text=True, timeout=25, check=False)
+        except subprocess.TimeoutExpired:
+            return {"status": "failed", "branch_ok": False, "error_type": "github_timeout", "log": ["GitHub/repo validation timed out while checking the branch."]}
+        stderr = self._redact(completed.stderr)
+        stdout = completed.stdout.strip()
+        if completed.returncode != 0:
+            hint = stderr or "git ls-remote failed. Check repo URL/token access."
+            return {"status": "failed", "branch_ok": False, "error_type": "github_token_error", "log": [hint]}
+        if not stdout:
+            return {"status": "failed", "branch_ok": False, "error_type": "branch_not_found", "log": [f"Branch not found or not accessible: {client.branch}."]}
+        return {"status": "ok", "branch_ok": True, "log": ["GitHub repo/token access succeeded and branch exists."]}
+
+    def _check_checkout(self, client: ResolvedClient) -> dict[str, Any]:
+        try:
+            result = RepoService().prepare_repo(client_name=client.name, timeout_seconds=180)
+            return {"status": "ok", "log": [f"Local checkout ready: {result.project_path} on branch {result.branch}."]}
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "failed", "error_type": "checkout_error", "log": [f"Repo checkout/prepare failed: {self._redact(str(exc))}"]}
+
+    def _check_odoo_shell(self, client: ResolvedClient) -> dict[str, Any]:
+        try:
+            result = OdooService(client).health()
+            if result.status == "ok":
+                source = "HTTPS JSON-RPC fallback" if result.base_url else "Odoo.sh shell"
+                return {"status": "ok", "log": [f"Odoo data query health check succeeded through {source} for database {result.database}."]}
+            return {"status": "failed", "error_type": "odoo_login_error", "log": [f"Odoo shell failed: {self._redact(result.error or 'unknown error')}"]}
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "failed", "error_type": "odoo_shell_error", "log": [f"Odoo shell validation failed: {self._redact(str(exc))}"]}
+
+    def _check_odoosh(self, client: ResolvedClient) -> dict[str, Any]:
+        try:
+            service = OdooShService(client)
+            user_path = client.odoosh_user_addons_path or "/home/odoo/src/user"
+            odoo_path = client.odoosh_odoo_path or "/home/odoo/src/odoo"
+            db = client.odoosh_db_name or client.odoo_db or ""
+            script = (
+                "set -e; echo ODOOSH_SSH_OK; "
+                f"test -d {self._sh_quote(user_path)} && echo USER_ADDONS_OK; "
+                f"test -d {self._sh_quote(odoo_path)} && echo ODOO_PATH_OK; "
+                f"test -n {self._sh_quote(db)} && echo DB_NAME_OK"
+            )
+            result = service.run_shell(script, timeout_seconds=30)
+            text = (result.stdout or "") + "\n" + (result.stderr or "")
+            if result.exit_code != 0:
+                return {"status": "failed", "addons_path_status": "skipped", "error_type": "odoosh_ssh_error", "log": [f"Odoo.sh SSH failed: {self._redact(text.strip() or 'unknown SSH error')}"]}
+            addons_ok = "USER_ADDONS_OK" in result.stdout
+            if not addons_ok:
+                return {"status": "failed", "addons_path_status": "failed", "error_type": "addons_path_missing", "log": [f"Odoo.sh SSH connected but addons path is missing: {user_path}."]}
+            return {"status": "ok", "addons_path_status": "ok", "log": ["Odoo.sh SSH connected and addons/core paths were verified."]}
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "failed", "addons_path_status": "skipped", "error_type": "odoosh_ssh_error", "log": [f"Odoo.sh validation failed: {self._redact(str(exc))}"]}
+
+    @staticmethod
+    def _sh_quote(value: str) -> str:
+        import shlex
+
+        return shlex.quote(value)
+
+    @staticmethod
+    def _redact(text: str) -> str:
+        if not text:
+            return text
+        text = re.sub(r"oauth2:[^@\s]+@", "oauth2:***@", text)
+        text = re.sub(r"gh[pousr]_[A-Za-z0-9_]+", "gh***", text)
+        text = re.sub(r"(?i)(password|token|private_key)[=:]\s*[^\s,;]+", r"\1=***", text)
+        return text[-2000:]

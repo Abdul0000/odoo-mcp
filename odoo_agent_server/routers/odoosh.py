@@ -12,11 +12,13 @@ from ..schemas import (
     JobRecord,
     JobStatus,
     JobStep,
-    OdooRpcModuleRequest,
+    ClientOnlyRequest,
+    OdooModuleRequest,
     OdooShCheckCommitRequest,
     OdooShCommandRequest,
     OdooShLogRequest,
     OdooShModuleUpdateRequest,
+    OdooShQueryRequest,
     OdooShVerifyManifestRequest,
     OdooShWaitForCommitRequest,
 )
@@ -26,8 +28,31 @@ from ..services.store_service import JsonStore
 from ..services.workflow_guard_service import safe_deploy_command_block
 from ..services.background_executor import submit_background
 from ..services.git_service import GitService
+from ..services.client_gate_service import ClientGateService
+from ..services.client_resolver_service import ClientResolverService
 
 router = APIRouter(prefix="/odoosh", tags=["odoosh"], dependencies=[AuthDependency])
+
+
+def _validated_client_for_payload(payload: object, action: str):
+    client_name = getattr(payload, "client_name", None)
+    ClientGateService().require_validated_client(client_name, action)
+    if client_name:
+        client = ClientResolverService().resolve_client(client_name=client_name, require_complete=True)
+        return client
+    return None
+
+
+def _service_for_client(client):
+    if client is None:
+        return OdooShService()
+    try:
+        return OdooShService(client)
+    except TypeError:
+        # Tests and older extensions sometimes monkeypatch OdooShService with a
+        # zero-argument factory. Keep compatibility while real service still
+        # receives the selected client.
+        return OdooShService()
 
 
 def _run(name: str, callback) -> CommandResult:
@@ -47,7 +72,7 @@ def _resolve_manual_project_path(payload) -> str | None:
     if explicit:
         return str(explicit)
     store = JsonStore()
-    state = store.load_session_state()
+    state = store.load_session_state(client_name=getattr(payload, "client_name", None))
     state_project = state.get("project_path")
     if isinstance(state_project, str) and state_project.strip():
         return state_project.strip()
@@ -183,10 +208,25 @@ def _background_command_job(
             "job": waited.model_dump(mode="json"),
         }
         if not payload["finished"]:
-            payload["message"] = (
-                f"Command still running after {wait_timeout_seconds}s server-side wait. "
-                "Call jobs.get with this job_id; jobs.get also waits by default."
-            )
+            payload.update({
+                "message": (
+                    f"Command still running after {wait_timeout_seconds}s server-side wait. "
+                    "This is not confirmed success. Call jobs.get until terminal passed/failed."
+                ),
+                "completion_required": True,
+                "success_allowed": False,
+                "tool_exit_allowed": False,
+                "poll_after_seconds": 5,
+                "next_call": {
+                    "tool": "jobs.get",
+                    "arguments": {
+                        "job_id": waited.id,
+                        "wait_for_result": True,
+                        "wait_timeout_seconds": 20,
+                        "poll_interval_seconds": 2.0,
+                    },
+                },
+            })
         return CommandResult(
             command=[name, "background"],
             cwd="odoosh:ssh",
@@ -202,54 +242,97 @@ def _background_command_job(
             "job_id": job.id,
             "status": "running",
             "finished": False,
-            "message": "Command started in background. jobs.get waits by default until done or timeout.",
+            "message": "Command started in background. This is not confirmed success. Poll jobs.get until terminal passed/failed.",
+            "completion_required": True,
+            "success_allowed": False,
+            "tool_exit_allowed": False,
+            "poll_after_seconds": 5,
+            "next_call": {
+                "tool": "jobs.get",
+                "arguments": {
+                    "job_id": job.id,
+                    "wait_for_result": True,
+                    "wait_timeout_seconds": 20,
+                    "poll_interval_seconds": 2.0,
+                },
+            },
         }),
     )
 
 
+@router.post("/query")
+def odoosh_query(payload: OdooShQueryRequest):
+    """Read-only search_read via Odoo.sh SSH/Odoo shell. Does not require Odoo shell login."""
+    client = None
+    if payload.client_name:
+        client = ClientResolverService().resolve_client(client_name=payload.client_name, require_complete=True)
+    return OdooShService(client).search_read(
+        payload.model,
+        payload.domain,
+        payload.fields,
+        payload.limit,
+        payload.offset,
+        payload.order,
+        payload.context,
+        payload.timeout_seconds,
+    )
+
+
 @router.post("/health", response_model=CommandResult)
-def odoosh_health() -> CommandResult:
-    return _run("odoosh.health", lambda: OdooShService().health())
+def odoosh_health(payload: ClientOnlyRequest | None = None) -> CommandResult:
+    payload = payload or ClientOnlyRequest()
+    client = _validated_client_for_payload(payload, "odoosh.health")
+    return _run("odoosh.health", lambda: _service_for_client(client).health())
 
 
 @router.post("/git-status", response_model=CommandResult)
-def odoosh_git_status() -> CommandResult:
-    return _run("odoosh.git_status", lambda: OdooShService().git_status())
+def odoosh_git_status(payload: ClientOnlyRequest | None = None) -> CommandResult:
+    payload = payload or ClientOnlyRequest()
+    client = _validated_client_for_payload(payload, "odoosh.git_status")
+    return _run("odoosh.git_status", lambda: _service_for_client(client).git_status())
 
 
 @router.post("/deployed-sha", response_model=CommandResult)
-def odoosh_deployed_sha() -> CommandResult:
-    return _run("odoosh.deployed_sha", lambda: OdooShService().deployed_sha())
+def odoosh_deployed_sha(payload: ClientOnlyRequest | None = None) -> CommandResult:
+    payload = payload or ClientOnlyRequest()
+    client = _validated_client_for_payload(payload, "odoosh.deployed_sha")
+    return _run("odoosh.deployed_sha", lambda: _service_for_client(client).deployed_sha())
 
 
 @router.post("/wait-for-commit", response_model=CommandResult)
 def odoosh_wait_for_commit(payload: OdooShWaitForCommitRequest) -> CommandResult:
-    return _run("odoosh.wait_for_commit", lambda: OdooShService().wait_for_commit(payload.expected_sha, payload.timeout_seconds, payload.interval_seconds))
+    client = _validated_client_for_payload(payload, "odoosh.wait_for_commit")
+    return _run("odoosh.wait_for_commit", lambda: _service_for_client(client).wait_for_commit(payload.expected_sha, payload.timeout_seconds, payload.interval_seconds))
 
 
 @router.post("/check-commit", response_model=CommandResult)
 def odoosh_check_commit(payload: OdooShCheckCommitRequest) -> CommandResult:
     """Non-blocking single check — returns immediately with deployed=true/false in stdout JSON."""
-    return _run("odoosh.check_commit", lambda: OdooShService().check_commit_deployed(payload.expected_sha))
+    client = _validated_client_for_payload(payload, "odoosh.check_commit")
+    return _run("odoosh.check_commit", lambda: _service_for_client(client).check_commit_deployed(payload.expected_sha))
 
 
 @router.post("/verify-module-manifest", response_model=CommandResult)
 def odoosh_verify_module_manifest(payload: OdooShVerifyManifestRequest) -> CommandResult:
-    return _run("odoosh.verify_module_manifest", lambda: OdooShService().verify_module_manifest(payload.module_name))
+    client = _validated_client_for_payload(payload, "odoosh.verify_module_manifest")
+    return _run("odoosh.verify_module_manifest", lambda: _service_for_client(client).verify_module_manifest(payload.module_name))
 
 
 @router.post("/log", response_model=CommandResult)
 def odoosh_log(payload: OdooShLogRequest) -> CommandResult:
-    return _run("odoosh.log", lambda: OdooShService().tail_log(payload.log_name, payload.tail_lines))
+    client = _validated_client_for_payload(payload, "odoosh.log")
+    return _run("odoosh.log", lambda: _service_for_client(client).tail_log(payload.log_name, payload.tail_lines))
 
 
 @router.post("/grep-errors", response_model=CommandResult)
 def odoosh_grep_errors(payload: OdooShCommandRequest) -> CommandResult:
-    return _run("odoosh.grep_errors", lambda: OdooShService().grep_errors(payload.tail_lines))
+    client = _validated_client_for_payload(payload, "odoosh.grep_errors")
+    return _run("odoosh.grep_errors", lambda: _service_for_client(client).grep_errors(payload.tail_lines))
 
 
 @router.post("/module-install-ssh", response_model=CommandResult)
-def odoosh_module_install_ssh(payload: OdooRpcModuleRequest) -> CommandResult:
+def odoosh_module_install_ssh(payload: OdooModuleRequest) -> CommandResult:
+    client = _validated_client_for_payload(payload, "odoosh.module_install_ssh")
     blocked = safe_deploy_command_block(
         "odoosh.module_install_ssh",
         project_path=payload.project_path,
@@ -263,7 +346,7 @@ def odoosh_module_install_ssh(payload: OdooRpcModuleRequest) -> CommandResult:
         return push_guard
     approval = ApprovalService()
     approval.ensure_allowed("odoosh.module_install_ssh", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
-    service = OdooShService()
+    service = _service_for_client(client)
 
     def _callback() -> CommandResult:
         if resolved_sha:
@@ -286,6 +369,7 @@ def odoosh_module_install_ssh(payload: OdooRpcModuleRequest) -> CommandResult:
 @router.post("/module-deploy-ssh", response_model=CommandResult)
 def odoosh_module_deploy_ssh(payload: OdooShModuleUpdateRequest) -> CommandResult:
     """SSH smart install/upgrade. Background job: poll jobs.get."""
+    client = _validated_client_for_payload(payload, "odoosh.module_deploy_ssh")
     blocked = safe_deploy_command_block(
         "odoosh.module_deploy_ssh",
         project_path=payload.project_path,
@@ -299,7 +383,7 @@ def odoosh_module_deploy_ssh(payload: OdooShModuleUpdateRequest) -> CommandResul
         return push_guard
     approval = ApprovalService()
     approval.ensure_allowed("odoosh.module_deploy_ssh", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
-    service = OdooShService()
+    service = _service_for_client(client)
 
     def _callback() -> CommandResult:
         if resolved_sha:
@@ -321,6 +405,7 @@ def odoosh_module_deploy_ssh(payload: OdooShModuleUpdateRequest) -> CommandResul
 
 @router.post("/module-update", response_model=CommandResult)
 def odoosh_module_update(payload: OdooShModuleUpdateRequest) -> CommandResult:
+    client = _validated_client_for_payload(payload, "odoosh.module_update")
     blocked = safe_deploy_command_block(
         "odoosh.module_update",
         project_path=payload.project_path,
@@ -334,7 +419,7 @@ def odoosh_module_update(payload: OdooShModuleUpdateRequest) -> CommandResult:
         return push_guard
     approval = ApprovalService()
     approval.ensure_allowed("odoosh.module_update", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
-    service = OdooShService()
+    service = _service_for_client(client)
 
     def _callback() -> CommandResult:
         if resolved_sha:

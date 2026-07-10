@@ -79,9 +79,9 @@ def test_git_push_touching_module_auto_triggers_odoosh_upgrade_job(project, monk
 
     result = git.git_push(GitPushRequest(project_path=str(project), branch="dev"))
 
-    assert result.exit_code == 0
+    assert result.exit_code == 2
     assert "Detected module x_module in this push" in result.stdout
-    assert "auto-triggered Odoo.sh upgrade" in result.stdout
+    assert "Odoo.sh upgrade job started" in result.stdout
     assert "Poll with jobs.get" in result.stdout
     marker = "AUTO_UPGRADE_ON_PUSH="
     payload_line = next(line for line in result.stdout.splitlines() if line.startswith(marker))

@@ -70,9 +70,9 @@ def test_browser_menu_crawl_fails_on_odoo_ui_breakage(monkeypatch):
                 url="https://example.test/web#action=1",
                 title="Odoo",
                 screenshot_path="/tmp/odoo.png",
-                console_errors=["odoo_ui_error_text:RPC_ERROR"],
+                console_errors=["odoo_ui_error_text:shell_ERROR"],
                 network_errors=[],
-                error="odoo_ui_error_text:RPC_ERROR",
+                error="odoo_ui_error_text:shell_ERROR",
             )
 
     monkeypatch.setattr(workflow, "CdpBrowserService", FakeCdpBrowserService)

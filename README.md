@@ -9,7 +9,7 @@ OpenAPI Actions / lightweight MCP JSON-RPC bridge
         ↓
 FastAPI Odoo Agent Server = tools only
         ↓
-GitHub + Odoo.sh + Odoo RPC + optional external CDP browser
+GitHub + Odoo.sh + Odoo shell + optional external CDP browser
 ```
 
 No Codex, no CLI agent, no backend AI model, and no frontend UI are required. The connected MCP agent writes and reasons about code; this server performs the allowed operations.
@@ -64,7 +64,7 @@ No Codex, no CLI agent, no backend AI model, and no frontend UI are required. Th
 
 Odoo.sh deployment is normally triggered by GitHub push. The Odoo.sh tools verify and troubleshoot the build through SSH/logs.
 
-### Odoo RPC tools
+### Odoo shell tools
 
 - `POST /odoo/health`
 - `POST /odoo/module-status`
@@ -137,12 +137,17 @@ docker compose up --build
 
 Mount your Odoo repo under `./repos` or change the volume and `ODOO_AGENT_ALLOWED_ROOTS`.
 
-## Optional CDP browser setup
+## Optional manual browser diagnostics
 
-The connector does not bundle Chromium. For UI console diagnostics, run Chrome/Chromium outside the connector with remote debugging enabled and set `ODOO_AGENT_CDP_URL`:
+The Docker image includes Chromium and `start.sh` can launch a local CDP browser at `http://127.0.0.1:9222`. Browser login, screenshot, and POS-flow endpoints remain available for explicit manual diagnostics only. They are never called by `workflow.safe_deploy_module` and never determine push, deploy, upgrade, or registry success.
 
 ```text
 ODOO_AGENT_CDP_URL=http://chrome-host:9222
+ODOO_AGENT_SCREENSHOT_DIR=/tmp/odoo_agent_screenshots
+ODOO_AGENT_SCREENSHOT_AUTO_CLEAN=true
+ODOO_AGENT_SCREENSHOT_RETENTION_SECONDS=3600
+ODOO_AGENT_SCREENSHOT_MAX_FILES=50
+ODOO_AGENT_SCREENSHOT_PUBLIC_BASE_URL=
 ```
 
 Example local Chrome launch:
@@ -270,7 +275,7 @@ The package includes tests for:
 - `.pyc` cleanup
 - git status/diff
 - Odoo.sh config error handling
-- Odoo RPC missing config handling
+- Odoo shell missing config handling
 - approval blocking and approval consumption
 - `/tools/call` bridge
 - `/workflow/full-verify`
@@ -503,3 +508,11 @@ GIT_SSH_KEY_PATH=/tmp/keys/github_key
 ```
 
 For SSH GitHub repos, either set `GIT_SSH_COMMAND` yourself or set `GIT_SSH_KEY_PATH`; `repo.prepare` will build a safe `GIT_SSH_COMMAND` using that key.
+
+## Manual browser diagnostics
+
+Automatic screenshot/visual verification has been removed from the deployment pipeline because it was not reliable enough to gate successful Odoo changes. `workflow.safe_deploy_module` now validates code, Git, Odoo.sh deployment, module upgrade, and registry state only.
+
+The standalone authenticated `/browser/screenshot` endpoint remains available for optional manual diagnostics. It is never called automatically and never affects push, deploy, or upgrade success. Screenshots can be served through `/browser/screenshots/<filename>` when `ODOO_AGENT_SCREENSHOT_PUBLIC_BASE_URL` or `ODOO_AGENT_PUBLIC_BASE_URL` is configured.
+
+Use `screenshot_mode="memory_only"` for temporary in-memory capture, `persist_latest` only when a retained image is explicitly needed, and `disabled` for DOM/console diagnostics without image capture.

@@ -7,8 +7,8 @@ from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
-from odoo_agent_server.schemas import JobRecord, JobStatus, OdooRpcResult
-from odoo_agent_server.services.odoo_rpc_service import OdooRpcService
+from odoo_agent_server.schemas import JobRecord, JobStatus, OdooResult
+from odoo_agent_server.services.odoo_service import OdooService
 from odoo_agent_server.services.store_service import JsonStore
 
 
@@ -45,9 +45,9 @@ def test_module_deploy_waits_and_returns_final_job(monkeypatch, tmp_path):
 
     def fake_module_deploy(self, module_name):
         time.sleep(0.3)
-        return OdooRpcResult(status="ok", result={"module_name": module_name, "operation": "upgrade"})
+        return OdooResult(status="ok", result={"module_name": module_name, "operation": "upgrade"})
 
-    monkeypatch.setattr(OdooRpcService, "module_deploy", fake_module_deploy)
+    monkeypatch.setattr(OdooService, "module_deploy", fake_module_deploy)
     client = TestClient(app)
     response = client.post(
         "/tools/call",
@@ -62,27 +62,28 @@ def test_module_deploy_waits_and_returns_final_job(monkeypatch, tmp_path):
     data = response.json()
     assert data["status"] == "ok"
     result = data["result"]
-    assert result["status"] == "ok"
-    assert result["result"]["finished"] is True
-    assert result["result"]["job_status"] == "passed"
+    assert result["status"] == "failed"
+    assert result["result"]["finished"] is False
+    assert result["result"]["success_allowed"] is False
+    assert result["result"]["next_call"]["tool"] == "jobs.get"
 
 
-def test_module_deploy_returns_running_cleanly_when_wait_timeout_expires(monkeypatch, tmp_path):
+def test_module_deploy_non_wait_mode_returns_job_id_for_polling(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     monkeypatch.setattr(settings, "require_approval", False)
 
     def slow_module_deploy(self, module_name):
         time.sleep(0.6)
-        return OdooRpcResult(status="ok", result={"module_name": module_name})
+        return OdooResult(status="ok", result={"module_name": module_name})
 
-    monkeypatch.setattr(OdooRpcService, "module_deploy", slow_module_deploy)
+    monkeypatch.setattr(OdooService, "module_deploy", slow_module_deploy)
     client = TestClient(app)
     response = client.post(
         "/tools/call",
         headers={"Authorization": f"Bearer {settings.api_token}"},
         json={
             "name": "odoo.module_deploy",
-            "arguments": {"module_name": "karachi_school_management", "wait_timeout_seconds": 0, "poll_interval_seconds": 0.25},
+            "arguments": {"module_name": "karachi_school_management", "wait_for_result": False, "poll_interval_seconds": 0.25},
         },
     )
 
@@ -92,4 +93,35 @@ def test_module_deploy_returns_running_cleanly_when_wait_timeout_expires(monkeyp
     result = data["result"]["result"]
     assert result["finished"] is False
     assert result["job_status"] == "running"
-    assert result["next_call"]["tool"] == "jobs.get"
+    assert "job_id" in result
+
+
+def test_module_deploy_wait_for_result_true_never_returns_progress_text(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "require_approval", False)
+
+    def slow_module_deploy(self, module_name):
+        time.sleep(0.3)
+        return OdooResult(status="ok", result={"module_name": module_name})
+
+    monkeypatch.setattr(OdooService, "module_deploy", slow_module_deploy)
+    client = TestClient(app)
+    response = client.post(
+        "/tools/call",
+        headers={"Authorization": f"Bearer {settings.api_token}"},
+        json={
+            "name": "odoo.module_deploy",
+            "arguments": {"module_name": "karachi_school_management", "wait_for_result": True, "wait_timeout_seconds": 0, "poll_interval_seconds": 0.25},
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    text = str(data).lower()
+    assert data["status"] == "ok"
+    assert data["result"]["status"] == "failed"
+    assert data["result"]["result"]["finished"] is False
+    assert data["result"]["result"]["success_allowed"] is False
+    assert data["result"]["result"]["next_call"]["tool"] == "jobs.get"
+    assert "may take a few minutes" not in text
+    assert "check back" not in text

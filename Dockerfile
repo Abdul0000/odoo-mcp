@@ -1,13 +1,17 @@
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    CHROME_BIN=chromium \
+    ODOO_AGENT_CDP_URL=http://127.0.0.1:9222
 
 WORKDIR /app
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
        git openssh-client rsync curl ca-certificates \
+       chromium fonts-liberation libnss3 libatk-bridge2.0-0 libxkbcommon0 \
+       libgtk-3-0 libasound2 libgbm1 libxss1 libxshmfence1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Node.js is required for real JS/OWL syntax parsing (node --check), not just

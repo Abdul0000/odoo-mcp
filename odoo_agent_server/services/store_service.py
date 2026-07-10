@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - Windows
 
 from fastapi import HTTPException, status
 
-from ..config import settings
+from ..config import get_odoo_clients, settings
 from ..schemas import ApprovalRecord, ApprovalStatus, AuditEvent, JobRecord, JobStatus, JobStep
 
 
@@ -142,22 +142,26 @@ class JsonStore:
                 return JobRecord.model_validate(row)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
-    def wait_job(self, job_id: str, timeout_seconds: int = 20, poll_interval_seconds: float = 2.0) -> JobRecord:
+    def wait_job(self, job_id: str, timeout_seconds: int = 600, poll_interval_seconds: float = 10.0) -> JobRecord:
         """Wait for a job to finish without requiring repeated client/tool calls.
 
-        The default timeout is intentionally below common Render HTTP timeouts so
-        callers get either the final result or a clean still-running response
-        instead of a broken message stream.
+        Safe deploy must not be treated as complete until its owning job reaches
+        a terminal status. Use short positive waits for MCP/browser clients so
+        pages stay responsive. A timeout value of 0 means wait indefinitely and
+        should be reserved for CLI/internal callers.
         """
-        deadline = time.monotonic() + max(timeout_seconds, 0)
+        deadline = None if timeout_seconds <= 0 else time.monotonic() + max(timeout_seconds, 0)
         interval = max(min(poll_interval_seconds, 10.0), 0.25)
         while True:
             job = self.get_job(job_id)
             if job.status not in {JobStatus.queued, JobStatus.running}:
                 return job
-            if timeout_seconds <= 0 or time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 return job
-            time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+            if deadline is None:
+                time.sleep(interval)
+            else:
+                time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
     def update_job(self, job: JobRecord) -> JobRecord:
         rows = self._read_list(self.jobs_file)
@@ -264,9 +268,9 @@ class JsonStore:
         each milestone so the agent can resume without repeating step 1.
         state dict is shallow-merged into the existing persisted state.
 
-        Always updates the legacy global file (unchanged behavior). Also
-        updates a per-client file when client_name is known, either passed
-        explicitly or found inside `state["client_name"]`.
+        In multi-client mode, writes only the per-client file when a client is
+        known. The legacy global file is used only for no-client/single-client
+        fallback state so one client's deploy state cannot bleed into another.
         """
         effective_client = client_name or state.get("client_name") or None
         from datetime import datetime, timezone
@@ -284,10 +288,9 @@ class JsonStore:
                 path.write_text(json.dumps(current, indent=2), encoding="utf-8")
             return current
 
-        merged = _write(self._session_file)
         if effective_client:
-            _write(self._session_file_for_client(effective_client))
-        return merged
+            return _write(self._session_file_for_client(effective_client))
+        return _write(self._session_file)
 
     def load_session_state(self, client_name: str | None = None) -> dict:
         """Return last persisted session state, or empty dict if none.
@@ -298,13 +301,55 @@ class JsonStore:
         configured, so a resumed session can never pick up another client's
         project_path/sha by accident.
         """
+        if not client_name and len(get_odoo_clients()) > 1:
+            return {
+                "requires_client_name": True,
+                "message": "Multiple ODOO_CLIENTS entries are configured; pass client_name to load isolated session state.",
+            }
         path = self._session_file_for_client(client_name) if client_name else self._session_file
         if not path.exists():
             return {}
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            state = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return {}
+        return self._with_validated_project_path(state if isinstance(state, dict) else {})
+
+    def _with_validated_project_path(self, state: dict) -> dict:
+        project_path = state.get("project_path")
+        if not project_path:
+            return state
+
+        checked = dict(state)
+        try:
+            resolved = Path(str(project_path)).expanduser().resolve()
+        except OSError as exc:
+            checked["project_path"] = None
+            checked["project_path_valid"] = False
+            checked["stale_project_path"] = str(project_path)
+            checked["project_path_error"] = f"Could not resolve project_path: {exc}"
+            return checked
+
+        allowed_roots = settings.allowed_roots
+        if not allowed_roots or not any(resolved == root or root in resolved.parents for root in allowed_roots):
+            checked["project_path"] = None
+            checked["project_path_valid"] = False
+            checked["stale_project_path"] = str(project_path)
+            checked["project_path_error"] = f"Project path is outside allowed roots: {resolved}"
+            return checked
+
+        if not resolved.exists() or not resolved.is_dir():
+            checked["project_path"] = None
+            checked["project_path_valid"] = False
+            checked["stale_project_path"] = str(project_path)
+            checked["project_path_error"] = f"Project path is missing or not a directory: {resolved}"
+            return checked
+
+        checked["project_path"] = str(resolved)
+        checked["project_path_valid"] = True
+        checked.pop("stale_project_path", None)
+        checked.pop("project_path_error", None)
+        return checked
 
     def clear_session_state(self, client_name: str | None = None) -> None:
         """Wipe the session state file (e.g. after a successful full deploy)."""
