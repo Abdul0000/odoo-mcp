@@ -14,7 +14,7 @@ from ..services.store_service import JsonStore
 from ..services.workflow_guard_service import safe_deploy_shell_block
 from ..services.client_gate_service import ClientGateService
 from ..services.client_resolver_service import ClientResolverService
-from ..services.background_executor import BackgroundQueueFull, submit_background
+from ..services.background_executor import submit_background
 
 router = APIRouter(prefix="/odoo", tags=["odoo"], dependencies=[AuthDependency])
 
@@ -324,16 +324,7 @@ def odoo_module_install(payload: OdooModuleRequest) -> OdooResult:
         approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_install succeeded", "odoo.module_install failed")
         store.log_audit("odoo.module_install", result.status, payload.module_name)
 
-    try:
-        submit_background(_bg)
-    except BackgroundQueueFull as exc:
-        failed = store.finish_job(store.get_job(job.id), JobStatus.failed, {
-            "status": "background_capacity_full",
-            "error": str(exc),
-            "success_allowed": False,
-        })
-        approval.mark_failed(payload.approval_id, "odoo.module_install could not start: background capacity full")
-        return OdooResult(status="failed", error=str(exc), result={"job_id": failed.id, "finished": True, "status": "background_capacity_full"})
+    submit_background(_bg)
     return _background_job_response(store, job, payload, "Install started.")
 
 
@@ -360,66 +351,34 @@ def odoo_module_update(payload: OdooModuleRequest) -> OdooResult:
         approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_update succeeded", "odoo.module_update failed")
         store.log_audit("odoo.module_update", result.status, payload.module_name)
 
-    try:
-        submit_background(_bg)
-    except BackgroundQueueFull as exc:
-        failed = store.finish_job(store.get_job(job.id), JobStatus.failed, {
-            "status": "background_capacity_full",
-            "error": str(exc),
-            "success_allowed": False,
-        })
-        approval.mark_failed(payload.approval_id, "odoo.module_update could not start: background capacity full")
-        return OdooResult(status="failed", error=str(exc), result={"job_id": failed.id, "finished": True, "status": "background_capacity_full"})
+    submit_background(_bg)
     return _background_job_response(store, job, payload, "Upgrade started.")
 
 
-def run_odoo_module_deploy_inline(
-    payload: OdooModuleRequest,
-    approval: ApprovalService | None = None,
-    enforce_deploy_guard: bool = False,
-) -> OdooResult:
-    """Run module deploy synchronously inside the owning workflow worker.
-
-    Safe deploy already owns a scarce background worker. Starting a child job on
-    the same tiny executor can deadlock a one-worker Render instance, so internal
-    workflows call this inline path. Public endpoints may still wrap it in one
-    background job.
-    """
-    client = _prepare_validated_client(payload, "odoo.module_deploy")
-    store = JsonStore()
-    try:
-        guarded = _direct_module_deploy_guard(payload, store) if enforce_deploy_guard else None
-        result = guarded or _odoo_service_for_client(client).module_deploy(payload.module_name)
-    except Exception as exc:  # noqa: BLE001
-        result = OdooResult(status="failed", error=f"Unexpected error: {exc}")
-    if approval:
-        approval.finalize_status(
-            payload.approval_id,
-            result.status == "ok",
-            "odoo.module_deploy succeeded",
-            "odoo.module_deploy failed",
-        )
-    store.log_audit("odoo.module_deploy", result.status, payload.module_name)
-    return result
-
-
 def start_odoo_module_deploy_job(payload: OdooModuleRequest, approval: ApprovalService | None = None, enforce_deploy_guard: bool = False) -> OdooResult:
-    """Start one public background module-deploy job."""
-    _prepare_validated_client(payload, "odoo.module_deploy")
+    client = _prepare_validated_client(payload, "odoo.module_deploy")
+    """Start smart deploy in the existing background-job path.
+
+    Public router calls pass an ApprovalService after approval succeeds. Internal
+    workflows that already enforced their own approval can reuse the same job
+    path without asking for a second, mismatched approval.
+    """
     store = JsonStore()
     job = store.create_job(JobRecord(job_type="odoo.module_deploy", status=JobStatus.running, request={"module_name": payload.module_name}))
 
     def _bg():
-        result = run_odoo_module_deploy_inline(payload, approval, enforce_deploy_guard)
+        try:
+            guarded = _direct_module_deploy_guard(payload, store) if enforce_deploy_guard else None
+            result = guarded or _odoo_service_for_client(client).module_deploy(payload.module_name)
+        except Exception as exc:
+            result = OdooResult(status="failed", error=f"Unexpected error: {exc}")
         j = store.get_job(job.id)
         store.finish_job(j, JobStatus.passed if result.status == "ok" else JobStatus.failed, result.model_dump(mode="json"))
+        if approval:
+            approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_deploy succeeded", "odoo.module_deploy failed")
+        store.log_audit("odoo.module_deploy", result.status, payload.module_name)
 
-    try:
-        submit_background(_bg)
-    except BackgroundQueueFull as exc:
-        j = store.get_job(job.id)
-        store.finish_job(j, JobStatus.failed, {"error": str(exc), "status": "background_capacity_full"})
-        return OdooResult(status="failed", error=str(exc), result={"job_id": job.id, "finished": True})
+    submit_background(_bg)
     return _background_job_response(store, job, payload, "Deploy started.")
 
 

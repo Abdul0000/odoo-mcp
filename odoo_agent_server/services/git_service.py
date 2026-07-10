@@ -9,10 +9,9 @@ from fastapi import HTTPException, status
 from ..config import mask_repo_url, settings
 from ..schemas import CommandResult
 from .client_resolver_service import ClientResolverService
-from .path_service import ensure_mutable_project, resolve_allowed_path
+from .path_service import resolve_allowed_path
 from .repo_service import RepoService
 from .lock_service import RepoLockService
-from .repo_index_service import RepoIndexService
 
 
 class GitService:
@@ -38,17 +37,6 @@ class GitService:
             if result.exit_code != 0:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="project_path is not a git repository")
         return project
-
-    def _mutable_project(self, project_path: str, action: str) -> Path:
-        project = self._project(project_path)
-        ensure_mutable_project(project, action=action)
-        return project
-
-    @staticmethod
-    def _invalidate_if_ok(project: Path, result: CommandResult) -> CommandResult:
-        if result.exit_code == 0:
-            RepoIndexService().invalidate(str(project))
-        return result
 
     def status(self, project_path: str) -> CommandResult:
         return self._run(["git", "status", "--short", "--branch"], self._project(project_path), 30)
@@ -113,7 +101,7 @@ class GitService:
         return CommandResult(command=["git", "remote-head-sha", remote, branch], cwd=str(project), exit_code=0, stdout=sha + "\n")
 
     def configure_identity(self, project_path: str) -> CommandResult:
-        project = self._mutable_project(project_path, "git.configure_identity")
+        project = self._project(project_path)
         name_result = self._run(["git", "config", "user.name", settings.git_author_name], project, 20)
         if name_result.exit_code != 0:
             return name_result
@@ -167,7 +155,7 @@ class GitService:
         happen after an ephemeral workspace reset or when a different checkout
         instance pushed the module earlier.
         """
-        project = self._mutable_project(project_path, "git.fetch_reset_hard")
+        project = self._project(project_path)
         if not branch:
             branch_result = self.current_branch(str(project))
             if branch_result.exit_code != 0:
@@ -186,10 +174,10 @@ class GitService:
         fetch = self._run(["git", "fetch", remote], project, timeout_seconds)
         if fetch.exit_code != 0:
             return fetch
-        return self._invalidate_if_ok(project, self._run(["git", "reset", "--hard", f"{remote}/{branch}"], project, timeout_seconds))
+        return self._run(["git", "reset", "--hard", f"{remote}/{branch}"], project, timeout_seconds)
 
     def pull_rebase(self, project_path: str, remote: str = "origin", branch: str | None = None, timeout_seconds: int = 120) -> CommandResult:
-        project = self._mutable_project(project_path, "git.pull_rebase")
+        project = self._project(project_path)
         if not branch:
             branch_result = self.current_branch(str(project))
             if branch_result.exit_code != 0:
@@ -203,10 +191,10 @@ class GitService:
         fetch = self._run(["git", "fetch", remote], project, timeout_seconds)
         if fetch.exit_code != 0:
             return fetch
-        return self._invalidate_if_ok(project, self._run(["git", "pull", "--rebase", "--autostash", remote, branch], project, timeout_seconds))
+        return self._run(["git", "pull", "--rebase", "--autostash", remote, branch], project, timeout_seconds)
 
     def commit(self, project_path: str, message: str, paths: list[str], timeout_seconds: int = 60) -> CommandResult:
-        project = self._mutable_project(project_path, "git.commit")
+        project = self._project(project_path)
         branch_result = self.current_branch(str(project))
         branch = branch_result.stdout.strip() if branch_result.exit_code == 0 else None
         # Speed fix: only pull --rebase if remote has commits we don't have.
@@ -236,17 +224,17 @@ class GitService:
             diff_result = self._run(["git", "diff", "--cached", "--quiet"], project, timeout_seconds)
             if diff_result.exit_code == 0:
                 return CommandResult(command=["git", "commit", "-m", message], cwd=str(project), exit_code=1, stderr="No staged changes to commit.")
-            return self._invalidate_if_ok(project, self._run(["git", "commit", "-m", message], project, timeout_seconds))
+            return self._run(["git", "commit", "-m", message], project, timeout_seconds)
 
 
     def revert_commit(self, project_path: str, sha: str, timeout_seconds: int = 120) -> CommandResult:
-        project = self._mutable_project(project_path, "git.revert_commit")
+        project = self._project(project_path)
         if not sha or not all(c in "0123456789abcdefABCDEF" for c in sha[:40]):
             return CommandResult(command=["git", "revert", sha], cwd=str(project), exit_code=2, stderr="Unsafe or empty SHA for revert.")
-        return self._invalidate_if_ok(project, self._run(["git", "revert", "--no-edit", sha], project, timeout_seconds))
+        return self._run(["git", "revert", "--no-edit", sha], project, timeout_seconds)
 
     def push(self, project_path: str, remote: str = "origin", branch: str | None = None, set_upstream: bool = True, timeout_seconds: int = 120) -> CommandResult:
-        project = self._mutable_project(project_path, "git.push")
+        project = self._project(project_path)
         if not branch:
             branch_result = self.current_branch(project_path)
             if branch_result.exit_code != 0:

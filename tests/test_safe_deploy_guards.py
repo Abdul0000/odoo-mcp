@@ -62,8 +62,6 @@ def test_safe_deploy_starter_failure_returns_report(monkeypatch, tmp_path):
 def test_safe_deploy_endpoint_starts_job_for_grok_payload(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
-    monkeypatch.setattr(settings, "upgrade_max_attempts", 2)
-    monkeypatch.setattr(settings, "upgrade_retry_delay_seconds", 0.0)
     project = tmp_path / "repo"
     (project / "sale_order_notebook_tab").mkdir(parents=True)
 
@@ -1132,8 +1130,8 @@ def test_safe_deploy_retries_instead_of_finishing_as_nested_upgrade_running(tmp_
 
     finished = store.get_job(job.id)
     assert finished.status == JobStatus.failed
-    assert finished.result["status"] == "upgrade_failed_requires_code_fix"
-    # A nested non-terminal child job is a connector contract violation: retrying
+    assert finished.result["status"] == "upgrade_failed_after_retries"
+    # An unmappable/nested upgrade-running error is verifier-blocked: retrying
     # would only re-push byte-identical code, so the loop must stop after one
     # actionable failure instead of exhausting max_fix_cycles.
     assert finished.result["attempts"] == 1
@@ -1840,9 +1838,8 @@ class _SafeDeployRetryGit:
 
 
 class _SafeDeployRetryOdooSh:
-    def __init__(self, calls, transient=True):
+    def __init__(self, calls):
         self.calls = calls
-        self.transient = transient
 
     def check_commit_deployed(self, sha):
         self.calls["odoosh_check"] += 1
@@ -1858,25 +1855,19 @@ class _SafeDeployRetryOdooSh:
 
     def error_pack(self, tail_lines=800):
         self.calls["error_pack"] += 1
-        if self.transient:
-            traceback = "ConnectionResetError: connection reset by peer during Odoo worker restart"
-            hints = ["Transient worker/network failure; retry the same deployed SHA."]
-        else:
-            traceback = "ParseError: invalid XML view in x_module/views/a.xml"
-            hints = ["Permanent XML/code failure; edit and redeploy."]
-        stdout = f"""MCP_ERROR_PACK
-{{
+        stdout = """MCP_ERROR_PACK
+{
   "summary": "Odoo.sh traceback/error pack",
   "files": ["/home/odoo/src/user/x_module/models/a.py"],
   "xml_locations": [],
   "models_mentioned": [],
-  "hints": {hints!r}
-}}
+  "hints": ["Python import failure: check __init__.py imports, renamed files, and manifest dependencies."]
+}
 
 TRACEBACK_BLOCKS
 Traceback (most recent call last):
   File "/home/odoo/src/user/x_module/models/a.py", line 1, in <module>
-{traceback}
+RuntimeError: real upgrade failure
 """
         return CommandResult(command=["odoosh.error_pack", str(tail_lines)], cwd="odoosh:ssh", exit_code=0, stdout=stdout)
 
@@ -1889,7 +1880,7 @@ class _SafeDeployRetryOdooService:
         return OdooResult(status="ok", result={"module": module_name})
 
 
-def _retry_project(tmp_path, monkeypatch, success_on=None, max_fix_cycles=5, transient=True):
+def _retry_project(tmp_path, monkeypatch, success_on=None, max_fix_cycles=5):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     project = tmp_path / "repo"
@@ -1909,21 +1900,16 @@ def _retry_project(tmp_path, monkeypatch, success_on=None, max_fix_cycles=5, tra
         "manifest": 0,
     }
     git = _SafeDeployRetryGit(calls)
-    odoosh = _SafeDeployRetryOdooSh(calls, transient=transient)
+    odoosh = _SafeDeployRetryOdooSh(calls)
 
     def fake_deploy(req):
         calls["deploy"] += 1
         if success_on is not None and calls["deploy"] >= success_on:
             return OdooResult(status="ok", result={"finished": True, "job_status": "passed", "module_name": req.module_name})
-        error = (
-            f"connection reset during Odoo worker restart {calls['deploy']}"
-            if transient else
-            f"ParseError: invalid XML view {calls['deploy']}"
-        )
         return OdooResult(
             status="failed",
-            error=error,
-            result={"finished": True, "job_status": "failed", "error": error},
+            error=f"real upgrade failure {calls['deploy']}",
+            result={"finished": True, "job_status": "failed", "error": f"real upgrade failure {calls['deploy']}"},
         )
 
     monkeypatch.setattr(workflow, "GitService", lambda: git)
@@ -1956,16 +1942,13 @@ def test_safe_deploy_upgrade_fail_then_succeeds_on_retry(tmp_path, monkeypatch):
     assert finished.result["module_upgrade"]["attempt"] == 2
     assert calls["deploy"] == 2
     assert calls["error_pack"] == 1
-    # The retry reuses the exact deployed SHA; it never creates a fake fix commit.
-    assert calls["commit"] == 1
-    assert calls["push"] == 1
-    assert finished.request["last_sha"] == "abc0001"
+    assert calls["commit"] == 2
+    assert calls["push"] == 2
+    assert finished.request["last_sha"] == "abc0002"
     steps = {step.name: step.status for step in finished.steps}
     assert steps["upgrade_attempt_1"] == "failed"
-    assert steps["upgrade_retry_classification_1"] == "warning"
-    assert steps["upgrade_transient_retry_1"] == "passed"
+    assert steps["fix_cycle_1"] == "passed"
     assert steps["upgrade_attempt_2"] == "passed"
-    assert not any(name.startswith("fix_cycle_") for name in steps)
 
 
 def test_safe_deploy_upgrade_fails_all_5_cycles_with_real_error(tmp_path, monkeypatch):
@@ -1975,26 +1958,25 @@ def test_safe_deploy_upgrade_fails_all_5_cycles_with_real_error(tmp_path, monkey
 
     finished = store.get_job(job.id)
     assert finished.status == JobStatus.failed
-    assert finished.result["status"] == "upgrade_failed_after_transient_retries"
-    assert finished.result["requested_max_attempts"] == 5
-    assert finished.result["effective_max_attempts"] == 2
-    assert finished.result["attempts"] == 2
-    assert "connection reset" in finished.result["last_real_error"].lower()
-    assert finished.result["transient"] is True
+    assert finished.result["status"] == "upgrade_failed_after_retries"
+    assert finished.result["max_fix_cycles"] == 5
+    assert finished.result["attempts"] == 5
+    assert "real upgrade failure 5" in finished.result["last_real_error"]
+    assert "RuntimeError: real upgrade failure" in finished.result["last_real_error"]
     assert finished.result["next_call"] == {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
     assert "pushed & upgrade triggered" not in finished.result["message"].lower()
     assert "deployed successfully" not in finished.result["message"].lower()
-    assert calls["deploy"] == 2
-    assert calls["error_pack"] == 2
-    assert calls["commit"] == 1
-    assert calls["push"] == 1
+    assert calls["deploy"] == 5
+    assert calls["error_pack"] == 5
+    assert calls["commit"] == 5
+    assert calls["push"] == 5
     step_names = [step.name for step in finished.steps]
-    assert ["upgrade_attempt_1", "upgrade_attempt_2"] == [name for name in step_names if name.startswith("upgrade_attempt_")]
-    assert not any(name.startswith("fix_cycle_") for name in step_names)
+    assert [f"upgrade_attempt_{i}" for i in range(1, 6)] == [name for name in step_names if name.startswith("upgrade_attempt_")]
+    assert [f"fix_cycle_{i}" for i in range(1, 5)] == [name for name in step_names if name.startswith("fix_cycle_") and name.count("_") == 2]
 
 
 def test_safe_deploy_stops_retry_loop_when_fix_cycle_is_blocked(tmp_path, monkeypatch):
-    store, job, payload, calls = _retry_project(tmp_path, monkeypatch, success_on=None, max_fix_cycles=5, transient=False)
+    store, job, payload, calls = _retry_project(tmp_path, monkeypatch, success_on=None, max_fix_cycles=5)
 
     class BlockingFixVerifier:
         def verify(self, req):
@@ -2019,14 +2001,12 @@ def test_safe_deploy_stops_retry_loop_when_fix_cycle_is_blocked(tmp_path, monkey
     finished = store.get_job(job.id)
     step_names = [step.name for step in finished.steps]
     assert finished.status == JobStatus.failed
-    assert finished.result["status"] == "upgrade_failed_requires_code_fix"
+    assert finished.result["status"] == "upgrade_failed_after_retries"
     assert finished.result["attempts"] == 1
-    assert finished.result["transient"] is False
     assert calls["deploy"] == 1
     assert calls["commit"] == 1
     assert calls["push"] == 1
-    assert calls["verify"] == 1  # pre-push verification only; no fake repair verifier
-    assert not any(name.startswith("fix_cycle_") for name in step_names)
+    assert "fix_cycle_1" in step_names
     assert "upgrade_attempt_2" not in step_names
 
 
@@ -2116,12 +2096,12 @@ def test_safe_deploy_wait_for_result_fail_all_retries_returns_real_last_error(tm
 
     assert result.status == "failed"
     assert finished.status == JobStatus.failed
-    assert calls["deploy"] == 2
-    assert result.summary["status"] == "upgrade_failed_after_transient_retries"
-    assert result.summary["attempts"] == 2
-    assert result.summary["effective_max_attempts"] == 2
-    assert "Upgrade failed after 2 attempts" in result.summary["message"]
-    assert "connection reset" in result.summary["last_real_error"].lower()
+    assert calls["deploy"] == 5
+    assert result.summary["status"] == "upgrade_failed_after_retries"
+    assert result.summary["attempts"] == 5
+    assert "Upgrade failed after 5 attempts, last error:" in result.summary["message"]
+    assert "real upgrade failure 5" in result.summary["message"]
+    assert "RuntimeError: real upgrade failure" in result.summary["last_real_error"]
     assert result.summary["next_call"] == {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
     assert "check back" not in str(result.summary).lower()
     assert "may take a few minutes" not in str(result.summary).lower()
@@ -2140,53 +2120,7 @@ def test_safe_deploy_wait_for_result_response_never_uses_progress_wording(tmp_pa
     # finished job and monkeypatch state interacting with the second scenario.
     result, _finished_failure, _calls_failure = _run_safe_deploy_endpoint_retry_case(tmp_path / "failure", monkeypatch, success_on=None, max_fix_cycles=5)
     failure_text = str(result.summary).lower()
-    assert "upgrade failed after 2 attempts" in failure_text
+    assert "upgrade failed after 5 attempts" in failure_text
     assert "may take a few minutes" not in failure_text
     assert "check back" not in failure_text
     assert "in progress" not in failure_text
-
-
-def test_module_upgrade_success_accepts_inline_odoosh_ssh_fallback():
-    result = OdooResult(
-        status="ok",
-        result={
-            "operation": "deploy",
-            "ssh": {
-                "command": ["odoosh.module_deploy_ssh", "x_module", "-u"],
-                "cwd": "odoosh:ssh",
-                "exit_code": 0,
-                "stdout": "MCP_SSH_DEPLOY mode=upgrade state=installed module=x_module\n",
-                "stderr": "INFO odoo.modules.loading: Modules loaded.\nINFO odoo.modules.registry: Registry loaded in 3.0s\n",
-                "timed_out": False,
-            },
-            "fallback": "odoosh",
-        },
-    )
-
-    assert workflow._module_upgrade_success(result) is True
-
-
-def test_module_upgrade_success_rejects_failed_inline_odoosh_ssh_fallback():
-    result = OdooResult(
-        status="ok",
-        result={
-            "operation": "deploy",
-            "ssh": {
-                "command": ["odoosh.module_deploy_ssh", "x_module", "-u"],
-                "exit_code": 3,
-                "stdout": "MCP_SSH_DEPLOY mode=upgrade state=installed module=x_module\n",
-                "stderr": "MCP_CLASSIFIED_FAILURE: ParseError",
-            },
-        },
-    )
-
-    assert workflow._module_upgrade_success(result) is False
-
-
-def test_unknown_upgrade_result_is_inconclusive_not_permanent():
-    transient, classification = workflow._classify_upgrade_failure(
-        "Module upgrade failed; odoosh.error_pack returned no additional detail."
-    )
-
-    assert transient is False
-    assert classification == "inconclusive:no_explicit_failure"

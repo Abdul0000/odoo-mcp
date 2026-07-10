@@ -72,7 +72,7 @@ from ..services.path_service import resolve_allowed_path
 from ..services.browser_cdp_service import CdpBrowserService
 from ..services.repo_service import RepoService
 from ..services.store_service import JsonStore
-from ..services.background_executor import BackgroundQueueFull, submit_background
+from ..services.background_executor import submit_background
 from ..services.core_finder_service import CoreFinderService          # V14
 from ..services.prewrite_gate_service import PreWriteGateService
 from ..services.syntax_verifier_service import SyntaxVerifierService  # V14+
@@ -85,15 +85,9 @@ from ..services.workflow_guard_service import (
 )
 from ..services.checkout_guard_service import ensure_module_exists_or_sync, maybe_ensure_known_module_current
 from .qa import self_run
-from .odoo import run_odoo_module_deploy_inline
+from .odoo import start_odoo_module_deploy_job
 
 router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDependency])
-
-
-def start_odoo_module_deploy_job(payload: OdooModuleRequest) -> OdooResult:
-    """Compatibility hook for tests/plugins; executes inline, never nested."""
-    return run_odoo_module_deploy_inline(payload, enforce_deploy_guard=False)
-
 
 # Serializes the safe_deploy_module entry gate inside this process so two
 # near-simultaneous retries cannot both pass the duplicate-job check before the
@@ -687,49 +681,31 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
         approval = ApprovalService()
         approval.ensure_allowed("workflow.safe_deploy_module", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
 
-        # Preserve resumable terminal-job behaviour, but active ownership is
-        # admitted atomically in SQLite so multiple Uvicorn workers/processes
-        # cannot start the same project/module deploy.
-        if not payload.force_new_deploy:
-            existing_job = find_blocking_safe_deploy(
-                project_path=payload.project_path,
-                module_name=payload.module_name,
-                client_name=payload.client_name,
-            )
-            if existing_job is not None and existing_job.status not in {JobStatus.queued, JobStatus.running}:
+        with _SAFE_DEPLOY_ENTRY_LOCK:
+            existing_job = None
+            if not payload.force_new_deploy:
+                existing_job = find_blocking_safe_deploy(
+                    project_path=payload.project_path,
+                    module_name=payload.module_name,
+                    client_name=payload.client_name,
+                )
+            if existing_job is not None:
                 return _existing_job_report(existing_job)
 
-        store = JsonStore()
-        candidate = JobRecord(
-            job_type="safe_deploy_module",
-            status=JobStatus.running,
-            request=payload.model_dump(mode="json"),
-        )
-        if hasattr(store, "admit_safe_deploy") and hasattr(store, "deploy_lease_key"):
-            lease_key = store.deploy_lease_key(
-                payload.client_name,
-                payload.project_path,
-                payload.branch,
-                payload.module_name,
-            )
-            job, admitted, _reason = store.admit_safe_deploy(
-                candidate,
-                lease_key=lease_key,
-                force_new=payload.force_new_deploy,
-            )
-            if not admitted:
-                return _existing_job_report(job)
-        else:  # compatibility for injected test stores; production JsonStore is atomic
-            job = store.create_job(candidate)
-
-        store.save_session_state({
-            "last_safe_deploy_job_id": job.id,
-            "module_name": payload.module_name,
-            "project_path": payload.project_path,
-            "branch": payload.branch,
-            "client_name": payload.client_name,
-            "safe_deploy_status": "running",
-        }, client_name=payload.client_name)
+            store = JsonStore()
+            job = store.create_job(JobRecord(
+                job_type="safe_deploy_module",
+                status=JobStatus.running,
+                request=payload.model_dump(mode="json"),
+            ))
+            store.save_session_state({
+                "last_safe_deploy_job_id": job.id,
+                "module_name": payload.module_name,
+                "project_path": payload.project_path,
+                "branch": payload.branch,
+                "client_name": payload.client_name,
+                "safe_deploy_status": "running",
+            }, client_name=payload.client_name)
 
         def _background():
             try:
@@ -745,28 +721,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                     # leaking background exception handling back to the MCP stream.
                     pass
 
-        try:
-            submit_background(_background)
-        except BackgroundQueueFull as exc:
-            failed = store.finish_job(
-                store.get_job(job.id),
-                JobStatus.failed,
-                {
-                    "status": "background_capacity_full",
-                    "message": str(exc),
-                    "deploy_confirmed": False,
-                    "success_allowed": False,
-                },
-            )
-            return WorkflowReport(
-                status="failed",
-                job_id=failed.id,
-                steps=failed.steps,
-                deploy_confirmed=False,
-                verified_already_deployed=False,
-                already_deployed_confirmed=False,
-                summary=failed.result,
-            )
+        submit_background(_background)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -1245,35 +1200,57 @@ def _wait_nested_module_job(
 
 
 def _start_and_wait_module_deploy(payload: SafeDeployModuleRequest) -> OdooResult:
-    """Run upgrade inline in the owning safe-deploy worker."""
-    result = start_odoo_module_deploy_job(
-        OdooModuleRequest(
-            client_name=payload.client_name,
-            module_name=payload.module_name,
-            project_path=payload.project_path,
-            remote=payload.remote,
-            branch=payload.branch,
-            wait_for_result=True,
-            wait_timeout_seconds=payload.odoo_module_deploy_timeout_seconds,
-            poll_interval_seconds=payload.odoo_module_deploy_poll_interval_seconds,
-        )
+    started = start_odoo_module_deploy_job(OdooModuleRequest(
+        client_name=payload.client_name,
+        module_name=payload.module_name,
+        wait_for_result=True,
+        wait_timeout_seconds=min(max(int(payload.odoo_module_deploy_timeout_seconds or 1), 1), 25),
+        poll_interval_seconds=max(min(float(payload.odoo_module_deploy_poll_interval_seconds or 10.0), 10.0), 0.25),
+    ))
+    started_payload = started.model_dump(mode="json") if hasattr(started, "model_dump") else started
+    result_payload = started_payload.get("result") if isinstance(started_payload, dict) and isinstance(started_payload.get("result"), dict) else {}
+    if result_payload.get("finished") is True or not result_payload.get("job_id"):
+        return started
+
+    nested_job_id = str(result_payload.get("job_id"))
+    waited = _wait_nested_module_job(
+        JsonStore(),
+        nested_job_id,
+        payload.odoo_module_deploy_timeout_seconds,
+        payload.odoo_module_deploy_poll_interval_seconds,
     )
-    data = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
-    inner = data.get("result") if isinstance(data, dict) and isinstance(data.get("result"), dict) else {}
-    if inner.get("job_id") and inner.get("finished") is False:
+    if waited is None:
         return OdooResult(
             status="failed",
             error=(
-                "Odoo module deploy returned a non-terminal child job even though "
-                "wait_for_result=true. Nested jobs are not allowed on the small-instance worker."
+                f"Odoo module deploy did not reach a terminal pass/fail state within "
+                f"{payload.odoo_module_deploy_timeout_seconds}s while wait_for_result=true."
             ),
             result={
-                **inner,
+                "job_id": nested_job_id,
+                "job_status": "timeout",
                 "finished": True,
                 "status": "module_upgrade_timeout",
             },
         )
-    return result
+
+    data = waited.model_dump(mode="json")
+    if waited.status == JobStatus.passed:
+        return OdooResult(status="ok", result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data})
+    if waited.status in {JobStatus.failed, JobStatus.warning}:
+        result_error = waited.result.get("error") if isinstance(waited.result, dict) else None
+        if not result_error and isinstance(waited.result, dict):
+            result_error = waited.result.get("message")
+        return OdooResult(
+            status="failed" if waited.status == JobStatus.failed else "ok",
+            error=result_error or f"Odoo module deploy job finished with status={waited.status.value}",
+            result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data},
+        )
+    return OdooResult(
+        status="failed",
+        error=f"Odoo module deploy returned unexpected non-terminal job status={waited.status.value}",
+        result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data},
+    )
 
 
 def _poll_odoosh_deployed(
@@ -1344,63 +1321,24 @@ def _safe_deploy_payload(value) -> dict[str, object]:
 
 
 def _module_upgrade_success(value) -> bool:
-    """Return True only when the upgrade has explicit terminal success proof.
-
-    Two valid result shapes exist:
-
-    * background-job results: ``finished=True`` with a passed job status;
-    * the synchronous Odoo.sh SSH fallback: ``status=ok`` and an embedded
-      ``ssh`` command result with ``exit_code=0``.
-
-    The previous implementation understood only the first shape, so every
-    successful SSH fallback was misclassified as failed and then reverted.
-    """
+    """True only for explicit finished/success module-upgrade proof."""
     payload = _safe_deploy_payload(value)
     if payload.get("status") != "ok":
         return False
-
     nested = payload.get("result")
     if not isinstance(nested, dict):
         return False
-
-    # Public/background deploy contract. A non-terminal child job must never be
-    # accepted as success.
-    if "finished" in nested:
-        if nested.get("finished") is not True:
+    if nested.get("finished") is not True:
+        return False
+    job_status = nested.get("job_status")
+    if job_status is not None and str(job_status) not in {JobStatus.passed.value, "ok", "passed"}:
+        return False
+    nested_job = nested.get("job")
+    if isinstance(nested_job, dict):
+        nested_status = nested_job.get("status")
+        if nested_status is not None and str(nested_status) != JobStatus.passed.value:
             return False
-        job_status = nested.get("job_status")
-        if job_status is not None and str(job_status) not in {JobStatus.passed.value, "ok", "passed"}:
-            return False
-        nested_job = nested.get("job")
-        if isinstance(nested_job, dict):
-            nested_status = nested_job.get("status")
-            if nested_status is not None and str(nested_status) != JobStatus.passed.value:
-                return False
-        return True
-
-    # Inline Odoo.sh SSH fallback contract produced by
-    # OdooService._command_result(). The outer status is derived from the same
-    # command exit code, but require the embedded proof as well so an arbitrary
-    # ``status=ok`` payload cannot be treated as an upgrade confirmation.
-    operation = str(nested.get("operation") or "").strip().lower()
-    ssh_result = nested.get("ssh")
-    if operation in {"deploy", "module_deploy", "module_update", "module_install"} and isinstance(ssh_result, dict):
-        try:
-            exit_code = int(ssh_result.get("exit_code"))
-        except (TypeError, ValueError):
-            return False
-        if exit_code != 0:
-            return False
-        command = ssh_result.get("command")
-        command_text = " ".join(str(part) for part in command) if isinstance(command, list) else str(command or "")
-        stdout = str(ssh_result.get("stdout") or "")
-        return (
-            "odoosh.module_deploy_ssh" in command_text
-            or "MCP_SSH_DEPLOY" in stdout
-            or operation in {"module_update", "module_install"}
-        )
-
-    return False
+    return True
 
 
 def _extract_error_pack_json(error_pack: CommandResult | None) -> dict[str, object]:
@@ -1466,39 +1404,6 @@ def _safe_deploy_error_text(deploy_result=None, error_pack: CommandResult | None
             seen.add(value)
             clean.append(value)
     return "\n\n".join(clean) or "Module upgrade failed; odoosh.error_pack returned no additional detail."
-
-
-
-
-_TRANSIENT_UPGRADE_ERROR_RE = re.compile(
-    r"(?is)(?:timed?\s*out|timeout|temporar(?:y|ily)\s+unavailable|service\s+unavailable|"
-    r"bad\s+gateway|gateway\s+timeout|\b50[234]\b|connection\s+(?:reset|closed|refused|aborted)|"
-    r"network\s+(?:error|unreachable)|ssh.*(?:closed|reset|timeout)|deadlock|serialization\s+failure|"
-    r"could\s+not\s+serialize|lock\s+timeout|worker.*(?:restart|killed|terminated)|server\s+restart|"
-    r"module_upgrade_timeout|database\s+is\s+locked)"
-)
-_PERMANENT_UPGRADE_ERROR_RE = re.compile(
-    r"(?is)(?:parseerror|xmlsyntaxerror|syntaxerror|validationerror|importerror|modulenotfounderror|"
-    r"attributeerror|keyerror|nameerror|typeerror|external\s+id.*not\s+found|field .* does not exist|"
-    r"invalid\s+(?:view|field|xml)|accesserror|access\s+denied|constraint|duplicate\s+key|"
-    r"nested jobs are not allowed|wait_for_result=true)"
-)
-
-
-def _classify_upgrade_failure(text: str) -> tuple[bool, str]:
-    """Classify an upgrade failure without pretending to repair code.
-
-    Permanent code/schema errors stop immediately. Only clearly transient
-    transport, worker, locking, or gateway failures are retried.
-    """
-    value = str(text or "")
-    permanent = _PERMANENT_UPGRADE_ERROR_RE.search(value)
-    if permanent:
-        return False, f"non_retryable:{permanent.group(0).strip()[:120]}"
-    transient = _TRANSIENT_UPGRADE_ERROR_RE.search(value)
-    if transient:
-        return True, f"transient:{transient.group(0).strip()[:120]}"
-    return False, "inconclusive:no_explicit_failure"
 
 
 def _error_pack_implicated_files(
@@ -1571,46 +1476,6 @@ def _error_pack_implicated_files(
                     seen.add(key)
                     local_files.append(key)
     return local_files
-
-
-_DESTRUCTIVE_CHANGE_RE = re.compile(
-    r"\b(?:DROP\s+(?:TABLE|COLUMN|CONSTRAINT|INDEX)|TRUNCATE\s+TABLE|ALTER\s+TABLE|DELETE\s+FROM)\b|"
-    r"\benv\.cr\.execute\s*\(|\b(?:pre_init_hook|post_init_hook|uninstall_hook)\b|\.unlink\s*\(",
-    flags=re.IGNORECASE,
-)
-
-
-def _detect_destructive_upgrade(
-    project_path: Path,
-    module_name: str,
-    deploy_paths: list[str],
-    explicit: bool | None,
-) -> tuple[bool, list[str]]:
-    # Explicit False is only a hint, never a bypass. The server still scans the
-    # actual changed files so destructive SQL/migration code cannot disable the
-    # recovery checkpoint.
-    reasons: list[str] = []
-    if explicit is True:
-        reasons.append("request.destructive_migration=true")
-    for rel in deploy_paths[:100]:
-        normalized = rel.replace("\\", "/").lower()
-        if "/migrations/" in f"/{normalized}/" or "/upgrades/" in f"/{normalized}/":
-            reasons.append(f"migration path: {rel}")
-        target = (project_path / rel).resolve()
-        try:
-            if project_path not in target.parents and target != project_path:
-                continue
-            if not target.is_file() or target.stat().st_size > 750_000:
-                continue
-            text = target.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        match = _DESTRUCTIVE_CHANGE_RE.search(text)
-        if match:
-            reasons.append(f"destructive pattern in {rel}: {match.group(0)[:80]}")
-        if len(reasons) >= 10:
-            break
-    return bool(reasons), list(dict.fromkeys(reasons))
 
 
 def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
@@ -1753,38 +1618,6 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         return
     changed_files = _changed_file_set(changed_files_result)
     _step("git_changed_files", "passed", changed_files_result)
-
-    destructive, destructive_reasons = _detect_destructive_upgrade(
-        project_path, payload.module_name, deploy_paths or sorted(changed_files), payload.destructive_migration
-    )
-    if destructive and settings.require_backup_for_destructive:
-        if not payload.backup_confirmed or not (payload.backup_reference or "").strip():
-            job = store.get_job(job_id)
-            result = {
-                "status": "backup_required",
-                "message": (
-                    "Destructive schema/data change detected. Safe deploy is blocked until a restorable "
-                    "Odoo.sh backup or duplicate is explicitly confirmed."
-                ),
-                "module_name": payload.module_name,
-                "destructive_reasons": destructive_reasons,
-                "required_fields": ["backup_confirmed=true", "backup_reference"],
-                "deploy_confirmed": False,
-                "success_allowed": False,
-            }
-            _step("db_rollback_checkpoint", "failed", result, result["message"])
-            store.finish_job(job, JobStatus.failed, result)
-            _save_state("backup_required", {"destructive_reasons": destructive_reasons})
-            approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module backup required")
-            return
-        _step("db_rollback_checkpoint", "passed", {
-            "backup_reference": payload.backup_reference,
-            "destructive_reasons": destructive_reasons,
-            "message": "Restorable recovery point explicitly confirmed before destructive upgrade.",
-        })
-    else:
-        _step("db_rollback_checkpoint", "not_required", {"destructive": False})
-
     no_changes_detected = not _deploy_request_has_module_changes(payload.module_name, deploy_paths, changed_files)
     if no_changes_detected:
         try:
@@ -2173,31 +2006,153 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         )
         return error_pack
 
+    fix_cycle_blocked_by_verifier = False
+
+    def _run_fix_cycle(attempt: int, deploy_result, error_pack: CommandResult) -> bool:
+        nonlocal verify_files, expected_user_hashes, expected_registry_fields, pushed_sha, push_started_epoch, fix_cycle_blocked_by_verifier
+        fix_cycle_blocked_by_verifier = False
+        implicated_files = _error_pack_implicated_files(
+            project_path=project_path,
+            module_name=payload.module_name,
+            error_pack=error_pack,
+            fallback_files=verify_files,
+        )
+        verifier_payload = None
+        verifier_blocked = False
+        verifier_error = None
+        if implicated_files:
+            try:
+                verifier_payload = SyntaxVerifierService().verify(SyntaxVerifyRequest(
+                    written_files=implicated_files,
+                    fix_cycle=attempt,
+                    project_path=str(project_path),
+                ))
+                verifier_blocked = bool(verifier_payload.push_blocked)
+            except Exception as exc:  # noqa: BLE001
+                verifier_error = str(exc)
+                verifier_blocked = True
+        else:
+            verifier_error = "No local .py/.xml/.js/.scss/__manifest__.py file could be mapped from odoosh.error_pack."
+            verifier_blocked = True
+
+        fix_result = {
+            "attempt": attempt,
+            "implicated_files": implicated_files,
+            "upgrade_error": _safe_deploy_error_text(deploy_result, error_pack),
+            "verifier": verifier_payload.model_dump(mode="json") if hasattr(verifier_payload, "model_dump") else verifier_payload,
+            "verifier_error": verifier_error,
+            "message": (
+                "Verifier-guided fix cycle completed; recommitting and repushing before retry."
+                if not verifier_blocked else
+                "Verifier still blocks the implicated files; no retry commit was attempted for this cycle."
+            ),
+        }
+        _step(f"fix_cycle_{attempt}", "failed" if verifier_blocked else "passed", fix_result, verifier_error)
+        if verifier_blocked:
+            # Blocked either because the verifier rejected mappable files, OR because
+            # no local file could be mapped from the error at all. Both mean this
+            # fix cycle cannot make a different attempt with the current inputs —
+            # looping again would just re-push identical code and repeat the same
+            # failure. Stop the outer loop in either case.
+            fix_cycle_blocked_by_verifier = True
+            return False
+
+        retry_paths: list[str]
+        if implicated_files:
+            retry_paths = [Path(path).resolve().relative_to(project_path).as_posix() for path in implicated_files]
+        else:
+            retry_paths = deploy_paths
+        retry_paths = list(dict.fromkeys(retry_paths or deploy_paths))
+
+        commit_result = git.commit(
+            str(project_path),
+            f"{payload.commit_message} [safe-deploy fix cycle {attempt}]",
+            retry_paths,
+            min(payload.timeout_seconds, 300),
+        )
+        _step(f"fix_cycle_{attempt}_git_commit", "passed" if commit_result.exit_code == 0 else "failed", commit_result)
+        if commit_result.exit_code != 0:
+            return False
+
+        head_path_gate = _assert_head_commit_contains_paths(git, project_path, retry_paths)
+        _step(f"fix_cycle_{attempt}_git_head_commit_path_gate", "passed" if head_path_gate.exit_code == 0 else "failed", head_path_gate)
+        if head_path_gate.exit_code != 0:
+            return False
+
+        sha_result = git.head_sha(str(project_path))
+        _step(f"fix_cycle_{attempt}_git_head_sha", "passed" if sha_result.exit_code == 0 else "failed", sha_result)
+        if sha_result.exit_code != 0:
+            return False
+        pushed_sha = sha_result.stdout.strip()
+        push_started_epoch = int(time.time())
+
+        push_result = git.push(str(project_path), payload.remote, branch, True, min(payload.timeout_seconds, 600))
+        _step(f"fix_cycle_{attempt}_git_push", "passed" if push_result.exit_code == 0 else "failed", push_result)
+        if push_result.exit_code != 0:
+            return False
+
+        if hasattr(git, "remote_head_sha"):
+            remote_head = git.remote_head_sha(str(project_path), payload.remote, branch, 60)
+        else:
+            remote_ok = "PUSH_OK" in (push_result.stdout or "") and f"sha={pushed_sha}" in (push_result.stdout or "")
+            remote_head = CommandResult(
+                command=["git", "remote-head-sha", "legacy-fake"],
+                cwd=str(project_path),
+                exit_code=0 if remote_ok else 1,
+                stdout=(pushed_sha + "\n") if remote_ok else "",
+                stderr="GitService test double has no remote_head_sha()." if not remote_ok else "",
+            )
+        remote_sha = (remote_head.stdout or "").strip()
+        _step(
+            f"fix_cycle_{attempt}_git_remote_head_verify",
+            "passed" if remote_head.exit_code == 0 and remote_sha == pushed_sha else "failed",
+            remote_head,
+            None if remote_head.exit_code == 0 and remote_sha == pushed_sha else f"expected_sha={pushed_sha}; remote_sha={remote_sha or '<missing>'}",
+        )
+        if remote_head.exit_code != 0 or remote_sha != pushed_sha:
+            return False
+
+        verify_files = _pre_push_verify_files(project_path, payload.module_name, retry_paths, git.status(str(project_path)).stdout if hasattr(git, "status") else "") or implicated_files
+        expected_user_hashes = _expected_user_file_hashes(project_path, verify_files)
+        expected_registry_fields = _normalise_expected_registry_fields(payload.expected_registry_fields) or _infer_registry_fields_from_python(project_path, payload.module_name, verify_files)
+        job = store.get_job(job_id)
+        job.request["push_started_epoch"] = push_started_epoch
+        job.request["last_sha"] = pushed_sha
+        job.request["branch"] = branch
+        job.request["expected_user_file_hashes"] = expected_user_hashes
+        job.request["expected_registry_fields"] = expected_registry_fields
+        store.update_job(job)
+
+        if not _wait_for_odoosh_deployment(f"fix_cycle_{attempt}_"):
+            return False
+        if payload.wait_for_odoosh and expected_user_hashes:
+            code_verify = odoosh.verify_user_file_hashes(expected_user_hashes)
+            _step(f"fix_cycle_{attempt}_odoosh_user_file_verify", "passed" if code_verify.exit_code == 0 else "failed", code_verify)
+            if code_verify.exit_code != 0:
+                return False
+        manifest_result = odoosh.verify_module_manifest(payload.module_name)
+        _step(f"fix_cycle_{attempt}_odoosh_verify_module_manifest", "passed" if manifest_result.exit_code == 0 else "failed", manifest_result)
+        return manifest_result.exit_code == 0
+
     if payload.upgrade_module:
-        requested_attempts = max(1, int(payload.max_fix_cycles or 2))
-        max_attempts = min(requested_attempts, int(settings.upgrade_max_attempts or 2))
+        _step("db_rollback_checkpoint", "warning", {"note": "Code rollback is automatic, but database schema/data rollback requires an Odoo.sh backup or duplicate staging before upgrade. Create/confirm backup before destructive migrations."})
+        max_fix_cycles = max(1, int(payload.max_fix_cycles or 5))
         last_deploy_result = None
         last_error_pack: CommandResult | None = None
         last_real_error = ""
-        last_classification = ""
-        last_was_transient = False
         attempts_made = 0
         upgrade_passed = False
-
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(1, max_fix_cycles + 1):
             attempts_made = attempt
-            _save_state(
-                "running",
-                {
-                    "upgrade_attempt": attempt,
-                    "requested_upgrade_attempts": requested_attempts,
-                    "effective_upgrade_attempts": max_attempts,
-                },
-            )
+            _save_state("running", {"upgrade_attempt": attempt, "max_fix_cycles": max_fix_cycles})
             deploy_result = _start_and_wait_module_deploy(payload)
             last_deploy_result = deploy_result
             deploy_payload = _safe_deploy_payload(deploy_result)
             deploy_passed = _module_upgrade_success(deploy_result)
+            # A wait-for-result safe deploy cannot complete in an intermediate
+            # nested upgrade state. Treat any non-success, including a nested
+            # timeout/non-terminal result, as a failed upgrade attempt and keep
+            # the bounded error-pack/fix/retry loop inside this same job.
             attempt_status = "passed" if deploy_passed else "failed"
             _step(f"upgrade_attempt_{attempt}", attempt_status, deploy_result)
             if attempt == 1:
@@ -2217,78 +2172,24 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
 
             last_error_pack = _fetch_upgrade_error_pack(attempt, deploy_result)
             last_real_error = _safe_deploy_error_text(deploy_result, last_error_pack)
-            last_was_transient, last_classification = _classify_upgrade_failure(last_real_error)
-            _step(
-                f"upgrade_retry_classification_{attempt}",
-                "warning" if last_was_transient else "failed",
-                {
-                    "transient": last_was_transient,
-                    "classification": last_classification,
-                    "attempt": attempt,
-                    "effective_max_attempts": max_attempts,
-                    "message": (
-                        "Retrying the same deployed SHA because the failure is clearly transient."
-                        if last_was_transient and attempt < max_attempts
-                        else "Stopping without a fake code-fix commit. A real code/configuration fix is required."
-                    ),
-                },
-            )
-            if not last_was_transient or attempt >= max_attempts:
+            if attempt >= max_fix_cycles:
                 break
-
-            delay = max(0.0, float(settings.upgrade_retry_delay_seconds or 0.0))
-            _step(
-                f"upgrade_transient_retry_{attempt}",
-                "passed",
-                {
-                    "retrying_attempt": attempt + 1,
-                    "delay_seconds": delay,
-                    "same_sha": pushed_sha,
-                },
-            )
-            if delay:
-                time.sleep(delay)
+            fixed = _run_fix_cycle(attempt, deploy_result, last_error_pack)
+            if not fixed:
+                if fix_cycle_blocked_by_verifier:
+                    break
+                continue
 
         if not upgrade_passed:
-            # Revert only when Odoo produced a proven permanent code/schema
-            # failure. Transport failures and inconclusive result shapes must
-            # preserve the pushed commit so a parser/availability issue cannot
-            # silently undo valid user work.
-            proven_permanent_failure = bool(
-                last_classification.startswith("non_retryable:")
-                and last_classification != "non_retryable:unclassified_failure"
-            )
-            if proven_permanent_failure:
-                _rollback_after_failure("odoo_module_deploy")
-            else:
-                _step(
-                    "rollback_skipped_unproven_failure",
-                    "passed",
-                    {
-                        "classification": last_classification or "inconclusive:no_explicit_failure",
-                        "reason": "No proven permanent upgrade error; preserving pushed commit.",
-                    },
-                )
             job = store.get_job(job_id)
             attempts_text = f"{attempts_made} attempt" if attempts_made == 1 else f"{attempts_made} attempts"
-            final_status = (
-                "upgrade_failed_after_transient_retries"
-                if last_was_transient and attempts_made >= max_attempts
-                else "upgrade_failed_requires_code_fix"
-            )
             result = {
-                "status": final_status,
-                "message": (
-                    f"Upgrade failed after {attempts_text}. No byte-identical fix commits were created. "
-                    f"Classification: {last_classification or 'non_retryable:unknown'}."
-                ),
+                "status": "upgrade_failed_after_retries",
+                "message": f"Upgrade failed after {attempts_text}, last error: {last_real_error or _safe_deploy_error_text(last_deploy_result, last_error_pack)}",
                 "module_name": payload.module_name,
                 "sha": pushed_sha,
                 "attempts": attempts_made,
-                "requested_max_attempts": requested_attempts,
-                "effective_max_attempts": max_attempts,
-                "transient": last_was_transient,
-                "classification": last_classification,
+                "max_fix_cycles": max_fix_cycles,
                 "last_real_error": last_real_error or _safe_deploy_error_text(last_deploy_result, last_error_pack),
                 "last_upgrade_result": _safe_deploy_payload(last_deploy_result) if last_deploy_result is not None else None,
                 "last_error_pack": last_error_pack.model_dump(mode="json") if hasattr(last_error_pack, "model_dump") else None,
@@ -2299,12 +2200,11 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                     "attempts": attempts_made,
                 },
                 "odoosh_check_commit": odoosh_deploy_confirmation,
-                "rollback_attempted": rollback_attempted,
                 "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
             }
             store.finish_job(job, JobStatus.failed, result)
-            _save_state(final_status, {"last_upgrade_error": result["last_real_error"]})
-            approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module module upgrade failed")
+            _save_state("upgrade_failed_after_retries", {"last_upgrade_error": result["last_real_error"]})
+            approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module module upgrade failed after retries")
             return
 
     module_status = _odoo_service_for_client(client).module_status(payload.module_name)

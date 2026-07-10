@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import ast
 import re
 from pathlib import Path
-from xml.sax.saxutils import quoteattr
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,7 +41,6 @@ class FrontendVisualService:
         strategy = self._select_strategy(payload, design_text)
         asset_name = self._safe_name(payload.asset_name or self._default_asset_name(component_type, design_text))
         css_file, existing_css = self._choose_css_target(payload, module_name, asset_name, design_text)
-        binding_proof = self._prove_binding(payload, module_name, css_file, design_text)
 
         if strategy == "svg_asset":
             variants = self._variants(payload, asset_name, design_text)
@@ -61,8 +58,7 @@ class FrontendVisualService:
                 "css_file": css_file,
                 "assets": [f"{module_name}/static/src/img/{variant.file_name}" for variant in variants],
                 "reason": "SVG asset selected for exact visual shapes, logos, backgrounds, decorative borders, and pipe-like curves that CSS borders approximate poorly.",
-                "manifest_note": "The target stylesheet is already present in an Odoo asset bundle and the selector binding was proven before generation.",
-                "binding_proof": binding_proof,
+                "manifest_note": "Static SVGs in static/src/img are served by Odoo directly. The generated SCSS still needs to be included in the relevant asset bundle, or its content can be merged into an existing bundled SCSS file.",
             }
             return writes, plan
 
@@ -75,7 +71,6 @@ class FrontendVisualService:
             "asset_name": asset_name,
             "css_file": css_file,
             "reason": "SCSS-only selected because SVG asset generation was not requested and the task appears to be normal layout/card styling.",
-            "binding_proof": binding_proof,
         }
         return writes, plan
 
@@ -155,88 +150,10 @@ class FrontendVisualService:
             selected = max(dict.fromkeys(candidates), key=score)
             return selected, self._read_existing_css(payload, selected)
 
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "Visual generation requires an existing bundled CSS/SCSS target. "
-                "Pass css_file_path or include a bundled stylesheet in target_files; "
-                "the service will not create orphan asset code."
-            ),
+        selected = self._normalise_css_path(
+            module_name, f"static/src/css/{asset_name}.scss"
         )
-
-    def _manifest_asset_paths(self, payload: FrontendVisualImplementRequest, module_name: str) -> set[str]:
-        if not payload.project_path:
-            return set()
-        manifest = Path(payload.project_path).expanduser().resolve() / module_name / "__manifest__.py"
-        try:
-            data = ast.literal_eval(manifest.read_text(encoding="utf-8"))
-        except Exception:
-            return set()
-        assets = data.get("assets", {}) if isinstance(data, dict) else {}
-        result: set[str] = set()
-        if isinstance(assets, dict):
-            for items in assets.values():
-                if isinstance(items, (list, tuple)):
-                    for item in items:
-                        if isinstance(item, str) and not item.startswith(("!", "(")):
-                            result.add(item.replace("\\", "/").lstrip("/"))
-        return result
-
-    def _prove_binding(
-        self,
-        payload: FrontendVisualImplementRequest,
-        module_name: str,
-        css_file: str,
-        design_text: str,
-    ) -> dict[str, Any]:
-        if not payload.project_path:
-            return {"status": "unverified_no_project_path", "bundled_css": css_file}
-        module_root = Path(payload.project_path).expanduser().resolve() / module_name
-        manifest = module_root / "__manifest__.py"
-        if not manifest.exists():
-            # Unit tests/standalone generators may not have a full addon tree.
-            # Real workflow checkouts always have a manifest and are strict.
-            return {"status": "unverified_no_manifest", "bundled_css": css_file}
-        bundled = self._manifest_asset_paths(payload, module_name)
-        if css_file not in bundled:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Visual stylesheet is not declared in an Odoo asset bundle: {css_file}",
-            )
-        selector = str(payload.css_selector or "").strip()
-        if selector:
-            tokens = re.findall(r"[.#]([A-Za-z_][A-Za-z0-9_-]*)", selector)
-            required = tokens[-1] if tokens else selector.strip(".#")
-        elif "trolley" in design_text:
-            required = "pos-theme-trolley"
-        else:
-            raise HTTPException(
-                status_code=409,
-                detail="Provide css_selector for generic visual generation so attachment to a rendered node can be proven.",
-            )
-        evidence: list[str] = []
-        for suffix in ("*.xml", "*.js"):
-            for path in module_root.rglob(suffix):
-                if any(part in {".git", "node_modules", "__pycache__"} for part in path.parts):
-                    continue
-                try:
-                    if required in path.read_text(encoding="utf-8", errors="ignore"):
-                        evidence.append(path.relative_to(Path(payload.project_path).resolve()).as_posix())
-                except OSError:
-                    continue
-                if len(evidence) >= 5:
-                    break
-            if evidence:
-                break
-        if not evidence:
-            has_frontend_sources = any(module_root.rglob("*.xml")) or any(module_root.rglob("*.js"))
-            if not has_frontend_sources:
-                return {"status": "unverified_no_frontend_sources", "bundled_css": css_file, "selector_token": required}
-            raise HTTPException(
-                status_code=409,
-                detail=f"Visual selector binding could not be proven; token '{required}' was not found in module XML/JS.",
-            )
-        return {"bundled_css": css_file, "selector_token": required, "template_evidence": evidence}
+        return selected, self._read_existing_css(payload, selected)
 
     def _merge_generated_css(self, existing_css: str, asset_name: str, generated_css: str) -> str:
         """Idempotently add or replace one generated visual block."""
@@ -321,9 +238,8 @@ class FrontendVisualService:
 
     def _svg_for_variant(self, variant: VisualVariant, payload: FrontendVisualImplementRequest) -> str:
         pal = self._palette(variant.palette)
-        title = (payload.design_goal or variant.name)[:120]
-        aria_label = quoteattr(title)
-        return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 360" role="img" aria-label={aria_label}>
+        title = (payload.design_goal or variant.name).replace("&", "and").replace("<", "").replace(">", "")[:120]
+        return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 360" role="img" aria-label="{title}">
   <defs>
     <linearGradient id="pipe" x1="0" x2="1" y1="0" y2="0">
       <stop offset="0" stop-color="{pal['dark']}"/>
@@ -363,10 +279,7 @@ class FrontendVisualService:
                 lines.append(f"{selector}{suffix}::before {{\n    content: \"\";\n    position: absolute;\n    left: -1.15rem;\n    top: .25rem;\n    bottom: .25rem;\n    width: 2.2rem;\n    background-image: url(\"{url(variant)}\");\n    background-repeat: no-repeat;\n    background-size: 100% 100%;\n    background-position: left center;\n    pointer-events: none;\n    z-index: 2;\n}}\n")
             return "\n".join(lines)
 
-        # Pipe/trolley variants must bind to the proven trolley selectors even
-        # when the request calls the component "full_ui". Generating a generic
-        # unattached helper class would be a silent no-op.
-        if any("pipe" in variant.file_name for variant in variants):
+        if component_type in {"border", "auto"} and any("pipe" in variant.file_name for variant in variants):
             by_role = {variant.role: variant for variant in variants}
             active = by_role.get("active", variants[0])
             purple = by_role.get("packed_purple", variants[min(1, len(variants)-1)])

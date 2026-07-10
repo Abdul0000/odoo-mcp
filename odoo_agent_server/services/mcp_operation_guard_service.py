@@ -40,23 +40,6 @@ _UNIQUE_ONCE_TOOLS = {"repo.list_custom_modules", "workflow.list_module_files", 
 _MAX_SEARCH_CALLS = 2
 _FRONTEND_SUFFIXES = (".xml", ".css", ".scss", ".js", ".qweb")
 
-_GUARD_EXEMPT_TOOLS = {
-    # Bootstrap, health, artifacts, and job-status tools must stay stateless.
-    "connector.health",
-    "client.check",
-    "workflow.agent_instructions",
-    "workflow.start_session",
-    "workflow.odoo_code_change",
-    "workflow.frontend_visual_implement",
-    "artifacts.read",
-    "jobs.get",
-    "jobs.list",
-    "jobs.status_compact",
-    "browser.login",
-    "browser.screenshot",
-    "odoosh.error_pack",
-}
-
 
 class McpOperationGuardService:
     """Small provider-side orchestration guard for Grok remote MCP.
@@ -112,8 +95,6 @@ class McpOperationGuardService:
         return data
 
     def before_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
-        if tool_name in _GUARD_EXEMPT_TOOLS:
-            return None
         client_name = self._client_name(arguments)
         state = self._load(client_name)
         guard = state.setdefault("mcp_operation_guard", {})
@@ -218,8 +199,6 @@ class McpOperationGuardService:
         return None
 
     def after_tool_call(self, tool_name: str, arguments: dict[str, Any], structured: dict[str, Any]) -> None:
-        if tool_name in _GUARD_EXEMPT_TOOLS and tool_name != "jobs.get":
-            return
         client_name = self._client_name(arguments)
         state = self._load(client_name)
         guard = state.setdefault("mcp_operation_guard", {})

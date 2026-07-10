@@ -27,15 +27,6 @@ _INTERESTING_SUFFIXES = {".py", ".xml", ".js", ".scss"}
 
 
 class RepoIndexService:
-    def invalidate(self, project_path: str) -> None:
-        """Drop the cached index after any checkout mutation."""
-        try:
-            project = resolve_allowed_path(project_path)
-            self._cache_file(project).unlink(missing_ok=True)
-        except Exception:
-            # Mutation success must not be hidden by a cache cleanup problem.
-            return
-
     def index(self, project_path: str, force_refresh: bool = False, max_files: int = 5000) -> RepoIndexResult:
         project = resolve_allowed_path(project_path)
         if not project.exists() or not project.is_dir():
@@ -190,12 +181,6 @@ class RepoIndexService:
         return settings.cache_path / "repo_index" / f"{key}.json"
 
     def _fingerprint(self, project: Path) -> str:
-        """Fingerprint HEAD plus current dirty file bytes, not only status names.
-
-        `git status --porcelain` stays unchanged when the same dirty file is
-        edited twice. Hashing bounded dirty contents prevents stale templates
-        without re-indexing every repository file.
-        """
         try:
             head = subprocess.run(
                 ["git", "rev-parse", "HEAD"],
@@ -205,35 +190,17 @@ class RepoIndexService:
                 timeout=3,
                 check=False,
             )
-            dirty = subprocess.run(
-                ["git", "status", "--porcelain", "-z"],
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
                 cwd=str(project),
                 capture_output=True,
+                text=True,
                 timeout=3,
                 check=False,
             )
-            if head.returncode == 0 and dirty.returncode == 0:
-                digest = hashlib.sha256()
-                digest.update(f"git:{head.stdout.strip()}".encode("utf-8"))
-                raw_entries = [entry for entry in dirty.stdout.split(b"\x00") if entry]
-                # A huge dirty tree should not exhaust a 512 MB instance. The
-                # first 200 paths are enough to invalidate normal agent edits.
-                for raw in raw_entries[:200]:
-                    digest.update(raw)
-                    text = raw.decode("utf-8", errors="surrogateescape")
-                    path_text = text[3:] if len(text) >= 4 else text
-                    if " -> " in path_text:
-                        path_text = path_text.rsplit(" -> ", 1)[-1]
-                    candidate = project / path_text
-                    try:
-                        stat = candidate.stat()
-                        digest.update(f":{stat.st_mtime_ns}:{stat.st_size}:".encode("ascii"))
-                        if candidate.is_file() and stat.st_size <= 1_000_000:
-                            digest.update(candidate.read_bytes())
-                    except OSError:
-                        digest.update(b":missing")
-                digest.update(f":dirty_count={len(raw_entries)}".encode("ascii"))
-                return digest.hexdigest()
+            if head.returncode == 0 and status.returncode == 0:
+                payload = f"git:{head.stdout.strip()}:{status.stdout.strip()}"
+                return hashlib.sha256(payload.encode("utf-8")).hexdigest()
         except Exception:
             pass
         try:

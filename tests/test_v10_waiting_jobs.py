@@ -120,15 +120,8 @@ def test_module_deploy_wait_for_result_true_never_returns_progress_text(monkeypa
     text = str(data).lower()
     assert data["status"] == "ok"
     assert data["result"]["status"] == "failed"
-    result = data["result"]["result"]
-    # Under suite-wide load the intentionally tiny executor may reject this job
-    # with explicit terminal backpressure. Otherwise MCP deploy tools return a
-    # non-terminal job_id and require jobs.get polling. Neither path may sound
-    # like success.
-    if result["finished"] is True:
-        assert data["result"].get("error") or result.get("error") or result.get("message")
-    else:
-        assert result["success_allowed"] is False
-        assert result["next_call"]["tool"] == "jobs.get"
+    assert data["result"]["result"]["finished"] is False
+    assert data["result"]["result"]["success_allowed"] is False
+    assert data["result"]["result"]["next_call"]["tool"] == "jobs.get"
     assert "may take a few minutes" not in text
     assert "check back" not in text

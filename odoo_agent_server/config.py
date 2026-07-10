@@ -16,10 +16,7 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     api_token: str = Field(default="change-me", alias="ODOO_AGENT_API_TOKEN")
-    environment: str = Field(default="development", alias="ODOO_AGENT_ENV")
-    allow_insecure_default_token: bool = Field(default=False, alias="ODOO_AGENT_ALLOW_INSECURE_DEFAULT_TOKEN")
     allowed_roots_raw: str = Field(default="/workspace/repos,/tmp,/home/odoo/src", alias="ODOO_AGENT_ALLOWED_ROOTS")
-    immutable_roots_raw: str = Field(default="/home/odoo/src/odoo,/home/odoo/src/enterprise", alias="ODOO_AGENT_IMMUTABLE_ROOTS")
     state_dir: str = Field(default="/tmp/odoo_agent_state", alias="ODOO_AGENT_STATE_DIR")
     screenshot_dir: str = Field(default="/tmp/odoo_agent_screenshots", alias="ODOO_AGENT_SCREENSHOT_DIR")
     screenshot_auto_clean: bool = Field(default=True, alias="ODOO_AGENT_SCREENSHOT_AUTO_CLEAN")
@@ -32,7 +29,7 @@ class Settings(BaseSettings):
     # Approval gating is disabled in this build so MCP tools can write, commit, push, and deploy directly.
     require_approval: bool = Field(default=False, alias="ODOO_AGENT_REQUIRE_APPROVAL")
     approval_required_actions_raw: str = Field(default="", alias="ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS")
-    protected_branches_raw: str = Field(default="main,master,production", alias="ODOO_AGENT_PROTECTED_BRANCHES")
+    protected_branches_raw: str = Field(default="", alias="ODOO_AGENT_PROTECTED_BRANCHES")
 
     # Git deployment guardrails. These are optional but strongly recommended in production.
     target_git_repo: str | None = Field(default=None, alias="TARGET_GIT_REPO")
@@ -73,20 +70,6 @@ class Settings(BaseSettings):
     fast_write_max_files: int = Field(default=8, alias="ODOO_AGENT_FAST_WRITE_MAX_FILES")
     fast_write_max_bytes_each: int = Field(default=300_000, alias="ODOO_AGENT_FAST_WRITE_MAX_BYTES_EACH")
     fast_write_max_total_bytes: int = Field(default=750_000, alias="ODOO_AGENT_FAST_WRITE_MAX_TOTAL_BYTES")
-
-    # Small-instance runtime limits. Render free instances have very limited CPU/RAM,
-    # so one worker owns long-running jobs and only a tiny bounded queue is allowed.
-    background_workers: int = Field(default=1, ge=1, le=4, alias="ODOO_AGENT_BACKGROUND_WORKERS")
-    background_queue_limit: int = Field(default=1, ge=0, le=20, alias="ODOO_AGENT_BACKGROUND_QUEUE_LIMIT")
-    max_active_deploys: int = Field(default=1, ge=1, le=4, alias="ODOO_AGENT_MAX_ACTIVE_DEPLOYS")
-    mcp_dispatch_concurrency: int = Field(default=2, ge=1, le=8, alias="ODOO_AGENT_MCP_DISPATCH_CONCURRENCY")
-    sqlite_busy_timeout_ms: int = Field(default=5000, ge=100, le=30000, alias="ODOO_AGENT_SQLITE_BUSY_TIMEOUT_MS")
-    safe_deploy_lease_seconds: int = Field(default=1200, ge=60, le=7200, alias="ODOO_AGENT_SAFE_DEPLOY_LEASE_SECONDS")
-    frontend_preflight_max_reads: int = Field(default=20, ge=4, le=60, alias="ODOO_AGENT_FRONTEND_PREFLIGHT_MAX_READS")
-    upgrade_max_attempts: int = Field(default=2, ge=1, le=5, alias="ODOO_AGENT_UPGRADE_MAX_ATTEMPTS")
-    upgrade_retry_delay_seconds: float = Field(default=2.0, ge=0.0, le=30.0, alias="ODOO_AGENT_UPGRADE_RETRY_DELAY_SECONDS")
-    browser_tools_enabled: bool = Field(default=False, alias="ODOO_AGENT_BROWSER_TOOLS_ENABLED")
-    require_backup_for_destructive: bool = Field(default=True, alias="ODOO_AGENT_REQUIRE_BACKUP_FOR_DESTRUCTIVE")
 
     # Fast/correct agent optimisations. These keep strict validation while avoiding
     # repeated full-source scans on every OWL/POS/website task.
@@ -137,19 +120,6 @@ class Settings(BaseSettings):
             if raw:
                 roots.append(Path(raw).expanduser().resolve())
         return roots
-
-    @property
-    def immutable_roots(self) -> List[Path]:
-        roots: list[Path] = []
-        for raw in self.immutable_roots_raw.split(","):
-            raw = raw.strip()
-            if raw:
-                roots.append(Path(raw).expanduser().resolve())
-        return roots
-
-    @property
-    def is_production(self) -> bool:
-        return self.environment.strip().lower() in {"prod", "production"} or bool(os.getenv("RENDER_EXTERNAL_URL"))
 
     @property
     def approval_required_actions(self) -> set[str]:

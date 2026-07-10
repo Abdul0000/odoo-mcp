@@ -119,15 +119,7 @@ start_chromium_cdp() {
   fi
 }
 
-case "${ODOO_AGENT_BROWSER_TOOLS_ENABLED:-false}" in
-  1|true|TRUE|yes|YES|on|ON)
-    start_chromium_cdp
-    ;;
-  *)
-    unset ODOO_AGENT_CDP_URL || true
-    echo "INFO: Browser tools disabled; Chromium will not start (saves RAM on small instances)."
-    ;;
-esac
+start_chromium_cdp
 
 # Verify SSH keys are valid
 if [ -f /tmp/keys/odoosh_key ]; then

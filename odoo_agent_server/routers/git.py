@@ -13,7 +13,7 @@ from ..auth import AuthDependency
 from ..config import settings
 from ..schemas import ApprovalRecord, ApprovalStatus, BaseProjectRequest, CommandResult, GitCommitRequest, GitDiffRequest, GitPushRequest, JobRecord, JobStatus, JobStep
 from ..services.approval_service import ApprovalService
-from ..services.background_executor import BackgroundQueueFull, submit_background
+from ..services.background_executor import submit_background
 from ..services.git_service import GitService
 from ..services.odoosh_service import OdooShService
 from ..services.client_resolver_service import ClientResolverService
@@ -262,35 +262,21 @@ def _start_auto_odoosh_upgrade_job(project_path: str, module_name: str, expected
                 {"job_id": job.id, "expected_sha": expected_sha, "error": str(exc)},
             )
 
-    try:
-        submit_background(_bg)
-    except BackgroundQueueFull as exc:
-        _finish(JobStatus.failed, {
-            "status": "background_capacity_full",
-            "message": str(exc),
-            "module_name": module_name,
-            "sha": expected_sha,
-            "success_allowed": False,
-        })
+    submit_background(_bg)
     return job.id
 
 
 def _append_auto_upgrade_note(result: CommandResult, module_name: str, job_id: str) -> CommandResult:
-    job = JsonStore().get_job(job_id)
-    capacity_failed = job.status == JobStatus.failed and isinstance(job.result, dict) and job.result.get("status") == "background_capacity_full"
     note = (
-        f"Detected module {module_name}, but the follow-up Odoo.sh upgrade could not start because background capacity is full; job_id={job_id}. "
-        "The Git push succeeded, but deployment/upgrade is NOT confirmed. Poll jobs.get or retry workflow.safe_deploy_module after capacity is available."
-        if capacity_failed else
         f"Detected module {module_name} in this push — Odoo.sh upgrade job started, job_id={job_id}. "
         "This is NOT deployed/upgraded yet. Poll with jobs.get until terminal passed/failed. Do not report success from git.push."
     )
     payload = {
-        "status": "background_capacity_full" if capacity_failed else "running",
+        "status": "running",
         "follow_up_job_id": job_id,
         "job_id": job_id,
         "module_name": module_name,
-        "completion_required": not capacity_failed,
+        "completion_required": True,
         "success_allowed": False,
         "tool_exit_allowed": False,
         "poll_after_seconds": 5,

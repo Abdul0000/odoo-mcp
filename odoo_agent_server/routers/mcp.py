@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from typing import Any
@@ -22,31 +21,6 @@ qwen_router = APIRouter(prefix="/qwen", tags=["mcp-qwen"] )
 claude_router = APIRouter(prefix="/claude", tags=["mcp-claude"], dependencies=[AuthDependency])
 chatgpt_router = APIRouter(prefix="/chatgpt", tags=["mcp-chatgpt"], dependencies=[AuthDependency])
 grok_router = APIRouter(prefix="/grok", tags=["mcp-grok"], dependencies=[AuthDependency])
-
-# MCP compatibility endpoints are async, while most tool implementations are
-# intentionally synchronous (Git/SSH/filesystem). Run them off the event loop
-# and cap request execution for 0.1 CPU / 512 MB instances. Long jobs still use
-# the separate one-worker bounded background executor.
-_MCP_DISPATCH_SEMAPHORE = asyncio.Semaphore(settings.mcp_dispatch_concurrency)
-_NATIVE_ASYNC_TOOLS = {
-    "jobs.get",
-    "browser.login",
-    "browser.pos_flow",
-    "browser.screenshot",
-    "workflow.browser_menu_crawl",
-    "workflow.verify_pos_change",
-}
-
-
-async def _dispatch_without_blocking_event_loop(tool_name: str, arguments: dict[str, Any]) -> object:
-    if tool_name in _NATIVE_ASYNC_TOOLS:
-        return await _dispatch(tool_name, arguments)
-
-    def run_in_worker() -> object:
-        return asyncio.run(_dispatch(tool_name, arguments))
-
-    async with _MCP_DISPATCH_SEMAPHORE:
-        return await asyncio.to_thread(run_in_worker)
 
 
 def _shell_response(request_id: Any, result: Any = None, error: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -571,7 +545,7 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                     },
                 )
             arguments = _arguments_for_profile(internal_name, arguments, profile)
-            if profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and isinstance(arguments, dict):
+            if False and profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and isinstance(arguments, dict):
                 op_guard = McpOperationGuardService()
                 arguments = op_guard.canonicalize_arguments(internal_name, arguments)
                 guarded = op_guard.before_tool_call(internal_name, arguments)
@@ -585,11 +559,11 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                             "isError": False,
                         },
                     )
-            result = await _dispatch_without_blocking_event_loop(internal_name, arguments)
+            result = await _dispatch(internal_name, arguments)
             structured = _to_structured_content(result, tool_name=internal_name)
             if profile in {"provider", "claude", "chatgpt", "grok", "qwen"}:
                 structured = _provider_safe_next_calls(structured)
-            if profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and isinstance(arguments, dict):
+            if False and profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and isinstance(arguments, dict):
                 op_guard = McpOperationGuardService()
                 op_guard.after_tool_call(internal_name, arguments, structured if isinstance(structured, dict) else {"result": structured})
                 structured = op_guard.annotate_result(internal_name, arguments, structured if isinstance(structured, dict) else {"result": structured})

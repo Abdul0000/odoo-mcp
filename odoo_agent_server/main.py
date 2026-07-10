@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
-
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -48,36 +46,11 @@ from .routers.repo import router as repo_router
 from .routers.tools import router as tools_router
 from .routers.workflow import router as workflow_router
 from .services.prompt_service import load_mcp_system_prompt, load_client_check_system_prompt
-from .config import settings
-from .services.background_executor import background_capacity
-from .services.store_service import JsonStore
-
-
-@asynccontextmanager
-async def _lifespan(_app: FastAPI):
-    token = (settings.api_token or "").strip()
-    if settings.is_production and not settings.allow_insecure_default_token:
-        normalized_token = token.lower()
-        placeholder_prefixes = ("replace-", "replace_", "your-", "your_", "example-", "example_")
-        if (
-            normalized_token in {"", "change-me", "changeme", "password", "token", "secret"}
-            or normalized_token.startswith(placeholder_prefixes)
-            or len(token) < 24
-        ):
-            raise RuntimeError(
-                "Refusing production startup with an empty/default/short ODOO_AGENT_API_TOKEN. "
-                "Set a random token of at least 24 characters or explicitly set "
-                "ODOO_AGENT_ALLOW_INSECURE_DEFAULT_TOKEN=true for a private test only."
-            )
-    JsonStore().reconcile_interrupted_jobs(grace_seconds=30)
-    yield
-
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 
 app = FastAPI(
     title="Odoo MCP Agent Connector",
-    lifespan=_lifespan,
     version="1.4.0",
     description=(
         "V14 Self-Learning Agent connector for Odoo development automation over MCP/HTTP: "
@@ -89,18 +62,8 @@ app = FastAPI(
 
 
 @app.get("/health")
-def health() -> dict:
-    return {
-        "status": "ok",
-        "service": "odoo-mcp-agent-connector",
-        "small_instance_profile": {
-            **background_capacity(),
-            "max_active_deploys": settings.max_active_deploys,
-            "mcp_dispatch_concurrency": settings.mcp_dispatch_concurrency,
-            "upgrade_max_attempts": settings.upgrade_max_attempts,
-            "browser_tools_enabled": settings.browser_tools_enabled,
-        },
-    }
+def health() -> dict[str, str]:
+    return {"status": "ok", "service": "odoo-mcp-agent-connector"}
 
 
 @app.get("/agent-instructions")

@@ -66,7 +66,6 @@ from ..schemas import (
     RepoWriteManyAtomicRequest,
     RepoWriteManyFastSafeRequest,
     RepoWriteManySmartRequest,
-    RepoWriteItem,
     RepoWriteRequest,
     SelfRunRequest,
     JobStatus,
@@ -108,7 +107,7 @@ from ..services.workflow_guard_service import mark_stale_safe_deploy_running_job
 from .qa import self_run
 from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_write_many_fast_safe, repo_write_many_smart, repo_apply_patch, repo_apply_patch_atomic, repo_clean_pyc, repo_prepare, repo_custom_modules
 from .git import git_commit, git_push
-from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy, run_odoo_module_deploy_inline
+from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy, start_odoo_module_deploy_job
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
 from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index, verify_deployed_module, _poll_odoosh_deployed, _pre_push_verify_files, _expected_user_file_hashes, _infer_registry_fields_from_python, _normalise_expected_registry_fields, _verify_registry_fields, _assert_head_commit_contains_paths
 from ..schemas import ApprovalRecord
@@ -116,12 +115,6 @@ from ..services.store_service import JsonStore
 from ..services.frontend_visual_service import FrontendVisualService
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
-
-
-def start_odoo_module_deploy_job(payload: OdooModuleRequest) -> OdooResult:
-    """Compatibility hook; internal resume deploy remains inline."""
-    return run_odoo_module_deploy_inline(payload, enforce_deploy_guard=False)
-
 
 _STRICT_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
@@ -1617,25 +1610,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             if item.mandatory and not str(item.path).startswith("NOT_FOUND:") and item.path not in mandatory_paths:
                 mandatory_paths.append(item.path)
 
-    mandatory_paths = list(dict.fromkeys(mandatory_paths))
-    if len(mandatory_paths) > settings.frontend_preflight_max_reads:
-        return {
-            "status": "scope_overflow",
-            "message": (
-                f"Frontend/core preflight produced {len(mandatory_paths)} mandatory reads, above the "
-                f"small-instance limit of {settings.frontend_preflight_max_reads}. Refine target_files/target_hint "
-                "instead of silently skipping required source evidence."
-            ),
-            "client_name": client_name,
-            "project_path": project_path,
-            "module_name": effective_module_name,
-            "mandatory_paths": mandatory_paths,
-            "success_allowed": False,
-            "completion_required": True,
-        }
-
     core_reads: list[dict[str, Any]] = []
-    for raw_path in mandatory_paths:
+    for raw_path in mandatory_paths[:60]:
         path = Path(str(raw_path)).expanduser()
         try:
             resolved = path.resolve()
@@ -1702,11 +1678,9 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             },
         }
 
-    # 5) Validate every requested edit first, then apply all final contents as one
-    # rollback-protected transaction. A missing search in file B must never leave
-    # file A partially modified.
-    prepared_items: list[RepoWriteItem] = []
-    prepared_rel_paths: list[str] = []
+    # 5) Apply writes through normal repo.write so the pre-write gate is still enforced.
+    written_files_abs: list[str] = []
+    write_results: list[dict[str, Any]] = []
     for change in writes_to_apply:
         rel = _safe_module_relative(effective_module_name, change.relative_path)
         if change.content is not None and (change.search is not None or change.replace is not None):
@@ -1717,53 +1691,19 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             if change.search is None or change.replace is None:
                 raise HTTPException(status_code=400, detail=f"Missing content or search+replace for {rel}")
             target = project / rel
-            if not target.exists() or not target.is_file():
-                raise HTTPException(status_code=404, detail=f"Target file not found: {rel}")
             old = target.read_text(encoding="utf-8")
             if change.regex:
-                try:
-                    new_content, replaced = re.subn(change.search, change.replace, old, count=change.count or 0)
-                except re.error as exc:
-                    raise HTTPException(status_code=400, detail=f"Invalid regex for {rel}: {exc}") from exc
+                new_content, replaced = re.subn(change.search, change.replace, old, count=change.count or 0)
             else:
-                occurrences = old.count(change.search)
-                replaced = occurrences if change.count == 0 else min(occurrences, change.count)
+                replaced = old.count(change.search) if change.count == 0 else min(old.count(change.search), change.count)
                 new_content = old.replace(change.search, change.replace, change.count or -1)
             if replaced <= 0:
                 raise HTTPException(status_code=409, detail=f"Search text not found in {rel}")
-        prepared_items.append(RepoWriteItem(relative_path=rel, content=new_content, create_dirs=True))
-        prepared_rel_paths.append(rel)
-
-    write_command = repo_write_many_smart(RepoWriteManySmartRequest(
-        project_path=project_path,
-        client_name=client_name,
-        files=prepared_items,
-        strategy="auto",
-        check_only=False,
-        timeout_seconds=120,
-    ))
-    if write_command.exit_code != 0:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error_type": "atomic_write_failed",
-                "message": "No partial composite write is accepted; rollback was attempted.",
-                "stderr": write_command.stderr[-8000:],
-                "stdout": write_command.stdout[-8000:],
-            },
-        )
-
-    written_files_abs = [str((project / rel).resolve()) for rel in prepared_rel_paths]
-    write_results = [
-        {
-            "relative_path": rel,
-            "status": "written",
-            "size": (project / rel).stat().st_size,
-            "transaction": "write_many_smart",
-        }
-        for rel in prepared_rel_paths
-    ]
-    steps.append({"step": "repo.write_many_smart", "status": "ok", "written_count": len(written_files_abs), "strategy_output": write_command.stdout[-2000:]})
+        result = repo_write(RepoWriteRequest(project_path=project_path, client_name=client_name, relative_path=rel, content=new_content))
+        written_abs = str((project / rel).resolve())
+        written_files_abs.append(written_abs)
+        write_results.append({"relative_path": rel, "status": "written", "size": result.size, "extra": result.extra})
+    steps.append({"step": "repo.write", "status": "ok", "written_count": len(written_files_abs)})
 
     # 6) Diff, QA, verify against core before deploy.
     diff = GitService().diff(project_path, staged=False, timeout_seconds=60)
@@ -1819,9 +1759,6 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         wait_for_result=False,
         wait_timeout_seconds=0,
         upgrade_module=True,
-        destructive_migration=payload.destructive_migration,
-        backup_confirmed=payload.backup_confirmed,
-        backup_reference=payload.backup_reference,
     )
     try:
         deploy = await safe_deploy_module(deploy_payload)
@@ -1932,10 +1869,7 @@ async def _workflow_frontend_visual_implement(payload: FrontendVisualImplementRe
     return result
 
 
-_TOOL_NOT_HANDLED = object()
-
-
-async def _dispatch_connector_and_workflow(name: str, args: dict) -> object:
+async def _dispatch(name: str, args: dict) -> object:
     if name == "connector.health":
         EmptyRequest.model_validate(args)
         return {"status": "ok", "service": "odoo-mcp-agent-connector"}
@@ -1983,10 +1917,6 @@ async def _dispatch_connector_and_workflow(name: str, args: dict) -> object:
         return frontend_pattern_preflight(FrontendPatternPreflightRequest.model_validate(args))
     if name == "qa.self_run":
         return self_run(SelfRunRequest.model_validate(args))
-    return _TOOL_NOT_HANDLED
-
-
-async def _dispatch_repo_and_git(name: str, args: dict) -> object:
     if name == "repo.prepare":
         return repo_prepare(RepoPrepareRequest.model_validate(args))
     if name == "repo.list_custom_modules":
@@ -2032,10 +1962,6 @@ async def _dispatch_repo_and_git(name: str, args: dict) -> object:
         return git_commit(GitCommitRequest.model_validate(args))
     if name == "git.push":
         return git_push(GitPushRequest.model_validate(args))
-    return _TOOL_NOT_HANDLED
-
-
-async def _dispatch_odoo_services(name: str, args: dict) -> object:
     if name == "odoosh.module_install_ssh":
         return odoosh_module_install_ssh(OdooModuleRequest.model_validate(_force_mcp_async_deploy_args(args)))
     if name == "odoosh.health":
@@ -2117,21 +2043,6 @@ async def _dispatch_odoo_services(name: str, args: dict) -> object:
             client_name=req.client_name,
         )
         return data.get("odoo") if data.get("status") == "ok" else OdooResult(status="failed", result=data, error=data.get("message") or "Odoo search_read failed")
-    return _TOOL_NOT_HANDLED
-
-
-async def _dispatch_browser(name: str, args: dict) -> object:
-    if name.startswith("browser.") and not settings.browser_tools_enabled:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "error_type": "browser_tools_disabled",
-                "message": (
-                    "Browser tools are disabled for the small-instance profile. "
-                    "Enable ODOO_AGENT_BROWSER_TOOLS_ENABLED=true and configure an external ODOO_AGENT_CDP_URL."
-                ),
-            },
-        )
     if name == "browser.login":
         req = BrowserLoginRequest.model_validate(args)
         return await CdpBrowserService().login_odoo(req)
@@ -2183,10 +2094,6 @@ async def _dispatch_browser(name: str, args: dict) -> object:
             pos_config_id=req.pos_config_id,
             pos_config_name=req.pos_config_name,
         )
-    return _TOOL_NOT_HANDLED
-
-
-async def _dispatch_state(name: str, args: dict) -> object:
     if name == "approvals.list":
         req = LimitRequest.model_validate(args)
         return JsonStore().list_approvals(limit=req.limit)
@@ -2199,7 +2106,7 @@ async def _dispatch_state(name: str, args: dict) -> object:
     if name == "jobs.get":
         req = JobGetRequest.model_validate(args)
         if req.wait_for_result:
-            return await JsonStore().wait_job_async(req.job_id, req.wait_timeout_seconds, req.poll_interval_seconds)
+            return JsonStore().wait_job(req.job_id, req.wait_timeout_seconds, req.poll_interval_seconds)
         return JsonStore().get_job(req.job_id)
     if name == "jobs.status_compact":
         req = JobGetRequest.model_validate(args)
@@ -2227,10 +2134,6 @@ async def _dispatch_state(name: str, args: dict) -> object:
     if name == "audit.list":
         req = AuditListRequest.model_validate(args)
         return JsonStore().list_audit(limit=req.limit)
-    return _TOOL_NOT_HANDLED
-
-
-async def _dispatch_recovery_and_discovery(name: str, args: dict) -> object:
     # Fix 3: Resume pipeline from last successful step
     if name == "workflow.resume_job":
         req = ResumeJobRequest.model_validate(args)
@@ -2261,22 +2164,6 @@ async def _dispatch_recovery_and_discovery(name: str, args: dict) -> object:
         return verify_against_core(SyntaxVerifyRequest.model_validate(args))
     if name == "workflow.verify_pos_change":
         return await verify_pos_change(PosChangeVerifyRequest.model_validate(args))
-    return _TOOL_NOT_HANDLED
-
-
-async def _dispatch(name: str, args: dict) -> object:
-    """Route one MCP tool through small, independently testable tool families."""
-    for handler in (
-        _dispatch_connector_and_workflow,
-        _dispatch_repo_and_git,
-        _dispatch_odoo_services,
-        _dispatch_browser,
-        _dispatch_state,
-        _dispatch_recovery_and_discovery,
-    ):
-        result = await handler(name, args)
-        if result is not _TOOL_NOT_HANDLED:
-            return result
     raise HTTPException(status_code=404, detail=f"Unknown tool: {name}")
 
 
@@ -2480,18 +2367,45 @@ def _persist_resume_result(store: JsonStore, job, resume_results: dict, original
 
 
 def _start_and_wait_module_deploy_for_resume(original_request: dict, module_name: str) -> OdooResult:
-    """Resume upgrade inline; never queue a child job behind its parent."""
-    return start_odoo_module_deploy_job(
-        OdooModuleRequest(
-            client_name=original_request.get("client_name"),
-            module_name=module_name,
-            project_path=original_request.get("project_path"),
-            remote=original_request.get("remote", "origin"),
-            branch=original_request.get("branch"),
-            wait_for_result=True,
-            wait_timeout_seconds=int(original_request.get("odoo_module_deploy_timeout_seconds", 600)),
-            poll_interval_seconds=float(original_request.get("odoo_module_deploy_poll_interval_seconds", 10.0)),
+    started = start_odoo_module_deploy_job(OdooModuleRequest(
+        client_name=original_request.get("client_name"),
+        module_name=module_name,
+        wait_for_result=False,
+        wait_timeout_seconds=0,
+        poll_interval_seconds=1.0,
+    ))
+    started_payload = started.model_dump(mode="json") if hasattr(started, "model_dump") else started
+    result_payload = started_payload.get("result") if isinstance(started_payload, dict) and isinstance(started_payload.get("result"), dict) else {}
+    if result_payload.get("finished") or not result_payload.get("job_id"):
+        return started
+
+    nested_job_id = result_payload.get("job_id")
+    timeout_seconds = int(original_request.get("odoo_module_deploy_timeout_seconds", 600))
+    poll_interval = float(original_request.get("odoo_module_deploy_poll_interval_seconds", 10.0))
+    waited = JsonStore().wait_job(str(nested_job_id), timeout_seconds, poll_interval)
+    data = waited.model_dump(mode="json")
+    if waited.status == JobStatus.passed:
+        return OdooResult(status="ok", result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data})
+    if waited.status in {JobStatus.failed, JobStatus.warning}:
+        result_error = waited.result.get("error") if isinstance(waited.result, dict) else None
+        return OdooResult(
+            status="failed" if waited.status == JobStatus.failed else "ok",
+            error=result_error or f"Odoo module deploy job finished with status={waited.status.value}",
+            result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "job": data},
         )
+    return OdooResult(
+        status="ok",
+        result={
+            "job_id": waited.id,
+            "job_status": waited.status.value,
+            "finished": False,
+            "completion_required": True,
+            "success_allowed": False,
+            "tool_exit_allowed": False,
+            "poll_after_seconds": 10,
+            "message": f"Odoo module deploy is still running after {timeout_seconds}s. Safe deploy is not complete and final success is blocked.",
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": waited.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
+        },
     )
 
 
