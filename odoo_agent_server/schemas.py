@@ -238,6 +238,9 @@ class OdooCodeChangeRequest(BaseModel):
     writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=20, description="Actual file edits to apply. If empty, the tool returns focused inspection context or can autopatch when allow_autopatch/style/target_text are provided.")
     commit_message: str | None = Field(default=None, max_length=300, description="Commit message for safe deploy. Defaults to a concise message from task_description.")
     auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
+    destructive_migration: bool | None = Field(default=None, description="Set True for schema/data-destructive changes. None lets the connector detect migrations/SQL/unlink patterns.")
+    backup_confirmed: bool = Field(default=False, description="Confirm that a restorable Odoo.sh backup/duplicate exists before destructive upgrade.")
+    backup_reference: str | None = Field(default=None, max_length=300, description="Backup/duplicate identifier or operator reference used as the rollback checkpoint.")
     verify_ui_paths: list[str] = Field(default_factory=list, max_length=20, description="Deprecated compatibility field. Automatic browser verification is removed and these paths are ignored.")
     max_search_matches: int = Field(default=20, ge=1, le=100, description="Max candidate matches returned during inspect mode")
 
@@ -1157,7 +1160,10 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     odoosh_deploy_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for Odoo.sh deployed SHA checks")
     odoo_module_deploy_timeout_seconds: int = Field(default=600, ge=0, le=900, description="Maximum time for the internal Odoo module install/upgrade job to finish before returning a non-success resumable state")
     odoo_module_deploy_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for the internal Odoo module install/upgrade job")
-    max_fix_cycles: int = Field(default=5, ge=1, le=5, description="Maximum safe-deploy upgrade/fix retry cycles before failing with upgrade_failed_after_retries")
+    max_fix_cycles: int = Field(default=2, ge=1, le=5, description="Backward-compatible requested retry ceiling. Runtime policy clamps transient retries for small instances and never pretends to edit code between retries.")
+    destructive_migration: bool | None = Field(default=None, description="Set True for schema/data-destructive changes. None enables conservative automatic detection.")
+    backup_confirmed: bool = Field(default=False, description="Confirm a restorable Odoo.sh backup or duplicate exists before destructive upgrade.")
+    backup_reference: str | None = Field(default=None, max_length=300, description="Backup ID, duplicate build, or operator recovery reference.")
     expected_registry_fields: dict[str, list[str]] = Field(default_factory=dict, description="Optional live registry fields to verify after upgrade, e.g. {'purchase.order': ['grok_y']}. If omitted, safe_deploy infers Python fields from changed addon files.")
     force_new_deploy: bool = Field(
         default=False,

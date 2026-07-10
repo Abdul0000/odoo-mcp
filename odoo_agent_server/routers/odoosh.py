@@ -26,7 +26,7 @@ from ..services.approval_service import ApprovalService
 from ..services.odoosh_service import OdooShService
 from ..services.store_service import JsonStore
 from ..services.workflow_guard_service import safe_deploy_command_block
-from ..services.background_executor import submit_background
+from ..services.background_executor import BackgroundQueueFull, submit_background
 from ..services.git_service import GitService
 from ..services.client_gate_service import ClientGateService
 from ..services.client_resolver_service import ClientResolverService
@@ -198,7 +198,16 @@ def _background_command_job(
             approval.mark_failed(approval_id, f"{name} failed")
             store.log_audit(name, "failed", request.get("module_name", name), {"job_id": job.id, "error": str(exc)})
 
-    submit_background(_bg)
+    try:
+        submit_background(_bg)
+    except BackgroundQueueFull as exc:
+        current = store.get_job(job.id)
+        store.finish_job(current, JobStatus.failed, {
+            "status": "background_capacity_full",
+            "error": str(exc),
+            "success_allowed": False,
+        })
+        approval.mark_failed(approval_id, f"{name} could not start: background capacity full")
     if wait_for_result:
         waited = store.wait_job(job.id, wait_timeout_seconds, poll_interval_seconds)
         payload = {

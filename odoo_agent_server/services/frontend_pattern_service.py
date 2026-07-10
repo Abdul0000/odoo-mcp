@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 from typing import Iterable
@@ -44,36 +45,29 @@ _AREA_KEYWORDS: dict[str, tuple[str, ...]] = {
 
 _AREA_PLANS: dict[str, list[tuple[str, str, str]]] = {
     "pos": [
-        ("point_of_sale", "static/src/app", "POS OWL app entrypoints, store, services, screens, and components"),
-        ("point_of_sale", "static/src/app/screens", "POS screen component patterns and template names"),
-        ("point_of_sale", "static/src/app/store", "POS store/service access patterns"),
-        ("point_of_sale", "static/src/app/components", "Reusable POS component patterns"),
-        ("point_of_sale", "static/src/xml", "POS QWeb/OWL template extension patterns when present"),
-        ("point_of_sale", "views", "POS asset bundle declaration patterns"),
-        ("web", "static/src/core", "OWL hooks/services/registry base patterns"),
+        ("point_of_sale", "static/src/app/screens", "Exact POS screen/component patterns"),
+        ("point_of_sale", "static/src/app/store", "POS store and order model patterns"),
+        ("point_of_sale", "views", "POS asset bundle declarations"),
+        ("web", "static/src/core", "Only the OWL core primitive used by the target"),
     ],
     "website": [
-        ("website", "static/src", "Website frontend/editor JS and options patterns"),
-        ("website", "views", "Website template/snippet/view inheritance patterns"),
-        ("website_form", "static/src", "Website form field/snippet/widget patterns"),
-        ("website_sale", "static/src", "Website sale frontend component patterns when shop/cart is involved"),
-        ("web", "static/src/core", "OWL hooks/services/registry base patterns"),
+        ("website", "static/src", "Website frontend/editor implementation patterns"),
+        ("website", "views", "Website template and snippet inheritance"),
+        ("website_form", "static/src", "Website form patterns when applicable"),
     ],
     "payment": [
-        ("payment", "static/src", "Payment provider frontend and form patterns"),
-        ("payment", "views", "Payment provider backend/frontend view patterns"),
-        ("website_payment", "static/src", "Website payment checkout JS patterns"),
-        ("website_payment", "views", "Website payment QWeb/template inheritance patterns"),
-        ("website_sale", "static/src", "Checkout/shop integration patterns"),
-        ("web", "static/src/core", "OWL hooks/services/registry base patterns"),
+        ("payment", "static/src", "Payment provider frontend patterns"),
+        ("payment", "views", "Payment provider view patterns"),
+        ("website_payment", "static/src", "Checkout integration patterns"),
+        ("website_payment", "views", "Checkout template patterns"),
     ],
     "web": [
-        ("web", "static/src/core", "Core OWL hooks, services, registry, dialogs, notifications"),
-        ("web", "static/src/views", "View/controller/renderer/model patterns"),
-        ("web", "static/src/webclient", "Action/webclient service patterns"),
-        ("web", "views", "Backend asset bundle declaration patterns"),
+        ("web", "static/src/core", "Core OWL hook/service/registry pattern"),
+        ("web", "static/src/views", "Specific view/controller/renderer pattern"),
+        ("web", "views", "Backend asset bundle declarations"),
     ],
 }
+
 
 _AREA_ASSET_BUNDLES: dict[str, list[str]] = {
     "pos": ["point_of_sale._assets_pos"],
@@ -158,7 +152,7 @@ class FrontendPatternService:
                 except Exception:  # noqa: BLE001 - preflight must never crash the agent session
                     result = None
 
-                selected = self._select_relevant_paths(result.files if result and result.found else [], area)
+                selected = self._select_relevant_paths(result.files if result and result.found else [], area, limit=2)
                 if selected:
                     for path in selected:
                         instructions.append(FrontendReadInstruction(
@@ -179,12 +173,21 @@ class FrontendPatternService:
                         mandatory=False,
                     ))
 
+        # The mandatory plan is deliberately compact for a 0.1 CPU/512 MB
+        # service. Custom targets are preserved first; core examples are ranked
+        # and limited here, so callers never silently skip an instruction later.
+        if is_frontend_task:
+            custom_items = [item for item in instructions if item.source == "custom"]
+            core_items = [item for item in instructions if item.source != "custom"]
+            room = max(settings.frontend_preflight_max_reads - len(custom_items), 0)
+            instructions = custom_items + core_items[:room]
+
         validation_steps = [
             "Run git.diff and inspect every JS/XML/manifest asset change before committing.",
             "Run qa.self_run for XML/Python/manifest checks.",
             "Run workflow.verify_against_core with all changed .py, .xml, .js, .scss, and __manifest__.py files.",
             "If verify_against_core returns push_blocked=True, fix all CRITICAL findings and re-run before git.push.",
-            "After upgrade, verify exact affected Odoo web/POS/website paths in browser with console/network capture.",
+            "Browser verification is manual/optional and runs only when browser tools are explicitly enabled; it never gates deployment.",
         ]
 
         result = FrontendPatternPreflightResult(
@@ -235,6 +238,7 @@ class FrontendPatternService:
         return {
             "paths": stats,
             "core_sync_host": settings.odoosh_ssh_host or "",
+            "max_reads": settings.frontend_preflight_max_reads,
         }
 
     def _cache_path(self, request: FrontendPatternPreflightRequest) -> Path:
@@ -276,16 +280,26 @@ class FrontendPatternService:
         if explicit in {"pos", "website", "web", "payment"}:
             return explicit
 
-        haystack_parts = [request.task_description or "", request.target_module_name or ""]
-        haystack_parts.extend(request.custom_file_paths or [])
-        haystack_parts.extend(request.planned_file_paths or [])
-        haystack = " ".join(haystack_parts).lower().replace("-", "_")
+        parts = [request.task_description or "", request.target_module_name or ""]
+        parts.extend(request.custom_file_paths or [])
+        parts.extend(request.planned_file_paths or [])
+        haystack = " ".join(parts).lower().replace("-", "_")
+        words = set(re.findall(r"[a-z0-9_]+", haystack))
 
-        # POS uses terms such as PaymentScreen, so prioritize POS before generic payment.
+        def matches(term: str) -> bool:
+            normalized = term.lower().replace("-", "_")
+            if " " in normalized:
+                return normalized in haystack
+            if "_" in normalized:
+                return normalized in words or normalized in haystack.split("/")
+            return normalized in words
+
+        # Technical path/module evidence wins; ordinary words such as position,
+        # possible, and repository must not trigger POS.
         for area in ("pos", "payment", "website", "web"):
-            if any(term in haystack for term in _AREA_KEYWORDS[area]):
+            if any(matches(term) for term in _AREA_KEYWORDS[area]):
                 return area
-        if any(ext in haystack for ext in (".js", ".scss", "static/src", "owl", "t-inherit", "t-name")):
+        if any(ext in haystack for ext in (".js", ".scss", "static/src", "t-inherit", "t-name")) or "owl" in words:
             return "web"
         return "none"
 

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 import re
+import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from contextlib import contextmanager
 from threading import Lock
-from typing import Any
+from typing import Any, Iterator
 from uuid import uuid4
 
 try:  # pragma: no cover - platform-specific import
@@ -22,134 +25,320 @@ from ..config import get_odoo_clients, settings
 from ..schemas import ApprovalRecord, ApprovalStatus, AuditEvent, JobRecord, JobStatus, JobStep
 
 
-class JsonStore:
-    """Small JSON-file state store for approvals, jobs, and audit events.
+_RUNTIME_ID = uuid4().hex
+_TERMINAL_JOB_STATUSES = {JobStatus.passed.value, JobStatus.failed.value, JobStatus.warning.value}
+_ACTIVE_JOB_STATUSES = {JobStatus.queued.value, JobStatus.running.value}
 
-    This keeps the first production-ready version dependency-light. Replace with
-    PostgreSQL when multiple workers/servers are used.
+
+class StateStoreCorruptionError(RuntimeError):
+    """Raised when legacy/persistent state is malformed and cannot be trusted."""
+
+
+class JsonStore:
+    """Dependency-light transactional state store backed by SQLite.
+
+    The class name is retained for API compatibility, but approvals, jobs, audit
+    events, and deploy leases are stored transactionally in SQLite WAL mode. This
+    avoids lost updates across threads/processes while remaining suitable for a
+    0.1 CPU / 512 MB Render instance.
     """
 
-    _lock = Lock()  # in-process thread safety
+    _lock = Lock()
+    _init_lock = Lock()
+    _initialized_paths: set[str] = set()
+    # Compatibility attribute used by older tests/clients. SQLite does not use it.
     _read_cache: dict[str, tuple[float, int, list[dict[str, Any]]]] = {}
-
-    @contextmanager
-    def _file_lock(self, path: Path):
-        """Cross-process file lock to prevent JSON corruption."""
-        lock_path = path.with_suffix(".lock")
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(lock_path, "w") as lf:
-            try:
-                if fcntl is not None:
-                    fcntl.flock(lf, fcntl.LOCK_EX)
-                else:
-                    msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
-                yield
-            finally:
-                if fcntl is not None:
-                    fcntl.flock(lf, fcntl.LOCK_UN)
-                else:
-                    lf.seek(0)
-                    msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
 
     def __init__(self) -> None:
         self.root = settings.state_path
-        self.approvals_file = self.root / "approvals.json"
-        self.jobs_file = self.root / "jobs.json"
-        self.audit_file = self.root / "audit.json"
+        self.approvals_file = self.root / "approvals.json"  # legacy migration input
+        self.jobs_file = self.root / "jobs.json"  # legacy migration input
+        self.audit_file = self.root / "audit.json"  # legacy migration input
+        self.db_file = self.root / "state.sqlite3"
         self.artifacts_dir = self.root / "artifacts"
+        self._initialize()
 
+    # ------------------------------------------------------------------
+    # SQLite primitives
+    # ------------------------------------------------------------------
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            self.db_file,
+            timeout=max(settings.sqlite_busy_timeout_ms, 100) / 1000,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={max(settings.sqlite_busy_timeout_ms, 100)}")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    @contextmanager
+    def _transaction(self, *, immediate: bool = True) -> Iterator[sqlite3.Connection]:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def _initialize(self) -> None:
+        key = str(self.db_file)
+        with self._init_lock:
+            if key in self._initialized_paths and self.db_file.exists():
+                return
+            self.root.mkdir(parents=True, exist_ok=True)
+            conn = self._connect()
+            try:
+                # WAL gives safe cross-process reads with one serialized writer and
+                # uses little memory. NORMAL sync is appropriate for ephemeral/small
+                # containers while SQLite transactions still remain atomic.
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.execute("PRAGMA temp_store=FILE")
+                conn.execute("PRAGMA cache_size=-2000")  # about 2 MB per connection
+                conn.execute("PRAGMA wal_autocheckpoint=100")
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS approvals (
+                        id TEXT PRIMARY KEY,
+                        created_at TEXT NOT NULL,
+                        payload TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS jobs (
+                        id TEXT PRIMARY KEY,
+                        job_type TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        finished_at TEXT,
+                        runtime_id TEXT,
+                        heartbeat_at REAL NOT NULL,
+                        payload TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_jobs_status_created
+                        ON jobs(status, created_at DESC);
+                    CREATE INDEX IF NOT EXISTS idx_jobs_type_status
+                        ON jobs(job_type, status);
+                    CREATE TABLE IF NOT EXISTS audit (
+                        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                        created_at TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        payload TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS deploy_leases (
+                        lease_key TEXT PRIMARY KEY,
+                        job_id TEXT NOT NULL UNIQUE,
+                        runtime_id TEXT NOT NULL,
+                        heartbeat_at REAL NOT NULL,
+                        expires_at REAL NOT NULL,
+                        FOREIGN KEY(job_id) REFERENCES jobs(id) ON DELETE CASCADE
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_deploy_leases_expiry
+                        ON deploy_leases(expires_at);
+                    """
+                )
+            finally:
+                conn.close()
+            self._migrate_legacy_json_if_needed()
+            self._initialized_paths.add(key)
+
+    def _quarantine_corrupt(self, path: Path, exc: Exception) -> Path:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        quarantine = path.with_name(f"{path.name}.corrupt.{stamp}")
+        try:
+            path.replace(quarantine)
+        except OSError:
+            quarantine = path
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error_type": "state_store_corruption",
+                "message": f"Persistent state is corrupt and destructive actions are blocked: {path}",
+                "quarantined_path": str(quarantine),
+                "cause": str(exc),
+            },
+        ) from exc
+
+    def _legacy_rows(self, path: Path) -> list[dict[str, Any]]:
+        if not path.exists():
+            return []
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8") or "[]")
+        except (json.JSONDecodeError, OSError) as exc:
+            return self._quarantine_corrupt(path, exc)  # type: ignore[return-value]
+        if not isinstance(raw, list) or not all(isinstance(row, dict) for row in raw):
+            return self._quarantine_corrupt(path, ValueError("Expected a JSON list of objects"))  # type: ignore[return-value]
+        return raw
+
+    def _migrate_legacy_json_if_needed(self) -> None:
+        with self._transaction() as conn:
+            counts = {
+                "approvals": conn.execute("SELECT COUNT(*) FROM approvals").fetchone()[0],
+                "jobs": conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+                "audit": conn.execute("SELECT COUNT(*) FROM audit").fetchone()[0],
+            }
+            approvals = self._legacy_rows(self.approvals_file) if counts["approvals"] == 0 else []
+            jobs = self._legacy_rows(self.jobs_file) if counts["jobs"] == 0 else []
+            audit = self._legacy_rows(self.audit_file) if counts["audit"] == 0 else []
+            now = time.time()
+            for row in approvals:
+                record = ApprovalRecord.model_validate(row)
+                conn.execute(
+                    "INSERT OR IGNORE INTO approvals(id, created_at, payload) VALUES(?, ?, ?)",
+                    (record.id, record.created_at, json.dumps(record.model_dump(mode="json"), ensure_ascii=False)),
+                )
+            for row in jobs:
+                record = JobRecord.model_validate(row)
+                conn.execute(
+                    """INSERT OR IGNORE INTO jobs
+                       (id, job_type, status, created_at, updated_at, finished_at, runtime_id, heartbeat_at, payload)
+                       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        record.id,
+                        record.job_type,
+                        record.status.value,
+                        record.created_at,
+                        record.finished_at or record.created_at,
+                        record.finished_at,
+                        "legacy",
+                        now,
+                        json.dumps(record.model_dump(mode="json"), ensure_ascii=False),
+                    ),
+                )
+            for row in audit:
+                record = AuditEvent.model_validate(row)
+                conn.execute(
+                    "INSERT INTO audit(created_at, action, status, payload) VALUES(?, ?, ?, ?)",
+                    (record.created_at, record.action, record.status, json.dumps(record.model_dump(mode="json"), ensure_ascii=False)),
+                )
+
+    # Compatibility helpers used by older code/tests.
     def _read_list(self, path: Path) -> list[dict[str, Any]]:
-        with self._lock:
-            if not path.exists():
-                self._read_cache.pop(str(path), None)
-                return []
-            try:
-                stat = path.stat()
-                cache_key = str(path)
-                cached = self._read_cache.get(cache_key)
-                if cached and cached[0] == stat.st_mtime and cached[1] == stat.st_size:
-                    return [dict(row) for row in cached[2]]
-                raw = json.loads(path.read_text(encoding="utf-8") or "[]")
-            except json.JSONDecodeError:
-                raw = []
-            rows = raw if isinstance(raw, list) else []
-            try:
-                stat = path.stat()
-                self._read_cache[str(path)] = (stat.st_mtime, stat.st_size, [dict(row) for row in rows])
-            except OSError:
-                pass
-            return [dict(row) for row in rows]
+        if path.name == self.approvals_file.name:
+            return [item.model_dump(mode="json") for item in reversed(self.list_approvals(limit=2000))]
+        if path.name == self.jobs_file.name:
+            return [item.model_dump(mode="json") for item in reversed(self.list_jobs(limit=2000))]
+        if path.name == self.audit_file.name:
+            return [item.model_dump(mode="json") for item in reversed(self.list_audit(limit=2000))]
+        return self._legacy_rows(path)
 
     def _write_list(self, path: Path, rows: list[dict[str, Any]]) -> None:
-        with self._lock:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            payload = json.dumps(rows, indent=2, sort_keys=True)
-            with self._file_lock(path):
-                tmp_path = path.with_suffix(path.suffix + ".tmp")
-                tmp_path.write_text(payload, encoding="utf-8")
-                tmp_path.replace(path)
-            try:
-                stat = path.stat()
-                self._read_cache[str(path)] = (stat.st_mtime, stat.st_size, [dict(row) for row in rows])
-            except OSError:
-                self._read_cache.pop(str(path), None)
+        # Deliberately limited to legacy compatibility; normal runtime code uses
+        # transactional record methods below.
+        if path.name == self.jobs_file.name:
+            with self._transaction() as conn:
+                conn.execute("DELETE FROM deploy_leases")
+                conn.execute("DELETE FROM jobs")
+                for row in rows:
+                    record = JobRecord.model_validate(row)
+                    self._insert_job(conn, record)
+            return
+        payload = json.dumps(rows, indent=2, sort_keys=True)
+        with self._file_lock(path):
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(path)
+
+    # ------------------------------------------------------------------
+    # Approvals
+    # ------------------------------------------------------------------
 
     def create_approval(self, record: ApprovalRecord) -> ApprovalRecord:
-        rows = self._read_list(self.approvals_file)
-        rows.append(record.model_dump(mode="json"))
-        self._write_list(self.approvals_file, rows)
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT INTO approvals(id, created_at, payload) VALUES(?, ?, ?)",
+                (record.id, record.created_at, json.dumps(record.model_dump(mode="json"), ensure_ascii=False)),
+            )
         self.log_audit("approval.request", "pending", record.summary, {"approval_id": record.id, "action": record.action})
         return record
 
     def list_approvals(self, limit: int = 100) -> list[ApprovalRecord]:
-        rows = self._read_list(self.approvals_file)
-        return [ApprovalRecord.model_validate(row) for row in rows[-limit:]][::-1]
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT payload FROM approvals ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+            return [ApprovalRecord.model_validate(json.loads(row["payload"])) for row in rows]
+        finally:
+            conn.close()
 
     def get_approval(self, approval_id: str) -> ApprovalRecord:
-        for row in self._read_list(self.approvals_file):
-            if row.get("id") == approval_id:
-                return ApprovalRecord.model_validate(row)
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval not found")
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT payload FROM approvals WHERE id=?", (approval_id,)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval not found")
+        return ApprovalRecord.model_validate(json.loads(row["payload"]))
 
     def set_approval_status(self, approval_id: str, target: ApprovalStatus, reason: str | None = None) -> ApprovalRecord:
-        rows = self._read_list(self.approvals_file)
-        for index, row in enumerate(rows):
-            if row.get("id") == approval_id:
-                record = ApprovalRecord.model_validate(row)
-                record.status = target
-                record.decided_at = datetime.now(timezone.utc).isoformat()
-                record.reason = reason
-                rows[index] = record.model_dump(mode="json")
-                self._write_list(self.approvals_file, rows)
-                self.log_audit("approval." + target.value, target.value, record.summary, {"approval_id": record.id, "action": record.action})
-                return record
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval not found")
+        with self._transaction() as conn:
+            row = conn.execute("SELECT payload FROM approvals WHERE id=?", (approval_id,)).fetchone()
+            if not row:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval not found")
+            record = ApprovalRecord.model_validate(json.loads(row["payload"]))
+            record.status = target
+            record.decided_at = datetime.now(timezone.utc).isoformat()
+            record.reason = reason
+            conn.execute("UPDATE approvals SET payload=? WHERE id=?", (json.dumps(record.model_dump(mode="json"), ensure_ascii=False), approval_id))
+        self.log_audit("approval." + target.value, target.value, record.summary, {"approval_id": record.id, "action": record.action})
+        return record
+
+    # ------------------------------------------------------------------
+    # Jobs and deploy leases
+    # ------------------------------------------------------------------
+
+    def _insert_job(self, conn: sqlite3.Connection, job: JobRecord) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        now = time.time()
+        conn.execute(
+            """INSERT INTO jobs
+               (id, job_type, status, created_at, updated_at, finished_at, runtime_id, heartbeat_at, payload)
+               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                job.id,
+                job.job_type,
+                job.status.value,
+                job.created_at,
+                now_iso,
+                job.finished_at,
+                _RUNTIME_ID,
+                now,
+                json.dumps(job.model_dump(mode="json"), ensure_ascii=False),
+            ),
+        )
 
     def create_job(self, job: JobRecord) -> JobRecord:
-        rows = self._read_list(self.jobs_file)
-        rows.append(job.model_dump(mode="json"))
-        self._write_list(self.jobs_file, rows)
+        with self._transaction() as conn:
+            self._insert_job(conn, job)
         self.log_audit("job.create", job.status.value, job.job_type, {"job_id": job.id})
         return job
 
     def list_jobs(self, limit: int = 100) -> list[JobRecord]:
-        rows = self._read_list(self.jobs_file)
-        return [JobRecord.model_validate(row) for row in rows[-limit:]][::-1]
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT payload FROM jobs ORDER BY rowid DESC LIMIT ?", (limit,)).fetchall()
+            return [JobRecord.model_validate(json.loads(row["payload"])) for row in rows]
+        finally:
+            conn.close()
 
     def get_job(self, job_id: str) -> JobRecord:
-        for row in self._read_list(self.jobs_file):
-            if row.get("id") == job_id:
-                return JobRecord.model_validate(row)
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT payload FROM jobs WHERE id=?", (job_id,)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+        return JobRecord.model_validate(json.loads(row["payload"]))
 
     def wait_job(self, job_id: str, timeout_seconds: int = 600, poll_interval_seconds: float = 10.0) -> JobRecord:
-        """Wait for a job to finish without requiring repeated client/tool calls.
-
-        Safe deploy must not be treated as complete until its owning job reaches
-        a terminal status. Use short positive waits for MCP/browser clients so
-        pages stay responsive. A timeout value of 0 means wait indefinitely and
-        should be reserved for CLI/internal callers.
-        """
         deadline = None if timeout_seconds <= 0 else time.monotonic() + max(timeout_seconds, 0)
         interval = max(min(poll_interval_seconds, 10.0), 0.25)
         while True:
@@ -158,42 +347,237 @@ class JsonStore:
                 return job
             if deadline is not None and time.monotonic() >= deadline:
                 return job
-            if deadline is None:
-                time.sleep(interval)
-            else:
-                time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+            sleep_for = interval if deadline is None else min(interval, max(deadline - time.monotonic(), 0.0))
+            time.sleep(max(sleep_for, 0.0))
+
+    async def wait_job_async(self, job_id: str, timeout_seconds: int = 600, poll_interval_seconds: float = 10.0) -> JobRecord:
+        """Nonblocking MCP wait; SQLite reads are tiny and sleeps yield the loop."""
+        deadline = None if timeout_seconds <= 0 else time.monotonic() + max(timeout_seconds, 0)
+        interval = max(min(poll_interval_seconds, 10.0), 0.25)
+        while True:
+            job = await asyncio.to_thread(self.get_job, job_id)
+            if job.status not in {JobStatus.queued, JobStatus.running}:
+                return job
+            if deadline is not None and time.monotonic() >= deadline:
+                return job
+            sleep_for = interval if deadline is None else min(interval, max(deadline - time.monotonic(), 0.0))
+            await asyncio.sleep(max(sleep_for, 0.0))
+
+    @staticmethod
+    def _step_key(step: JobStep) -> tuple[str, str | None, str | None]:
+        return (step.name, step.started_at, step.finished_at)
+
+    def _merge_job(self, current: JobRecord, incoming: JobRecord) -> JobRecord:
+        existing_keys = {self._step_key(step) for step in incoming.steps}
+        merged_steps = list(incoming.steps)
+        for step in current.steps:
+            if self._step_key(step) not in existing_keys:
+                merged_steps.append(step)
+        incoming.steps = merged_steps
+        incoming.request = {**current.request, **incoming.request}
+        return incoming
+
+    def _update_job_row(self, conn: sqlite3.Connection, job: JobRecord) -> JobRecord:
+        row = conn.execute("SELECT payload FROM jobs WHERE id=?", (job.id,)).fetchone()
+        if row:
+            current = JobRecord.model_validate(json.loads(row["payload"]))
+            job = self._merge_job(current, job)
+        else:
+            self._insert_job(conn, job)
+            return job
+        now_iso = datetime.now(timezone.utc).isoformat()
+        now = time.time()
+        conn.execute(
+            """UPDATE jobs SET job_type=?, status=?, updated_at=?, finished_at=?, runtime_id=?,
+               heartbeat_at=?, payload=? WHERE id=?""",
+            (
+                job.job_type,
+                job.status.value,
+                now_iso,
+                job.finished_at,
+                _RUNTIME_ID,
+                now,
+                json.dumps(job.model_dump(mode="json"), ensure_ascii=False),
+                job.id,
+            ),
+        )
+        conn.execute(
+            "UPDATE deploy_leases SET runtime_id=?, heartbeat_at=?, expires_at=? WHERE job_id=?",
+            (_RUNTIME_ID, now, now + settings.safe_deploy_lease_seconds, job.id),
+        )
+        return job
 
     def update_job(self, job: JobRecord) -> JobRecord:
-        rows = self._read_list(self.jobs_file)
-        for index, row in enumerate(rows):
-            if row.get("id") == job.id:
-                rows[index] = job.model_dump(mode="json")
-                self._write_list(self.jobs_file, rows)
-                self.log_audit("job.update", job.status.value, job.job_type, {"job_id": job.id})
-                return job
-        return self.create_job(job)
+        with self._transaction() as conn:
+            updated = self._update_job_row(conn, job)
+        self.log_audit("job.update", updated.status.value, updated.job_type, {"job_id": updated.id})
+        return updated
 
     def add_step(self, job: JobRecord, step: JobStep) -> JobRecord:
         step.finished_at = step.finished_at or datetime.now(timezone.utc).isoformat()
-        job.steps.append(step)
-        return self.update_job(job)
+        with self._transaction() as conn:
+            row = conn.execute("SELECT payload FROM jobs WHERE id=?", (job.id,)).fetchone()
+            if not row:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+            current = JobRecord.model_validate(json.loads(row["payload"]))
+            if self._step_key(step) not in {self._step_key(item) for item in current.steps}:
+                current.steps.append(step)
+            updated = self._update_job_row(conn, current)
+        return updated
 
     def finish_job(self, job: JobRecord, status_: JobStatus, result: Any = None) -> JobRecord:
-        job.status = status_
-        job.finished_at = datetime.now(timezone.utc).isoformat()
-        job.result = result
-        return self.update_job(job)
+        with self._transaction() as conn:
+            row = conn.execute("SELECT payload FROM jobs WHERE id=?", (job.id,)).fetchone()
+            current = JobRecord.model_validate(json.loads(row["payload"])) if row else job
+            current.status = status_
+            current.finished_at = datetime.now(timezone.utc).isoformat()
+            current.result = result
+            updated = self._update_job_row(conn, current)
+            conn.execute("DELETE FROM deploy_leases WHERE job_id=?", (job.id,))
+        self.log_audit("job.update", updated.status.value, updated.job_type, {"job_id": updated.id})
+        return updated
+
+    @staticmethod
+    def deploy_lease_key(client_name: str | None, project_path: str, branch: str | None, module_name: str) -> str:
+        return "|".join((client_name or "", str(Path(project_path).expanduser().resolve()), branch or "", module_name))
+
+    def admit_safe_deploy(
+        self,
+        job: JobRecord,
+        *,
+        lease_key: str,
+        force_new: bool = False,
+    ) -> tuple[JobRecord, bool, str]:
+        """Atomically admit one safe deploy or return the existing owner.
+
+        The global capacity defaults to one on small Render instances. A same-key
+        race always returns the existing job; a different active deploy receives
+        HTTP 429 backpressure instead of an unbounded queued/running job.
+        """
+        now = time.time()
+        with self._transaction() as conn:
+            conn.execute("DELETE FROM deploy_leases WHERE expires_at <= ?", (now,))
+            existing = conn.execute(
+                """SELECT l.job_id, j.payload, j.status FROM deploy_leases l
+                   JOIN jobs j ON j.id=l.job_id WHERE l.lease_key=?""",
+                (lease_key,),
+            ).fetchone()
+            if existing and existing["status"] in _ACTIVE_JOB_STATUSES | {JobStatus.warning.value}:
+                record = JobRecord.model_validate(json.loads(existing["payload"]))
+                return record, False, "existing_owner"
+
+            active = conn.execute(
+                """SELECT l.job_id, j.payload FROM deploy_leases l
+                   JOIN jobs j ON j.id=l.job_id
+                   WHERE l.expires_at > ? AND j.status IN (?, ?)
+                   ORDER BY l.heartbeat_at ASC""",
+                (now, JobStatus.queued.value, JobStatus.running.value),
+            ).fetchall()
+            if len(active) >= settings.max_active_deploys:
+                owner = JobRecord.model_validate(json.loads(active[0]["payload"]))
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail={
+                        "error_type": "deploy_capacity_full",
+                        "message": f"This small instance allows {settings.max_active_deploys} active deploy(s). Poll the current job before starting another.",
+                        "active_job_id": owner.id,
+                        "next_call": {"tool": "jobs.get", "arguments": {"job_id": owner.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
+                    },
+                )
+
+            # force_new can replace terminal/resumable ownership but never an active
+            # owner; active ownership was handled above.
+            self._insert_job(conn, job)
+            conn.execute(
+                "INSERT OR REPLACE INTO deploy_leases(lease_key, job_id, runtime_id, heartbeat_at, expires_at) VALUES(?, ?, ?, ?, ?)",
+                (lease_key, job.id, _RUNTIME_ID, now, now + settings.safe_deploy_lease_seconds),
+            )
+        self.log_audit("job.create", job.status.value, job.job_type, {"job_id": job.id, "lease_key": lease_key})
+        return job, True, "admitted"
+
+    def reconcile_interrupted_jobs(self, grace_seconds: int = 60) -> int:
+        """Mark stale jobs from a previous process as resumable warnings.
+
+        This is intentionally deterministic rather than pretending an in-memory
+        callback survived a Render restart. Safe-deploy jobs point to resume_job.
+        """
+        cutoff = time.time() - max(grace_seconds, 1)
+        changed = 0
+        with self._transaction() as conn:
+            rows = conn.execute(
+                "SELECT id, payload FROM jobs WHERE status IN (?, ?) AND runtime_id != ? AND heartbeat_at < ?",
+                (JobStatus.queued.value, JobStatus.running.value, _RUNTIME_ID, cutoff),
+            ).fetchall()
+            for row in rows:
+                job = JobRecord.model_validate(json.loads(row["payload"]))
+                job.status = JobStatus.warning
+                job.finished_at = datetime.now(timezone.utc).isoformat()
+                job.result = {
+                    "status": "interrupted_restart",
+                    "message": "The service restarted while this job was active. No success is claimed; resume the deterministic pipeline from the last recorded step.",
+                    "job_id": job.id,
+                    "next_call": {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}},
+                    "deploy_confirmed": False,
+                    "success_allowed": False,
+                }
+                conn.execute(
+                    "UPDATE jobs SET status=?, updated_at=?, finished_at=?, runtime_id=?, heartbeat_at=?, payload=? WHERE id=?",
+                    (
+                        JobStatus.warning.value,
+                        job.finished_at,
+                        job.finished_at,
+                        _RUNTIME_ID,
+                        time.time(),
+                        json.dumps(job.model_dump(mode="json"), ensure_ascii=False),
+                        job.id,
+                    ),
+                )
+                conn.execute("DELETE FROM deploy_leases WHERE job_id=?", (job.id,))
+                changed += 1
+        return changed
+
+    # ------------------------------------------------------------------
+    # Audit and artifacts
+    # ------------------------------------------------------------------
 
     def log_audit(self, action: str, status_: str, summary: str = "", metadata: dict[str, Any] | None = None) -> AuditEvent:
         event = AuditEvent(action=action, status=status_, summary=summary, metadata=metadata or {})
-        rows = self._read_list(self.audit_file)
-        rows.append(event.model_dump(mode="json"))
-        self._write_list(self.audit_file, rows[-2000:])
+        with self._transaction() as conn:
+            conn.execute(
+                "INSERT INTO audit(created_at, action, status, payload) VALUES(?, ?, ?, ?)",
+                (event.created_at, event.action, event.status, json.dumps(event.model_dump(mode="json"), ensure_ascii=False)),
+            )
+            conn.execute(
+                "DELETE FROM audit WHERE seq NOT IN (SELECT seq FROM audit ORDER BY seq DESC LIMIT 2000)"
+            )
         return event
 
     def list_audit(self, limit: int = 200) -> list[AuditEvent]:
-        rows = self._read_list(self.audit_file)
-        return [AuditEvent.model_validate(row) for row in rows[-limit:]][::-1]
+        conn = self._connect()
+        try:
+            rows = conn.execute("SELECT payload FROM audit ORDER BY seq DESC LIMIT ?", (limit,)).fetchall()
+            return [AuditEvent.model_validate(json.loads(row["payload"])) for row in rows]
+        finally:
+            conn.close()
+
+    @contextmanager
+    def _file_lock(self, path: Path):
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(lock_path, "a+b") as lock_file:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX)
+                else:  # pragma: no cover - Windows
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+                yield
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_file, fcntl.LOCK_UN)
+                else:  # pragma: no cover - Windows
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
     def create_artifact(self, kind: str, source_tool: str, payload: Any) -> dict[str, Any]:
         artifact_id = f"art_{uuid4().hex}"
@@ -209,7 +593,9 @@ class JsonStore:
         }
         path = self.artifacts_dir / f"{artifact_id}.json"
         with self._file_lock(path):
-            path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
         self.log_audit("artifact.create", "ok", source_tool, {"artifact_id": artifact_id, "bytes": record["bytes"]})
         return {key: record[key] for key in ("artifact_id", "kind", "source_tool", "created_at", "bytes")}
 
@@ -239,19 +625,9 @@ class JsonStore:
             "text": text[start:end],
         }
 
-    # ---------------------------------------------------------------------------
-    # Fix 7: Session state persistence — survives Render/Koyeb restarts.
-    # The agent can save and reload: last_sha, module_name, step_history, and
-    # any arbitrary context across sessions.
-    #
-    # Phase 3: multi-client isolation. The legacy unsuffixed session_state.json
-    # keeps being written exactly as before (so session.load_state() with no
-    # args behaves identically to today — nothing breaks for the no-client or
-    # single-client case). When a client_name is known (passed explicitly, or
-    # present inside the saved state dict — workflow.start_session already
-    # includes it), an additional per-client file is written/read so two
-    # different clients' sessions never silently bleed into each other.
-    # ---------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Session state (small JSON objects; atomic locked merge)
+    # ------------------------------------------------------------------
 
     @property
     def _session_file(self) -> Path:
@@ -261,90 +637,57 @@ class JsonStore:
         safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", client_name)
         return self.root / f"session_state__{safe}.json"
 
+    def _read_session_locked(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8") or "{}")
+        except (json.JSONDecodeError, OSError) as exc:
+            return self._quarantine_corrupt(path, exc)  # type: ignore[return-value]
+        if not isinstance(raw, dict):
+            return self._quarantine_corrupt(path, ValueError("Expected a JSON object"))  # type: ignore[return-value]
+        return raw
+
     def save_session_state(self, state: dict, client_name: str | None = None) -> dict:
-        """Persist arbitrary session state (sha, module, step history, etc.).
-
-        Called by workflow.start_session after success and by safe_deploy on
-        each milestone so the agent can resume without repeating step 1.
-        state dict is shallow-merged into the existing persisted state.
-
-        In multi-client mode, writes only the per-client file when a client is
-        known. The legacy global file is used only for no-client/single-client
-        fallback state so one client's deploy state cannot bleed into another.
-        """
         effective_client = client_name or state.get("client_name") or None
-        from datetime import datetime, timezone
-
-        def _write(path: Path) -> dict:
-            current: dict = {}
-            if path.exists():
-                try:
-                    current = json.loads(path.read_text(encoding="utf-8"))
-                except Exception:
-                    current = {}
+        path = self._session_file_for_client(effective_client) if effective_client else self._session_file
+        with self._file_lock(path):
+            current = self._read_session_locked(path)
             current.update(state)
             current["updated_at"] = datetime.now(timezone.utc).isoformat()
-            with self._file_lock(path):
-                path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
             return current
 
-        if effective_client:
-            return _write(self._session_file_for_client(effective_client))
-        return _write(self._session_file)
-
     def load_session_state(self, client_name: str | None = None) -> dict:
-        """Return last persisted session state, or empty dict if none.
-
-        With no client_name, reads the legacy global file (same as before
-        this feature existed). With client_name, reads that client's
-        isolated state file — recommended once you have more than one client
-        configured, so a resumed session can never pick up another client's
-        project_path/sha by accident.
-        """
         if not client_name and len(get_odoo_clients()) > 1:
             return {
                 "requires_client_name": True,
                 "message": "Multiple ODOO_CLIENTS entries are configured; pass client_name to load isolated session state.",
             }
         path = self._session_file_for_client(client_name) if client_name else self._session_file
-        if not path.exists():
-            return {}
-        try:
-            state = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-        return self._with_validated_project_path(state if isinstance(state, dict) else {})
+        with self._file_lock(path):
+            state = self._read_session_locked(path)
+        return self._with_validated_project_path(state)
 
     def _with_validated_project_path(self, state: dict) -> dict:
         project_path = state.get("project_path")
         if not project_path:
             return state
-
         checked = dict(state)
         try:
             resolved = Path(str(project_path)).expanduser().resolve()
         except OSError as exc:
-            checked["project_path"] = None
-            checked["project_path_valid"] = False
-            checked["stale_project_path"] = str(project_path)
-            checked["project_path_error"] = f"Could not resolve project_path: {exc}"
+            checked.update(project_path=None, project_path_valid=False, stale_project_path=str(project_path), project_path_error=f"Could not resolve project_path: {exc}")
             return checked
-
         allowed_roots = settings.allowed_roots
         if not allowed_roots or not any(resolved == root or root in resolved.parents for root in allowed_roots):
-            checked["project_path"] = None
-            checked["project_path_valid"] = False
-            checked["stale_project_path"] = str(project_path)
-            checked["project_path_error"] = f"Project path is outside allowed roots: {resolved}"
+            checked.update(project_path=None, project_path_valid=False, stale_project_path=str(project_path), project_path_error=f"Project path is outside allowed roots: {resolved}")
             return checked
-
         if not resolved.exists() or not resolved.is_dir():
-            checked["project_path"] = None
-            checked["project_path_valid"] = False
-            checked["stale_project_path"] = str(project_path)
-            checked["project_path_error"] = f"Project path is missing or not a directory: {resolved}"
+            checked.update(project_path=None, project_path_valid=False, stale_project_path=str(project_path), project_path_error=f"Project path is missing or not a directory: {resolved}")
             return checked
-
         checked["project_path"] = str(resolved)
         checked["project_path_valid"] = True
         checked.pop("stale_project_path", None)
@@ -352,6 +695,5 @@ class JsonStore:
         return checked
 
     def clear_session_state(self, client_name: str | None = None) -> None:
-        """Wipe the session state file (e.g. after a successful full deploy)."""
         path = self._session_file_for_client(client_name) if client_name else self._session_file
         path.unlink(missing_ok=True)

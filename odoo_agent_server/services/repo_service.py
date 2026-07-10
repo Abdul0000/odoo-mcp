@@ -16,7 +16,7 @@ from fastapi import HTTPException, status
 from ..config import mask_repo_url, settings
 from ..schemas import CommandResult, CustomModuleItem, FileContent, FileListItem, RepoCleanPycResult, RepoPrepareResult
 from .client_resolver_service import ClientResolverService
-from .path_service import resolve_allowed_path
+from .path_service import ensure_mutable_path, ensure_mutable_project, resolve_allowed_path
 from .lock_service import RepoLockService
 
 _TEXT_LIMIT_HINT = "File is too large for this endpoint. Increase max_bytes or use a narrower file."
@@ -38,6 +38,14 @@ class RepoService:
     def target(self, project_path: str, relative_path: str) -> Path:
         project = self.project(project_path)
         return self._safe_join(project, relative_path)
+
+
+    def _ensure_mutation_target(self, project_path: str, relative_path: str, action: str) -> tuple[Path, Path]:
+        project = self.project(project_path)
+        ensure_mutable_project(project, action=action)
+        target = self._safe_join(project, relative_path)
+        ensure_mutable_path(target, action=action)
+        return project, target
 
 
     def prepare_repo(
@@ -401,8 +409,8 @@ class RepoService:
         what changed, allowing the agent to verify correctness before committing.
         """
         self._reject_git_internal_path(relative_path)
+        project, target = self._ensure_mutation_target(project_path, relative_path, "repo.write")
         with RepoLockService().locked(project_path, owner="repo.write", timeout_seconds=60):
-            target = self.target(project_path, relative_path)
             if create_dirs:
                 target.parent.mkdir(parents=True, exist_ok=True)
             elif not target.parent.exists():
@@ -472,7 +480,7 @@ class RepoService:
                     diff_preview = self._unified_diff_preview(
                         old_content,
                         content,
-                        str(target.relative_to(self.project(project_path)).as_posix()),
+                        str(target.relative_to(project).as_posix()),
                         max_lines=self._DIFF_PREVIEW_LINES,
                     )
                     extra["diff_preview"] = diff_preview if diff_preview else "[no changes — content identical]"
@@ -480,7 +488,7 @@ class RepoService:
                     extra["diff_preview"] = "[new file created]"
 
             return FileContent(
-                path=target.relative_to(self.project(project_path)).as_posix(),
+                path=target.relative_to(project).as_posix(),
                 content=content if is_complete else f"[chunk {chunk_index+1}/{total_chunks} appended]",
                 size=size,
                 extra=extra,
@@ -506,15 +514,16 @@ class RepoService:
 
     def delete_file(self, project_path: str, relative_path: str) -> dict[str, str]:
         self._reject_git_internal_path(relative_path)
+        project, target = self._ensure_mutation_target(project_path, relative_path, "repo.delete")
         with RepoLockService().locked(project_path, owner="repo.delete", timeout_seconds=60):
-            target = self.target(project_path, relative_path)
             if not target.exists() or not target.is_file():
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"File not found: {target}")
             target.unlink()
-            return {"deleted": target.relative_to(self.project(project_path)).as_posix()}
+            return {"deleted": target.relative_to(project).as_posix()}
 
     def apply_patch(self, project_path: str, patch: str, check_only: bool = False, timeout_seconds: int = 60) -> CommandResult:
         project = self.project(project_path)
+        ensure_mutable_project(project, action="repo.apply_patch")
         self._validate_patch_paths(project, patch)
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".patch", delete=False) as handle:
             handle.write(patch)
@@ -557,6 +566,7 @@ class RepoService:
     def write_many_atomic(self, project_path: str, files: list[object], check_only: bool = False, timeout_seconds: int = 60) -> CommandResult:
         """Write many files as one atomic transaction via temp worktree/branch."""
         project = self.project(project_path)
+        ensure_mutable_project(project, action="repo.write_many_atomic")
         normalized_files = self._normalise_write_many_files(project, files, action="repo.write_many_atomic")
 
         return self._run_atomic_worktree_transaction(
@@ -577,6 +587,7 @@ class RepoService:
         isolation adds latency but not meaningful extra quality.
         """
         project = self.project(project_path)
+        ensure_mutable_project(project, action="repo.write_many_fast_safe")
         normalized_files = self._normalise_write_many_files(project, files, action="repo.write_many_fast_safe")
         allowed, reason = self._fast_safe_write_allowed(normalized_files)
         if not allowed:
@@ -670,6 +681,7 @@ class RepoService:
     def write_many_smart(self, project_path: str, files: list[object], check_only: bool = False, timeout_seconds: int = 60, strategy: str = "auto") -> CommandResult:
         """Choose the fastest safe writer without weakening validation quality."""
         project = self.project(project_path)
+        ensure_mutable_project(project, action="repo.write_many_smart")
         normalized_files = self._normalise_write_many_files(project, files, action="repo.write_many_smart")
         strategy = (strategy or "auto").strip().lower()
         if strategy not in {"auto", "fast_safe", "atomic"}:
@@ -700,6 +712,7 @@ class RepoService:
             create_dirs = bool(getattr(item, "create_dirs", True))
             self._reject_git_internal_path(raw_path)
             resolved = self._safe_join(project, raw_path)
+            ensure_mutable_path(resolved, action=action)
             rel = resolved.relative_to(project).as_posix()
             if rel in seen:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Duplicate file in {action}: {rel}")
@@ -924,17 +937,16 @@ class RepoService:
                 return True
             if "\x00" in candidate or candidate.startswith(("/", "~")):
                 return False
-            # Standard git patches use a/ and b/ prefixes. We reject unusual
-            # absolute/implicit targets because this connector should only patch
-            # files inside project_path.
             if candidate.startswith(("a/", "b/")):
                 candidate = candidate[2:]
             parts = [part for part in candidate.replace("\\", "/").split("/") if part]
-            if not parts:
+            if not parts or parts[0] == ".git" or any(part in {".", ".."} for part in parts):
                 return False
-            if parts[0] == ".git":
+            try:
+                ensure_mutable_path(self._safe_join(project, "/".join(parts)), action="repo.apply_patch")
+            except HTTPException:
                 return False
-            return all(part not in {".", ".."} for part in parts)
+            return True
 
         for line in patch.splitlines():
             if line.startswith("diff --git "):

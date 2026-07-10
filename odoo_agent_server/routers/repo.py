@@ -32,6 +32,7 @@ from ..services.client_resolver_service import ClientResolverService
 from ..services.checkout_guard_service import maybe_ensure_known_module_current, module_name_from_relative_path
 from ..services.client_gate_service import ClientGateService
 from ..services.prewrite_gate_service import PreWriteGateService
+from ..services.repo_index_service import RepoIndexService
 
 router = APIRouter(prefix="/repo", tags=["repo"], dependencies=[AuthDependency])
 
@@ -167,12 +168,19 @@ def repo_write(payload: RepoWriteRequest) -> FileContent:
         raise
     approval.mark_consumed(payload.approval_id, "repo.write succeeded")
     JsonStore().log_audit("repo.write", "ok", payload.relative_path, _preview(payload))
+    RepoIndexService().invalidate(payload.project_path)
     return result
 
 
 @router.post("/delete", response_model=dict[str, str])
 def repo_delete(payload: RepoDeleteRequest) -> dict[str, str]:
     _require_explicit_client_when_multiclient(payload, "repo.delete")
+    PreWriteGateService().ensure_repo_write_allowed(
+        project_path=payload.project_path,
+        relative_paths=[payload.relative_path],
+        client_name=payload.client_name,
+        action="repo.delete",
+    )
     approval = ApprovalService()
     approval.ensure_allowed("repo.delete", payload.approval_id, _preview(payload))
     try:
@@ -182,6 +190,7 @@ def repo_delete(payload: RepoDeleteRequest) -> dict[str, str]:
         raise
     approval.mark_consumed(payload.approval_id, "repo.delete succeeded")
     JsonStore().log_audit("repo.delete", "ok", payload.relative_path, _preview(payload))
+    RepoIndexService().invalidate(payload.project_path)
     return result
 
 
@@ -198,6 +207,8 @@ def repo_apply_patch(payload: RepoPatchRequest) -> CommandResult:
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.apply_patch succeeded", "repo.apply_patch failed")
     JsonStore().log_audit("repo.apply_patch", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
+    if result.exit_code == 0 and not payload.check_only:
+        RepoIndexService().invalidate(payload.project_path)
     return result
 
 
@@ -216,6 +227,8 @@ def repo_write_many_fast_safe(payload: RepoWriteManyFastSafeRequest) -> CommandR
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.write_many_fast_safe succeeded", "repo.write_many_fast_safe failed")
     JsonStore().log_audit("repo.write_many_fast_safe", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
+    if result.exit_code == 0 and not payload.check_only:
+        RepoIndexService().invalidate(payload.project_path)
     return result
 
 
@@ -230,6 +243,8 @@ def repo_write_many_smart(payload: RepoWriteManySmartRequest) -> CommandResult:
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.write_many_smart succeeded", "repo.write_many_smart failed")
     JsonStore().log_audit("repo.write_many_smart", "ok" if result.exit_code == 0 else "failed", payload.strategy, _preview(payload))
+    if result.exit_code == 0 and not payload.check_only:
+        RepoIndexService().invalidate(payload.project_path)
     return result
 
 
@@ -244,6 +259,8 @@ def repo_write_many_atomic(payload: RepoWriteManyAtomicRequest) -> CommandResult
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.write_many_atomic succeeded", "repo.write_many_atomic failed")
     JsonStore().log_audit("repo.write_many_atomic", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
+    if result.exit_code == 0 and not payload.check_only:
+        RepoIndexService().invalidate(payload.project_path)
     return result
 
 
@@ -260,6 +277,8 @@ def repo_apply_patch_atomic(payload: RepoAtomicPatchRequest) -> CommandResult:
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.apply_patch_atomic succeeded", "repo.apply_patch_atomic failed")
     JsonStore().log_audit("repo.apply_patch_atomic", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
+    if result.exit_code == 0 and not payload.check_only:
+        RepoIndexService().invalidate(payload.project_path)
     return result
 
 

@@ -516,3 +516,56 @@ Automatic screenshot/visual verification has been removed from the deployment pi
 The standalone authenticated `/browser/screenshot` endpoint remains available for optional manual diagnostics. It is never called automatically and never affects push, deploy, or upgrade success. Screenshots can be served through `/browser/screenshots/<filename>` when `ODOO_AGENT_SCREENSHOT_PUBLIC_BASE_URL` or `ODOO_AGENT_PUBLIC_BASE_URL` is configured.
 
 Use `screenshot_mode="memory_only"` for temporary in-memory capture, `persist_latest` only when a retained image is explicitly needed, and `disabled` for DOM/console diagnostics without image capture.
+
+## Render Free / 512 MB hardened profile
+
+This build is tuned for a single Render free instance with approximately 0.1 CPU and 512 MB RAM. The defaults intentionally favor correctness and bounded resource use over parallel throughput:
+
+```env
+ODOO_AGENT_ENV=production
+ODOO_AGENT_BACKGROUND_WORKERS=1
+ODOO_AGENT_BACKGROUND_QUEUE_LIMIT=1
+ODOO_AGENT_MAX_ACTIVE_DEPLOYS=1
+ODOO_AGENT_MCP_DISPATCH_CONCURRENCY=2
+ODOO_AGENT_SQLITE_BUSY_TIMEOUT_MS=5000
+ODOO_AGENT_SAFE_DEPLOY_LEASE_SECONDS=1200
+ODOO_AGENT_FRONTEND_PREFLIGHT_MAX_READS=20
+ODOO_AGENT_UPGRADE_MAX_ATTEMPTS=2
+ODOO_AGENT_UPGRADE_RETRY_DELAY_SECONDS=2
+ODOO_AGENT_BROWSER_TOOLS_ENABLED=false
+ODOO_AGENT_REQUIRE_BACKUP_FOR_DESTRUCTIVE=true
+```
+
+### Runtime behavior
+
+- Exactly one long-running background job executes at a time, with at most one queued job. Additional requests fail quickly with `background_capacity_full` instead of exhausting memory or silently waiting forever.
+- Exactly one safe deployment may own the instance at a time. The ownership lease is persisted in SQLite, so duplicate processes cannot deploy the same or a different module concurrently.
+- MCP file/Git/SSH calls run outside the event loop, but only two lightweight dispatches run concurrently.
+- Job and lease state is stored in SQLite WAL with transactional updates. A restart marks interrupted work as resumable rather than falsely successful.
+- Automatic Chromium startup and screenshot verification are disabled. The small Render image does not install Chromium; optional manual browser tools require an external `ODOO_AGENT_CDP_URL` and `ODOO_AGENT_BROWSER_TOOLS_ENABLED=true`.
+- A production/Render startup refuses the default or short API token. Generate a strong token before deployment.
+- Odoo Community and Enterprise source roots are hard read-only. Only custom checkout/user-addon paths may be mutated.
+- Destructive migrations, hooks, unlink operations, or destructive SQL require `backup_confirmed=true` and a non-empty `backup_reference` before safe deployment starts.
+- Module upgrade retry is limited to clearly transient failures. Permanent Python/XML/schema errors stop immediately and require an actual code correction; the connector never creates fake retry commits.
+
+### Backpressure is expected
+
+On this profile, receiving HTTP 429 or `background_capacity_full` while another deployment is running is normal protection, not a connector crash. Wait for the owning `job_id` to finish, then retry. Do not increase workers on the 512 MB plan. For parallel deployments, move the state database and workers to a larger instance instead.
+
+### Persistent state on Render
+
+`ODOO_AGENT_STATE_DIR` defaults to `/tmp/odoo_agent_state`. Render free filesystems are ephemeral across redeploys. The connector safely reconciles interrupted jobs at process restart, but completed history is lost after a fresh container replacement. For durable history, mount a persistent disk on a paid plan and point `ODOO_AGENT_STATE_DIR` to it.
+
+### Destructive deployment request fields
+
+A safe deployment that contains migrations or destructive operations must include:
+
+```json
+{
+  "destructive_migration": true,
+  "backup_confirmed": true,
+  "backup_reference": "Odoo.sh backup/build identifier or verified snapshot reference"
+}
+```
+
+Setting `destructive_migration=false` does not bypass scanning; the changed files are inspected independently.

@@ -25,11 +25,15 @@ from ..schemas import CommandResult, FileContent, OdooResult, OdooShLogName
 # ---------------------------------------------------------------------------
 
 class _SshMasterPool:
-    """Singleton pool of SSH ControlMaster background processes, one per target."""
+    """Small socket-based SSH ControlMaster pool, one target at a time.
+
+    `ssh -f` forks and the original Popen exits, so process.poll() cannot prove
+    master health. OpenSSH's `-O check` is the authoritative lifecycle check.
+    """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._masters: dict[str, tuple[subprocess.Popen, Path]] = {}
+        self._masters: dict[str, tuple[Path, str, int]] = {}
         self._tmpdir = Path(tempfile.mkdtemp(prefix="odoosh_ssh_pool_"))
 
     def _key(self, host: str, port: int, user: str) -> str:
@@ -39,6 +43,20 @@ class _SshMasterPool:
         safe = key.replace("/", "_").replace(":", "_").replace("@", "_")
         return self._tmpdir / f"cm_{safe}.sock"
 
+    @staticmethod
+    def _control(sock: Path, target: str, port: int, operation: str, timeout: int = 5) -> bool:
+        try:
+            result = subprocess.run(
+                ["ssh", "-S", str(sock), "-O", operation, "-p", str(port), target],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout,
+                check=False,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
     def ensure_master(
         self,
         host: str,
@@ -47,16 +65,19 @@ class _SshMasterPool:
         key_path: Path | None,
         timeout: int = 15,
     ) -> Path | None:
-        """Ensure a ControlMaster is alive; return socket path or None on failure."""
         key = self._key(host, port, user)
+        target = f"{user}@{host}"
         with self._lock:
             entry = self._masters.get(key)
             if entry is not None:
-                proc, sock = entry
-                if proc.poll() is None and sock.exists():
-                    return sock  # healthy
+                sock, saved_target, saved_port = entry
+                if sock.exists() and self._control(sock, saved_target, saved_port, "check"):
+                    return sock
+                self._masters.pop(key, None)
+                sock.unlink(missing_ok=True)
+
             sock = self._socket_path(key)
-            sock.parent.mkdir(parents=True, exist_ok=True)
+            sock.unlink(missing_ok=True)
             cmd = [
                 "ssh", "-N", "-f", "-M",
                 "-S", str(sock),
@@ -64,26 +85,30 @@ class _SshMasterPool:
                 "-o", "BatchMode=yes",
                 "-o", "StrictHostKeyChecking=accept-new",
                 "-o", f"ConnectTimeout={timeout}",
+                "-o", "ControlPersist=180",
                 "-o", "ServerAliveInterval=30",
-                "-o", "ServerAliveCountMax=3",
+                "-o", "ServerAliveCountMax=2",
             ]
             if key_path:
                 cmd.extend(["-i", str(key_path), "-o", "IdentitiesOnly=yes"])
-            cmd.append(f"{user}@{host}")
+            cmd.append(target)
             try:
-                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                deadline = time.monotonic() + 6
-                while time.monotonic() < deadline:
-                    if sock.exists():
-                        self._masters[key] = (proc, sock)
-                        return sock
-                    time.sleep(0.2)
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=timeout + 5,
+                    check=False,
+                )
+                if result.returncode == 0 and sock.exists() and self._control(sock, target, port, "check"):
+                    self._masters[key] = (sock, target, port)
+                    return sock
             except Exception:
                 pass
+            sock.unlink(missing_ok=True)
             return None
 
     def mux_args(self, sock: Path | None) -> list[str]:
-        """Extra ssh args to route a call through an existing ControlMaster."""
         if sock and sock.exists():
             return ["-o", f"ControlPath={sock}", "-o", "ControlMaster=no"]
         return []
@@ -93,8 +118,8 @@ class _SshMasterPool:
         with self._lock:
             entry = self._masters.pop(key, None)
             if entry:
-                proc, sock = entry
-                proc.terminate()
+                sock, target, saved_port = entry
+                self._control(sock, target, saved_port, "exit")
                 sock.unlink(missing_ok=True)
 
 

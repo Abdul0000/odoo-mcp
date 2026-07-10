@@ -13,13 +13,29 @@ from ..services.browser_cdp_service import CdpBrowserService
 router = APIRouter(prefix="/browser", tags=["browser"], dependencies=[AuthDependency])
 
 
+def _require_browser_tools_enabled() -> None:
+    if not settings.browser_tools_enabled:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error_type": "browser_tools_disabled",
+                "message": (
+                    "Browser tools are disabled for the small-instance profile. "
+                    "Enable ODOO_AGENT_BROWSER_TOOLS_ENABLED=true and configure an external ODOO_AGENT_CDP_URL."
+                ),
+            },
+        )
+
+
 @router.post("/login", response_model=BrowserCheckResult)
 async def browser_login(payload: BrowserLoginRequest) -> BrowserCheckResult:
+    _require_browser_tools_enabled()
     return await CdpBrowserService().login_odoo(payload)
 
 
 @router.post("/screenshot", response_model=BrowserCheckResult)
 async def browser_screenshot(payload: BrowserCheckRequest) -> BrowserCheckResult:
+    _require_browser_tools_enabled()
     return await CdpBrowserService().screenshot_odoo_page(
         base_url=payload.base_url,
         login=payload.login,
@@ -101,4 +117,5 @@ async def browser_pos_flow(payload: PosFlowCheckRequest) -> PosFlowCheckResult:
     a single cold-load screenshot never exercises the click/payment surface
     where POS component bugs actually throw.
     """
+    _require_browser_tools_enabled()
     return await CdpBrowserService().run_pos_flow(payload)
