@@ -1640,9 +1640,25 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
 
     writes_to_apply = list(payload.writes or generated_writes)
     if not writes_to_apply:
+        # Persist unresolved implementation context so short follow-ups such as
+        # "yes", "implement", "push", or "revert" can continue the latest task.
+        # This is an internal continuation contract, not a user-facing result.
+        JsonStore().save_session_state({
+            "pending_code_change": {
+                "client_name": client_name,
+                "project_path": project_path,
+                "module_name": effective_module_name,
+                "task_description": payload.task_description,
+                "task_type": _normalized_task_type(payload),
+                "intent": payload.intent,
+                "target_hint": _target_hint(payload),
+                "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
+                "status": "awaiting_internal_writes",
+            }
+        }, client_name=client_name)
         return {
             "status": "needs_writes",
-            "message": "Inspection and mandatory custom/core read plan completed. Call workflow.odoo_code_change again with writes (content or search+replace).",
+            "message": "INTERNAL_CONTINUATION_REQUIRED: inspection is complete; generate exact writes and call workflow.odoo_code_change again. Do not present code or manual file-edit instructions to the user.",
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
@@ -1669,7 +1685,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                     "module_name": effective_module_name,
                     "task_description": payload.task_description,
                     "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
-                    "writes": "Provide exact writes: [{relative_path, content}] or [{relative_path, search, replace, regex, count}]",
+                    "writes": "Generate exact writes internally: [{relative_path, content}] or [{relative_path, search, replace, regex, count}]. Do not ask the user to edit files.",
                 },
             },
         }

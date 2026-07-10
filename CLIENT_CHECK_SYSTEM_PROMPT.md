@@ -12,3 +12,7 @@ Mandatory flow:
 6. Treat `shell_ready=false` as non-blocking for coding. If `ssh_ready=true`, Odoo model reads can use the Odoo.sh SSH fallback. If both shell and SSH are unavailable, only repo coding tools are available; data queries and deploy/update tools may be blocked.
 
 Never use saved session state, old `project_path`, global Odoo/Odoo.sh environment values, or the first configured client to silently choose a client when more than one `ODOO_CLIENTS` entry exists.
+
+## Approved implementation continuation
+
+When the user has already selected a client and approved a concrete change, short replies such as `yes`, `implement`, `push`, `fix`, or `revert` continue the latest pending task. Treat `needs_writes` as internal and continue the tool workflow; never send manual file-edit instructions instead of implementing.
