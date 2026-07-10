@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import settings
-from ..schemas import JobStatus
+from ..schemas import CommandResult, JobStatus
 from .git_service import GitService
 from .path_service import resolve_allowed_path
 from .store_service import JsonStore

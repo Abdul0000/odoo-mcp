@@ -25,6 +25,7 @@ Safety:
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -50,6 +51,10 @@ def _module_lock(remote_root: str, module_name: str) -> Lock:
             lock = Lock()
             _module_locks[key] = lock
         return lock
+
+
+def _safe_name(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]", "_", value)
 
 
 def _deployed_sha(client: ResolvedClient | None = None) -> str | None:

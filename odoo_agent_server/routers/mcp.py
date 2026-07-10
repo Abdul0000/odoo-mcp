@@ -252,10 +252,6 @@ _PROVIDER_TOOL_NAMES = {
     "workflow.agent_instructions",
     "workflow.odoo_code_change",
     "workflow.frontend_visual_implement",
-    # Runtime visual/screenshot tools exposed to provider clients after CDP support.
-    "browser.login",
-    "browser.screenshot",
-    "jobs.status_compact",
     # Read-only source discovery tools exposed so provider agents can inspect
     # native Odoo/Odoo.sh source before complex POS/OWL/XML work instead of
     # guessing or relying on workflow verifier fallbacks.
@@ -341,6 +337,17 @@ def _force_remote_tool_list(tools: list[dict[str, Any]]) -> list[dict[str, Any]]
         item.setdefault("description", "Odoo MCP tool")
         sanitized.append(item)
     return sanitized
+
+
+def _is_claude_request(request: Request | None) -> bool:
+    if request is None:
+        return False
+    headers = request.headers
+    joined = " ".join(
+        str(headers.get(name, ""))
+        for name in ("user-agent", "x-client-name", "anthropic-version", "mcp-client")
+    ).lower()
+    return "claude" in joined or "anthropic" in joined
 
 
 def _tools_for_profile(profile: str | None = None) -> list[Any]:

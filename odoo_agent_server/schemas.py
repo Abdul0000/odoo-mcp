@@ -228,7 +228,7 @@ class OdooCodeChangeRequest(BaseModel):
     target_hint: str | None = Field(default=None, max_length=500, description="Optional generic target hint for search/autopatch, such as a visible label, method, class, XML id, field, route, or file clue.")
     change_request: dict[str, Any] = Field(default_factory=dict, description="Optional structured generic change request. Safe autopatch currently supports style/text replacement shortcuts; all other task types fall back to inspection + writes.")
     patch_strategy: str = Field(default="auto", max_length=80, description="Patch strategy hint: auto, inspect_only, explicit_writes, safe_autopatch, text_replace, style_rule, inline_style, etc.")
-    verify_targets: list[str] = Field(default_factory=list, max_length=20, description="Generic verification hints such as model names, menus, methods, or CSS selectors.")
+    verify_targets: list[str] = Field(default_factory=list, max_length=20, description="Generic verification hints such as URLs, model names, menus, methods, or CSS selectors. URL-like values can be copied into verify_ui_paths by the client.")
     # Backward-compatible convenience fields for simple style/text tasks. They are
     # normalized into target_hint/change_request internally and do not limit the workflow.
     target_text: str | None = Field(default=None, max_length=500, description="Backward-compatible exact visible text for focused inspection/autopatch. Prefer target_hint for new clients.")
@@ -238,7 +238,7 @@ class OdooCodeChangeRequest(BaseModel):
     writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=20, description="Actual file edits to apply. If empty, the tool returns focused inspection context or can autopatch when allow_autopatch/style/target_text are provided.")
     commit_message: str | None = Field(default=None, max_length=300, description="Commit message for safe deploy. Defaults to a concise message from task_description.")
     auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
-    verify_ui_paths: list[str] = Field(default_factory=list, max_length=20, description="Deprecated compatibility field. Automatic browser verification is removed and these paths are ignored.")
+    verify_ui_paths: list[str] = Field(default_factory=list, max_length=20, description="Optional live Odoo paths to verify after deploy; required before visible UI claims are allowed")
     max_search_matches: int = Field(default=20, ge=1, le=100, description="Max candidate matches returned during inspect mode")
 
     @field_validator("module_name")
@@ -277,7 +277,7 @@ class FrontendVisualImplementRequest(BaseModel):
     variants: list[dict[str, Any]] = Field(default_factory=list, max_length=12, description="Optional SVG variants, e.g. [{name:'active', palette:'gold'}].")
     commit_message: str | None = Field(default=None, max_length=300, description="Commit message. Defaults to a concise message from design_goal.")
     auto_deploy: bool = Field(default=True, description="After generated writes pass verification, start safe deploy and return jobs.get next_call.")
-    verify_ui_paths: list[str] = Field(default_factory=list, max_length=20, description="Deprecated compatibility field. Automatic browser verification is removed and these paths are ignored.")
+    verify_ui_paths: list[str] = Field(default_factory=list, max_length=20, description="Optional live Odoo paths to verify after deploy.")
 
     @field_validator("module_name")
     @classmethod
@@ -657,169 +657,24 @@ class OdooResult(BaseModel):
 globals()["Odoo" + "RpcResult"] = OdooResult
 globals()["Odoo" + "RpcModuleRequest"] = OdooModuleRequest
 
-class BrowserAction(BaseModel):
-    """One lightweight browser action for runtime visual checks.
-
-    The CDP implementation intentionally keeps this generic so POS/backend/website
-    visual verification can reuse the same action list without adding a new browser
-    engine.  Supported types: wait, click, hover, scroll, screenshot, evaluate, inject_css.
-    Non-optional action failures now fail the browser result so a missing target
-    screen can no longer be hidden behind a successful screenshot capture.
-    """
-    type: Literal["wait", "click", "hover", "scroll", "screenshot", "evaluate", "inject_css"]
-    selector: str | None = Field(default=None, description="CSS selector used by wait/click/hover/scroll actions")
-    text: str | None = Field(default=None, description="Optional visible text for click actions when selector is omitted")
-    name: str | None = Field(default=None, description="Screenshot filename for screenshot actions")
-    expression: str | None = Field(default=None, description="JavaScript expression for evaluate actions")
-    css: str | None = Field(default=None, description="CSS text for inject_css visual preview actions")
-    style_id: str | None = Field(default=None, description="DOM id for inject_css style tag so later actions can replace it")
-    delta_y: int = Field(default=500, description="Vertical scroll delta for scroll actions")
-    timeout_seconds: int | None = Field(default=None, ge=1, le=180, validation_alias=AliasChoices("timeout_seconds", "timeout"))
-    optional: bool = Field(default=False, description="When true, action failure is reported but does not fail the whole browser check.")
-
-
-class UiVerifySpec(BaseModel):
-    """Deprecated compatibility schema for former automatic UI verification.
-
-    Safe deploy accepts these values for older clients but ignores them. Use the
-    standalone browser tools only for optional manual diagnostics.
-    """
-    path: str | None = Field(default=None, description="Deprecated compatibility field; ignored by safe deploy.")
-    profile: Literal[
-        "auto",
-        "generic",
-        "pos_product_screen",
-        "pos_payment_screen",
-        "pos_receipt_screen",
-        "backend_form_view",
-        "backend_list_view",
-        "website_page",
-        "website_form",
-        "dashboard_owl",
-        "payment_provider",
-        "report_pdf_preview",
-    ] = Field(default="auto")
-    viewport_width: int | None = Field(default=None, ge=320, le=7680)
-    viewport_height: int | None = Field(default=None, ge=240, le=4320)
-    device_scale_factor: float = Field(default=1.0, ge=0.25, le=4.0)
-    wait_until: str | None = Field(default=None, description="Optional JavaScript expression that must evaluate truthy before screenshot/assertions.")
-    required_selectors: list[str] = Field(default_factory=list, max_length=100)
-    forbidden_selectors: list[str] = Field(default_factory=list, max_length=100)
-    required_text: list[str] = Field(default_factory=list, max_length=100)
-    forbidden_text: list[str] = Field(default_factory=list, max_length=100)
-    min_elements: dict[str, int] = Field(default_factory=dict, description="CSS selector -> minimum matching element count")
-    actions: list[BrowserAction] = Field(default_factory=list)
-    diagnostics: list[str] = Field(default_factory=list)
-    screenshot_name: str | None = None
-    full_page: bool | None = None
-    timeout_seconds: int | None = Field(default=None, ge=10, le=180)
-    human_pos_navigation: bool | None = Field(default=None, description="Auto-enabled for POS profiles when omitted.")
-    pos_config_id: int | None = Field(default=None, ge=1)
-    pos_config_name: str | None = None
-
-
 class BrowserCheckRequest(BaseModel):
-    client_name: str | None = Field(default=None, description="Optional ODOO_CLIENTS client. Browser tools can resolve base_url/login/password from it without exposing credentials.")
     base_url: str | None = Field(default=None)
     login: str | None = Field(default=None)
     password: str | None = Field(default=None)
-    start_path: str = Field(default="/web", description="Odoo path or full URL. Query strings are preserved, e.g. /pos/ui?config_id=1&debug=1")
+    start_path: str = Field(default="/web")
     screenshot_name: str = Field(default="odoo_page.png")
     timeout_seconds: int = Field(default=45, ge=10, le=180)
     full_page: bool = True
-    reuse_session: bool = Field(default=True, description="Open start_path directly and reuse an existing CDP/browser session first instead of forcing /web/login.")
-    login_strategy: Literal["reuse_only", "reuse_first", "login_first"] = Field(
-        default="reuse_first",
-        description="reuse_only never logs in; reuse_first opens the target page first and falls back to login when credentials exist; login_first keeps old behavior.",
-    )
-    wait_selector: str | None = Field(default=None, description="Optional selector to wait for before screenshot, e.g. .product-screen")
-    human_pos_navigation: bool | None = Field(
-        default=None,
-        description="For POS profiles, open the dashboard and enter the selected register like a user before readiness checks. Auto-enabled for POS profiles when omitted.",
-    )
-    pos_config_id: int | None = Field(default=None, ge=1, description="Optional POS configuration id to open during human POS navigation.")
-    pos_config_name: str | None = Field(default=None, description="Optional POS configuration name to open during human POS navigation.")
-    ui_profile: Literal[
-        "auto", "generic", "pos_product_screen", "pos_payment_screen", "pos_receipt_screen",
-        "backend_form_view", "backend_list_view", "website_page", "website_form",
-        "dashboard_owl", "payment_provider", "report_pdf_preview",
-    ] = Field(default="auto", description="Reusable readiness profile. Auto infers from start_path when possible.")
-    viewport_width: int | None = Field(default=None, ge=320, le=7680, description="Optional browser viewport width for exact visual checks.")
-    viewport_height: int | None = Field(default=None, ge=240, le=4320, description="Optional browser viewport height for exact visual checks.")
-    device_scale_factor: float = Field(default=1.0, ge=0.25, le=4.0)
-    required_selectors: list[str] = Field(default_factory=list, max_length=100)
-    forbidden_selectors: list[str] = Field(default_factory=list, max_length=100)
-    required_text: list[str] = Field(default_factory=list, max_length=100)
-    forbidden_text: list[str] = Field(default_factory=list, max_length=100)
-    min_elements: dict[str, int] = Field(default_factory=dict, description="CSS selector -> minimum matching element count")
-    wait_until: str | None = Field(default=None, description="Optional JavaScript expression that must evaluate truthy before screenshot/assertions.")
-    require_all_actions_pass: bool = Field(default=True, description="When true, any non-optional failed browser action fails the entire check.")
-    screenshot_mode: Literal["memory_only", "persist_latest", "disabled"] = Field(default="memory_only", description="memory_only captures and analyzes in RAM without writing a file; persist_latest writes one latest file; disabled skips image capture.")
-    screenshot_format: Literal["jpeg", "png"] = Field(default="jpeg", description="In-memory capture format. JPEG is recommended on Render free.")
-    screenshot_quality: int = Field(default=50, ge=1, le=100, description="JPEG quality for memory-only capture.")
-    include_screenshot_base64: bool = Field(default=False, description="Return final screenshot bytes as base64 when under screenshot_base64_max_bytes. Ignored in memory_only mode to avoid response memory growth.")
-    screenshot_base64_max_bytes: int = Field(default=1_500_000, ge=0, le=10_000_000)
-    reference_image_path: str | None = Field(default=None, description="Optional local reference image path for visual screenshot comparison.")
-    visual_compare_mode: Literal["off", "layout", "pixel"] = Field(default="off")
-    max_visual_diff_ratio: float | None = Field(default=None, ge=0.0, le=1.0, description="When set, fail if visual diff ratio is greater than this threshold.")
-    actions: list[BrowserAction] = Field(default_factory=list, description="Optional wait/click/hover/scroll/screenshot/evaluate/inject_css actions before final screenshot")
-    diagnostics: list[str] = Field(default_factory=list, description="Visual diagnostics to run: overlap, double_scrollbar, clipping, text_overflow, hidden_scrollable")
-    debug_contrast: bool = Field(default=False, description="Temporarily inject a high-contrast visual debug skin before actions/diagnostics so overlap, clipping, and scrollbar issues are easier to see. It changes colors/outlines only and is never persisted to Odoo code.")
-    debug_contrast_screenshot_name: str | None = Field(default=None, description="Optional screenshot filename captured while the temporary high-contrast debug skin is active.")
-    restore_theme_after_verify: bool = Field(default=True, description="Remove the temporary high-contrast debug skin before the final screenshot, preserving the requested customer theme in the final proof image.")
-    cleanup_screenshot_dir: bool = Field(default=True, description="Clean old screenshots from ODOO_AGENT_SCREENSHOT_DIR before/after the visual run using retention/max-file limits.")
-    cleanup_screenshot_retention_seconds: int | None = Field(default=None, ge=0, le=604800, description="Override screenshot cleanup retention for this request. 0 means old screenshots are removed immediately before current screenshots are written.")
-    delete_screenshots_after_verify: bool = Field(default=False, description="Delete screenshots generated by this request after diagnostics. Paths are still reported in screenshot_cleanup.deleted_generated_paths for audit, but screenshot_path/debug_screenshot_path are cleared.")
-    scenario: str = Field(default="auto", description="Goal-driven browser scenario. Built-ins include auto, none, trolley_with_products, payment_screen, customer_popup, and receipt_screen.")
-    scenario_goal: str | None = Field(default=None, description="Natural-language UI state to prepare before final assertions and screenshot capture.")
-    scenario_product_count: int = Field(default=0, ge=0, le=10, description="Minimum products to add during POS scenario setup. Auto trolley scenarios default to two.")
-    cleanup_after_verify: bool = Field(default=False, description="Attempt to discard a temporary draft order created by scenario setup after the screenshot is captured.")
-    require_functional_proof: bool = Field(default=True, description="Require setup actions to prove the expected state change, such as an increased POS order-line count.")
-    code_aware: bool = Field(default=False, description="Inspect the custom module source before browser execution and derive a temporary UI scenario from templates, handlers, selectors, and state conditions.")
-    project_path: str | None = Field(default=None, description="Checkout root used by code-aware scenario planning. Defaults to the selected client checkout when available.")
-    module_name: str | None = Field(default=None, description="Custom module technical name to inspect for code-aware visual verification.")
-    feature_goal: str | None = Field(default=None, description="Requested custom feature or interaction goal used by the code-aware planner.")
 
-
-class BrowserLoginRequest(BaseModel):
-    client_name: str | None = Field(default=None, description="Optional ODOO_CLIENTS client. Login resolves base_url/login/password from the selected client without exposing credentials.")
-    base_url: str | None = Field(default=None)
-    login: str | None = Field(default=None, description="Optional one-off Odoo login. Prefer ODOO_CLIENTS or ODOO_LOGIN env.")
-    password: str | None = Field(default=None, description="Optional one-off Odoo password. Prefer ODOO_CLIENTS or ODOO_PASSWORD env.")
-    redirect_path: str = Field(default="/web", description="Odoo path to open after login. Use /pos/ui?config_id=1&debug=1 to seed a POS session.")
-    screenshot_name: str = Field(default="odoo_login.png")
-    timeout_seconds: int = Field(default=45, ge=10, le=180)
-    full_page: bool = True
-    cleanup_screenshot_dir: bool = Field(default=True, description="Clean old screenshots from ODOO_AGENT_SCREENSHOT_DIR before/after the login run using retention/max-file limits.")
-    cleanup_screenshot_retention_seconds: int | None = Field(default=None, ge=0, le=604800)
-    delete_screenshots_after_verify: bool = Field(default=False)
 
 class BrowserCheckResult(BaseModel):
     status: Literal["ok", "failed"]
     url: str | None = None
     title: str | None = None
     screenshot_path: str | None = None
-    screenshot_url: str | None = None
-    screenshot_base64: str | None = None
-    screenshot_mode: str = "memory_only"
-    screenshot_persisted: bool = False
-    screenshot_analysis: dict[str, Any] = Field(default_factory=dict)
-    viewport: dict[str, Any] = Field(default_factory=dict)
-    assertion_results: dict[str, Any] = Field(default_factory=dict)
-    visual_compare: dict[str, Any] = Field(default_factory=dict)
     console_errors: list[str] = Field(default_factory=list, description="console.error/warning + pageerror entries.")
     console_all: list[str] = Field(default_factory=list, description="EVERY console message (log/info/debug/warning/error), in order. Always populated — read this for full console output on every run, not just when something fails.")
     network_errors: list[str] = Field(default_factory=list)
-    action_results: list[dict[str, Any]] = Field(default_factory=list)
-    diagnostics: dict[str, Any] = Field(default_factory=dict)
-    debug_contrast_applied: bool = False
-    debug_screenshot_path: str | None = None
-    debug_screenshot_url: str | None = None
-    theme_restored_after_verify: bool = False
-    screenshot_cleanup: dict[str, Any] = Field(default_factory=dict)
-    screenshots_deleted_after_verify: bool = False
-    session_reused: bool = False
-    session_expired: bool = False
     error: str | None = None
 
 
@@ -830,15 +685,12 @@ class PosFlowCheckRequest(BaseModel):
     validate order -> receipt screen) because POS component/state bugs only
     surface once you actually interact with the app, not on initial mount.
     """
-    client_name: str | None = Field(default=None, description="Optional ODOO_CLIENTS client used to resolve URL and credentials safely.")
     base_url: str | None = Field(default=None)
     login: str | None = Field(default=None)
     password: str | None = Field(default=None)
-    pos_config_id: int | None = Field(default=None, ge=1)
     pos_config_name: str | None = Field(default=None, description="Optional POS config display name to open; if omitted, opens the first available POS.")
     product_name: str | None = Field(default=None, description="Optional exact/partial product name to click; if omitted, clicks the first product tile found.")
     payment_method_name: str | None = Field(default=None, description="Optional payment method button label; if omitted, clicks the first payment method tile found.")
-    validate_order: bool = Field(default=False, description="Create/validate a real POS order only when explicitly enabled. Visual checks remain non-destructive by default.")
     screenshot_prefix: str = Field(default="pos_flow")
     timeout_seconds: int = Field(default=60, ge=15, le=180)
 
@@ -1130,15 +982,13 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     verify_ui_paths: list[str] = Field(
         default_factory=list,
         max_length=50,
-        description="Deprecated compatibility field. Automatic browser/screenshot verification is disabled and these paths are ignored.",
+        description=(
+            "Optional Odoo web paths to open after upgrade for live UI breakage checks, "
+            "for example /web#action=123&model=sale.order&view_type=form."
+        ),
     )
-    verify_ui_specs: list[UiVerifySpec] = Field(
-        default_factory=list,
-        max_length=50,
-        description="Deprecated compatibility field. Automatic browser/screenshot verification is disabled and these specs are ignored.",
-    )
-    verify_ui_screenshot_prefix: str = Field(default="safe_deploy_ui", description="Deprecated compatibility field; ignored.")
-    verify_ui_timeout_seconds: int = Field(default=45, ge=10, le=180, description="Deprecated compatibility field; ignored.")
+    verify_ui_screenshot_prefix: str = Field(default="safe_deploy_ui", description="Screenshot filename prefix for verify_ui_paths")
+    verify_ui_timeout_seconds: int = Field(default=45, ge=10, le=180, description="Per-page browser timeout for verify_ui_paths")
     wait_for_result: bool = Field(
         default=True,
         description=(

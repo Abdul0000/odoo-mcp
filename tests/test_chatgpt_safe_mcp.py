@@ -30,9 +30,6 @@ _PROVIDER_TOOLS = {
     "jobs_list",
     "jobs_get",
     "odoosh_error_pack",
-    "browser_login",
-    "browser_screenshot",
-    "jobs_status_compact",
 }
 
 

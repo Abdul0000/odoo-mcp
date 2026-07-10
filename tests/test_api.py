@@ -18,8 +18,7 @@ def test_self_run_endpoint(monkeypatch):
     fixture_root = Path(__file__).parent / "fixtures"
     # Other tests/compileall can create pycache under the fixture module; QA is
     # correct to warn on that in real addons, so keep this fixture clean first.
-    for cache_dir in (fixture_root / "test_module").rglob("__pycache__"):
-        shutil.rmtree(cache_dir, ignore_errors=True)
+    shutil.rmtree(fixture_root / "test_module" / "models" / "__pycache__", ignore_errors=True)
     monkeypatch.setattr(settings, "allowed_roots_raw", str(fixture_root))
     client = TestClient(app)
     response = client.post(

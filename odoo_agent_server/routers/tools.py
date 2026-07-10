@@ -14,11 +14,11 @@ from ..auth import AuthDependency
 from ..config import settings, get_odoo_clients, normalise_client
 from ..schemas import (
     ApprovalCreateRequest,
+    ApprovalDecisionRequest,
     ArtifactReadRequest,
     AuditListRequest,
     BaseProjectRequest,
     BrowserCheckRequest,
-    BrowserLoginRequest,
     ClientCheckRequest,
     ClientOnlyRequest,
     DeployedModuleVerifyRequest,
@@ -102,6 +102,7 @@ from ..services.odoosh_service import OdooShService
 from ..services.browser_cdp_service import CdpBrowserService
 from ..services.repo_service import RepoService
 from ..services.prewrite_gate_service import PreWriteGateService
+from ..services.path_service import resolve_allowed_path
 from ..services.syntax_verifier_service import SyntaxVerifierService
 from ..services.workflow_guard_service import mark_stale_safe_deploy_running_job
 from .qa import self_run
@@ -110,7 +111,7 @@ from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy, start_odoo_module_deploy_job
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
 from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index, verify_deployed_module, _poll_odoosh_deployed, _pre_push_verify_files, _expected_user_file_hashes, _infer_registry_fields_from_python, _normalise_expected_registry_fields, _verify_registry_fields, _assert_head_commit_contains_paths
-from ..schemas import ApprovalRecord
+from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 from ..services.frontend_visual_service import FrontendVisualService
 
@@ -263,7 +264,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.full_verify",
         title="Run full verification", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module",
-        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 10 minutes for the pushed SHA, reject recent Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, and upgrade an Odoo module. Automatic screenshot verification is removed and never gates deploy success. For MCP clients this starts/resumes a background safe-deploy job and returns job_id/next_call immediately; status=running is not success and must be followed via jobs.get. Only treat the deployment as complete when response.deploy_confirmed == true. A finished job without this field set to true means the deploy did not fully complete — do not report success to the user. If git diff shows no changes for this module, safe_deploy_module automatically runs Odoo.sh source verification and returns verified_already_deployed/already_deployed_confirmed; read this field before telling the user anything is 'already added' or 'already live'. Do not make that claim from memory of a previous turn.", requires_approval=True),
+        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 10 minutes for the pushed SHA, reject recent Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, upgrade an Odoo module, and optionally open exact UI paths with verify_ui_paths. For MCP clients this starts/resumes a background safe-deploy job and returns job_id/next_call immediately; status=running is not success and must be followed via jobs.get. Only treat the deployment as complete when response.deploy_confirmed == true. A finished job without this field set to true means the deploy did not fully complete — do not report success to the user. If git diff shows no changes for this module, safe_deploy_module automatically runs Odoo.sh source verification and returns verified_already_deployed/already_deployed_confirmed; read this field before telling the user anything is 'already added' or 'already live'. Do not make that claim from memory of a previous turn.", requires_approval=True),
     ToolDescriptor(
         name="workflow.verify_deployed_module",
         title="Verify deployed source",
@@ -498,12 +499,10 @@ _TOOL_DESCRIPTORS = [
         title="Upgrade Odoo module", description="[LEGACY] Direct button_immediate_upgrade — use odoo.module_deploy instead", requires_approval=True, deprecated=True),
     ToolDescriptor(name="odoo.search_read",
         title="Query Odoo records", description="Run Odoo search_read safely. Uses Odoo.sh SSH first, then HTTPS JSON-RPC read-only fallback when SSH is refused/unavailable for a client.", read_only=True),
-    ToolDescriptor(name="browser.login",
-        title="Login to Odoo in browser", description="Open Odoo /web/login through CDP, submit credentials from ODOO_CLIENTS or env, and keep the browser session for optional manual diagnostics.", read_only=True),
     ToolDescriptor(name="browser.screenshot",
-        title="Check browser page", description="Navigate an Odoo page through the configured CDP browser and capture screenshots plus console/network errors; POS profiles can enter the register through the dashboard automatically.", read_only=True),
+        title="Check browser page", description="Navigate an Odoo page through external CDP browser and capture console/network errors; screenshot_path is optional", read_only=True),
     ToolDescriptor(name="browser.pos_flow",
-        title="Run POS end-to-end flow", description="Login, select the exact POS dashboard card, open/resume its session, click a product, and reach payment in one CDP session with a screenshot at every step. Order validation is disabled unless validate_order=true.", read_only=True),
+        title="Run POS end-to-end flow", description="Login, open POS, click product, pay, validate order in one CDP browser session with console/network capture at every step. Use for any POS OWL change.", read_only=True),
     ToolDescriptor(name="approvals.list",
         title="List pending approvals", description="List pending/recent approval records", read_only=True),
     ToolDescriptor(name="approvals.request",
@@ -518,8 +517,6 @@ _TOOL_DESCRIPTORS = [
         title="List background jobs", description="List recent connector jobs", read_only=True),
     ToolDescriptor(name="jobs.get",
         title="Check background job status", description="Read one connector job by id; waits server-side by default until done or timeout to avoid fragile client polling. Only treat the deployment as complete when response.deploy_confirmed == true. A finished job without this field set to true means the deploy did not fully complete — do not report success to the user.", read_only=True),
-    ToolDescriptor(name="jobs.status_compact",
-        title="Compact job status", description="Return compact deploy/job progress without huge logs/artifacts: current step, deployed/upgraded/ui flags, and final message.", read_only=True),
     ToolDescriptor(name="audit.list",
         title="View audit log", description="List recent audit events", read_only=True),
     # Fix 3: Resume failed pipeline from last successful step
@@ -713,14 +710,12 @@ _TOOL_INPUT_MODELS = {
     "odoo.module_install": OdooModuleRequest,
     "odoo.module_update": OdooModuleRequest,
     "odoo.search_read": OdooSearchReadRequest,
-    "browser.login": BrowserLoginRequest,
     "browser.screenshot": BrowserCheckRequest,
     "browser.pos_flow": PosFlowCheckRequest,
     "approvals.list": LimitRequest,
     "approvals.request": ApprovalCreateRequest,
     "jobs.list": LimitRequest,
     "jobs.get": JobGetRequest,
-    "jobs.status_compact": JobGetRequest,
     "audit.list": AuditListRequest,
     # Fix 3/7/10
     "workflow.resume_job": ResumeJobRequest,
@@ -1759,6 +1754,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         wait_for_result=False,
         wait_timeout_seconds=0,
         upgrade_module=True,
+        verify_ui_paths=payload.verify_ui_paths,
     )
     try:
         deploy = await safe_deploy_module(deploy_payload)
@@ -1786,7 +1782,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         }
     job_id = deploy_struct.get("job_id") if isinstance(deploy_struct, dict) else None
     frontend_touched = any(str(p).endswith((".xml", ".scss", ".css", ".js")) for p in written_files_abs)
-    visible_claim_allowed = bool(deploy_struct.get("deploy_confirmed") is True)
+    visible_claim_allowed = bool(payload.verify_ui_paths and deploy_struct.get("deploy_confirmed") is True)
     return {
         "status": "deploy_started" if deploy_struct.get("status") in {"running", "already_running", "already_in_progress", "resumable_existing_job"} else deploy_struct.get("status", "deploy_started"),
         "message": "Code change workflow completed through verify phase; safe deploy is server-owned. Poll jobs.get until terminal result before final answer.",
@@ -1857,6 +1853,7 @@ async def _workflow_frontend_visual_implement(payload: FrontendVisualImplementRe
         writes=writes,
         commit_message=payload.commit_message or f"Implement frontend visual {visual_plan.get('asset_name', 'asset')}",
         auto_deploy=payload.auto_deploy,
+        verify_ui_paths=payload.verify_ui_paths,
     )
     result = await _workflow_odoo_code_change(change_payload)
     if isinstance(result, dict):
@@ -2043,9 +2040,6 @@ async def _dispatch(name: str, args: dict) -> object:
             client_name=req.client_name,
         )
         return data.get("odoo") if data.get("status") == "ok" else OdooResult(status="failed", result=data, error=data.get("message") or "Odoo search_read failed")
-    if name == "browser.login":
-        req = BrowserLoginRequest.model_validate(args)
-        return await CdpBrowserService().login_odoo(req)
     if name == "browser.pos_flow":
         req = PosFlowCheckRequest.model_validate(args)
         return await CdpBrowserService().run_pos_flow(req)
@@ -2059,40 +2053,6 @@ async def _dispatch(name: str, args: dict) -> object:
             req.screenshot_name,
             req.timeout_seconds,
             req.full_page,
-            client_name=req.client_name,
-            reuse_session=req.reuse_session,
-            login_strategy=req.login_strategy,
-            wait_selector=req.wait_selector,
-            actions=req.actions,
-            diagnostics=req.diagnostics,
-            debug_contrast=req.debug_contrast,
-            debug_contrast_screenshot_name=req.debug_contrast_screenshot_name,
-            restore_theme_after_verify=req.restore_theme_after_verify,
-            cleanup_screenshot_dir=req.cleanup_screenshot_dir,
-            cleanup_screenshot_retention_seconds=req.cleanup_screenshot_retention_seconds,
-            delete_screenshots_after_verify=req.delete_screenshots_after_verify,
-            ui_profile=req.ui_profile,
-            viewport_width=req.viewport_width,
-            viewport_height=req.viewport_height,
-            device_scale_factor=req.device_scale_factor,
-            required_selectors=req.required_selectors,
-            forbidden_selectors=req.forbidden_selectors,
-            required_text=req.required_text,
-            forbidden_text=req.forbidden_text,
-            min_elements=req.min_elements,
-            wait_until=req.wait_until,
-            require_all_actions_pass=req.require_all_actions_pass,
-            screenshot_mode=req.screenshot_mode,
-            screenshot_format=req.screenshot_format,
-            screenshot_quality=req.screenshot_quality,
-            include_screenshot_base64=req.include_screenshot_base64,
-            screenshot_base64_max_bytes=req.screenshot_base64_max_bytes,
-            reference_image_path=req.reference_image_path,
-            visual_compare_mode=req.visual_compare_mode,
-            max_visual_diff_ratio=req.max_visual_diff_ratio,
-            human_pos_navigation=req.human_pos_navigation,
-            pos_config_id=req.pos_config_id,
-            pos_config_name=req.pos_config_name,
         )
     if name == "approvals.list":
         req = LimitRequest.model_validate(args)
@@ -2108,29 +2068,6 @@ async def _dispatch(name: str, args: dict) -> object:
         if req.wait_for_result:
             return JsonStore().wait_job(req.job_id, req.wait_timeout_seconds, req.poll_interval_seconds)
         return JsonStore().get_job(req.job_id)
-    if name == "jobs.status_compact":
-        req = JobGetRequest.model_validate(args)
-        job = JsonStore().get_job(req.job_id)
-        result = job.result if isinstance(job.result, dict) else {}
-        last_step = job.steps[-1] if job.steps else None
-        return {
-            "id": job.id,
-            "job_type": job.job_type,
-            "status": job.status,
-            "current_step": last_step.name if last_step else None,
-            "current_step_status": last_step.status if last_step else None,
-            "created_at": job.created_at,
-            "finished_at": job.finished_at,
-            "deploy_confirmed": bool(result.get("deploy_confirmed") or result.get("already_deployed_confirmed") or result.get("verified_already_deployed")),
-            "source_pushed": bool(result.get("source_pushed")),
-            "source_deployed": bool(result.get("source_deployed") or result.get("source_on_odoosh")),
-            "module_upgraded": bool(result.get("module_upgraded")),
-            "ui_checked": bool(result.get("ui_checked")),
-            "visible_change_confirmed": bool(result.get("visible_change_confirmed")),
-            "summary_status": result.get("status"),
-            "message": result.get("message"),
-            "next_call": result.get("next_call"),
-        }
     if name == "audit.list":
         req = AuditListRequest.model_validate(args)
         return JsonStore().list_audit(limit=req.limit)
@@ -2190,6 +2127,7 @@ _SAFE_DEPLOY_STEPS = [
     "odoo_module_status",
     "registry_field_verify",
     "registry_smoke_test",
+    "browser_ui_verify",
 ]
 _SAFE_DEPLOY_STEP_ALIASES = {
     "qa": "qa_self_run",
@@ -2215,23 +2153,6 @@ _RESUME_COMPLETED_STATUSES = {"ok", "passed", "skipped"}
 
 def _step_payload(result: object) -> object:
     return result.model_dump(mode="json") if hasattr(result, "model_dump") else result
-
-
-def _odoosh_poll_payload(result) -> dict[str, object]:
-    try:
-        payload = json.loads(getattr(result, "stdout", "") or "{}")
-        return payload if isinstance(payload, dict) else {}
-    except Exception:
-        return {}
-
-
-def _odoosh_poll_probably_dropped(result) -> bool:
-    payload = _odoosh_poll_payload(result)
-    return bool(
-        payload.get("probable_dropped")
-        or payload.get("status") in {"timeout_probable_dropped", "odoosh_build_failed_or_dropped"}
-        or getattr(result, "exit_code", None) == 2
-    )
 
 
 def _extract_sha_from_steps(job) -> str | None:
@@ -2706,26 +2627,13 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                     pushed_sha,
                     int(original_request.get("odoosh_deploy_timeout_seconds", 600)),
                     float(original_request.get("odoosh_deploy_poll_interval_seconds", 10.0)),
-                    failure_check_since_epoch=int(original_request.get("push_started_epoch") or 0) or None,
                 )
                 deployed = check.exit_code == 0 and '"deployed": true' in (check.stdout or "").lower()
                 resume_results["steps_run"][step_name] = {"status": "ok" if deployed else "warning", "sha": pushed_sha, "deployed": deployed, "result": _step_payload(check)}
                 if not deployed:
-                    poll_payload = _odoosh_poll_payload(check)
-                    probably_dropped = _odoosh_poll_probably_dropped(check)
-                    resume_results["status"] = "deploy_failed_or_dropped" if probably_dropped else "deploy_failed_or_timeout"
-                    resume_results["message"] = (
-                        "Odoo.sh appears to have failed/dropped the pushed commit before it became active. Stop resuming this SHA; fix the code and push a new commit."
-                        if probably_dropped
-                        else "Odoo.sh did not report the pushed commit as deployed within the polling window. Completed commit/push steps will not be replayed."
-                    )
-                    resume_results["probable_dropped"] = probably_dropped
-                    resume_results["current_sha"] = poll_payload.get("current_sha")
-                    resume_results["next_call"] = (
-                        {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
-                        if probably_dropped
-                        else {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}}
-                    )
+                    resume_results["status"] = "deploy_failed_or_timeout"
+                    resume_results["message"] = "Odoo.sh did not report the pushed commit as deployed within the polling window. Completed commit/push steps will not be replayed."
+                    resume_results["next_call"] = {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}}
                     return _persist_resume_result(store, job, resume_results, original_request)
                 failure_guard = getattr(odoosh, "recent_build_failure", None)
                 if callable(failure_guard):
@@ -2802,6 +2710,32 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                 result = odoo.registry_smoke_test(module_name, [], [], strict=False)
                 resume_results["steps_run"][step_name] = {"status": result.status, "result": _step_payload(result)}
 
+            elif step_name == "browser_ui_verify":
+                verify_paths = original_request.get("verify_ui_paths") or []
+                if not verify_paths:
+                    resume_results["steps_run"][step_name] = {"status": "skipped"}
+                    continue
+                browser_results = []
+                browser = CdpBrowserService()
+                failed_paths = []
+                warning_paths = []
+                for index, path in enumerate(verify_paths, start=1):
+                    result = await browser.screenshot_odoo_page(
+                        start_path=path,
+                        screenshot_name=f"{module_name}_resume_ui_{index}.png",
+                    )
+                    payload_result = _step_payload(result)
+                    browser_results.append({"path": path, "result": payload_result})
+                    if result.status == "failed":
+                        failed_paths.append(path)
+                    elif result.console_errors or result.network_errors:
+                        warning_paths.append(path)
+                status_value = "failed" if failed_paths else "warning" if warning_paths else "ok"
+                resume_results["steps_run"][step_name] = {"status": status_value, "result": browser_results}
+                if failed_paths:
+                    resume_results["status"] = "failed"
+                    resume_results["message"] = f"Browser UI verification failed for: {failed_paths}"
+                    return _persist_resume_result(store, job, resume_results, original_request)
 
         except Exception as exc:
             resume_results["steps_run"][step_name] = {"status": "error", "error": str(exc)}

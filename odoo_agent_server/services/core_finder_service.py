@@ -34,6 +34,7 @@ from ..schemas import (
     FindCoreFileResult,
     FindSimilarViewResult,
     SimilarViewMatch,
+    ScopeAdviceRequest,
     ScopeAdviceResult,
     ScopeLevel,
     ScopeReadInstruction,

@@ -11,7 +11,7 @@ import hashlib
 import json
 import time
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Sequence
 
 from ..schemas import (
     FrontendPatternPreflightRequest,

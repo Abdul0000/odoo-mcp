@@ -123,7 +123,7 @@ def agent_instructions() -> dict:
                 "Never answer a code-changing request by printing JSON MCP tool calls or saying the client/user should execute them. You are connected to the MCP tools; call them yourself.",
                 "Never create module schema changes by direct ORM/Studio writes to ir.model.fields or ir.ui.view unless the user explicitly asks for a no-code Studio/database customization. For normal Odoo development, write Python/XML files in the custom module and deploy the module.",
                 "Never generate Pydantic models/imports inside Odoo addon code. Pydantic is only for this MCP server's API schemas; Odoo modules must use the normal Odoo ORM: models.Model, fields, api, and XML views.",
-                "Do not require screenshot paths for deploy completion. Automatic screenshot verification is not part of the deploy pipeline.",
+                "For hard UI/POS/website/view tasks, include exact post-upgrade Odoo paths in workflow.safe_deploy_module.verify_ui_paths so the deploy job opens each page through CDP and records console/network errors plus Odoo UI breakage.",
                 "SMART ROUTER: for coding tasks, call workflow.smart_tool_router early to choose the fastest correct path. For pure data queries, use direct odoo.search_read and skip repo tools.",
                 "STRICT FRONTEND: before writing any Odoo JS/OWL/POS/website/payment/QWeb/XML/SCSS asset code, call workflow.frontend_pattern_preflight and read the mandatory pattern files it returns. Results are cached; do not guess framework syntax.",
                 "POS CONFIG RULE: never use legacy load_fields('pos.config', ...) / models.load_fields for pos.config. Read installed point_of_sale source and use the version's real loader/backend pattern.",
@@ -143,7 +143,7 @@ def agent_instructions() -> dict:
                     "5. Patch with repo.apply_patch_atomic or repo.write_many_smart. Use repo.write_many_atomic only for large/risky refactors.",
                     "6. Run git.diff and qa.self_run(run_pytest=false) unless tests/shared logic are touched.",
                     "7. workflow.verify_against_core only for changed files.",
-                    "8. Call workflow.safe_deploy_module with module_name, commit_message, changed paths, run_qa=false if qa.self_run already passed, wait_for_odoosh=true, upgrade_module=true, and expected_registry_fields for known new fields. MCP clients must use the returned job_id/next_call jobs.get polling path until terminal proof.",
+                    "8. Call workflow.safe_deploy_module with module_name, commit_message, changed paths, run_qa=false if qa.self_run already passed, wait_for_odoosh=true, upgrade_module=true, expected_registry_fields for known new fields, and exact verify_ui_paths when UI proof is needed. MCP clients must use the returned job_id/next_call jobs.get polling path until terminal proof.",
                     "9. If safe_deploy returns status=running, module_upgrade_running, or any next_call, call the returned next_call/jobs.get or workflow.resume_job. If Odoo.sh deploy polling times out, recent Odoo.sh logs show build/test failure, changed /home/odoo/src/user file hashes do not match, the Odoo module deploy is still running, or registry_field_verify fails, do not claim success. Do not repeat commit/push.",
                     "10. If the client loses job_id mid-flow, call workflow.resume_job without job_id to use the latest saved safe-deploy job, or pass override_step=push/install/upgrade for an explicit user-requested continuation point.",
                     "11. Finish only after safe deploy/resume reports passed, or report the exact blocker and next_call returned by the workflow.",
@@ -202,7 +202,7 @@ def agent_instructions() -> dict:
                     "4. Confirm exact import aliases, registry category, service names, hooks, patch syntax, Component.template/t-name, t-inherit/xpath, and asset bundle from real source.",
                     "5. Only then write code; keep syntax/style matching the installed Odoo framework source.",
                     "6. After coding, call workflow.verify_against_core with changed .py, .xml, .js, .scss, and __manifest__.py files.",
-                    "7. For POS/website/payment UI changes, use static/core checks, deploy confirmation, module upgrade, and registry checks. Browser diagnostics are optional manual tools and never a completion gate.",
+                    "7. For POS/website/payment UI changes, deploy with exact verify_ui_paths or call workflow.browser_menu_crawl after upgrade.",
                 ],
                 "areas": {
                     "pos": "Read point_of_sale/static/src/app + views and use point_of_sale._assets_pos unless source proves otherwise.",
@@ -270,7 +270,7 @@ def agent_instructions() -> dict:
                 "12. odoo.ensure_dependencies → odoo.module_deploy → poll jobs.get every 10s; direct module_deploy blocks itself if recent pushed code is not verified",
                 "    If Access Denied → SSH fallback auto-triggered inside module_deploy",
                 "13. If failed → odoosh.grep_errors → read traceback → fix → back to step 6 (max 3x)",
-                "14. Automatic screenshot verification is not part of the workflow and must not be used as a completion gate.",
+                "14. For UI/POS/website/view tasks, open exact affected paths with verify_ui_paths or workflow.browser_menu_crawl; failed page load, Odoo error dialog, shell_ERROR, traceback, console error, or 4xx/5xx network response means breakage.",
                 "15. odoo.module_status = installed ✅",
             ],
             "error_guide": {
@@ -337,7 +337,7 @@ def agent_instructions() -> dict:
     }
 
 
-@app.api_route("/", methods=["GET", "HEAD"])
+@app.get("/")
 def root() -> dict[str, object]:
     return {
         "service": "Odoo MCP Agent Connector",

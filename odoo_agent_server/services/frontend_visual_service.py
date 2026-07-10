@@ -74,104 +74,6 @@ class FrontendVisualService:
         }
         return writes, plan
 
-
-    def _normalise_css_path(self, module_name: str, value: str) -> str:
-        """Return a safe project-relative CSS/SCSS path inside ``module_name``."""
-        raw = str(value or "").replace("\\", "/").strip().lstrip("/")
-        if "\x00" in raw or ".." in raw.split("/"):
-            raise HTTPException(status_code=400, detail="Unsafe visual CSS path")
-        if not raw:
-            raise HTTPException(status_code=400, detail="Visual CSS path is empty")
-        if not raw.startswith(f"{module_name}/"):
-            raw = f"{module_name}/{raw}"
-        if Path(raw).suffix.lower() not in {".scss", ".css"}:
-            raise HTTPException(status_code=400, detail="Visual CSS target must end with .scss or .css")
-        return raw
-
-    def _read_existing_css(self, payload: FrontendVisualImplementRequest, relative_path: str) -> str:
-        """Read an existing target only from the selected checkout.
-
-        Missing files are valid because the visual workflow can create a new bundled
-        stylesheet.  Any resolved path outside the checkout is rejected.
-        """
-        if not payload.project_path:
-            return ""
-        root = Path(payload.project_path).expanduser().resolve()
-        target = (root / relative_path).resolve()
-        try:
-            target.relative_to(root)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail="Visual CSS target escapes project_path") from exc
-        if not target.is_file():
-            return ""
-        try:
-            return target.read_text(encoding="utf-8")
-        except UnicodeDecodeError as exc:
-            raise HTTPException(status_code=400, detail=f"Visual CSS target is not UTF-8 text: {relative_path}") from exc
-
-    def _choose_css_target(
-        self,
-        payload: FrontendVisualImplementRequest,
-        module_name: str,
-        asset_name: str,
-        design_text: str,
-    ) -> tuple[str, str]:
-        """Choose a deterministic existing stylesheet, or a safe new one.
-
-        Priority is explicit ``css_file_path``, then existing CSS/SCSS entries in
-        ``target_files``.  Trolley/final-match files are preferred for trolley
-        visuals so generated rules are appended to the stylesheet already loaded
-        by the module instead of silently creating an unbundled file.
-        """
-        if payload.css_file_path:
-            selected = self._normalise_css_path(module_name, payload.css_file_path)
-            return selected, self._read_existing_css(payload, selected)
-
-        candidates: list[str] = []
-        for item in payload.target_files or []:
-            raw = str(item or "").replace("\\", "/").strip()
-            if Path(raw).suffix.lower() not in {".scss", ".css"}:
-                continue
-            candidates.append(self._normalise_css_path(module_name, raw))
-
-        def score(path: str) -> tuple[int, int, str]:
-            lower = path.lower()
-            visual_match = 0
-            if "trolley" in design_text and "trolley" in lower:
-                visual_match += 40
-            if "final_match" in lower:
-                visual_match += 20
-            if asset_name in lower:
-                visual_match += 10
-            existing = 1 if self._read_existing_css(payload, path) else 0
-            return (existing, visual_match, path)
-
-        if candidates:
-            selected = max(dict.fromkeys(candidates), key=score)
-            return selected, self._read_existing_css(payload, selected)
-
-        selected = self._normalise_css_path(
-            module_name, f"static/src/css/{asset_name}.scss"
-        )
-        return selected, self._read_existing_css(payload, selected)
-
-    def _merge_generated_css(self, existing_css: str, asset_name: str, generated_css: str) -> str:
-        """Idempotently add or replace one generated visual block."""
-        safe_asset = self._safe_name(asset_name)
-        begin = f"/* BEGIN GENERATED VISUAL: {safe_asset} */"
-        end = f"/* END GENERATED VISUAL: {safe_asset} */"
-        block = f"{begin}\n{generated_css.strip()}\n{end}"
-        current = str(existing_css or "")
-        pattern = re.compile(
-            rf"^[ \t]*{re.escape(begin)}.*?^[ \t]*{re.escape(end)}[ \t]*$",
-            flags=re.MULTILINE | re.DOTALL,
-        )
-        if pattern.search(current):
-            merged = pattern.sub(block, current, count=1)
-        else:
-            merged = f"{current.rstrip()}\n\n{block}" if current.strip() else block
-        return f"{merged.rstrip()}\n"
-
     def _select_strategy(self, payload: FrontendVisualImplementRequest, design_text: str) -> str:
         allowed = {self._normalise(item) for item in (payload.allowed_methods or []) if item}
         if "svg_asset" in allowed or "svg" in allowed:
@@ -213,9 +115,9 @@ class FrontendVisualService:
                 name = self._safe_name(str(raw.get("name") or raw.get("role") or "variant"))
                 role = self._normalise(str(raw.get("role") or name))
                 palette = self._normalise(str(raw.get("palette") or raw.get("color") or role or "gold"))
-                requested_file = str(raw.get("file_name") or f"{asset_name}_{name}.svg").strip()
-                stem = Path(requested_file).stem
-                file_name = f"{self._safe_name(stem)}.svg"
+                file_name = self._safe_name(str(raw.get("file_name") or f"{asset_name}_{name}.svg"))
+                if not file_name.endswith(".svg"):
+                    file_name = f"{file_name}.svg"
                 variants.append(VisualVariant(name=name, role=role, palette=palette, file_name=file_name))
             return variants or [VisualVariant("default", "default", "gold", f"{asset_name}.svg")]
 

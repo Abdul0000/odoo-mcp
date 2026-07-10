@@ -303,8 +303,6 @@ class OdooShService:
         timeout_seconds: int = 300,
         interval_seconds: float = 10.0,
         progress_cb=None,
-        failure_check_since_epoch: int | None = None,
-        early_failure_after_seconds: int = 90,
     ) -> CommandResult:
         """Poll Odoo.sh until ``expected_sha`` is active in ``~/src/user``.
 
@@ -327,20 +325,12 @@ class OdooShService:
             check_result = self.check_commit_deployed(expected)
             deployed = OdooShService._check_result_deployed(check_result)
             elapsed_seconds = round(time.monotonic() - started, 3)
-            current_sha = "unknown"
-            try:
-                check_payload = json.loads(check_result.stdout or "{}")
-                if isinstance(check_payload, dict):
-                    current_sha = str(check_payload.get("current_sha") or "unknown")
-            except Exception:
-                current_sha = "unknown"
             attempt_payload = {
                 "attempt": attempt,
                 "exit_code": check_result.exit_code,
                 "stdout": check_result.stdout,
                 "stderr": check_result.stderr,
                 "deployed": deployed,
-                "current_sha": current_sha,
                 "expected_sha": expected,
                 "poll_interval_seconds": interval_seconds,
                 "elapsed_seconds": elapsed_seconds,
@@ -357,7 +347,6 @@ class OdooShService:
                     "command": ["odoosh.check_commit_poll", expected],
                     "stdout": json.dumps({
                         "deployed": True,
-                        "current_sha": current_sha,
                         "expected_sha": expected,
                         "attempts": attempt,
                         "poll_interval_seconds": interval_seconds,
@@ -367,66 +356,21 @@ class OdooShService:
                     }),
                 })
 
-            if (
-                failure_check_since_epoch
-                and elapsed_seconds >= max(30, int(early_failure_after_seconds))
-                and attempt >= 4
-                and attempt % 3 == 0
-            ):
-                failure = self.recent_build_failure(int(failure_check_since_epoch))
-                if failure.exit_code == 1:
-                    return CommandResult(
-                        command=["odoosh.check_commit_poll", expected],
-                        cwd="odoosh:ssh",
-                        exit_code=2,
-                        stdout=json.dumps({
-                            "deployed": False,
-                            "status": "odoosh_build_failed_or_dropped",
-                            "current_sha": current_sha,
-                            "expected_sha": expected,
-                            "attempts": attempt,
-                            "poll_interval_seconds": interval_seconds,
-                            "elapsed_seconds": elapsed_seconds,
-                            "message": "Odoo.sh reported build/test failure evidence for the pushed SHA before it became active. Stop polling this SHA; fix the code and push a new commit.",
-                            "failure_guard": json.loads(failure.stdout or "{}"),
-                            "recent_checks": attempts[-5:],
-                        }, ensure_ascii=False),
-                        stderr=f"Odoo.sh build/test failed or dropped pushed commit {expected} before deployment.",
-                    )
-
             now = time.monotonic()
             if now >= deadline:
                 elapsed_seconds = round(now - started, 3)
-                recent_checks = attempts[-10:]
-                recent_current = [str(item.get("current_sha") or "unknown") for item in recent_checks]
-                known_current = [sha for sha in recent_current if sha and sha != "unknown"]
-                stable_other_sha = (
-                    len(known_current) >= 5
-                    and len(set(known_current)) == 1
-                    and known_current[-1] != expected
-                    and not expected.startswith(known_current[-1])
-                    and not known_current[-1].startswith(expected)
-                )
                 return CommandResult(
                     command=["odoosh.check_commit_poll", expected],
                     cwd="odoosh:ssh",
                     exit_code=124,
                     stdout=json.dumps({
                         "deployed": False,
-                        "status": "timeout_probable_dropped" if stable_other_sha else "timeout",
-                        "probable_dropped": stable_other_sha,
-                        "current_sha": known_current[-1] if known_current else "unknown",
                         "expected_sha": expected,
                         "attempts": attempt,
                         "poll_interval_seconds": interval_seconds,
                         "elapsed_seconds": elapsed_seconds,
                         "timeout_seconds": timeout_seconds,
-                        "recent_checks": recent_checks,
-                        "message": (
-                            "Odoo.sh kept serving a different stable SHA for the full polling window; the pushed SHA was likely dropped by a failed Odoo.sh test/build. Start a new fix commit instead of resuming this SHA."
-                            if stable_other_sha
-                            else "Odoo.sh did not deploy the pushed SHA within the polling window."
-                        ),
+                        "recent_checks": attempts[-10:],
                     }),
                     stderr=f"Odoo.sh did not deploy pushed commit {expected} within {timeout_seconds}s.",
                     timed_out=True,
@@ -865,24 +809,18 @@ class OdooShService:
             "deleting attachments",
             "initiating shutdown",
             "connectionpool",
-            # Runtime filestore/menu cache noise can be logged after a push but
-            # does not mean the pushed build failed. It was causing false
-            # safe-deploy failures before the module upgrade step.
-            "ir_attachment.py",
-            "_file_read",
-            "filestore",
-            "filenotfounderror",
-            "ir.ui.menu",
-            "load_menus",
         ]
-        true_failure_re = r"Failed to load registry|ParseError|ValidationError|ModuleNotFoundError|ImportError|SyntaxError|QWebException|SCSS|CRITICAL|Build\s+failed|Test:\s*Failed"
-        filestore_noise = ("filestore" in lowered or "_file_read" in lowered or "ir_attachment.py" in lowered) and "filenotfounderror" in lowered
-        menu_cache_noise = "ir.ui.menu" in lowered and "load_menus" in lowered and "keyerror" in lowered
-        if (filestore_noise or menu_cache_noise) and not re.search(true_failure_re, text, re.I):
+        if any(pattern in lowered for pattern in benign_patterns) and not re.search(
+            r"Traceback \(most recent call last\)|Failed to load registry|ParseError|ValidationError|ModuleNotFoundError|ImportError|CRITICAL|Build\s+failed|Test:\s*Failed",
+            text,
+            re.I,
+        ):
             return False
-        if any(pattern in lowered for pattern in benign_patterns) and not re.search(true_failure_re, text, re.I):
-            return False
-        return bool(re.search(true_failure_re, text, re.I) or ("Traceback (most recent call last)" in text and not (filestore_noise or menu_cache_noise)))
+        return bool(re.search(
+            r"Traceback \(most recent call last\)|Failed to load registry|ParseError|ValidationError|ModuleNotFoundError|ImportError|CRITICAL|Build\s+failed|Test:\s*Failed",
+            text,
+            re.I,
+        ))
 
 
     def _extract_error_blocks(self, text: str) -> list[str]:

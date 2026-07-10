@@ -11,6 +11,7 @@ from ..config import (
     make_authenticated_repo_url,
     normalise_client,
     safe_client_public,
+    settings,
 )
 
 
@@ -52,12 +53,6 @@ class ResolvedClient:
                 "path": self.path,
                 "odoo_url": self.odoo_url,
                 "odoo_db": self.odoo_db,
-                # Include credential presence only for safe_client_public() to
-                # compute browser_*_configured flags. safe_client_public never
-                # returns these secret values, so client_check stays redacted
-                # while accurately showing whether browser login can run.
-                "odoo_login": self.odoo_login,
-                "odoo_password": self.odoo_password,
                 "odoo_verify_ssl": self.odoo_verify_ssl,
                 "odoosh_db_name": self.odoosh_db_name,
                 "odoosh_ssh_host": self.odoosh_ssh_host,

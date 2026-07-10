@@ -19,11 +19,6 @@ class Settings(BaseSettings):
     allowed_roots_raw: str = Field(default="/workspace/repos,/tmp,/home/odoo/src", alias="ODOO_AGENT_ALLOWED_ROOTS")
     state_dir: str = Field(default="/tmp/odoo_agent_state", alias="ODOO_AGENT_STATE_DIR")
     screenshot_dir: str = Field(default="/tmp/odoo_agent_screenshots", alias="ODOO_AGENT_SCREENSHOT_DIR")
-    screenshot_auto_clean: bool = Field(default=True, alias="ODOO_AGENT_SCREENSHOT_AUTO_CLEAN")
-    screenshot_retention_seconds: int = Field(default=3600, alias="ODOO_AGENT_SCREENSHOT_RETENTION_SECONDS")
-    screenshot_max_files: int = Field(default=1, alias="ODOO_AGENT_SCREENSHOT_MAX_FILES")
-    screenshot_keep_latest_only: bool = Field(default=True, alias="ODOO_AGENT_SCREENSHOT_KEEP_LATEST_ONLY")
-    screenshot_public_base_url: str | None = Field(default=None, alias="ODOO_AGENT_SCREENSHOT_PUBLIC_BASE_URL")
     cdp_url: str | None = Field(default=None, alias="ODOO_AGENT_CDP_URL")
 
     # Approval gating is disabled in this build so MCP tools can write, commit, push, and deploy directly.
@@ -234,40 +229,8 @@ def _odoo_client_json_candidates(raw: str) -> list[str]:
 
 
 def normalise_client(client: dict) -> dict:
-    """Return a string-normalized client dict without changing secret values.
-
-    Browser login credentials may be supplied with older/common aliases in
-    ODOO_CLIENTS.  Normalize them into odoo_login/odoo_password so every
-    browser workflow and login tool uses the same credential fields without
-    exposing secrets in public client metadata.
-    """
+    """Return a string-normalized client dict without changing secret values."""
     normalized: dict[str, str] = {}
-    aliases: dict[str, tuple[str, ...]] = {
-        "odoo_login": (
-            "odoo_login",
-            "browser_login",
-            "login",
-            "email",
-            "odoo_email",
-            "browser_email",
-            "username",
-            "user",
-        ),
-        "odoo_password": (
-            "odoo_password",
-            "browser_password",
-            "password",
-            "odoo_pass",
-            "browser_pass",
-            "pass",
-        ),
-    }
-    for canonical, keys in aliases.items():
-        for key in keys:
-            value = client.get(key)
-            if value not in (None, ""):
-                normalized[canonical] = str(value).strip()
-                break
     for key in (
         "name",
         "repo",
@@ -276,6 +239,8 @@ def normalise_client(client: dict) -> dict:
         "token",
         "odoo_url",
         "odoo_db",
+        "odoo_login",
+        "odoo_password",
         "odoo_verify_ssl",
         "odoosh_db_name",
         "odoosh_ssh_host",
@@ -303,8 +268,6 @@ def safe_client_public(client: dict) -> dict:
         "odoo_url": normalized.get("odoo_url"),
         "odoo_db": normalized.get("odoo_db"),
         "odoo_verify_ssl": normalized.get("odoo_verify_ssl"),
-        "browser_login_configured": bool(normalized.get("odoo_login")),
-        "browser_password_configured": bool(normalized.get("odoo_password")),
         "odoosh_db_name": normalized.get("odoosh_db_name"),
         "odoosh_ssh_host": normalized.get("odoosh_ssh_host"),
         "odoosh_ssh_port": normalized.get("odoosh_ssh_port"),
