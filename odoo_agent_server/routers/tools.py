@@ -114,6 +114,7 @@ from .workflow import capability_check, full_verify, safe_deploy_module, coding_
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 from ..services.frontend_visual_service import FrontendVisualService
+from ..services.deploy_impact_service import classify_deploy_impact
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
@@ -1744,6 +1745,16 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         [str(Path(path).resolve().relative_to(project.resolve()).as_posix()) for path in written_files_abs]
         + dirty_module_paths
     ))
+    try:
+        deploy_impact = classify_deploy_impact(
+            project_path=project_path,
+            module_name=effective_module_name,
+            changed_paths=deploy_paths,
+            git_diff=diff.stdout,
+            deploy_mode=payload.deploy_mode,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     deploy_payload = SafeDeployModuleRequest(
         client_name=client_name,
         project_path=project_path,
@@ -1753,7 +1764,9 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         run_qa=False,
         wait_for_result=False,
         wait_timeout_seconds=0,
-        upgrade_module=True,
+        upgrade_module=deploy_impact.upgrade_required,
+        deploy_impact=deploy_impact.impact,
+        upgrade_reasons=list(deploy_impact.reasons),
     )
     try:
         deploy = await safe_deploy_module(deploy_payload)
@@ -1798,6 +1811,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "git_diff": {"exit_code": diff.exit_code, "stdout_preview": diff.stdout[-12000:], "stderr_preview": diff.stderr[-4000:]},
         "qa": qa.model_dump(mode="json"),
         "verify_against_core": verify.model_dump(mode="json"),
+        "deploy_impact": deploy_impact.as_dict(),
         "safe_deploy": deploy_struct,
         "job_id": job_id,
         "completion_required": True,

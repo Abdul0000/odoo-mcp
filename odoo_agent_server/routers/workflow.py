@@ -2245,8 +2245,11 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         "source_pushed": True,
         "source_on_odoosh": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")),
         "source_deployed": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")),
-        "module_upgraded": bool(module_upgrade_confirmation.get("passed")),
-        "deploy_confirmed": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")) and bool(module_upgrade_confirmation.get("passed")),
+        "module_upgrade_requested": bool(payload.upgrade_module),
+        "module_upgraded": bool(payload.upgrade_module and module_upgrade_confirmation.get("passed")),
+        "deploy_impact": payload.deploy_impact,
+        "upgrade_reasons": payload.upgrade_reasons,
+        "deploy_confirmed": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")) and (not payload.upgrade_module or bool(module_upgrade_confirmation.get("passed"))),
         "success_allowed": True,
     }
     store.finish_job(fresh_job, JobStatus.passed, final_result)

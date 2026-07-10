@@ -238,6 +238,7 @@ class OdooCodeChangeRequest(BaseModel):
     writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=20, description="Actual file edits to apply. If empty, the tool returns focused inspection context or can autopatch when allow_autopatch/style/target_text are provided.")
     commit_message: str | None = Field(default=None, max_length=300, description="Commit message for safe deploy. Defaults to a concise message from task_description.")
     auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
+    deploy_mode: Literal["auto", "always_upgrade", "source_only"] = Field(default="auto", description="Automatic impact classification by default. always_upgrade forces -u; source_only is allowed only for verified non-structural changes.")
     max_search_matches: int = Field(default=20, ge=1, le=100, description="Max candidate matches returned during inspect mode")
 
     @field_validator("module_name")
@@ -977,6 +978,8 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     run_qa: bool = Field(default=True, description="Run qa.self_run by default so deploy failures surface before long Odoo.sh polling. Set False only for an explicit, intentional bypass.")
     wait_for_odoosh: bool = Field(default=True)
     upgrade_module: bool = Field(default=True)
+    deploy_impact: str | None = Field(default=None, description="Classifier result: asset_only, python_restart_only, source_only, or module_upgrade")
+    upgrade_reasons: list[str] = Field(default_factory=list, description="Human-readable reasons for the chosen upgrade policy")
     wait_for_result: bool = Field(
         default=True,
         description=(
