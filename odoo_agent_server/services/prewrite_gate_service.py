@@ -117,9 +117,11 @@ class PreWriteGateService:
         if check_only:
             return
         project = self._safe_project(project_path)
+        self._reject_nested_addon_manifests(project, relative_paths)
         modules = self._modules_for_relative_paths(project, relative_paths)
         if not modules:
             return
+
         state = self._load(client_name)
         gate = self._gate(state)
         read_paths = set((gate.get("read_paths") or {}).keys())
@@ -221,6 +223,32 @@ class PreWriteGateService:
                     "blocked": blocked,
                 },
             )
+
+    @staticmethod
+    def _reject_nested_addon_manifests(project: Path, relative_paths: Iterable[str]) -> None:
+        """Never allow an addon manifest below an existing addon root."""
+        for raw in relative_paths:
+            target = (project / str(raw).replace("\\", "/").lstrip("/")).resolve()
+            try:
+                target.relative_to(project)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Write target escapes project checkout") from exc
+            if target.name not in _MANIFEST_NAMES:
+                continue
+            current = target.parent.parent
+            while current == project or project in current.parents:
+                if any((current / name).exists() for name in _MANIFEST_NAMES):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Nested Odoo addon rejected: {target.relative_to(project).as_posix()} is inside "
+                            f"existing addon {current.relative_to(project).as_posix() or '.'}. "
+                            "Use the repository checkout root as project_path."
+                        ),
+                    )
+                if current == project:
+                    break
+                current = current.parent
 
     def command_block_if_needed(
         self,

@@ -221,6 +221,7 @@ The scope expands automatically — if L0 reads reveal `_inherit`, L1 kicks in. 
 - **Multi-file normal edit** → `repo.write_many_smart`
 - **Small multi-file edit when explicitly forcing fast path** → `repo.write_many_fast_safe`
 - **Large/risky multi-file refactor/new module** → `repo.write_many_atomic`
+- **New addon path rule** → create/edit under `<project_path>/<module_name>` in the local checkout. Set `create_module=true` on the composite workflow. Never create one addon inside another addon. `/home/odoo/src/user/<module>` is remote Odoo.sh read/verification space, not a local write target.
 - **Multi-file diff** → `repo.apply_patch_atomic`
 - **Small single-file patch** → `repo.apply_patch`
 - **Large single file >1000 lines** → `repo.write` in chunked mode (chunk_index/total_chunks)

@@ -68,6 +68,7 @@ from ..schemas import (
     RepoWriteManyAtomicRequest,
     RepoWriteManyFastSafeRequest,
     RepoWriteManySmartRequest,
+    RepoWriteItem,
     RepoWriteRequest,
     SelfRunRequest,
     JobStatus,
@@ -238,6 +239,7 @@ _TOOL_DESCRIPTORS = [
             "scope_advice, verify, git.push, or module_deploy. It enforces the v15 flow internally: "
             "read custom module, scope_advice, read /home/odoo/src/odoo/addons related source first with enterprise fallback, "
             "apply provided edits, git.diff, qa.self_run, verify_against_core, then workflow.safe_deploy_module and jobs.get polling. "
+            "For a missing addon, set create_module=true with an exact lowercase technical name; it is created only at the checkout root. "
             "If writes is empty it returns focused inspection context and asks for a second call with exact writes."
         ),
         requires_approval=True,
@@ -250,7 +252,8 @@ _TOOL_DESCRIPTORS = [
             "Use when a design needs SCSS, SVG assets, decorative backgrounds, logos/icons, premium cards, "
             "or decorative shapes. It generates deterministic visual assets/writes, reads custom/native context, "
             "runs verify_against_core, then uses the same safe deploy pipeline. For exact geometric/logo/background shapes, "
-            "prefer allowed_methods=['svg_asset'] instead of guessing with CSS borders."
+            "prefer allowed_methods=['svg_asset'] instead of guessing with CSS borders. Set create_module=true only for a new "
+            "standalone root-level addon; otherwise module_name must already exist."
         ),
         requires_approval=True,
     ),
@@ -1058,6 +1061,42 @@ def _safe_module_relative(module_name: str, relative_path: str) -> str:
     return "/".join(parts)
 
 
+def _ensure_root_module_scaffold(repo: RepoService, project: Path, payload: OdooCodeChangeRequest) -> None:
+    """Create only the minimal root-level skeleton needed for first module reads."""
+    if not payload.create_module:
+        return
+    module_name = payload.module_name.strip()
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", module_name):
+        raise HTTPException(status_code=400, detail="create_module requires an exact lowercase technical module_name")
+    if not (project / ".git").exists():
+        raise HTTPException(status_code=400, detail="create_module requires project_path to be the repository checkout root")
+    if (project / "__manifest__.py").exists() or (project / "__openerp__.py").exists():
+        raise HTTPException(status_code=400, detail="project_path points to an addon, not the repository checkout root")
+    module_dir = (project / module_name).resolve()
+    if module_dir.parent != project.resolve():
+        raise HTTPException(status_code=400, detail="New modules must be direct children of the repository checkout root")
+    if (module_dir / "__manifest__.py").exists():
+        return
+
+    supplied = {_safe_module_relative(module_name, item.relative_path): item.content for item in payload.writes if item.content is not None}
+    skeleton = [
+        RepoWriteItem(
+            relative_path=f"{module_name}/__init__.py",
+            content=supplied.get(f"{module_name}/__init__.py", ""),
+        ),
+        RepoWriteItem(
+            relative_path=f"{module_name}/__manifest__.py",
+            content=supplied.get(
+                f"{module_name}/__manifest__.py",
+                repr({"name": module_name.replace("_", " ").title(), "depends": ["base"], "installable": True}) + "\n",
+            ),
+        ),
+    ]
+    result = repo.write_many_fast_safe(str(project), skeleton)
+    if result.exit_code != 0:
+        raise HTTPException(status_code=400, detail=result.stderr or "Could not create root-level module scaffold")
+
+
 def _read_text_safe(path: Path, limit: int = 300_000) -> str:
     data = path.read_text(encoding="utf-8")
     return data[:limit]
@@ -1562,6 +1601,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             raise
 
     # 2) Discover/validate module once, with a safe fuzzy resolver for human hints.
+    _ensure_root_module_scaffold(repo, project, payload)
     modules = repo.list_custom_modules(project_path, max_depth=5, include_uninstallable=False)
     module, module_resolution = _resolve_fuzzy_module(payload, modules)
     if not module:
@@ -2012,6 +2052,23 @@ async def _workflow_frontend_visual_implement(payload: FrontendVisualImplementRe
     """
     service = FrontendVisualService()
     writes, visual_plan = service.build_writes(payload, payload.module_name)
+    if payload.create_module:
+        area = (payload.target_area or "backend").lower()
+        bundle = "web.assets_frontend" if area == "website" else "point_of_sale._assets_pos" if area == "pos" else "web.assets_backend"
+        depends = ["web", "point_of_sale"] if area == "pos" else ["web"]
+        asset_paths = [write.relative_path for write in writes if write.relative_path.endswith((".js", ".xml", ".scss", ".css"))]
+        manifest = {
+            "name": payload.module_name.replace("_", " ").title(),
+            "depends": depends,
+            "assets": {bundle: asset_paths},
+            "installable": True,
+            "application": True,
+        }
+        writes = [
+            OdooCodeFileChange(relative_path=f"{payload.module_name}/__init__.py", content=""),
+            OdooCodeFileChange(relative_path=f"{payload.module_name}/__manifest__.py", content=repr(manifest) + "\n"),
+            *writes,
+        ]
     target_files = list(dict.fromkeys([*payload.target_files, *[w.relative_path for w in writes]]))
     description = (
         f"Frontend visual implementation ({visual_plan.get('implementation_type')}): {payload.design_goal}. "
@@ -2021,6 +2078,7 @@ async def _workflow_frontend_visual_implement(payload: FrontendVisualImplementRe
         client_name=payload.client_name,
         project_path=payload.project_path,
         module_name=payload.module_name,
+        create_module=payload.create_module,
         task_description=description[:2000],
         task_type="scss_css" if visual_plan.get("implementation_type") in {"svg_asset", "scss"} else "js_owl",
         intent="frontend_visual_implement",

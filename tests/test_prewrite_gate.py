@@ -86,6 +86,28 @@ def test_prewrite_gate_does_not_block_non_addon_helper_files(tmp_path, monkeypat
     assert response.status_code == 200
 
 
+def test_prewrite_gate_rejects_addon_nested_inside_existing_addon(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    project.mkdir()
+    _make_module(project)
+    client = TestClient(app)
+
+    response = client.post(
+        "/repo/write",
+        headers=_auth(),
+        json={
+            "project_path": str(project),
+            "relative_path": "x_module/nested_module/__manifest__.py",
+            "content": "{'name': 'Nested'}\n",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Nested Odoo addon rejected" in response.json()["detail"]
+    assert not (project / "x_module" / "nested_module" / "__manifest__.py").exists()
+
+
 def test_prewrite_gate_ui_requires_scope_after_target_read(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))

@@ -218,6 +218,7 @@ class OdooCodeChangeRequest(BaseModel):
     client_name: str | None = Field(default=None, description="Client from ODOO_CLIENTS. Required when multiple clients exist unless project_path resolves it.")
     project_path: str | None = Field(default=None, description="Existing checkout path. If omitted, resolved from client_name and prepared if needed.")
     module_name: str = Field(..., description="Custom module technical name or human hint. The workflow resolves fuzzy hints against actual custom modules before using paths.")
+    create_module: bool = Field(default=False, description="Create a missing addon as a direct child of the repository checkout. Requires an exact lowercase technical module_name; nested addon creation is rejected.")
     task_description: str = Field(..., min_length=3, max_length=2000, description="Natural-language task/change request")
     search_patterns: list[str] = Field(default_factory=list, max_length=10, description="Optional search terms to locate target files when writes are not yet provided")
     # Generic task-routing fields.  These are optional shortcuts; explicit writes[] remain
@@ -267,6 +268,7 @@ class FrontendVisualImplementRequest(BaseModel):
     client_name: str | None = Field(default=None, description="Client from ODOO_CLIENTS. Required when multiple clients exist unless project_path resolves it.")
     project_path: str | None = Field(default=None, description="Existing checkout path. If omitted, resolved from client_name and prepared if needed.")
     module_name: str = Field(..., description="Custom module technical name or human hint.")
+    create_module: bool = Field(default=False, description="Create module_name at the repository root when it does not exist. Never creates an addon inside another addon.")
     target_area: str = Field(default="auto", max_length=80, description="Odoo frontend area: pos, dashboard, website, backend, report, or auto.")
     design_goal: str = Field(..., min_length=3, max_length=2000, description="Natural-language visual goal, e.g. create a metallic trolley pipe border matching the reference.")
     reference_images: list[str] = Field(default_factory=list, max_length=10, description="Optional local/container paths or URLs to reference screenshots/images for planning.")
