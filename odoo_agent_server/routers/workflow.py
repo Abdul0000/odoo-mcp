@@ -2530,8 +2530,11 @@ def smart_tool_router(payload: SmartToolRouteRequest) -> SmartToolRouteResult:
     preflight, smart writes, changed-file verification, and browser checks when
     needed.
     """
-    text = (payload.task_description or "").lower()
+    text = (payload.task_description or "").lower().replace("-", "_")
     planned = [str(path).lower().replace("\\", "/") for path in payload.planned_file_paths]
+
+    def matched_terms(terms: tuple[str, ...]) -> list[str]:
+        return [term for term in terms if re.search(rf"(?<![a-z0-9_]){re.escape(term)}(?![a-z0-9_])", text)]
 
     def planned_frontend_path(path: str) -> bool:
         segments = [segment for segment in path.split("/") if segment]
@@ -2545,10 +2548,52 @@ def smart_tool_router(payload: SmartToolRouteRequest) -> SmartToolRouteResult:
             or any(segment in {"pos", "pos_store"} for segment in segments)
         )
 
-    frontend = _looks_like_frontend_task(payload.task_description) or any(planned_frontend_path(path) for path in planned)
-    read_verbs = ("list ", "show ", "find ", "search ", "count ", "get ", "read ", "display ")
-    mutation_verbs = ("fix", "implement", "create", "update", "change", "delete", "remove", "module", "code", "write", "patch", "deploy")
-    data_query = any(term in text for term in read_verbs) and not any(term in text for term in mutation_verbs)
+    evidence: list[str] = []
+    frontend_paths = [path for path in planned if planned_frontend_path(path)]
+    frontend_terms = matched_terms(("javascript", "js", "owl", "qweb", "scss", "pos", "point_of_sale", "website", "snippet", "frontend", "checkout"))
+    if payload.target_surface != "auto":
+        frontend = payload.target_surface == "frontend"
+        evidence.append(f"explicit target_surface={payload.target_surface}")
+    elif frontend_paths:
+        frontend = True
+        evidence.append(f"frontend file evidence: {frontend_paths[0]}")
+    else:
+        frontend = bool(frontend_terms)
+        if frontend_terms:
+            evidence.append(f"frontend terms: {', '.join(frontend_terms)}")
+
+    read_hits = matched_terms(("list", "show", "find", "search", "count", "get", "read", "display", "inspect", "query", "status"))
+    write_hits = matched_terms(("add", "fix", "implement", "create", "update", "change", "delete", "remove", "write", "patch", "modify", "refactor"))
+    deploy_hits = matched_terms(("deploy", "install", "upgrade", "push", "release"))
+    source_hits = matched_terms(("code", "method", "file", "manifest", "view", "xpath", "xml", "python", "javascript", "js", "owl", "scss", "qweb"))
+
+    if payload.operation != "auto":
+        intent = payload.operation
+        confidence = "high"
+        evidence.append(f"explicit operation={intent}")
+    elif deploy_hits:
+        intent = "deploy"
+        confidence = "high" if not read_hits else "medium"
+        evidence.append(f"deploy terms: {', '.join(deploy_hits)}")
+    elif write_hits or (payload.changed_file_count or 0) > 0:
+        intent = "write"
+        confidence = "high" if write_hits and not read_hits else "medium"
+        if write_hits:
+            evidence.append(f"write terms: {', '.join(write_hits)}")
+        if (payload.changed_file_count or 0) > 0:
+            evidence.append("changed_file_count indicates a code change")
+    elif read_hits:
+        intent = "read"
+        confidence = "high" if source_hits else "medium"
+        evidence.append(f"read terms: {', '.join(read_hits)}")
+    else:
+        intent = "ambiguous"
+        confidence = "low"
+        evidence.append("no explicit operation or reliable read/write/deploy signal")
+
+    source_read = intent == "read" and bool(source_hits or planned)
+    data_query = intent == "read" and not source_read
+    clarification_required = intent == "ambiguous"
     high_risk = payload.risk_level == "high" or any(term in text for term in (
         "new module", "migration", "large refactor", "rewrite", "multi module", "security", "access rights", "accounting", "payment provider"
     ))
@@ -2571,6 +2616,25 @@ def smart_tool_router(payload: SmartToolRouteRequest) -> SmartToolRouteResult:
             browser_check="none",
             steps=steps,
             fast_reason="Fastest path: no code write requested.",
+            confidence=confidence,
+            evidence=evidence,
+        )
+
+    if source_read or clarification_required:
+        add("repo.prepare", "Resolve the target repository without mutating code.")
+        add("workflow.repo_index", "Discover relevant modules and source files.", required=False)
+        add("repo.read", "Read the exact source before deciding whether a change is required.")
+        return SmartToolRouteResult(
+            task_type="source_read" if source_read else "ambiguous",
+            frontend_required=frontend,
+            recommended_write_tool="none",
+            validation_scope="none",
+            browser_check="none",
+            steps=steps,
+            fast_reason="Read-only discovery is the safe fallback; no write or deploy is authorized by fuzzy routing.",
+            confidence=confidence,
+            evidence=evidence,
+            clarification_required=clarification_required,
         )
 
     add("repo.prepare", "Ensure the correct target repo/branch is available before coding.")
@@ -2596,6 +2660,9 @@ def smart_tool_router(payload: SmartToolRouteRequest) -> SmartToolRouteResult:
         browser_check="required for frontend changes" if frontend else "only if views/UI changed",
         steps=steps,
         fast_reason="Strict validation remains; speed comes from repo index cache, pattern cache, smart writes, and changed-files-only checks.",
+        confidence=confidence,
+        evidence=evidence,
+        clarification_required=False,
     )
 
 

@@ -78,6 +78,7 @@ Do not perform broad unrelated source scans. Deployment success is not functiona
 6. Before upgrading Odoo.sh, ensure dependencies are installed: call `odoo.ensure_dependencies`
 7. If a pipeline fails mid-way, call `workflow.resume_job` with the job_id — do NOT restart from step 1
 8. After every session start, call `session.load_state` to see if there is context from a previous session
+9. For `workflow.smart_tool_router`, pass explicit `operation` and `target_surface` when known. Fuzzy routing is advisory: when `clarification_required=true` or `confidence=low`, follow only its read-only discovery steps and do not write or deploy until intent is clear.
 
 ---
 

@@ -1,4 +1,5 @@
-from odoo_agent_server.schemas import FrontendPatternPreflightRequest, OdooCodeChangeRequest
+from odoo_agent_server.schemas import FrontendPatternPreflightRequest, OdooCodeChangeRequest, SmartToolRouteRequest
+from odoo_agent_server.routers.workflow import smart_tool_router
 from odoo_agent_server.services.frontend_pattern_service import FrontendPatternService
 from odoo_agent_server.routers.tools import _looks_like_frontend_code_change
 
@@ -105,3 +106,43 @@ def test_product_path_does_not_trigger_pos_profile():
     profile = _task_profile(payload, payload.target_files)
     assert profile["scope"] == "model"
     assert profile["live_verifier"] == "registry_smoke_test"
+
+
+def test_smart_router_distinguishes_live_data_from_source_reads():
+    data = smart_tool_router(SmartToolRouteRequest(task_description="Show unpaid invoices"))
+    source = smart_tool_router(SmartToolRouteRequest(task_description="Show the existing Python method"))
+
+    assert data.task_type == "odoo_data_query"
+    assert data.recommended_write_tool == "none"
+    assert source.task_type == "source_read"
+    assert source.recommended_write_tool == "none"
+    assert source.steps[-1].tool == "repo.read"
+
+
+def test_smart_router_does_not_treat_module_as_a_write_signal():
+    result = smart_tool_router(SmartToolRouteRequest(task_description="Get module installation status"))
+
+    assert result.task_type == "odoo_data_query"
+    assert result.recommended_write_tool == "none"
+
+
+def test_smart_router_uses_safe_discovery_for_ambiguous_requests():
+    result = smart_tool_router(SmartToolRouteRequest(task_description="Customer portal improvements"))
+
+    assert result.task_type == "ambiguous"
+    assert result.confidence == "low"
+    assert result.clarification_required is True
+    assert result.recommended_write_tool == "none"
+
+
+def test_smart_router_explicit_write_and_file_evidence_win():
+    result = smart_tool_router(SmartToolRouteRequest(
+        task_description="Adjust the behavior",
+        operation="write",
+        planned_file_paths=["sample/static/src/js/widget.js"],
+    ))
+
+    assert result.task_type == "frontend_code"
+    assert result.frontend_required is True
+    assert result.confidence == "high"
+    assert result.clarification_required is False

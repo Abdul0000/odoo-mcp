@@ -1669,6 +1669,14 @@ class SmartToolRouteRequest(BaseModel):
     planned_file_paths: list[str] = Field(default_factory=list, description="Files likely to be read/written")
     changed_file_count: int | None = Field(default=None, ge=0, description="Expected number of files to change")
     risk_level: Literal["auto", "low", "medium", "high"] = Field(default="auto")
+    operation: Literal["auto", "read", "write", "deploy"] = Field(
+        default="auto",
+        description="Explicit intent. Use auto only when the caller genuinely cannot determine whether the task reads, changes, or deploys code.",
+    )
+    target_surface: Literal["auto", "backend", "frontend"] = Field(
+        default="auto",
+        description="Optional explicit surface. It takes precedence over fuzzy task wording and inferred file evidence.",
+    )
 
 
 class SmartToolRouteStep(BaseModel):
@@ -1686,6 +1694,9 @@ class SmartToolRouteResult(BaseModel):
     browser_check: str
     steps: list[SmartToolRouteStep] = Field(default_factory=list)
     fast_reason: str = ""
+    confidence: Literal["low", "medium", "high"] = "medium"
+    evidence: list[str] = Field(default_factory=list)
+    clarification_required: bool = False
 
 
 class RepoIndexRequest(BaseProjectRequest):
