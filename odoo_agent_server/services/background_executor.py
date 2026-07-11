@@ -7,8 +7,9 @@ from ..config import settings
 
 
 # Bound long-running connector work so one busy flow cannot create unbounded
-# daemon threads and make jobs.get/search_read sluggish. The low-resource
-# production default is one; larger deployments can opt in to more.
+# daemon threads and make jobs.get/search_read sluggish. Two workers let a
+# parent safe-deploy job wait for its nested module-deploy job without starving
+# the executor; larger deployments can opt in to more.
 _EXECUTOR = ThreadPoolExecutor(
     max_workers=settings.background_max_workers,
     thread_name_prefix="odoo_agent_job",

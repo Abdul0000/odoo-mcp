@@ -497,7 +497,7 @@ Recommended environment:
 ```env
 WORKSPACE_ROOT=/workspace/repos
 ODOO_AGENT_API_TOKEN=<strong-random-secret>
-ODOO_AGENT_BACKGROUND_MAX_WORKERS=1
+ODOO_AGENT_BACKGROUND_MAX_WORKERS=2
 TARGET_GIT_REPO=git@github.com:Abdul0000/test_18.git
 TARGET_GIT_BRANCH=feature_branch
 TARGET_PROJECT_PATH=/workspace/repos/odoo_project
