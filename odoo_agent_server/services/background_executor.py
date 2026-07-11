@@ -11,7 +11,9 @@ from ..config import settings
 # parent safe-deploy job wait for its nested module-deploy job without starving
 # the executor; larger deployments can opt in to more.
 _EXECUTOR = ThreadPoolExecutor(
-    max_workers=settings.background_max_workers,
+    # Accept legacy deployments configured with 1, but never recreate the
+    # parent/nested-job starvation fixed by the two-worker default.
+    max_workers=max(2, settings.background_max_workers),
     thread_name_prefix="odoo_agent_job",
 )
 

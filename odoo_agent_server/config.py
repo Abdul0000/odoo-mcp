@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     safe_deploy_stale_running_seconds: int = Field(default=7200, alias="ODOO_AGENT_SAFE_DEPLOY_STALE_RUNNING_SECONDS")
     # Two workers are the safe minimum: safe-deploy can wait for a nested
     # module-deploy job submitted to the same bounded executor.
-    background_max_workers: int = Field(default=2, ge=2, le=4, alias="ODOO_AGENT_BACKGROUND_MAX_WORKERS")
+    background_max_workers: int = Field(default=2, ge=1, le=4, alias="ODOO_AGENT_BACKGROUND_MAX_WORKERS")
     mcp_operation_guard_enabled: bool = Field(default=False, alias="ODOO_AGENT_OPERATION_GUARD_ENABLED")
 
     # Qwen URL-token fallback hardening. Qwen app may not pass headers, so the
