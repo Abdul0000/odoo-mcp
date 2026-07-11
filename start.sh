@@ -61,7 +61,7 @@ if [ -n "${TARGET_GIT_REPO:-}" ] && echo "$TARGET_GIT_REPO" | grep -q "^git@"; t
   fi
 fi
 
-TARGET_PROJECT_PATH="${TARGET_PROJECT_PATH:-/workspace/repos/test_18}"
+TARGET_PROJECT_PATH="${TARGET_PROJECT_PATH:-/workspace/repos/odoo_project}"
 TARGET_GIT_BRANCH="${TARGET_GIT_BRANCH:-}"
 GIT_AUTHOR_NAME="${GIT_AUTHOR_NAME:-Odoo MCP Agent}"
 GIT_AUTHOR_EMAIL="${GIT_AUTHOR_EMAIL:-odoo-mcp@example.local}"

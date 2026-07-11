@@ -47,7 +47,7 @@ def test_module_deploy_falls_back_to_ssh_when_update_list_access_denied(monkeypa
     monkeypatch.setattr(OdooService, "execute_kw", fake_execute_kw)
     monkeypatch.setattr(OdooShService, "module_deploy_ssh", fake_ssh_deploy)
 
-    result = OdooService().module_deploy("karachi_school_management")
+    result = OdooService().module_deploy("sample_custom_module")
 
     assert result.status == "ok"
     assert result.result["fallback"] == "odoosh"
@@ -89,7 +89,7 @@ def test_internal_module_deploy_job_does_not_require_second_approval(monkeypatch
     monkeypatch.setattr(OdooService, "module_deploy", fake_module_deploy)
 
     result = start_odoo_module_deploy_job(OdooModuleRequest(
-        module_name="karachi_school_management",
+        module_name="sample_custom_module",
         wait_timeout_seconds=2,
         poll_interval_seconds=0.25,
     ))
@@ -247,10 +247,10 @@ def test_odoosh_module_deploy_ssh_uses_upgrade_for_installed_module(monkeypatch)
     monkeypatch.setattr(OdooShService, "_dependency_guard", lambda self, module_name: None)
     monkeypatch.setattr(OdooShService, "_run_module_cli", fake_run_module_cli)
 
-    result = OdooShService().module_deploy_ssh("karachi_school_management")
+    result = OdooShService().module_deploy_ssh("sample_custom_module")
 
     assert result.exit_code == 0
-    assert called == {"module_name": "karachi_school_management", "flag": "-u"}
+    assert called == {"module_name": "sample_custom_module", "flag": "-u"}
     assert "mode=upgrade" in result.stdout
 
 

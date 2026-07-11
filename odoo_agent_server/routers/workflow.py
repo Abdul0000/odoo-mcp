@@ -848,7 +848,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
 
 def _pre_push_verify_files(project: Path, module_name: str, paths: list[str], status_output: str) -> list[str]:
     """Return completed written module files that must pass pre-push verification."""
-    allowed_suffixes = (".py", ".xml", ".js", ".scss", "__manifest__.py")
+    allowed_suffixes = (".py", ".xml", ".js", ".scss", ".css", ".csv", "__manifest__.py")
     module_prefix = f"{module_name}/"
 
     def status_candidates() -> list[str]:
@@ -910,7 +910,7 @@ def _expected_user_file_hashes(project: Path, verify_files: list[str]) -> dict[s
 def _deployed_compare_files(project: Path, module_name: str, paths: list[str], max_files: int) -> list[str]:
     if paths:
         return _pre_push_verify_files(project, module_name, paths, "")
-    allowed_suffixes = (".py", ".xml", ".js", ".scss", "__manifest__.py")
+    allowed_suffixes = (".py", ".xml", ".js", ".scss", ".css", ".csv", "__manifest__.py")
     module_path = (project / module_name).resolve()
     if not module_path.is_dir() or not (module_path == project or project in module_path.parents):
         return []
@@ -1074,7 +1074,7 @@ def _normalise_safe_deploy_paths(project: Path, module_name: str, paths: list[st
 
     This prevents the failure mode where the agent edits one checkout (for example
     /repos/test_18) but calls safe_deploy_module with another checkout (for example
-    /workspace/repos/test_18). Absolute paths are accepted only when they resolve
+    /workspace/repos/example_repo). Absolute paths are accepted only when they resolve
     inside the selected project, then they are converted to repo-relative paths.
     """
     clean: list[str] = []
@@ -1429,7 +1429,7 @@ def _error_pack_implicated_files(
     fallback_files: list[str],
 ) -> list[str]:
     """Map Odoo.sh traceback file paths back to local module files for verification."""
-    allowed_suffixes = (".py", ".xml", ".js", ".scss", "__manifest__.py")
+    allowed_suffixes = (".py", ".xml", ".js", ".scss", ".css", ".csv", "__manifest__.py")
     raw_candidates: list[str] = []
     pack_json = _extract_error_pack_json(error_pack)
     for value in pack_json.get("files") or []:
@@ -1808,7 +1808,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             "warning",
             {
                 "message": (
-                    "No changed module .py/.xml/.js/.scss/__manifest__.py files were detected for pre-push verification. "
+                    "No changed module .py/.xml/.js/.scss/.css/.csv/__manifest__.py files were detected for pre-push verification. "
                     "Push gate passed only because there were no verifiable code files in this deploy request."
                 )
             },
@@ -2031,7 +2031,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 verifier_error = str(exc)
                 verifier_blocked = True
         else:
-            verifier_error = "No local .py/.xml/.js/.scss/__manifest__.py file could be mapped from odoosh.error_pack."
+            verifier_error = "No local .py/.xml/.js/.scss/.css/.csv/__manifest__.py file could be mapped from odoosh.error_pack."
             verifier_blocked = True
 
         fix_result = {
@@ -2525,14 +2525,24 @@ def smart_tool_router(payload: SmartToolRouteRequest) -> SmartToolRouteResult:
     needed.
     """
     text = (payload.task_description or "").lower()
-    planned = [p.lower() for p in payload.planned_file_paths]
-    frontend = _looks_like_frontend_task(payload.task_description) or any(
-        any(token in p for token in ("static/src", ".js", ".scss", "qweb", "website", "point_of_sale", "pos"))
-        for p in planned
-    )
-    data_query = any(term in text for term in ("list ", "show ", "find ", "search ", "count ", "invoices", "employees")) and not any(
-        term in text for term in ("fix", "implement", "module", "code", "js", "xml", "view", "write")
-    )
+    planned = [str(path).lower().replace("\\", "/") for path in payload.planned_file_paths]
+
+    def planned_frontend_path(path: str) -> bool:
+        segments = [segment for segment in path.split("/") if segment]
+        if path.endswith((".js", ".scss", ".css")):
+            return True
+        if path.endswith(".xml") and any(marker in path for marker in ("/static/src/", "/static/", "/qweb/", "/templates/")):
+            return True
+        return (
+            "point_of_sale" in segments
+            or "_assets_pos" in path
+            or any(segment in {"pos", "pos_store"} for segment in segments)
+        )
+
+    frontend = _looks_like_frontend_task(payload.task_description) or any(planned_frontend_path(path) for path in planned)
+    read_verbs = ("list ", "show ", "find ", "search ", "count ", "get ", "read ", "display ")
+    mutation_verbs = ("fix", "implement", "create", "update", "change", "delete", "remove", "module", "code", "write", "patch", "deploy")
+    data_query = any(term in text for term in read_verbs) and not any(term in text for term in mutation_verbs)
     high_risk = payload.risk_level == "high" or any(term in text for term in (
         "new module", "migration", "large refactor", "rewrite", "multi module", "security", "access rights", "accounting", "payment provider"
     ))

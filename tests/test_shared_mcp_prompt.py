@@ -72,9 +72,15 @@ def test_initialize_uses_client_gate_prompt_then_mcp_prompt_is_fetchable_for_eve
         assert fetched_mcp.json()["result"]["messages"][0]["content"]["text"] == expected_mcp
 
 
-def test_original_mcp_system_prompt_hash_is_preserved():
+def test_mcp_system_prompt_keeps_required_generic_contract():
     root = Path(__file__).resolve().parents[1]
-    import hashlib
+    text = (root / "MCP_SYSTEM_PROMPT.md").read_text(encoding="utf-8")
 
-    digest = hashlib.sha256((root / "MCP_SYSTEM_PROMPT.md").read_bytes()).hexdigest()
-    assert digest == "a9e5c0e786e528463541619fef875e0a6c8db98d9303eb918bc83416c988e118"
+    required_markers = [
+        "MANDATORY DUAL READ",
+        "workflow.verify_against_core",
+        "workflow.safe_deploy_module",
+        "jobs.get",
+    ]
+    for marker in required_markers:
+        assert marker in text

@@ -49,7 +49,7 @@ def _is_protected_branch(branch: str | None) -> bool:
 def _push_file_hashes(project_path: str, changed_stdout: str) -> dict[str, str]:
     project = Path(project_path).resolve()
     expected: dict[str, str] = {}
-    allowed_suffixes = (".py", ".xml", ".js", ".scss", "__manifest__.py")
+    allowed_suffixes = (".py", ".xml", ".js", ".scss", ".css", ".csv", "__manifest__.py")
     for raw_line in changed_stdout.splitlines():
         rel = raw_line.strip().replace("\\", "/")
         if not rel or rel.startswith(".git/") or not rel.endswith(allowed_suffixes):

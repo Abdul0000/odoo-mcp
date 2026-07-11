@@ -351,7 +351,7 @@ Long install/upgrade commands still run in background jobs, but `odoo.module_dep
 Recommended call:
 
 ```json
-{"module_name":"karachi_school_management","wait_for_result":true,"wait_timeout_seconds":20}
+{"module_name":"sample_custom_module","wait_for_result":true,"wait_timeout_seconds":20}
 ```
 
 If the job is still running, the response contains `job_id`; call `jobs.get` with the same `job_id`. `jobs.get` also waits by default.
@@ -464,8 +464,8 @@ Recommended production variables:
 
 ```env
 TARGET_GIT_REPO=git@github.com:Abdul0000/test_18.git
-TARGET_GIT_BRANCH=test_stagging_18
-TARGET_PROJECT_PATH=/workspace/repos/test_18
+TARGET_GIT_BRANCH=feature_branch
+TARGET_PROJECT_PATH=/workspace/repos/odoo_project
 GIT_AUTHOR_NAME=Odoo MCP Agent
 GIT_AUTHOR_EMAIL=odoo-mcp@example.local
 ODOOSH_ODOO_PATH=/home/odoo/src/odoo
@@ -497,8 +497,8 @@ Recommended environment:
 ```env
 WORKSPACE_ROOT=/workspace/repos
 TARGET_GIT_REPO=git@github.com:Abdul0000/test_18.git
-TARGET_GIT_BRANCH=test_stagging_18
-TARGET_PROJECT_PATH=/workspace/repos/test_18
+TARGET_GIT_BRANCH=feature_branch
+TARGET_PROJECT_PATH=/workspace/repos/odoo_project
 GIT_SSH_KEY_PATH=/tmp/keys/github_key
 ```
 

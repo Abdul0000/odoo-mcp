@@ -241,8 +241,8 @@ _TOOL_DESCRIPTORS = [
         description=(
             "Generic visual implementation workflow for Odoo POS/OWL/dashboard/website/backend UI. "
             "Use when a design needs SCSS, SVG assets, decorative backgrounds, logos/icons, premium cards, "
-            "or special borders/pipes. It generates deterministic visual assets/writes, reads custom/native context, "
-            "runs verify_against_core, then uses the same safe deploy pipeline. For exact pipe/logo/background shapes, "
+            "or decorative shapes. It generates deterministic visual assets/writes, reads custom/native context, "
+            "runs verify_against_core, then uses the same safe deploy pipeline. For exact geometric/logo/background shapes, "
             "prefer allowed_methods=['svg_asset'] instead of guessing with CSS borders."
         ),
         requires_approval=True,
@@ -886,7 +886,7 @@ def _odoo_functional_query(req: OdooFunctionalQueryRequest) -> object:
 
     It tries Odoo shell first. When shell authentication fails but the selected
     client has Odoo.sh SSH settings, it automatically falls back to a read-only
-    ``odoo-bin shell`` query over SSH. This lets users read invoices/users/etc.
+    ``odoo-bin shell`` query over SSH. This lets users read business records
     without an Odoo email/password, as long as SSH access is working.
     """
     text = (req.query or "").strip().lower()
@@ -1413,9 +1413,9 @@ def _build_simple_style_autopatch(project: Path, module_path: str, target_text: 
 _TASK_PROFILES = {
     "python_model": {"frontend": False, "live_verifier": "registry_smoke_test", "scope": "model"},
     "controller": {"frontend": False, "live_verifier": "endpoint_smoke", "scope": "controller"},
-    "xml_view": {"frontend": True, "live_verifier": "backend_view_open", "scope": "view"},
+    "xml_view": {"frontend": False, "live_verifier": "backend_view_open", "scope": "view"},
     "qweb_template": {"frontend": True, "live_verifier": "report_or_page_render", "scope": "qweb"},
-    "report": {"frontend": True, "live_verifier": "report_render", "scope": "report"},
+    "report": {"frontend": False, "live_verifier": "report_render", "scope": "report"},
     "js_report": {"frontend": True, "live_verifier": "report_ui_smoke", "scope": "frontend"},
     "js_owl": {"frontend": True, "live_verifier": "owl_ui_smoke", "scope": "frontend"},
     "pos_owl": {"frontend": True, "live_verifier": "pos_flow", "scope": "pos"},
@@ -1432,10 +1432,27 @@ _TASK_PROFILES = {
 def _task_profile(payload: OdooCodeChangeRequest, rel_paths: list[str] | None = None) -> dict[str, Any]:
     task_type = _normalized_task_type(payload)
     profile = dict(_TASK_PROFILES.get(task_type, {"frontend": False, "live_verifier": "targeted_smoke", "scope": "auto"}))
-    paths = [str(p).lower() for p in (rel_paths or [])]
-    if any('/point_of_sale/' in p or p.endswith(('.js', '.xml', '.scss')) and 'pos' in p for p in paths):
+    paths = [str(p).lower().replace("\\", "/") for p in (rel_paths or [])]
+
+    def is_pos_path(path: str) -> bool:
+        segments = [segment for segment in path.split("/") if segment]
+        return (
+            "point_of_sale" in segments
+            or "_assets_pos" in path
+            or any(segment in {"pos", "pos_store"} for segment in segments)
+        )
+
+    def is_frontend_xml(path: str) -> bool:
+        return path.endswith(".xml") and (
+            "/static/src/" in path
+            or "/static/" in path
+            or "/qweb/" in path
+            or "/templates/" in path
+        )
+
+    if any(is_pos_path(path) for path in paths):
         profile.update({"frontend": True, "live_verifier": "pos_flow", "scope": "pos"})
-    elif any(p.endswith(('.js', '.xml', '.scss', '.css')) for p in paths):
+    elif any(path.endswith((".js", ".scss", ".css")) or is_frontend_xml(path) for path in paths):
         profile["frontend"] = True
     return profile
 
@@ -1462,11 +1479,14 @@ def _looks_like_frontend_code_change(payload: OdooCodeChangeRequest, rel_paths: 
     if profile.get("frontend"):
         return True
 
-    frontend_paths = [
-        path.lower() for path in rel_paths
-        if path.lower().endswith((".js", ".xml", ".scss", ".css"))
-    ]
-    if frontend_paths:
+    normalized_paths = [str(path).lower().replace("\\", "/") for path in rel_paths]
+    if any(path.endswith((".js", ".scss", ".css")) for path in normalized_paths):
+        return True
+    if any(
+        path.endswith(".xml")
+        and any(marker in path for marker in ("/static/src/", "/static/", "/qweb/", "/templates/"))
+        for path in normalized_paths
+    ):
         return True
 
     text = " ".join([

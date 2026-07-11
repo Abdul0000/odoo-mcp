@@ -183,7 +183,7 @@ class FrontendPatternService:
         validation_steps = [
             "Run git.diff and inspect every JS/XML/manifest asset change before committing.",
             "Run qa.self_run for XML/Python/manifest checks.",
-            "Run workflow.verify_against_core with all changed .py, .xml, .js, .scss, and __manifest__.py files.",
+            "Run workflow.verify_against_core with all changed .py, .xml, .js, .scss, .css, .csv, and __manifest__.py files.",
             "If verify_against_core returns push_blocked=True, fix all CRITICAL findings and re-run before git.push.",
             "After upgrade, verify exact affected Odoo web/POS/website paths in browser with console/network capture.",
         ]
@@ -294,7 +294,7 @@ class FrontendPatternService:
         # website_* must not become POS merely because its text contains "product".
         strong_website = any(token in haystack for token in (
             "website_", "/website/", "/website_sale/", "web.assets_frontend",
-            "controllers/main.py", "publicwidget", "snippet",
+            "publicwidget", "snippet",
         ))
         strong_pos = any(token in haystack for token in (
             "point_of_sale", "/pos/", "_assets_pos", "pos_store",

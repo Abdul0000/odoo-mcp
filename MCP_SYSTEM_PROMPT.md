@@ -327,7 +327,7 @@ Instead of restarting from step 0:
 |------|---------|------------|
 | `odoo_mcp:connector_health` | Check connector + Odoo.sh availability | Start of session, troubleshoot connectivity |
 | `odoo_mcp:odoo_health` | Check Odoo health + DB status via MCP | Diagnose Odoo downtime |
-| `odoo_mcp:odoo_query` | Natural-language Odoo reads (users, invoices, etc.) | List data, inspect before writing |
+| `odoo_mcp:odoo_query` | Natural-language Odoo reads (business records) | List data, inspect before writing |
 | `odoo_mcp:odoo_search_read` | Direct domain-based search_read via MCP/HTTPS JSON-RPC fallback | Precise queries with complex domains |
 | `odoo_mcp:odoo_module_status` | Check/install/upgrade module + wait for result | **Preferred over old tools for deployment** — includes server-side polling |
 

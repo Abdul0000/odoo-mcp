@@ -6,7 +6,7 @@ from odoo_agent_server.routers.workflow import scope_advice
 
 
 CLIENTS_JSON = '''[
-  {"name":"Test 18","repo":"https://example.com/test18.git","branch":"main","path":"/tmp/test18"},
+  {"name":"Client A","repo":"https://example.com/client-a.git","branch":"main","path":"/tmp/client-a"},
   {"name":"ClientA","repo":"https://example.com/client-a.git","branch":"main","path":"/tmp/client-a"}
 ]'''
 

@@ -104,14 +104,14 @@ def test_resolver_auto_selects_single_client(monkeypatch, tmp_path):
 def test_get_odoo_clients_accepts_shell_quoted_escaped_json(monkeypatch):
     monkeypatch.setenv(
         "ODOO_CLIENTS",
-        "'[{\\\"name\\\":\\\"Test 18\\\",\\\"repo\\\":\\\"git@example.com:test.git\\\",\\\"branch\\\":\\\"test_stagging_18\\\",\\\"path\\\":\\\"/workspace/repos/test_18\\\"}]'",
+        "'[{\\\"name\\\":\\\"Client A\\\",\\\"repo\\\":\\\"git@example.com:test.git\\\",\\\"branch\\\":\\\"feature_branch\\\",\\\"path\\\":\\\"/workspace/repos/odoo_project\\\"}]'",
     )
 
     clients = get_odoo_clients()
 
-    assert clients[0]["name"] == "Test 18"
-    assert clients[0]["branch"] == "test_stagging_18"
-    assert clients[0]["path"] == "/workspace/repos/test_18"
+    assert clients[0]["name"] == "Client A"
+    assert clients[0]["branch"] == "feature_branch"
+    assert clients[0]["path"] == "/workspace/repos/odoo_project"
 
 
 def test_resolver_ambiguous_clients_lists_safe_names(monkeypatch, tmp_path):

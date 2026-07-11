@@ -1530,7 +1530,7 @@ class SyntaxVerifyRequest(BaseModel):
         ...,
         description=(
             "Absolute paths of files written by the agent that need pre-push verification. "
-            "Include ALL .py, .xml, .js, .scss, and __manifest__.py files changed in this task."
+            "Include ALL .py, .xml, .js, .scss, .css, .csv, and __manifest__.py files changed in this task."
         ),
     )
     fix_cycle: int | None = Field(
@@ -1579,7 +1579,7 @@ class PosChangeVerifyRequest(BaseModel):
     browser.pos_flow behind one bounded fix-cycle counter, mirroring the
     existing verify_against_core contract (push_blocked / fix_cycle / max 3).
     """
-    written_files: list[str] = Field(..., description="Absolute paths of files changed in this task (.py/.xml/.js/.scss/__manifest__.py).")
+    written_files: list[str] = Field(..., description="Absolute paths of files changed in this task (.py/.xml/.js/.scss/.css/.csv/__manifest__.py).")
     fix_cycle: int = Field(default=0, description="Current fix cycle number (0-indexed). After 3 cycles, stop and report to the user.")
     project_path: str | None = Field(default=None)
     run_pos_flow: bool = Field(default=True, description="If true and any written_files look POS-related, also run a live browser.pos_flow check.")

@@ -39,9 +39,9 @@ def test_task_profiles_are_proportional():
     cases = {
         "python_model": (False, "registry_smoke_test"),
         "controller": (False, "endpoint_smoke"),
-        "xml_view": (True, "backend_view_open"),
+        "xml_view": (False, "backend_view_open"),
         "qweb_template": (True, "report_or_page_render"),
-        "report": (True, "report_render"),
+        "report": (False, "report_render"),
         "js_report": (True, "report_ui_smoke"),
         "js_owl": (True, "owl_ui_smoke"),
         "pos_owl": (True, "pos_flow"),
@@ -73,3 +73,35 @@ def test_mixed_module_routes_from_changed_file_not_module_name():
     )
     assert not _looks_like_frontend_code_change(payload, ["website_pos_payment_mix/controllers/main.py"])
     assert _looks_like_frontend_code_change(payload, ["website_pos_payment_mix/static/src/js/payment_form.js"])
+
+
+def test_backend_xml_view_does_not_trigger_frontend_preflight():
+    payload = OdooCodeChangeRequest(
+        module_name="sample_module",
+        task_description="Update backend form view",
+        task_type="xml_view",
+        target_files=["sample_module/views/sample_views.xml"],
+    )
+    assert not _looks_like_frontend_code_change(payload, payload.target_files)
+
+
+def test_static_qweb_xml_still_triggers_frontend_preflight():
+    payload = OdooCodeChangeRequest(
+        module_name="sample_module",
+        task_description="Update frontend template",
+        task_type="qweb_template",
+        target_files=["sample_module/static/src/xml/sample_template.xml"],
+    )
+    assert _looks_like_frontend_code_change(payload, payload.target_files)
+
+
+def test_product_path_does_not_trigger_pos_profile():
+    payload = OdooCodeChangeRequest(
+        module_name="sample_module",
+        task_description="Update product backend logic",
+        task_type="python_model",
+        target_files=["sample_module/models/product_template.py"],
+    )
+    profile = _task_profile(payload, payload.target_files)
+    assert profile["scope"] == "model"
+    assert profile["live_verifier"] == "registry_smoke_test"

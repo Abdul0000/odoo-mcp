@@ -118,7 +118,7 @@ ModuleNotFoundError: No module named 'missing_lib'
 
 
 def test_validator_nested_one2many_no_false_positive_and_action_order(tmp_path):
-    module = tmp_path / "school_x"
+    module = tmp_path / "sample_relational_module"
     (module / "models").mkdir(parents=True)
     (module / "views").mkdir()
     (module / "security").mkdir()
@@ -127,19 +127,19 @@ def test_validator_nested_one2many_no_false_positive_and_action_order(tmp_path):
     (module / "models" / "m.py").write_text(
         "from odoo import fields, models\n"
         "class Parent(models.Model):\n"
-        "    _name = 'school.parent'\n"
+        "    _name = 'sample.parent'\n"
         "    name = fields.Char()\n"
-        "    line_ids = fields.One2many('school.line', 'parent_id')\n"
+        "    line_ids = fields.One2many('sample.line', 'parent_id')\n"
         "class Line(models.Model):\n"
-        "    _name = 'school.line'\n"
-        "    parent_id = fields.Many2one('school.parent')\n"
+        "    _name = 'sample.line'\n"
+        "    parent_id = fields.Many2one('sample.parent')\n"
         "    amount = fields.Float()\n",
         encoding="utf-8",
     )
     (module / "security" / "ir.model.access.csv").write_text(
         "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
-        "access_parent,school.parent,model_school_parent,base.group_user,1,1,1,0\n"
-        "access_line,school.line,model_school_line,base.group_user,1,1,1,0\n",
+        "access_parent,sample.parent,model_sample_parent,base.group_user,1,1,1,0\n"
+        "access_line,sample.line,model_sample_line,base.group_user,1,1,1,0\n",
         encoding="utf-8",
     )
     (module / "views" / "menus.xml").write_text(
@@ -147,14 +147,14 @@ def test_validator_nested_one2many_no_false_positive_and_action_order(tmp_path):
     )
     (module / "views" / "views.xml").write_text(
         "<odoo>"
-        "<record id='view_parent' model='ir.ui.view'><field name='name'>x</field><field name='model'>school.parent</field>"
+        "<record id='view_parent' model='ir.ui.view'><field name='name'>x</field><field name='model'>sample.parent</field>"
         "<field name='arch' type='xml'><form><field name='line_ids'><list><field name='amount'/></list></field></form></field></record>"
-        "<record id='action_parent' model='ir.actions.act_window'><field name='name'>Parent</field><field name='res_model'>school.parent</field></record>"
+        "<record id='action_parent' model='ir.actions.act_window'><field name='name'>Parent</field><field name='res_model'>sample.parent</field></record>"
         "</odoo>",
         encoding="utf-8",
     )
     (module / "__manifest__.py").write_text(
-        "{'name':'School X','version':'1.0','depends':['base'],'data':['security/ir.model.access.csv','views/menus.xml','views/views.xml']}",
+        "{'name':'Sample Relational Module','version':'1.0','depends':['base'],'data':['security/ir.model.access.csv','views/menus.xml','views/views.xml']}",
         encoding="utf-8",
     )
     findings = OdooModuleValidator().validate(module)

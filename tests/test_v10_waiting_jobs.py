@@ -54,7 +54,7 @@ def test_module_deploy_waits_and_returns_final_job(monkeypatch, tmp_path):
         headers={"Authorization": f"Bearer {settings.api_token}"},
         json={
             "name": "odoo.module_deploy",
-            "arguments": {"module_name": "karachi_school_management", "wait_timeout_seconds": 2, "poll_interval_seconds": 0.25},
+            "arguments": {"module_name": "sample_custom_module", "wait_timeout_seconds": 2, "poll_interval_seconds": 0.25},
         },
     )
 
@@ -83,7 +83,7 @@ def test_module_deploy_non_wait_mode_returns_job_id_for_polling(monkeypatch, tmp
         headers={"Authorization": f"Bearer {settings.api_token}"},
         json={
             "name": "odoo.module_deploy",
-            "arguments": {"module_name": "karachi_school_management", "wait_for_result": False, "poll_interval_seconds": 0.25},
+            "arguments": {"module_name": "sample_custom_module", "wait_for_result": False, "poll_interval_seconds": 0.25},
         },
     )
 
@@ -111,7 +111,7 @@ def test_module_deploy_wait_for_result_true_never_returns_progress_text(monkeypa
         headers={"Authorization": f"Bearer {settings.api_token}"},
         json={
             "name": "odoo.module_deploy",
-            "arguments": {"module_name": "karachi_school_management", "wait_for_result": True, "wait_timeout_seconds": 0, "poll_interval_seconds": 0.25},
+            "arguments": {"module_name": "sample_custom_module", "wait_for_result": True, "wait_timeout_seconds": 0, "poll_interval_seconds": 0.25},
         },
     )
 

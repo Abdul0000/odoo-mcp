@@ -199,7 +199,7 @@ def agent_instructions() -> dict:
                     "3. Execute every mandatory instruction returned: repo.read each concrete source path; for NOT_FOUND hints call workflow.list_module_files to browse manually.",
                     "4. Confirm exact import aliases, registry category, service names, hooks, patch syntax, Component.template/t-name, t-inherit/xpath, and asset bundle from real source.",
                     "5. Only then write code; keep syntax/style matching the installed Odoo framework source.",
-                    "6. After coding, call workflow.verify_against_core with changed .py, .xml, .js, .scss, and __manifest__.py files.",
+                    "6. After coding, call workflow.verify_against_core with changed .py, .xml, .js, .scss, .css, .csv, and __manifest__.py files.",
                 ],
                 "areas": {
                     "pos": "Read point_of_sale/static/src/app + views and use point_of_sale._assets_pos unless source proves otherwise.",

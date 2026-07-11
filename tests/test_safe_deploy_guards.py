@@ -21,7 +21,7 @@ from odoo_agent_server.routers import tools, workflow
 
 def _init_repo(path):
     path.mkdir(parents=True)
-    subprocess.run(["git", "init", "-b", "test_stagging_18"], cwd=path, check=True, capture_output=True, text=True)
+    subprocess.run(["git", "init", "-b", "feature_branch"], cwd=path, check=True, capture_output=True, text=True)
     subprocess.run(["git", "remote", "add", "origin", "git@github.com:Abdul0000/test_18.git"], cwd=path, check=True)
     (path / "README.md").write_text("ok\n", encoding="utf-8")
     subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
@@ -46,7 +46,7 @@ def test_safe_deploy_starter_failure_returns_report(monkeypatch, tmp_path):
         project_path=str(tmp_path),
         module_name="sale_order_notebook_tab",
         commit_message="[ADD] field",
-        branch="test_stagging_18",
+        branch="feature_branch",
         run_qa=False,
         wait_for_odoosh=True,
         upgrade_module=True,
@@ -74,7 +74,7 @@ def test_safe_deploy_endpoint_starts_job_for_grok_payload(tmp_path, monkeypatch)
         project_path=str(project),
         module_name="sale_order_notebook_tab",
         commit_message="[ADD] test_qwen field before quotation template in sale order form",
-        branch="test_stagging_18",
+        branch="feature_branch",
         run_qa=False,
         wait_for_odoosh=True,
         upgrade_module=True,
@@ -112,7 +112,7 @@ def test_safe_deploy_waits_and_returns_finished_job(tmp_path, monkeypatch):
         project_path=str(project),
         module_name="sale_order_notebook_tab",
         commit_message="[ADD] field",
-        branch="test_stagging_18",
+        branch="feature_branch",
         run_qa=False,
         wait_for_odoosh=True,
         upgrade_module=True,
@@ -145,7 +145,7 @@ def test_git_commit_configures_identity(tmp_path, monkeypatch):
 
 def test_git_push_target_validation_rejects_wrong_branch(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
-    monkeypatch.setattr(settings, "target_git_branch", "test_stagging_18")
+    monkeypatch.setattr(settings, "target_git_branch", "feature_branch")
     monkeypatch.setattr(settings, "target_git_repo", "git@github.com:Abdul0000/test_18.git")
     repo = tmp_path / "repo"
     _init_repo(repo)
@@ -153,7 +153,7 @@ def test_git_push_target_validation_rejects_wrong_branch(tmp_path, monkeypatch):
     result = GitService().validate_target(str(repo), branch="main", remote="origin")
 
     assert result.exit_code == 2
-    assert "expected test_stagging_18" in result.stderr
+    assert "expected feature_branch" in result.stderr
 
 
 def test_repo_write_blocks_git_internal_path(tmp_path, monkeypatch):
@@ -1330,7 +1330,7 @@ def test_safe_deploy_duplicate_call_returns_existing_running_job(tmp_path, monke
         project_path=str(project),
         module_name="sale_order_notebook_tab",
         commit_message="Add field grok_a",
-        branch="test_stagging_18",
+        branch="feature_branch",
         run_qa=False,
         wait_for_odoosh=True,
         upgrade_module=True,
@@ -1377,7 +1377,7 @@ def test_safe_deploy_resumable_failure_returns_existing_job_to_resume(tmp_path, 
         project_path=str(project),
         module_name="sale_order_notebook_tab",
         commit_message="Add field grok_a retry",
-        branch="test_stagging_18",
+        branch="feature_branch",
         run_qa=False,
         wait_for_odoosh=True,
         upgrade_module=True,
@@ -1421,7 +1421,7 @@ def test_safe_deploy_force_new_after_resumable_failure_starts_new_job(tmp_path, 
         project_path=str(project),
         module_name="sale_order_notebook_tab",
         commit_message="Force restart deploy",
-        branch="test_stagging_18",
+        branch="feature_branch",
         run_qa=False,
         wait_for_odoosh=True,
         upgrade_module=True,
@@ -1457,7 +1457,7 @@ def test_safe_deploy_request_defaults_to_final_wait_and_qa_enabled(tmp_path, mon
         project_path=str(project),
         module_name="sale_order_notebook_tab",
         commit_message="Add field grok_fast",
-        branch="test_stagging_18",
+        branch="feature_branch",
         wait_for_odoosh=True,
         upgrade_module=True,
         wait_for_result=False,

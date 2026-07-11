@@ -23,8 +23,8 @@ def test_tools_call_awaits_safe_deploy_module_and_returns_final_result(tmp_path,
     monkeypatch.setattr(settings, "require_approval", False)
 
     project = tmp_path / "repo"
-    (project / "karachi_school_management" / "models").mkdir(parents=True)
-    (project / "karachi_school_management" / "__manifest__.py").write_text("{'name': 'School'}\n", encoding="utf-8")
+    (project / "sample_custom_module" / "models").mkdir(parents=True)
+    (project / "sample_custom_module" / "__manifest__.py").write_text("{'name': 'Sample Module'}\n", encoding="utf-8")
 
     def fake_run(payload, job_id):
         store = JsonStore()
@@ -57,10 +57,10 @@ def test_tools_call_awaits_safe_deploy_module_and_returns_final_result(tmp_path,
         name="workflow.safe_deploy_module",
         arguments={
             "project_path": str(project),
-            "module_name": "karachi_school_management",
+            "module_name": "sample_custom_module",
             "commit_message": "Add emergency contact field",
-            "paths": ["karachi_school_management/models/school_management.py"],
-            "branch": "test_stagging_18",
+            "paths": ["sample_custom_module/models/sample_model.py"],
+            "branch": "feature_branch",
             "run_qa": False,
             "wait_for_odoosh": True,
             "upgrade_module": True,
