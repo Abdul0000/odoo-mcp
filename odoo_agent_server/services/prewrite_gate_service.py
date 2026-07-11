@@ -228,13 +228,14 @@ class PreWriteGateService:
     def _reject_nested_addon_manifests(project: Path, relative_paths: Iterable[str]) -> None:
         """Never allow an addon manifest below an existing addon root."""
         for raw in relative_paths:
-            target = (project / str(raw).replace("\\", "/").lstrip("/")).resolve()
+            value = str(raw).replace("\\", "/")
+            if Path(value).name not in _MANIFEST_NAMES:
+                continue
+            target = (project / value.lstrip("/")).resolve()
             try:
                 target.relative_to(project)
             except ValueError as exc:
-                raise HTTPException(status_code=400, detail="Write target escapes project checkout") from exc
-            if target.name not in _MANIFEST_NAMES:
-                continue
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Write target escapes project checkout") from exc
             current = target.parent.parent
             while current == project or project in current.parents:
                 if any((current / name).exists() for name in _MANIFEST_NAMES):
