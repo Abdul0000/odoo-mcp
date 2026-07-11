@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import difflib
+import json
 import re
 import time
 from pathlib import Path
