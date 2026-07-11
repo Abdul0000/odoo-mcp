@@ -1225,7 +1225,7 @@ def _focused_search(repo: RepoService, project_path: str, module_path: str, patt
     seen_paths: set[str] = set()
     for pattern in patterns[:10]:
         try:
-            result = repo.search(project_path, pattern, module_path, max(1, min(max_matches, 25)), 8, False)
+            result = repo.search(project_path, pattern, module_path, max(1, min(max_matches, 25)), 24, False)
             matches = result.get("matches", []) or []
             # Keep exact/template/style files first; avoid pulling large controllers/js unless needed.
             matches = sorted(
@@ -1423,17 +1423,76 @@ def _build_simple_style_autopatch(project: Path, module_path: str, target_text: 
 
 
 
+
+
+_TASK_PROFILES = {
+    "python_model": {"frontend": False, "live_verifier": "registry_smoke_test", "scope": "model"},
+    "controller": {"frontend": False, "live_verifier": "endpoint_smoke", "scope": "controller"},
+    "xml_view": {"frontend": True, "live_verifier": "backend_view_open", "scope": "view"},
+    "qweb_template": {"frontend": True, "live_verifier": "report_or_page_render", "scope": "qweb"},
+    "report": {"frontend": True, "live_verifier": "report_render", "scope": "report"},
+    "js_report": {"frontend": True, "live_verifier": "report_ui_smoke", "scope": "frontend"},
+    "js_owl": {"frontend": True, "live_verifier": "owl_ui_smoke", "scope": "frontend"},
+    "pos_owl": {"frontend": True, "live_verifier": "pos_flow", "scope": "pos"},
+    "scss_css": {"frontend": True, "live_verifier": "page_render", "scope": "style"},
+    "manifest": {"frontend": False, "live_verifier": "module_upgrade", "scope": "manifest"},
+    "data_xml": {"frontend": False, "live_verifier": "module_upgrade", "scope": "data"},
+    "init": {"frontend": False, "live_verifier": "module_import", "scope": "init"},
+    "security_csv": {"frontend": False, "live_verifier": "access_smoke", "scope": "security"},
+    "cron": {"frontend": False, "live_verifier": "method_smoke", "scope": "backend"},
+    "payment": {"frontend": False, "live_verifier": "payment_route_smoke", "scope": "payment"},
+    "payment_frontend": {"frontend": True, "live_verifier": "payment_ui_smoke", "scope": "payment"},
+}
+
+def _task_profile(payload: OdooCodeChangeRequest, rel_paths: list[str] | None = None) -> dict[str, Any]:
+    task_type = _normalized_task_type(payload)
+    profile = dict(_TASK_PROFILES.get(task_type, {"frontend": False, "live_verifier": "targeted_smoke", "scope": "auto"}))
+    paths = [str(p).lower() for p in (rel_paths or [])]
+    if any('/point_of_sale/' in p or p.endswith(('.js', '.xml', '.scss')) and 'pos' in p for p in paths):
+        profile.update({"frontend": True, "live_verifier": "pos_flow", "scope": "pos"})
+    elif any(p.endswith(('.js', '.xml', '.scss', '.css')) for p in paths):
+        profile["frontend"] = True
+    return profile
+
+def _evidence_signature(project: Path, module_name: str, payload: OdooCodeChangeRequest, rel_paths: list[str]) -> str:
+    import hashlib
+    rows=[]
+    for rel in sorted(set(rel_paths)):
+        path=project/rel
+        try:
+            st=path.stat(); rows.append((rel, st.st_mtime_ns, st.st_size))
+        except OSError:
+            rows.append((rel, None, None))
+    raw=json.dumps({"module":module_name,"task_type":_normalized_task_type(payload),"paths":rows},sort_keys=True,default=str)
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
+
+
 def _looks_like_frontend_code_change(payload: OdooCodeChangeRequest, rel_paths: list[str]) -> bool:
-    text = " ".join([
-        payload.task_description or "",
-        payload.task_type or "",
-        payload.intent or "",
-        payload.target_hint or "",
-        " ".join(rel_paths),
-    ]).lower()
-    if any(token in text for token in ("pos", "point_of_sale", "owl", "qweb", "website", "payment", "frontend", "screen", "widget")):
+    """Return True only when the change actually touches frontend code.
+
+    Website/payment words alone are not enough: controller/model Python changes
+    must not trigger dozens of JS/OWL/POS reads.
+    """
+    profile = _task_profile(payload, rel_paths)
+    if profile.get("frontend"):
         return True
-    return any(path.endswith((".js", ".xml", ".scss", ".css")) and "/static/" in path for path in rel_paths)
+
+    frontend_paths = [
+        path.lower() for path in rel_paths
+        if path.lower().endswith((".js", ".xml", ".scss", ".css"))
+    ]
+    if frontend_paths:
+        return True
+
+    text = " ".join([
+        payload.task_description or "", payload.intent or "", payload.target_hint or "",
+    ]).lower()
+    strong_markers = (
+        "owl component", "qweb template", "javascript", "scss", "css",
+        "frontend asset", "website editor", "public widget", "pos screen",
+        "payment form js",
+    )
+    return any(marker in text for marker in strong_markers)
 
 
 def _git_status_changed_module_files(project_path: str, module_path: str) -> list[str]:
@@ -1552,38 +1611,64 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         except UnicodeDecodeError:
             custom_reads.append({"relative_path": rel, "status": "binary_skipped"})
     steps.append({"step": "repo.read_custom", "status": "ok", "count": len([r for r in custom_reads if r.get("status") == "read"])})
+    evidence_signature = _evidence_signature(project, effective_module_name, payload, custom_rel_paths)
+    session_state = JsonStore().load_session_state(client_name=client_name)
+    evidence_cache = (session_state.get("code_change_evidence") or {}) if isinstance(session_state, dict) else {}
+    cached_evidence = evidence_cache.get(evidence_signature) if isinstance(evidence_cache, dict) else None
 
     # Ensure scope has at least manifest when nothing else exists.
     if not custom_file_paths_abs and manifest_abs.exists():
         custom_file_paths_abs.append(str(manifest_abs.resolve()))
 
     # 4) Scope advice with corrected installed-source priority (core addons first).
+    # Scope must follow the files actually being changed. Including every user-
+    # supplied target file made focused controller fixes scan unrelated models
+    # and escalate to L3/L4. Keep the manifest plus exact write files on write
+    # passes; inspection mode keeps the focused search files.
+    scope_file_paths = list(custom_file_paths_abs)
+    if payload.writes or generated_writes:
+        write_abs = {str((project / _safe_module_relative(effective_module_name, w.relative_path)).resolve()) for w in (payload.writes or generated_writes)}
+        manifest_resolved = str(manifest_abs.resolve()) if manifest_abs.exists() else ""
+        scope_file_paths = [path for path in custom_file_paths_abs if path == manifest_resolved or path in write_abs]
+        if not scope_file_paths:
+            scope_file_paths = list(custom_file_paths_abs)
+
     scope_payload = ScopeAdviceRequest(
         custom_module_name=effective_module_name,
-        custom_file_paths=custom_file_paths_abs,
+        custom_file_paths=scope_file_paths,
         task_description=payload.task_description,
         client_name=client_name,
     )
-    scope = scope_advice(scope_payload)
-    steps.append({"step": "workflow.scope_advice", "status": "ok", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level)})
+    if cached_evidence and cached_evidence.get("scope"):
+        from ..schemas import ScopeAdviceResult
+        scope = ScopeAdviceResult.model_validate(cached_evidence["scope"])
+        steps.append({"step": "workflow.scope_advice", "status": "cached", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level)})
+    else:
+        scope = scope_advice(scope_payload)
+        steps.append({"step": "workflow.scope_advice", "status": "ok", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level)})
 
     frontend_preflight = None
     frontend_paths = list(dict.fromkeys(custom_rel_paths + [_safe_module_relative(effective_module_name, w.relative_path) for w in payload.writes]))
     if _looks_like_frontend_code_change(payload, frontend_paths):
-        frontend_preflight = frontend_pattern_preflight(FrontendPatternPreflightRequest(
+        if cached_evidence and cached_evidence.get("frontend_preflight"):
+            from ..schemas import FrontendPatternPreflightResult
+            frontend_preflight = FrontendPatternPreflightResult.model_validate(cached_evidence["frontend_preflight"])
+            steps.append({"step": "workflow.frontend_pattern_preflight", "status": "cached", "target_area": frontend_preflight.target_area, "mandatory_count": frontend_preflight.mandatory_read_count})
+        else:
+            frontend_preflight = frontend_pattern_preflight(FrontendPatternPreflightRequest(
             client_name=client_name,
             task_description=payload.task_description,
             target_area="auto",
             target_module_name=effective_module_name,
             custom_file_paths=custom_file_paths_abs,
-            planned_file_paths=frontend_paths,
-        ))
-        steps.append({
-            "step": "workflow.frontend_pattern_preflight",
-            "status": "ok",
-            "target_area": frontend_preflight.target_area,
-            "mandatory_count": frontend_preflight.mandatory_read_count,
-        })
+                planned_file_paths=frontend_paths,
+            ))
+            steps.append({
+                "step": "workflow.frontend_pattern_preflight",
+                "status": "ok",
+                "target_area": frontend_preflight.target_area,
+                "mandatory_count": frontend_preflight.mandatory_read_count,
+            })
     else:
         frontend_preflight = None
 
@@ -1639,6 +1724,16 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         except Exception as exc:  # noqa: BLE001
             core_reads.append({"path": str(resolved), "status": "failed", "error": str(exc)})
     steps.append({"step": "repo.read_core", "status": "ok", "count": len([r for r in core_reads if r.get("status") == "read"])})
+    cache = dict(evidence_cache) if isinstance(evidence_cache, dict) else {}
+    cache[evidence_signature] = {
+        "scope": scope.model_dump(mode="json"),
+        "frontend_preflight": frontend_preflight.model_dump(mode="json") if frontend_preflight is not None else None,
+        "core_paths": [r.get("path") for r in core_reads if r.get("status") == "read"],
+        "task_profile": _task_profile(payload, frontend_paths),
+    }
+    if len(cache) > 20:
+        cache = dict(list(cache.items())[-20:])
+    JsonStore().save_session_state({"code_change_evidence": cache}, client_name=client_name)
 
     writes_to_apply = list(payload.writes or generated_writes)
     if not writes_to_apply:
@@ -1674,6 +1769,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "generated_autopatch_strategy": generated_autopatch_strategy,
             "generated_autopatch_reason": generated_autopatch_reason,
             "supported_autopatch_cases": ["style_rule", "text_replace"],
+            "task_profile": _task_profile(payload, frontend_paths),
+            "recommended_live_verifier": _task_profile(payload, frontend_paths).get("live_verifier"),
             "scope_advice": scope.model_dump(mode="json"),
             "frontend_preflight": frontend_preflight.model_dump(mode="json") if frontend_preflight is not None else None,
             "core_reads": core_reads[:30],

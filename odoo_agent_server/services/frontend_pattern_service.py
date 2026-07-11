@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+import re
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -281,9 +282,32 @@ class FrontendPatternService:
         haystack_parts.extend(request.planned_file_paths or [])
         haystack = " ".join(haystack_parts).lower().replace("-", "_")
 
-        # POS uses terms such as PaymentScreen, so prioritize POS before generic payment.
+        def has_term(term: str) -> bool:
+            normalized = term.lower().replace("-", "_")
+            # Short generic tokens such as "pos" must be matched as standalone
+            # words. Substring matching classified words like "product" as POS.
+            if len(normalized) <= 3 and normalized.replace("_", "").isalnum():
+                return re.search(rf"(?<![a-z0-9_]){re.escape(normalized)}(?![a-z0-9_])", haystack) is not None
+            return normalized in haystack
+
+        # Strong module/path signals win over generic task words. A module named
+        # website_* must not become POS merely because its text contains "product".
+        strong_website = any(token in haystack for token in (
+            "website_", "/website/", "/website_sale/", "web.assets_frontend",
+            "controllers/main.py", "publicwidget", "snippet",
+        ))
+        strong_pos = any(token in haystack for token in (
+            "point_of_sale", "/pos/", "_assets_pos", "pos_store",
+            "paymentscreen", "productscreen", "receiptscreen",
+        ))
+        if strong_pos:
+            return "pos"
+        if strong_website:
+            return "website"
+
+        # POS still precedes generic payment for real POS payment-screen tasks.
         for area in ("pos", "payment", "website", "web"):
-            if any(term in haystack for term in _AREA_KEYWORDS[area]):
+            if any(has_term(term) for term in _AREA_KEYWORDS[area]):
                 return area
         if any(ext in haystack for ext in (".js", ".scss", "static/src", "owl", "t-inherit", "t-name")):
             return "web"

@@ -193,43 +193,20 @@ def _extract_all_template_names(xml_contents: dict[str, str]) -> set[str]:
     return names
 
 
-def _template_declared_in_content(template_name: str, content: str) -> bool:
-    """Return whether XML declares a client QWeb name or server view XML ID.
-
-    Odoo frontend templates commonly use ``t-name="module.Name"`` while
-    server-rendered website/payment templates use ``<template id="name">``
-    or ``<record id="name" model="ir.ui.view">``.  The old verifier only
-    recognized t-name and therefore produced false CRITICAL findings for valid
-    references such as website.layout and payment.form.
-    """
-    if f't-name="{template_name}"' in content or f"t-name='{template_name}'" in content:
-        return True
-    if "." not in template_name:
-        return False
-    _module_name, xml_id = template_name.split(".", 1)
-    escaped = re.escape(xml_id)
-    template_re = re.compile(rf"<template\b[^>]*\bid=[\"']{escaped}[\"']", re.IGNORECASE)
-    view_record_re = re.compile(
-        rf"<record\b[^>]*\bid=[\"']{escaped}[\"'][^>]*\bmodel=[\"']ir\.ui\.view[\"']",
-        re.IGNORECASE,
-    )
-    return bool(template_re.search(content) or view_record_re.search(content))
-
-
 def _find_template_content(template_name: str, local_xml_contents: dict[str, str] | None = None, client_name: str | None = None) -> str:
-    """Find client QWeb or server-template source in local/installed XML."""
+    """Find QWeb template source in written XML files or Odoo source roots."""
     if local_xml_contents:
         for content in local_xml_contents.values():
-            if _template_declared_in_content(template_name, content):
+            if f't-name="{template_name}"' in content or f"t-name='{template_name}'" in content:
                 return content
-    # External IDs are module-qualified, so search that module first.
+    # Try module prefix first for speed: web.SomeTemplate -> module web.
     module_hint = template_name.split(".", 1)[0] if "." in template_name else None
     module_dirs = _iter_module_dirs(module_hint, client_name=client_name) if module_hint else []
     search_dirs = module_dirs or [root for root in _SRC_ROOTS if root.exists()]
     for search_dir in search_dirs:
         for xml_file in search_dir.rglob("*.xml"):
             content = _read_file(str(xml_file), max_bytes=1048576)
-            if _template_declared_in_content(template_name, content):
+            if f't-name="{template_name}"' in content or f"t-name='{template_name}'" in content:
                 return content
     return ""
 
@@ -308,7 +285,6 @@ class SyntaxVerifierService:
             ))
 
         written_files = self._impact_aware_files(request)
-        explicitly_written = {str(Path(path)) for path in request.written_files}
 
         # First pass: read files and collect XML/JS context for template matching.
         file_contents: dict[str, str] = {}
@@ -342,13 +318,7 @@ class SyntaxVerifierService:
                 findings.extend(self._verify_python_model(file_path, content, request.client_name))
             elif path.suffix == ".xml":
                 findings.extend(self._verify_xml_view(file_path, content, request.client_name))
-                findings.extend(self._verify_qweb_template(
-                    file_path,
-                    content,
-                    xml_contents,
-                    request.client_name,
-                    is_explicitly_written=str(Path(file_path)) in explicitly_written,
-                ))
+                findings.extend(self._verify_qweb_template(file_path, content, xml_contents, request.client_name))
             elif path.suffix == ".js":
                 findings.extend(self._verify_js_syntax_real(file_path, content))
                 findings.extend(self._verify_js_owl(file_path, content, template_names, request.client_name))
@@ -654,14 +624,7 @@ class SyntaxVerifierService:
                         ))
         return findings
 
-    def _verify_qweb_template(
-        self,
-        file_path: str,
-        content: str,
-        xml_contents: dict[str, str],
-        client_name: str | None = None,
-        is_explicitly_written: bool = True,
-    ) -> list[VerifyFinding]:
+    def _verify_qweb_template(self, file_path: str, content: str, xml_contents: dict[str, str], client_name: str | None = None) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
         template_names = [m.group(1) for m in _T_NAME_RE.finditer(content)]
         inherit_names = [m.group(1) for m in _T_INHERIT_RE.finditer(content)]
@@ -681,12 +644,9 @@ class SyntaxVerifierService:
             if not source:
                 findings.append(VerifyFinding(
                     file=file_path,
-                    severity=(VerifySeverity.CRITICAL if is_explicitly_written else VerifySeverity.WARNING),
+                    severity=VerifySeverity.CRITICAL,
                     check="qweb_template_source_exists",
-                    message=(
-                        f"Template reference '{template}' not found in written XML or Odoo source roots."
-                        + ("" if is_explicitly_written else " File was impact-added and unchanged, so this is non-blocking.")
-                    ),
+                    message=f"Template reference '{template}' not found in written XML or Odoo source roots.",
                     fix_hint="Run workflow.frontend_pattern_preflight and repo.read the source template before using t-inherit/t-call.",
                 ))
                 continue
