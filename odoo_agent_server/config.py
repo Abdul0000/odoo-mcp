@@ -78,6 +78,8 @@ class Settings(BaseSettings):
     # Best-effort deploy follow-through for raw git.push fallback paths.
     auto_upgrade_on_push: bool = Field(default=True, alias="ODOO_AGENT_AUTO_UPGRADE_ON_PUSH")
     safe_deploy_stale_running_seconds: int = Field(default=7200, alias="ODOO_AGENT_SAFE_DEPLOY_STALE_RUNNING_SECONDS")
+    background_max_workers: int = Field(default=1, ge=1, le=4, alias="ODOO_AGENT_BACKGROUND_MAX_WORKERS")
+    mcp_operation_guard_enabled: bool = Field(default=False, alias="ODOO_AGENT_OPERATION_GUARD_ENABLED")
 
     # Qwen URL-token fallback hardening. Qwen app may not pass headers, so the
     # server can mint a short-lived URL token that maps to the real API/OAuth token.

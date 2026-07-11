@@ -94,10 +94,27 @@ class JsonStore:
             except OSError:
                 self._read_cache.pop(str(path), None)
 
+    def _update_list(self, path: Path, update) -> Any:
+        """Atomically read, modify, and replace one JSON list."""
+        with self._lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._file_lock(path):
+                try:
+                    raw = json.loads(path.read_text(encoding="utf-8") or "[]") if path.exists() else []
+                except json.JSONDecodeError:
+                    raw = []
+                rows = raw if isinstance(raw, list) else []
+                result = update(rows)
+                payload = json.dumps(rows, indent=2, sort_keys=True)
+                tmp_path = path.with_suffix(path.suffix + ".tmp")
+                tmp_path.write_text(payload, encoding="utf-8")
+                tmp_path.replace(path)
+            stat = path.stat()
+            self._read_cache[str(path)] = (stat.st_mtime, stat.st_size, [dict(row) for row in rows])
+            return result
+
     def create_approval(self, record: ApprovalRecord) -> ApprovalRecord:
-        rows = self._read_list(self.approvals_file)
-        rows.append(record.model_dump(mode="json"))
-        self._write_list(self.approvals_file, rows)
+        self._update_list(self.approvals_file, lambda rows: rows.append(record.model_dump(mode="json")))
         self.log_audit("approval.request", "pending", record.summary, {"approval_id": record.id, "action": record.action})
         return record
 
@@ -112,23 +129,23 @@ class JsonStore:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval not found")
 
     def set_approval_status(self, approval_id: str, target: ApprovalStatus, reason: str | None = None) -> ApprovalRecord:
-        rows = self._read_list(self.approvals_file)
-        for index, row in enumerate(rows):
-            if row.get("id") == approval_id:
-                record = ApprovalRecord.model_validate(row)
-                record.status = target
-                record.decided_at = datetime.now(timezone.utc).isoformat()
-                record.reason = reason
-                rows[index] = record.model_dump(mode="json")
-                self._write_list(self.approvals_file, rows)
-                self.log_audit("approval." + target.value, target.value, record.summary, {"approval_id": record.id, "action": record.action})
-                return record
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval not found")
+        def update(rows):
+            for index, row in enumerate(rows):
+                if row.get("id") == approval_id:
+                    record = ApprovalRecord.model_validate(row)
+                    record.status = target
+                    record.decided_at = datetime.now(timezone.utc).isoformat()
+                    record.reason = reason
+                    rows[index] = record.model_dump(mode="json")
+                    return record
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Approval not found")
+
+        record = self._update_list(self.approvals_file, update)
+        self.log_audit("approval." + target.value, target.value, record.summary, {"approval_id": record.id, "action": record.action})
+        return record
 
     def create_job(self, job: JobRecord) -> JobRecord:
-        rows = self._read_list(self.jobs_file)
-        rows.append(job.model_dump(mode="json"))
-        self._write_list(self.jobs_file, rows)
+        self._update_list(self.jobs_file, lambda rows: rows.append(job.model_dump(mode="json")))
         self.log_audit("job.create", job.status.value, job.job_type, {"job_id": job.id})
         return job
 
@@ -164,14 +181,16 @@ class JsonStore:
                 time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
     def update_job(self, job: JobRecord) -> JobRecord:
-        rows = self._read_list(self.jobs_file)
-        for index, row in enumerate(rows):
-            if row.get("id") == job.id:
-                rows[index] = job.model_dump(mode="json")
-                self._write_list(self.jobs_file, rows)
-                self.log_audit("job.update", job.status.value, job.job_type, {"job_id": job.id})
-                return job
-        return self.create_job(job)
+        def update(rows):
+            for index, row in enumerate(rows):
+                if row.get("id") == job.id:
+                    rows[index] = job.model_dump(mode="json")
+                    return
+            rows.append(job.model_dump(mode="json"))
+
+        self._update_list(self.jobs_file, update)
+        self.log_audit("job.update", job.status.value, job.job_type, {"job_id": job.id})
+        return job
 
     def add_step(self, job: JobRecord, step: JobStep) -> JobRecord:
         step.finished_at = step.finished_at or datetime.now(timezone.utc).isoformat()
@@ -186,9 +205,12 @@ class JsonStore:
 
     def log_audit(self, action: str, status_: str, summary: str = "", metadata: dict[str, Any] | None = None) -> AuditEvent:
         event = AuditEvent(action=action, status=status_, summary=summary, metadata=metadata or {})
-        rows = self._read_list(self.audit_file)
-        rows.append(event.model_dump(mode="json"))
-        self._write_list(self.audit_file, rows[-2000:])
+        def update(rows):
+            rows.append(event.model_dump(mode="json"))
+            if len(rows) > 2000:
+                del rows[:-2000]
+
+        self._update_list(self.audit_file, update)
         return event
 
     def list_audit(self, limit: int = 200) -> list[AuditEvent]:
@@ -276,17 +298,21 @@ class JsonStore:
         from datetime import datetime, timezone
 
         def _write(path: Path) -> dict:
-            current: dict = {}
-            if path.exists():
-                try:
-                    current = json.loads(path.read_text(encoding="utf-8"))
-                except Exception:
-                    current = {}
-            current.update(state)
-            current["updated_at"] = datetime.now(timezone.utc).isoformat()
-            with self._file_lock(path):
-                path.write_text(json.dumps(current, indent=2), encoding="utf-8")
-            return current
+            with self._lock:
+                with self._file_lock(path):
+                    current: dict = {}
+                    if path.exists():
+                        try:
+                            raw = json.loads(path.read_text(encoding="utf-8"))
+                            current = raw if isinstance(raw, dict) else {}
+                        except (OSError, json.JSONDecodeError):
+                            current = {}
+                    current.update(state)
+                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    tmp_path = path.with_suffix(path.suffix + ".tmp")
+                    tmp_path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+                    tmp_path.replace(path)
+                    return current
 
         if effective_client:
             return _write(self._session_file_for_client(effective_client))

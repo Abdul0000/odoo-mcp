@@ -192,7 +192,7 @@ class CodingTaskPlanResult(BaseModel):
 
 
 class OdooCodeFileChange(BaseModel):
-    """A single file change for the Grok-safe composite Odoo workflow.
+    """A single file change for the provider-safe composite Odoo workflow.
 
     Exactly one of `content` or `search`+`replace` should be provided.  The
     connector reads custom + core context, applies the edit, verifies, and starts
@@ -207,9 +207,9 @@ class OdooCodeFileChange(BaseModel):
 
 
 class OdooCodeChangeRequest(BaseModel):
-    """Grok-safe high-level Odoo code-change workflow.
+    """Provider-safe high-level Odoo code-change workflow.
 
-    This is intentionally composite: Grok should call this instead of manually
+    This is intentionally composite: remote clients should call this instead of manually
     orchestrating repo.read/write, scope_advice, verify, safe_deploy, and jobs.
     The server enforces the uploaded v15 flow internally: custom read +
     /home/odoo/src/odoo/addons source read first, enterprise fallback only if
@@ -1001,7 +1001,7 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     odoo_module_deploy_timeout_seconds: int = Field(default=600, ge=0, le=900, description="Maximum time for the internal Odoo module install/upgrade job to finish before returning a non-success resumable state")
     odoo_module_deploy_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for the internal Odoo module install/upgrade job")
     max_fix_cycles: int = Field(default=5, ge=1, le=5, description="Maximum safe-deploy upgrade/fix retry cycles before failing with upgrade_failed_after_retries")
-    expected_registry_fields: dict[str, list[str]] = Field(default_factory=dict, description="Optional live registry fields to verify after upgrade, e.g. {'purchase.order': ['grok_y']}. If omitted, safe_deploy infers Python fields from changed addon files.")
+    expected_registry_fields: dict[str, list[str]] = Field(default_factory=dict, description="Optional live registry fields to verify after upgrade, e.g. {'purchase.order': ['custom_reference']}. If omitted, safe_deploy infers Python fields from changed addon files.")
     force_new_deploy: bool = Field(
         default=False,
         description=(

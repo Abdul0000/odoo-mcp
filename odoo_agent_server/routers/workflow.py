@@ -780,7 +780,13 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
         )
 
     if payload.wait_for_result:
-        waited = _wait_workflow_job_until_terminal(store, job.id, payload.poll_interval_seconds, payload.wait_timeout_seconds)
+        waited = await asyncio.to_thread(
+            _wait_workflow_job_until_terminal,
+            store,
+            job.id,
+            payload.poll_interval_seconds,
+            payload.wait_timeout_seconds,
+        )
         if waited.status in {JobStatus.queued, JobStatus.running}:
             return WorkflowReport(
                 status="running",

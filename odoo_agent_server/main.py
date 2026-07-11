@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+from .config import settings
 
 try:
     from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -48,6 +52,9 @@ from .routers.workflow import router as workflow_router
 from .services.prompt_service import load_mcp_system_prompt, load_client_check_system_prompt
 
 limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
+
+if os.getenv("RENDER", "").lower() in {"1", "true", "yes"} and settings.api_token == "change-me":
+    raise RuntimeError("ODOO_AGENT_API_TOKEN must be set to a non-default secret on Render")
 
 app = FastAPI(
     title="Odoo MCP Agent Connector",

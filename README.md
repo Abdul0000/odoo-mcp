@@ -496,10 +496,14 @@ Recommended environment:
 
 ```env
 WORKSPACE_ROOT=/workspace/repos
+ODOO_AGENT_API_TOKEN=<strong-random-secret>
+ODOO_AGENT_BACKGROUND_MAX_WORKERS=1
 TARGET_GIT_REPO=git@github.com:Abdul0000/test_18.git
 TARGET_GIT_BRANCH=feature_branch
 TARGET_PROJECT_PATH=/workspace/repos/odoo_project
 GIT_SSH_KEY_PATH=/tmp/keys/github_key
 ```
+
+`ODOO_AGENT_OPERATION_GUARD_ENABLED=false` preserves the current MCP flow. Enable it only after validating the stricter duplicate/phase guard with your clients.
 
 For SSH GitHub repos, either set `GIT_SSH_COMMAND` yourself or set `GIT_SSH_KEY_PATH`; `repo.prepare` will build a safe `GIT_SSH_COMMAND` using that key.

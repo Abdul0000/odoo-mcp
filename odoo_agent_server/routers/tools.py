@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ast
 import difflib
 import json
@@ -231,9 +232,9 @@ _TOOL_DESCRIPTORS = [
         title="Get coding workflow plan", description="Return the repo-first coding workflow guidance for MCP agents", read_only=True),
     ToolDescriptor(
         name="workflow.odoo_code_change",
-        title="Grok-safe Odoo code change",
+        title="Provider-safe Odoo code change",
         description=(
-            "Single high-level Grok-safe coding workflow. Use this instead of manually calling repo.read/write, "
+            "Single high-level provider-safe coding workflow. Use this instead of manually calling repo.read/write, "
             "scope_advice, verify, git.push, or module_deploy. It enforces the v15 flow internally: "
             "read custom module, scope_advice, read /home/odoo/src/odoo/addons related source first with enterprise fallback, "
             "apply provided edits, git.diff, qa.self_run, verify_against_core, then workflow.safe_deploy_module and jobs.get polling. "
@@ -2249,7 +2250,12 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "jobs.get":
         req = JobGetRequest.model_validate(args)
         if req.wait_for_result:
-            return JsonStore().wait_job(req.job_id, req.wait_timeout_seconds, req.poll_interval_seconds)
+            return await asyncio.to_thread(
+                JsonStore().wait_job,
+                req.job_id,
+                req.wait_timeout_seconds,
+                req.poll_interval_seconds,
+            )
         return JsonStore().get_job(req.job_id)
     if name == "audit.list":
         req = AuditListRequest.model_validate(args)

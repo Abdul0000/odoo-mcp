@@ -120,7 +120,7 @@ def _provider_safe_next_calls(value: Any) -> Any:
     return out
 
 
-def _normalize_chatgpt_structured(value: Any, tool_name: str) -> dict[str, Any]:
+def _normalize_remote_structured(value: Any, tool_name: str) -> dict[str, Any]:
     """Keep strict compatibility-profile MCP payloads bounded, with full data available by artifact.
 
     The visible content text was already capped, but several clients also load
@@ -358,8 +358,8 @@ def _tools_for_profile(profile: str | None = None) -> list[Any]:
     return [tool for tool in tools if tool.name in _PROVIDER_TOOL_NAMES]
 
 
-def _claude_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Return a small Claude-safe JSON schema.
+def _remote_compatible_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Return a compact JSON schema accepted by strict remote MCP clients.
 
     Claude's remote-MCP frontend can fail the message stream while loading tools
     when schemas contain lots of generated Pydantic metadata or nested $defs. This
@@ -401,6 +401,12 @@ def _claude_schema(schema: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+# Backward-compatible internal aliases for integrations/tests that imported the
+# former vendor-specific helper names.
+_normalize_chatgpt_structured = _normalize_remote_structured
+_claude_schema = _remote_compatible_schema
+
+
 def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
     title = getattr(tool, "title", None) or _humanize_tool_name(tool.name)
     if profile in {"provider", "claude", "chatgpt", "grok", "qwen"}:
@@ -411,7 +417,7 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
         item = {
             "name": _mcp_safe_tool_name(tool.name),
             "description": str(tool.description)[:900],
-            "inputSchema": _claude_schema(tool_input_schema(tool.name)),
+            "inputSchema": _remote_compatible_schema(tool_input_schema(tool.name)),
             "annotations": {
                 "readOnlyHint": bool(tool.read_only),
                 "destructiveHint": bool(tool.requires_approval),
@@ -552,7 +558,7 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                     },
                 )
             arguments = _arguments_for_profile(internal_name, arguments, profile)
-            if False and profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and isinstance(arguments, dict):
+            if settings.mcp_operation_guard_enabled and profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and isinstance(arguments, dict):
                 op_guard = McpOperationGuardService()
                 arguments = op_guard.canonicalize_arguments(internal_name, arguments)
                 guarded = op_guard.before_tool_call(internal_name, arguments)
@@ -570,12 +576,12 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
             structured = _to_structured_content(result, tool_name=internal_name)
             if profile in {"provider", "claude", "chatgpt", "grok", "qwen"}:
                 structured = _provider_safe_next_calls(structured)
-            if False and profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and isinstance(arguments, dict):
+            if settings.mcp_operation_guard_enabled and profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and isinstance(arguments, dict):
                 op_guard = McpOperationGuardService()
                 op_guard.after_tool_call(internal_name, arguments, structured if isinstance(structured, dict) else {"result": structured})
                 structured = op_guard.annotate_result(internal_name, arguments, structured if isinstance(structured, dict) else {"result": structured})
             if profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and internal_name != "artifacts.read":
-                structured = _normalize_chatgpt_structured(structured, internal_name)
+                structured = _normalize_remote_structured(structured, internal_name)
                 structured = _provider_safe_next_calls(structured)
             text = json.dumps(structured, ensure_ascii=False, default=str)
             # Context-bloat guard: in long sessions, oversized tool outputs (large diffs,
