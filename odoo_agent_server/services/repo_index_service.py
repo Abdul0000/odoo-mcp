@@ -23,6 +23,7 @@ from ..schemas import RepoIndexModule, RepoIndexResult
 from .path_service import resolve_allowed_path
 
 _TEMPLATE_RE = re.compile(r't-name=["\']([^"\']+)["\']')
+_JS_TEMPLATE_RE = re.compile(r'(?:static\s+template\s*=|\.template\s*=)\s*["\']([^"\']+)["\']')
 _SKIP_DIRS = {".git", "__pycache__", ".venv", "venv", "node_modules", ".mypy_cache", ".pytest_cache", "dist", "build"}
 _INTERESTING_SUFFIXES = {".py", ".xml", ".js", ".scss"}
 
@@ -84,18 +85,32 @@ class RepoIndexService:
             if manifest.exists():
                 add(manifest)
             if path.suffix == ".js":
-                # Same-module XML templates are the most useful companion for
-                # static template / Component.template checks. Cap keeps it fast.
-                for candidate in self._iter_interesting(module_root, suffix=".xml"):
-                    add(candidate)
-                    if len(ordered) >= len(written_files) + max_related:
-                        break
+                # Add only XML files that actually define a template referenced
+                # by this JS file.  Adding every XML file in the module caused
+                # unrelated legacy/server QWeb templates to block small JS fixes.
+                js_text = path.read_text(encoding="utf-8", errors="ignore")
+                referenced_templates = set(_JS_TEMPLATE_RE.findall(js_text))
+                if referenced_templates:
+                    for candidate in self._iter_interesting(module_root, suffix=".xml"):
+                        xml_text = candidate.read_text(encoding="utf-8", errors="ignore")
+                        defined_templates = set(_TEMPLATE_RE.findall(xml_text))
+                        if referenced_templates & defined_templates:
+                            add(candidate)
+                        if len(ordered) >= len(written_files) + max_related:
+                            break
             elif path.suffix == ".xml":
-                # XML template changes often need related JS component files.
-                for candidate in self._iter_interesting(module_root, suffix=".js"):
-                    add(candidate)
-                    if len(ordered) >= len(written_files) + max_related:
-                        break
+                # Add only JS files that explicitly reference templates defined
+                # in this XML file, rather than every JS file in the module.
+                xml_text = path.read_text(encoding="utf-8", errors="ignore")
+                defined_templates = set(_TEMPLATE_RE.findall(xml_text))
+                if defined_templates:
+                    for candidate in self._iter_interesting(module_root, suffix=".js"):
+                        js_text = candidate.read_text(encoding="utf-8", errors="ignore")
+                        referenced_templates = set(_JS_TEMPLATE_RE.findall(js_text))
+                        if defined_templates & referenced_templates:
+                            add(candidate)
+                        if len(ordered) >= len(written_files) + max_related:
+                            break
         return ordered
 
     def _build(self, project: Path, max_files: int) -> RepoIndexResult:
