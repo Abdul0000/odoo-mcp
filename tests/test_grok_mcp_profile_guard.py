@@ -53,29 +53,29 @@ def test_grok_profile_exposes_only_curated_non_bypass_tools():
 def test_grok_operation_guard_blocks_duplicate_scope_and_backwards_reads(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
-    project = tmp_path / "SproutBoxes"
-    module = project / "website_thumbnail_form"
+    project = tmp_path / "ClientA"
+    module = project / "sample_website_module"
     module.mkdir(parents=True)
     (module / "__manifest__.py").write_text("{'name': 'x'}\n", encoding="utf-8")
 
     svc = McpOperationGuardService()
-    base = {"client_name": "SproutBoxes", "project_path": str(project), "module_name": "website_thumbnail_form"}
+    base = {"client_name": "ClientA", "project_path": str(project), "module_name": "sample_website_module"}
 
     assert svc.before_tool_call("workflow.start_session", base) is None
     svc.after_tool_call("workflow.start_session", base, {"status": "ok"})
 
-    assert svc.before_tool_call("workflow.scope_advice", base | {"custom_module_name": "website_thumbnail_form"}) is None
-    svc.after_tool_call("workflow.scope_advice", base | {"custom_module_name": "website_thumbnail_form"}, {"status": "ok"})
-    duplicate = svc.before_tool_call("workflow.scope_advice", base | {"custom_module_name": "website_thumbnail_form"})
+    assert svc.before_tool_call("workflow.scope_advice", base | {"custom_module_name": "sample_website_module"}) is None
+    svc.after_tool_call("workflow.scope_advice", base | {"custom_module_name": "sample_website_module"}, {"status": "ok"})
+    duplicate = svc.before_tool_call("workflow.scope_advice", base | {"custom_module_name": "sample_website_module"})
     assert duplicate is not None
     assert duplicate["status"] == "duplicate_guard"
     assert duplicate["success_allowed"] is False
 
-    write_args = base | {"relative_path": "website_thumbnail_form/static/src/scss/bundle_builder.scss"}
+    write_args = base | {"relative_path": "sample_website_module/static/src/scss/page_widget.scss"}
     assert svc.before_tool_call("repo.write", write_args) is None
     svc.after_tool_call("repo.write", write_args, {"status": "ok"})
 
-    backwards = svc.before_tool_call("repo.read", base | {"relative_path": "website_thumbnail_form/static/src/scss/bundle_builder.scss"})
+    backwards = svc.before_tool_call("repo.read", base | {"relative_path": "sample_website_module/static/src/scss/page_widget.scss"})
     assert backwards is not None
     assert backwards["status"] == "phase_guard"
     assert backwards["next_call"]["tool"] == "git.diff"

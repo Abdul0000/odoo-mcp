@@ -5,30 +5,30 @@ from odoo_agent_server.routers.tools import _looks_like_frontend_code_change
 
 def test_product_word_does_not_trigger_pos():
     req = FrontendPatternPreflightRequest(
-        task_description="Fix product tax calculation in website bundle controller",
-        target_module_name="website_thumbnail_form",
-        custom_file_paths=["/repo/website_thumbnail_form/controllers/main.py"],
-        planned_file_paths=["website_thumbnail_form/controllers/main.py"],
+        task_description="Update backend controller behavior",
+        target_module_name="sample_website_module",
+        custom_file_paths=["/repo/sample_website_module/controllers/main.py"],
+        planned_file_paths=["sample_website_module/controllers/main.py"],
     )
     assert FrontendPatternService._detect_area(req) == "website"
 
 
 def test_python_website_controller_skips_frontend_preflight():
     payload = OdooCodeChangeRequest(
-        module_name="website_thumbnail_form",
-        task_description="Fix website bundle tax calculation in controller",
+        module_name="sample_website_module",
+        task_description="Update website controller logic",
         task_type="controller",
-        target_files=["website_thumbnail_form/controllers/main.py"],
+        target_files=["sample_website_module/controllers/main.py"],
     )
     assert not _looks_like_frontend_code_change(payload, payload.target_files)
 
 
 def test_real_frontend_file_still_triggers_preflight():
     payload = OdooCodeChangeRequest(
-        module_name="website_thumbnail_form",
-        task_description="Fix bundle page behavior",
+        module_name="sample_website_module",
+        task_description="Update public page behavior",
         task_type="controller",
-        target_files=["website_thumbnail_form/static/src/js/bundle_builder.js"],
+        target_files=["sample_website_module/static/src/js/page_widget.js"],
     )
     assert _looks_like_frontend_code_change(payload, payload.target_files)
 

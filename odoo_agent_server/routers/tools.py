@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import difflib
-import json
 import re
 import time
 from pathlib import Path
@@ -1111,24 +1110,9 @@ def _infer_code_change_search_patterns(payload: OdooCodeChangeRequest) -> list[s
     # works for labels, method names, fields, XML ids, routes, CSS selectors, etc.
     for raw in _change_request_values(payload.change_request):
         _append_unique(patterns, raw)
-    text = payload.task_description.lower()
-    # Add small, deterministic hints for common website/cart/report tasks without
-    # inventing code or making the connector task-specific.
-    for phrase in [
-        "prices are tax inclusive",
-        "prices are inclusive",
-        "tax inclusive",
-        "checkout",
-        "cart",
-        "bundle",
-        "report",
-        "wizard",
-        "pos",
-        "preparation",
-        "receipt",
-    ]:
-        if phrase in text:
-            _append_unique(patterns, phrase)
+    # Keep automatic search derivation generic. Domain-specific terms must come
+    # from explicit target hints, search patterns, file paths, or structured
+    # change_request values supplied by the caller.
     return patterns[:10]
 
 
@@ -1139,7 +1123,7 @@ def _file_preview(content: str, max_chars: int = 6000) -> str:
 
 
 def _module_hint_tokens(value: str) -> set[str]:
-    stop = {"module", "addon", "custom", "sproutboxes", "sprout", "box", "boxes", "odoo", "the", "form"}
+    stop = {"module", "addon", "custom", "odoo", "the", "form"}
     return {part for part in re.split(r"[^a-z0-9]+", value.lower()) if len(part) >= 3 and part not in stop}
 
 
@@ -1150,9 +1134,9 @@ def _normalise_module_hint(value: str) -> str:
 def _resolve_fuzzy_module(payload: OdooCodeChangeRequest, modules: list[Any]) -> tuple[Any | None, dict[str, Any]]:
     """Resolve a human module hint to an actual custom module.
 
-    Provider agents often receive phrases like ``sproutboxes thumbnail form`` while
-    the real technical module is ``website_thumbnail_form``.  This function keeps
-    path safety by selecting from the already-discovered module list only.
+    Human-facing module hints may differ from technical module names.
+    This function keeps path safety by selecting only from the discovered
+    custom-module list.
     """
     requested = str(payload.module_name or "").strip()
     exact = next((item for item in modules if item.module_name == requested), None)

@@ -222,7 +222,7 @@ class OdooCodeChangeRequest(BaseModel):
     search_patterns: list[str] = Field(default_factory=list, max_length=10, description="Optional search terms to locate target files when writes are not yet provided")
     # Generic task-routing fields.  These are optional shortcuts; explicit writes[] remain
     # the universal path for any Odoo task (Python, XML, QWeb, JS/OWL/POS, SCSS, CSV, data).
-    module_hint: str | None = Field(default=None, max_length=200, description="Optional human module hint used by the fuzzy resolver, e.g. 'thumbnail form'.")
+    module_hint: str | None = Field(default=None, max_length=200, description="Optional human module hint used by the fuzzy resolver, e.g. 'customer portal'.")
     task_type: str = Field(default="auto", max_length=80, description="Generic task type hint: auto, python_model, xml_view, qweb_template, js_owl, pos_owl, controller, security_csv, manifest, data_xml, scss_css, text_replace, style, etc.")
     intent: str | None = Field(default=None, max_length=160, description="Optional generic intent such as add_field, fix_bug, add_button, change_style, refactor, optimize, add_security, update_report, or modify_existing_feature.")
     target_hint: str | None = Field(default=None, max_length=500, description="Optional generic target hint for search/autopatch, such as a visible label, method, class, XML id, field, route, or file clue.")

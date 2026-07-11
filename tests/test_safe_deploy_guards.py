@@ -2128,15 +2128,15 @@ def test_safe_deploy_wait_for_result_response_never_uses_progress_wording(tmp_pa
 
 def test_frontend_ui_files_require_browser_proof_for_visible_claims():
     files = workflow._frontend_ui_files_requiring_live_proof(
-        "website_thumbnail_form",
+        "sample_website_module",
         [
-            "website_thumbnail_form/views/website_sale_tax_note_templates.xml",
-            "website_thumbnail_form/static/src/scss/bundle_builder.scss",
-            "website_thumbnail_form/models/order.py",
-            "website_thumbnail_form/security/ir.model.access.csv",
+            "sample_website_module/views/website_templates.xml",
+            "sample_website_module/static/src/scss/page_widget.scss",
+            "sample_website_module/models/order.py",
+            "sample_website_module/security/ir.model.access.csv",
         ],
     )
     assert files == [
-        "website_thumbnail_form/views/website_sale_tax_note_templates.xml",
-        "website_thumbnail_form/static/src/scss/bundle_builder.scss",
+        "sample_website_module/views/website_templates.xml",
+        "sample_website_module/static/src/scss/page_widget.scss",
     ]

@@ -7,12 +7,12 @@ from odoo_agent_server.config import settings
 
 def test_jsonrpc_respects_per_client_ssl_verify_false(monkeypatch):
     client = ResolvedClient(
-        name="SproutBoxes",
-        repo="https://github.com/SproutBoxes/SproutBoxes.git",
+        name="ClientA",
+        repo="https://github.com/ClientA/ClientA.git",
         branch="22-06-2026",
-        path="/workspace/repos/SproutBoxes",
-        odoo_url="https://sproutboxes.dev.odoo.com",
-        odoo_db="sproutboxes-db",
+        path="/workspace/repos/ClientA",
+        odoo_url="https://client-a.dev.odoo.com",
+        odoo_db="client-a-db",
         odoo_login="admin@example.com",
         odoo_password="secret",
         odoo_verify_ssl=False,
@@ -24,12 +24,12 @@ def test_jsonrpc_respects_per_client_ssl_verify_false(monkeypatch):
 def test_jsonrpc_defaults_to_global_ssl_setting(monkeypatch):
     monkeypatch.setattr(settings, "odoo_https_verify_ssl", True)
     client = ResolvedClient(
-        name="SproutBoxes",
-        repo="https://github.com/SproutBoxes/SproutBoxes.git",
+        name="ClientA",
+        repo="https://github.com/ClientA/ClientA.git",
         branch="22-06-2026",
-        path="/workspace/repos/SproutBoxes",
-        odoo_url="https://sproutboxes.dev.odoo.com",
-        odoo_db="sproutboxes-db",
+        path="/workspace/repos/ClientA",
+        odoo_url="https://client-a.dev.odoo.com",
+        odoo_db="client-a-db",
         odoo_login="admin@example.com",
         odoo_password="secret",
     )
