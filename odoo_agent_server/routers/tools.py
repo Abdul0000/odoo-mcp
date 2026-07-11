@@ -105,7 +105,12 @@ from ..services.repo_service import RepoService
 from ..services.prewrite_gate_service import PreWriteGateService
 from ..services.path_service import resolve_allowed_path
 from ..services.syntax_verifier_service import SyntaxVerifierService
-from ..services.workflow_guard_service import mark_stale_safe_deploy_running_job
+from ..services.workflow_guard_service import (
+    code_change_issue_fingerprint,
+    mark_stale_safe_deploy_running_job,
+    record_code_change_deploy_attempt,
+    repeated_failure_guard_status,
+)
 from .qa import self_run
 from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_write_many_fast_safe, repo_write_many_smart, repo_apply_patch, repo_apply_patch_atomic, repo_clean_pyc, repo_prepare, repo_custom_modules
 from .git import git_commit, git_push
@@ -1567,6 +1572,14 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "success_allowed": False,
         }
     effective_module_name = module.module_name
+    issue_fingerprint = code_change_issue_fingerprint(
+        project_path=project_path,
+        module_name=effective_module_name,
+        task_description=payload.task_description,
+        task_type=_normalized_task_type(payload),
+        intent=payload.intent,
+        target_hint=_target_hint(payload),
+    )
     module_dir = project / module.path
     manifest_rel = module.manifest_path
     manifest_abs = project / manifest_rel
@@ -1741,6 +1754,45 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         cache = dict(list(cache.items())[-20:])
     JsonStore().save_session_state({"code_change_evidence": cache}, client_name=client_name)
 
+    failure_guard = repeated_failure_guard_status(
+        client_name=client_name,
+        fingerprint=issue_fingerprint,
+        task_description=payload.task_description,
+        investigation_evidence=payload.investigation_evidence,
+        functional_verification_passed=payload.functional_verification_passed,
+    )
+    if failure_guard.get("blocked"):
+        return {
+            "status": "investigation_required",
+            "message": (
+                "The same user-visible issue remains after two technically successful attempts. "
+                "Further writes are blocked until the execution flow and runtime state are investigated."
+            ),
+            "client_name": client_name,
+            "project_path": project_path,
+            "module_name": effective_module_name,
+            "steps": steps,
+            "failure_guard": failure_guard,
+            "investigation_read_plan": {
+                "custom_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
+                "native_files": [r.get("path") for r in core_reads if r.get("status") == "read"],
+                "selection_rule": (
+                    "Select additional exact files only from inheritance, imports, dependencies, "
+                    "field definitions, method calls, templates, and runtime evidence. "
+                    "Do not scan unrelated source trees."
+                ),
+                "required_evidence": [
+                    "entry point to final output flow",
+                    "framework-owned methods and computed values involved",
+                    "expected runtime state compared with actual runtime state",
+                    "new evidence-based failing-point hypothesis",
+                ],
+            },
+            "success_allowed": False,
+            "completion_required": True,
+            "writes_blocked": True,
+        }
+
     writes_to_apply = list(payload.writes or generated_writes)
     if not writes_to_apply:
         # Persist unresolved implementation context so short follow-ups such as
@@ -1914,6 +1966,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "allowed_summary": "Code was written and verified, but not pushed/deployed/upgraded. Fix the deploy validation blocker, then rerun with auto_deploy=true.",
         }
     job_id = deploy_struct.get("job_id") if isinstance(deploy_struct, dict) else None
+    record_code_change_deploy_attempt(client_name=client_name, fingerprint=issue_fingerprint, job_id=job_id)
     frontend_touched = any(str(p).endswith((".xml", ".scss", ".css", ".js")) for p in written_files_abs)
     return {
         "status": "deploy_started" if deploy_struct.get("status") in {"running", "already_running", "already_in_progress", "resumable_existing_job"} else deploy_struct.get("status", "deploy_started"),

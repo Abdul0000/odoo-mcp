@@ -240,6 +240,8 @@ class OdooCodeChangeRequest(BaseModel):
     auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
     deploy_mode: Literal["auto", "always_upgrade", "source_only"] = Field(default="auto", description="Automatic impact classification by default. always_upgrade forces -u; source_only is allowed only for verified non-structural changes.")
     max_search_matches: int = Field(default=20, ge=1, le=100, description="Max candidate matches returned during inspect mode")
+    investigation_evidence: list[str] = Field(default_factory=list, max_length=50, description="Generic evidence gathered after repeated functional failure. Non-empty evidence unlocks a blocked follow-up write.")
+    functional_verification_passed: bool = Field(default=False, description="Set true only when the user-visible behavior was verified; resets repeated-failure attempt history for this issue.")
 
     @field_validator("module_name")
     @classmethod

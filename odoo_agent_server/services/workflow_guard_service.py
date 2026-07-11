@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -302,3 +304,103 @@ def safe_deploy_shell_block(action: str, *, module_name: str | None = None, proj
             result=payload,
         )
     return None
+
+
+_REPEATED_FAILURE_MARKERS = re.compile(
+    r"\b(still|again|same issue|same problem|not fixed|not resolved|persists?|continues?|remaining)\b",
+    re.IGNORECASE,
+)
+
+
+def code_change_issue_fingerprint(
+    *,
+    project_path: str,
+    module_name: str,
+    task_description: str,
+    task_type: str | None = None,
+    intent: str | None = None,
+    target_hint: str | None = None,
+) -> str:
+    """Build a stable, generic issue key without task- or module-specific rules."""
+    anchor = (target_hint or "").strip().lower()
+    if not anchor:
+        anchor = _REPEATED_FAILURE_MARKERS.sub(" ", task_description or "")
+        anchor = re.sub(r"[^a-z0-9_.-]+", " ", anchor.lower()).strip()[:500]
+    payload = "|".join((
+        str(Path(project_path).expanduser()),
+        module_name.strip().lower(),
+        (task_type or "auto").strip().lower(),
+        (intent or "").strip().lower(),
+        anchor,
+    ))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def repeated_failure_guard_status(
+    *,
+    client_name: str | None,
+    fingerprint: str,
+    task_description: str,
+    investigation_evidence: list[str] | None = None,
+    functional_verification_passed: bool = False,
+) -> dict[str, Any]:
+    """Evaluate the generic two-attempt escalation guard.
+
+    Existing workflows are unchanged unless the request explicitly indicates
+    that the symptom persists and two prior deploy jobs for the same issue have
+    completed successfully without functional verification.
+    """
+    store = JsonStore()
+    state = store.load_session_state(client_name)
+    guard_state = dict(state.get("code_change_failure_guard") or {})
+    entry = dict(guard_state.get(fingerprint) or {})
+
+    if functional_verification_passed:
+        guard_state.pop(fingerprint, None)
+        store.save_session_state({"code_change_failure_guard": guard_state}, client_name=client_name)
+        return {"blocked": False, "passed_attempts": 0, "reset": True}
+
+    passed_attempts = 0
+    valid_job_ids: list[str] = []
+    for job_id in entry.get("job_ids") or []:
+        try:
+            job = store.get_job(str(job_id))
+        except Exception:
+            continue
+        result = job.result if isinstance(job.result, dict) else {}
+        if job.status == JobStatus.passed and bool(result.get("deploy_confirmed")):
+            passed_attempts += 1
+            valid_job_ids.append(str(job_id))
+        elif job.status in _ACTIVE_JOB_STATUSES:
+            valid_job_ids.append(str(job_id))
+
+    entry["job_ids"] = valid_job_ids[-5:]
+    guard_state[fingerprint] = entry
+    store.save_session_state({"code_change_failure_guard": guard_state}, client_name=client_name)
+
+    recurrence_reported = bool(_REPEATED_FAILURE_MARKERS.search(task_description or ""))
+    evidence = [str(item).strip() for item in (investigation_evidence or []) if str(item).strip()]
+    blocked = recurrence_reported and passed_attempts >= 2 and not evidence
+    return {
+        "blocked": blocked,
+        "passed_attempts": passed_attempts,
+        "recurrence_reported": recurrence_reported,
+        "investigation_evidence_present": bool(evidence),
+    }
+
+
+def record_code_change_deploy_attempt(
+    *, client_name: str | None, fingerprint: str, job_id: str | None
+) -> None:
+    if not job_id:
+        return
+    store = JsonStore()
+    state = store.load_session_state(client_name)
+    guard_state = dict(state.get("code_change_failure_guard") or {})
+    entry = dict(guard_state.get(fingerprint) or {})
+    job_ids = [str(value) for value in (entry.get("job_ids") or []) if value]
+    if job_id not in job_ids:
+        job_ids.append(job_id)
+    entry["job_ids"] = job_ids[-5:]
+    guard_state[fingerprint] = entry
+    store.save_session_state({"code_change_failure_guard": guard_state}, client_name=client_name)

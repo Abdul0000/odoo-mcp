@@ -53,6 +53,20 @@ Agent reads real source → gets correct patterns for that version automatically
 
 ---
 
+
+## REPEATED FAILURE ESCALATION
+
+If the same user-visible issue remains after one technically successful code-change attempts, stop further writes.
+
+Before another write:
+- reconstruct the complete execution flow from entry point to final output;
+- identify framework-owned methods, computed values, templates, and runtime records;
+- read exact related native source selected from inheritance, imports, dependencies, field definitions, method calls, and runtime evidence;
+- compare expected state with actual runtime state;
+- form a new evidence-based hypothesis and identify the failing point.
+
+Do not perform broad unrelated source scans. Deployment success is not functional verification.
+
 ## GOLDEN RULES
 
 1. NEVER call the same tool twice in a row with the same arguments — if it fails, diagnose first
