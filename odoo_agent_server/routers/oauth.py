@@ -129,13 +129,11 @@ def _authorize_redirect(params: dict[str, str], resource_default: str) -> Redire
     code_challenge_method = params.get("code_challenge_method")
     scope = params.get("scope") or settings.oauth_default_scope
     state = params.get("state")
-    resource = params.get("resource")
+    resource = params.get("resource") or resource_default
     if response_type != "code":
         raise HTTPException(status_code=400, detail="Only response_type=code is supported")
     if not client_id or not redirect_uri:
         raise HTTPException(status_code=400, detail="client_id and redirect_uri are required")
-    if not resource:
-        raise HTTPException(status_code=400, detail=f"resource is required and must equal {resource_default}")
     if resource.rstrip("/") != resource_default.rstrip("/"):
         raise HTTPException(status_code=400, detail="resource must identify this MCP endpoint")
     code = OAuthStore().create_code(
@@ -186,8 +184,6 @@ async def oauth_token(request: Request) -> dict[str, Any]:
     if not client_id:
         raise HTTPException(status_code=400, detail="client_id is required")
     if grant_type == "authorization_code":
-        if not body.get("resource"):
-            raise HTTPException(status_code=400, detail="resource is required for authorization_code token requests")
         return OAuthStore().exchange_code(
             code=body.get("code") or "",
             client_id=client_id,
@@ -197,8 +193,6 @@ async def oauth_token(request: Request) -> dict[str, Any]:
             resource=body.get("resource"),
         )
     if grant_type == "refresh_token":
-        if not body.get("resource"):
-            raise HTTPException(status_code=400, detail="resource is required for refresh_token requests")
         return OAuthStore().refresh_access_token(
             refresh_token=body.get("refresh_token") or "",
             client_id=client_id,

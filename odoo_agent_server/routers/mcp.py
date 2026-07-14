@@ -473,6 +473,8 @@ def _origin_allowed(request: Request) -> bool:
     candidate = _origin_value(origin)
     if candidate is None:
         return False
+    if "*" in settings.mcp_allowed_origins:
+        return True
     allowed = {
         _origin_value(value)
         for value in (settings.public_base_url, settings.oauth_issuer)

@@ -74,7 +74,6 @@ def test_dynamic_client_registration_pkce_authorization_code_and_mcp_access(tmp_
             "scope": "odoo.agent",
             "code_challenge": _challenge(verifier),
             "code_challenge_method": "S256",
-            "resource": "https://agent.example.com/mcp",
         },
         follow_redirects=False,
     )
@@ -92,7 +91,6 @@ def test_dynamic_client_registration_pkce_authorization_code_and_mcp_access(tmp_
             "redirect_uri": "https://chatgpt.com/connector_platform_oauth_redirect",
             "code": code,
             "code_verifier": verifier,
-            "resource": "https://agent.example.com/mcp",
         },
     )
     assert token.status_code == 200
@@ -109,7 +107,7 @@ def test_dynamic_client_registration_pkce_authorization_code_and_mcp_access(tmp_
 
     refreshed = client.post(
         "/oauth/token",
-        data={"grant_type": "refresh_token", "client_id": client_id, "refresh_token": refresh_token, "resource": "https://agent.example.com/mcp"},
+        data={"grant_type": "refresh_token", "client_id": client_id, "refresh_token": refresh_token},
     )
     assert refreshed.status_code == 200
     assert refreshed.json()["access_token"] != access_token
@@ -148,7 +146,7 @@ def test_dynamic_client_registration_pkce_authorization_code_and_mcp_access(tmp_
     assert sum(not isinstance(item, dict) for item in outcomes) == 1
 
 
-def test_oauth_requires_resource_on_authorize_and_token(tmp_path, monkeypatch):
+def test_oauth_defaults_missing_resource_to_own_mcp_and_rejects_wrong_resource(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     monkeypatch.setattr(settings, "oauth_auto_approve", True)
     client = TestClient(app, base_url="https://agent.example.com")
@@ -165,8 +163,23 @@ def test_oauth_requires_resource_on_authorize_and_token(tmp_path, monkeypatch):
         },
         follow_redirects=False,
     )
-    assert authorize.status_code == 400
-    assert "resource" in authorize.json()["detail"]
+    assert authorize.status_code == 302
+
+    wrong = client.get(
+        "/oauth/authorize",
+        params={
+            "response_type": "code",
+            "client_id": settings.oauth_static_client_id,
+            "redirect_uri": "https://chatgpt.com/connector_platform_oauth_redirect",
+            "scope": "odoo.agent",
+            "code_challenge": _challenge(verifier),
+            "code_challenge_method": "S256",
+            "resource": "https://other.example.com/mcp",
+        },
+        follow_redirects=False,
+    )
+    assert wrong.status_code == 400
+    assert "resource" in wrong.json()["detail"]
 
 
 def test_manual_consent_requires_connector_token(tmp_path, monkeypatch):

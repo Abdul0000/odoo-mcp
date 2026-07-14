@@ -126,6 +126,17 @@ def test_streamable_http_accepts_explicit_browser_origin(monkeypatch):
     assert response.status_code == 200
 
 
+def test_streamable_http_accepts_any_valid_browser_origin_with_wildcard(monkeypatch):
+    monkeypatch.setattr(settings, "mcp_allowed_origins_raw", "*")
+    client = TestClient(app)
+    response = client.post(
+        "/mcp",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        headers={**_headers(monkeypatch), "Origin": "https://any-client.example"},
+    )
+    assert response.status_code == 200
+
+
 def test_initialize_negotiates_supported_legacy_protocol(monkeypatch):
     client = TestClient(app)
     response = client.post(
