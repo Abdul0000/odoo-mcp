@@ -37,7 +37,6 @@ class Settings(BaseSettings):
 
     # OAuth 2.1 / MCP App authentication for generic and compatibility MCP clients.
     public_base_url: str | None = Field(default=None, alias="ODOO_AGENT_PUBLIC_BASE_URL")
-    mcp_allowed_origins_raw: str = Field(default="", alias="ODOO_AGENT_MCP_ALLOWED_ORIGINS")
     oauth_issuer: str | None = Field(default=None, alias="ODOO_AGENT_OAUTH_ISSUER")
     oauth_default_scope: str = Field(default="odoo.agent", alias="ODOO_AGENT_OAUTH_DEFAULT_SCOPE")
     oauth_auto_approve: bool = Field(default=False, alias="ODOO_AGENT_OAUTH_AUTO_APPROVE")
@@ -74,7 +73,6 @@ class Settings(BaseSettings):
     pattern_cache_dir: str | None = Field(default=None, alias="ODOO_AGENT_PATTERN_CACHE_DIR")
     repo_index_enabled: bool = Field(default=True, alias="ODOO_AGENT_REPO_INDEX_ENABLED")
     repo_index_cache_seconds: int = Field(default=3600, alias="ODOO_AGENT_REPO_INDEX_CACHE_SECONDS")
-    repo_prepare_cache_seconds: int = Field(default=300, ge=0, le=3600, alias="ODOO_AGENT_REPO_PREPARE_CACHE_SECONDS")
     verify_impact_aware_default: bool = Field(default=True, alias="ODOO_AGENT_VERIFY_IMPACT_AWARE_DEFAULT")
 
     # Best-effort deploy follow-through for raw git.push fallback paths.
@@ -84,18 +82,6 @@ class Settings(BaseSettings):
     # module-deploy job submitted to the same bounded executor.
     background_max_workers: int = Field(default=2, ge=1, le=4, alias="ODOO_AGENT_BACKGROUND_MAX_WORKERS")
     mcp_operation_guard_enabled: bool = Field(default=False, alias="ODOO_AGENT_OPERATION_GUARD_ENABLED")
-    client_validation_ttl_seconds: int = Field(
-        default=28800,
-        ge=300,
-        le=604800,
-        alias="ODOO_AGENT_CLIENT_VALIDATION_TTL_SECONDS",
-    )
-    provider_job_wait_max_seconds: int = Field(
-        default=20,
-        ge=1,
-        le=60,
-        alias="ODOO_AGENT_PROVIDER_JOB_WAIT_MAX_SECONDS",
-    )
 
     # Qwen URL-token fallback hardening. Qwen app may not pass headers, so the
     # server can mint a short-lived URL token that maps to the real API/OAuth token.
@@ -152,10 +138,6 @@ class Settings(BaseSettings):
     @property
     def oauth_allowed_redirect_uris(self) -> list[str]:
         return [item.strip() for item in self.oauth_allowed_redirect_uris_raw.split(",") if item.strip()]
-
-    @property
-    def mcp_allowed_origins(self) -> list[str]:
-        return [item.strip().rstrip("/") for item in self.mcp_allowed_origins_raw.split(",") if item.strip()]
 
     @property
     def state_path(self) -> Path:

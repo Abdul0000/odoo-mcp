@@ -809,10 +809,7 @@ def test_resume_job_active_job_returns_poll_instruction_without_replay(tmp_path,
     result = asyncio.run(tools._resume_job(ResumeJobRequest(job_id=job.id)))
 
     assert result["status"] == "active_job"
-    assert result["next_call"] == {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}}
-    assert result["current_step"] is None
-    assert result["elapsed_seconds"] >= 0
-    assert result["last_progress_at"] == job.created_at
+    assert result["next_call"] == {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
     assert JsonStore().get_job(job.id).status == JobStatus.running
 
 
@@ -855,7 +852,7 @@ def test_safe_deploy_wait_for_result_positive_timeout_returns_running(tmp_path, 
     )))
 
     assert result.status == "running"
-    assert result.summary["next_call"] == {"tool": "jobs.get", "arguments": {"job_id": result.job_id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}}
+    assert result.summary["next_call"] == {"tool": "jobs.get", "arguments": {"job_id": result.job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
 
 
 def test_safe_deploy_wait_loop_does_not_sleep_past_timeout(tmp_path, monkeypatch):
@@ -1350,34 +1347,6 @@ def test_safe_deploy_duplicate_call_returns_existing_running_job(tmp_path, monke
     assert second.summary["next_call"]["tool"] == "jobs.get"
     assert submit_calls == {"count": 1}
     assert len(JsonStore().list_jobs()) == 1
-
-
-def test_safe_deploy_retry_rejoins_existing_job_before_diff_or_lease_validation(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
-    project = tmp_path / "repo"
-    (project / "x_module").mkdir(parents=True)
-    change_id = "chg_" + "a" * 32
-    existing = JsonStore().create_job(JobRecord(
-        job_type="safe_deploy_module",
-        status=JobStatus.running,
-        request={"project_path": str(project), "module_name": "x_module", "change_id": change_id},
-    ))
-
-    def must_not_validate(*args, **kwargs):
-        raise AssertionError("retry inspected mutable prepared state instead of rejoining the existing job")
-
-    monkeypatch.setattr(workflow.HybridChangeService, "validate_for_deploy", must_not_validate)
-    monkeypatch.setattr(workflow.ClientGateService, "require_validated_client", must_not_validate)
-    result = asyncio.run(workflow.safe_deploy_module(SafeDeployModuleRequest(
-        change_id=change_id,
-        project_path=str(project),
-        module_name="x_module",
-        commit_message="Retry existing deploy",
-        wait_for_result=False,
-    )))
-
-    assert result.status == "already_in_progress"
-    assert result.job_id == existing.id
 
 
 def test_safe_deploy_resumable_failure_returns_existing_job_to_resume(tmp_path, monkeypatch):

@@ -305,17 +305,7 @@ Protected branches such as `main`, `master`, `production`, `prod`, and `live` al
 All operational REST APIs are also exposed as MCP-callable tools through `POST /mcp` using JSON-RPC `tools/list` and `tools/call`.
 Tool lists expose strict underscore names such as `qa_self_run`, `git_push`, and `odoo_module_deploy`; `tools/call` still accepts the older dotted aliases such as `qa.self_run` for compatibility.
 
-The full/admin MCP surface remains backward compatible; provider endpoints expose the guarded hybrid subset described below.
-
-### Fast-resume hybrid workflow
-
-Provider MCP clients use the same guarded hybrid flow:
-
-`workflow.resume_context → workflow.intent_plan (when needed) → workflow.prepare_change_context → repo.patch_change → git.diff → workflow.safe_deploy_module → jobs.get`
-
-The model prepares exact edits and applies them through a `change_id`-restricted smart batch patch. The connector still owns mandatory custom/core evidence, QA, pre-push verification, commit, push, Odoo.sh deployed-SHA/source confirmation, module upgrade, and final proof. Direct provider commit/push tools remain hidden.
-
-Client capability validation is cached for eight hours by default (`ODOO_AGENT_CLIENT_VALIDATION_TTL_SECONDS=28800`). Resume is local-only while the lease is valid. Provider job polls are capped at 20 seconds (`ODOO_AGENT_PROVIDER_JOB_WAIT_MAX_SECONDS=20`) while the background deployment continues server-side.
+Current MCP tool count: `33`.
 
 ```text
 connector.health

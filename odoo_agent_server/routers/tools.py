@@ -3,14 +3,11 @@ from __future__ import annotations
 import asyncio
 import ast
 import difflib
-import hashlib
 import json
 import re
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 from pydantic import ValidationError
@@ -28,10 +25,6 @@ from ..schemas import (
     ClientOnlyRequest,
     DeployedModuleVerifyRequest,
     PosFlowCheckRequest,
-    ResumeContextRequest,
-    IntentPlanRequest,
-    PrepareChangeContextRequest,
-    PatchChangeRequest,
     StartSessionRequest,
     RegistrySmokeTestRequest,
     RestoreLastGoodCommitRequest,
@@ -125,12 +118,11 @@ from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_write_ma
 from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy, start_odoo_module_deploy_job
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
-from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index, verify_deployed_module, _poll_odoosh_deployed, _pre_push_verify_files, _expected_user_file_hashes, _infer_registry_fields_from_python, _normalise_expected_registry_fields, _verify_registry_fields, _assert_head_commit_contains_paths, SAFE_DEPLOY_WORKER_INSTANCE_ID
+from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index, verify_deployed_module, _poll_odoosh_deployed, _pre_push_verify_files, _expected_user_file_hashes, _infer_registry_fields_from_python, _normalise_expected_registry_fields, _verify_registry_fields, _assert_head_commit_contains_paths
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 from ..services.frontend_visual_service import FrontendVisualService
 from ..services.deploy_impact_service import classify_deploy_impact
-from ..services.hybrid_change_service import HybridChangeService
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
@@ -235,43 +227,6 @@ _TOOL_DESCRIPTORS = [
         ),
         read_only=True,
     ),
-    ToolDescriptor(
-        name="workflow.resume_context",
-        title="Resume active task quickly",
-        description=(
-            "Fast, local-only reconnect. Returns the active client, checkout, cached capability lease, pending change, "
-            "and active/recent jobs without Git fetch, Odoo login, or SSH health checks. Call first after an idle reconnect."
-        ),
-        read_only=True,
-    ),
-    ToolDescriptor(
-        name="workflow.intent_plan",
-        title="Classify task intent",
-        description=(
-            "Classify a request as quick, standard, or deep and return the shortest safe tool path. "
-            "Use explicit operation, target surface, module hint, and known paths when available."
-        ),
-        read_only=True,
-    ),
-    ToolDescriptor(
-        name="workflow.prepare_change_context",
-        title="Prepare verified coding context",
-        description=(
-            "One-call hybrid coding preflight: resolve client/repo/module, read focused custom source, gather mandatory "
-            "Odoo core evidence, and return a change_id plus bounded source context for the model to write an exact patch."
-        ),
-        requires_approval=True,
-    ),
-    ToolDescriptor(
-        name="repo.patch_change",
-        title="Patch prepared change",
-        description=(
-            "Apply exact full-content or search/replace edits for a prepared change_id using the fast-safe batch writer. "
-            "Paths remain restricted to the prepared custom module. Connector verification and safe deploy are still mandatory."
-        ),
-        requires_approval=True,
-        idempotent=True,
-    ),
     ToolDescriptor(name="workflow.capability_check",
         title="Check connector capabilities", description="Check local connector capabilities and missing runtime configuration", read_only=True),
     ToolDescriptor(name="workflow.coding_task_plan",
@@ -320,7 +275,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.full_verify",
         title="Run full verification", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module",
-        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 10 minutes for the pushed SHA, reject recent Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, upgrade an Odoo module, For MCP clients this starts/resumes a background safe-deploy job and returns job_id/next_call immediately; status=running is not success and must be followed via jobs.get. Only treat the deployment as complete when response.deploy_confirmed == true. A finished job without this field set to true means the deploy did not fully complete — do not report success to the user. If git diff shows no changes for this module, safe_deploy_module automatically runs Odoo.sh source verification and returns verified_already_deployed/already_deployed_confirmed; read this field before telling the user anything is 'already added' or 'already live'. Do not make that claim from memory of a previous turn.", requires_approval=True, idempotent=True, open_world=True),
+        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 10 minutes for the pushed SHA, reject recent Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, upgrade an Odoo module, For MCP clients this starts/resumes a background safe-deploy job and returns job_id/next_call immediately; status=running is not success and must be followed via jobs.get. Only treat the deployment as complete when response.deploy_confirmed == true. A finished job without this field set to true means the deploy did not fully complete — do not report success to the user. If git diff shows no changes for this module, safe_deploy_module automatically runs Odoo.sh source verification and returns verified_already_deployed/already_deployed_confirmed; read this field before telling the user anything is 'already added' or 'already live'. Do not make that claim from memory of a previous turn.", requires_approval=True),
     ToolDescriptor(
         name="workflow.verify_deployed_module",
         title="Verify deployed source",
@@ -709,10 +664,6 @@ _TOOL_INPUT_MODELS = {
     "artifacts.read": ArtifactReadRequest,
     "client.check": ClientCheckRequest,
     "workflow.agent_instructions": EmptyRequest,
-    "workflow.resume_context": ResumeContextRequest,
-    "workflow.intent_plan": IntentPlanRequest,
-    "workflow.prepare_change_context": PrepareChangeContextRequest,
-    "repo.patch_change": PatchChangeRequest,
     "workflow.capability_check": EmptyRequest,
     "workflow.coding_task_plan": CodingTaskPlanRequest,
     "workflow.odoo_code_change": OdooCodeChangeRequest,
@@ -1093,28 +1044,21 @@ def _resolve_code_change_project(payload: OdooCodeChangeRequest) -> tuple[str | 
     return resolved_client_name, str(project_path)
 
 
-def _safe_module_relative(module_name: str, relative_path: str, module_path: str | None = None) -> str:
+def _safe_module_relative(module_name: str, relative_path: str) -> str:
     """Normalize a user/provider path into <module>/... inside project_path."""
     value = str(relative_path or "").replace("\\", "/").strip()
     if not value or "\x00" in value:
         raise HTTPException(status_code=400, detail="Empty or unsafe relative_path")
     value = value.lstrip("/")
-    raw_parts = [part for part in value.split("/") if part and part != "."]
-    if ".." in raw_parts:
-        raise HTTPException(status_code=400, detail=f"Path traversal is not allowed: {relative_path}")
-    parts = raw_parts
+    parts = [part for part in value.split("/") if part and part not in {".", ".."}]
     if not parts:
         raise HTTPException(status_code=400, detail="Empty relative_path")
-    prefix = [part for part in str(module_path or module_name).replace("\\", "/").strip("/").split("/") if part]
-    if not prefix or prefix[-1] != module_name:
-        raise HTTPException(status_code=400, detail=f"Invalid prepared module path: {module_path or module_name}")
-    if parts[: len(prefix)] == prefix:
-        return "/".join(parts)
-    if parts[0] == module_name:
-        return "/".join([*prefix[:-1], *parts])
     if module_name in parts:
-        return "/".join([*prefix[:-1], *parts[parts.index(module_name) :]])
-    return "/".join([*prefix, *parts])
+        idx = parts.index(module_name)
+        parts = parts[idx:]
+    elif parts[0] != module_name:
+        parts = [module_name, *parts]
+    return "/".join(parts)
 
 
 def _ensure_root_module_scaffold(repo: RepoService, project: Path, payload: OdooCodeChangeRequest) -> None:
@@ -1222,26 +1166,6 @@ def _file_preview(content: str, max_chars: int = 6000) -> str:
     if len(content) <= max_chars:
         return content
     return content[: max_chars // 2] + f"\n\n...[{len(content)-max_chars} chars omitted]...\n\n" + content[-max_chars // 2 :]
-
-
-def _line_bounded_context(content: str, max_lines: int = 160) -> dict[str, Any]:
-    """Return explicit source ranges so providers can patch without broad rereads."""
-    lines = content.splitlines()
-    total = len(lines)
-    if total <= max_lines:
-        segments = [{"start_line": 1, "end_line": total, "content": "\n".join(lines)}] if total else []
-    else:
-        head_count = max_lines * 3 // 4
-        tail_count = max_lines - head_count
-        segments = [
-            {"start_line": 1, "end_line": head_count, "content": "\n".join(lines[:head_count])},
-            {
-                "start_line": total - tail_count + 1,
-                "end_line": total,
-                "content": "\n".join(lines[-tail_count:]),
-            },
-        ]
-    return {"total_lines": total, "segments": segments}
 
 
 def _module_hint_tokens(value: str) -> set[str]:
@@ -1579,15 +1503,15 @@ def _task_profile(payload: OdooCodeChangeRequest, rel_paths: list[str] | None = 
     return profile
 
 def _evidence_signature(project: Path, module_name: str, payload: OdooCodeChangeRequest, rel_paths: list[str]) -> str:
+    import hashlib
     rows=[]
     for rel in sorted(set(rel_paths)):
         path=project/rel
         try:
-            rows.append((rel, hashlib.sha256(path.read_bytes()).hexdigest()))
+            st=path.stat(); rows.append((rel, st.st_mtime_ns, st.st_size))
         except OSError:
-            rows.append((rel, None))
-    head = GitService().head_sha(str(project)).stdout.strip() if (project / ".git").exists() else None
-    raw=json.dumps({"module":module_name,"task_type":_normalized_task_type(payload),"head":head,"paths":rows},sort_keys=True,default=str)
+            rows.append((rel, None, None))
+    raw=json.dumps({"module":module_name,"task_type":_normalized_task_type(payload),"paths":rows},sort_keys=True,default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
@@ -1646,505 +1570,7 @@ def _git_status_changed_module_files(project_path: str, module_path: str) -> lis
                 changed.append(rel)
     return list(dict.fromkeys(changed))
 
-
-def _timed_workflow_result(action: str, result: dict[str, Any], started: float, client_name: str | None = None) -> dict[str, Any]:
-    timings = {"total": round((time.perf_counter() - started) * 1000, 3)}
-    result["timings_ms"] = timings
-    JsonStore().log_audit(
-        action,
-        str(result.get("status") or "ok"),
-        action,
-        {
-            "timings_ms": timings,
-            "resume_mode": result.get("resume_mode"),
-            "cache_hits": result.get("cache_hits") or [],
-            "change_id": result.get("change_id"),
-            "client_name": client_name or result.get("client_name"),
-        },
-    )
-    return result
-
-
-def _workflow_resume_context(payload: ResumeContextRequest) -> dict[str, Any]:
-    started = time.perf_counter()
-    resolver = ClientResolverService()
-    try:
-        client = resolver.resolve_client(
-            client_name=payload.client_name,
-            project_path=payload.project_path,
-            require_complete=False,
-        )
-    except Exception as exc:  # multi-client ambiguity is a normal resume result
-        return _timed_workflow_result("workflow.resume_context", {
-            "status": "client_selection_required",
-            "resume_mode": "selection_required",
-            "message": str(exc),
-            "available_client_names": [normalise_client(item).get("name") for item in get_odoo_clients()],
-        }, started, payload.client_name)
-
-    client_name = client.name if client else payload.client_name
-    store = JsonStore()
-    state = store.load_session_state(client_name=client_name)
-    project_path = payload.project_path or (client.path if client else None) or state.get("project_path") or settings.target_project_path
-    checkout_exists = bool(project_path and Path(project_path).expanduser().is_dir())
-    branch = None
-    branch_ok = None
-    if checkout_exists and (Path(project_path) / ".git").exists():
-        branch_result = GitService().current_branch(str(project_path))
-        branch = branch_result.stdout.strip() if branch_result.exit_code == 0 else None
-        expected_branch = (client.branch if client else None) or state.get("branch") or settings.target_git_branch
-        branch_ok = branch == expected_branch if expected_branch else branch_result.exit_code == 0
-
-    validation = ClientGateService(store).validation_state(client_name)
-    age_seconds = ClientGateService._validation_age_seconds(validation)
-    validation_fresh = bool(
-        validation.get("validated")
-        and age_seconds is not None
-        and age_seconds <= settings.client_validation_ttl_seconds
-        and checkout_exists
-        and branch_ok is not False
-    )
-    recent_jobs = []
-    active_job = None
-    for job in store.list_jobs(limit=max(payload.include_recent_jobs * 4, 20)):
-        request = job.request or {}
-        if client_name and request.get("client_name") not in {None, client_name}:
-            continue
-        if project_path and request.get("project_path") not in {None, str(project_path)}:
-            continue
-        item = {
-            "job_id": job.id,
-            "job_type": job.job_type,
-            "status": job.status.value,
-            "current_step": job.current_step,
-            "last_progress_at": job.last_progress_at,
-            "elapsed_seconds": job.elapsed_seconds,
-            "next_call": job.next_call,
-        }
-        worker_instance_id = request.get("worker_instance_id")
-        if job.job_type == "safe_deploy_module" and job.status in {JobStatus.queued, JobStatus.running} and worker_instance_id and worker_instance_id != SAFE_DEPLOY_WORKER_INSTANCE_ID:
-            item["worker_lost_after_restart"] = True
-            item["next_call"] = {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}}
-        recent_jobs.append(item)
-        if active_job is None and job.status in {JobStatus.queued, JobStatus.running}:
-            active_job = item
-        if len(recent_jobs) >= payload.include_recent_jobs:
-            break
-
-    pending = HybridChangeService(store).latest(client_name, str(project_path) if project_path else None)
-    if pending is None:
-        pending = state.get("pending_code_change") if isinstance(state.get("pending_code_change"), dict) else None
-    next_call = active_job.get("next_call") if active_job else None
-    if next_call is None and pending:
-        if pending.get("change_id") and pending.get("patched_at"):
-            next_call = {"tool": "git.diff", "arguments": {"client_name": client_name, "project_path": project_path}}
-        elif pending.get("change_id"):
-            next_call = {"tool": "repo.patch_change", "arguments": {"change_id": pending.get("change_id"), "edits": []}}
-        else:
-            next_call = {
-                "tool": "workflow.prepare_change_context",
-                "arguments": {
-                    "client_name": client_name,
-                    "project_path": project_path,
-                    "module_name": pending.get("module_name"),
-                    "task_description": pending.get("task_description"),
-                    "target_files": pending.get("target_files") or [],
-                },
-            }
-    if not checkout_exists or branch_ok is False:
-        refresh_required = "local"
-    elif not validation_fresh and pending and pending.get("patched_at"):
-        refresh_required = "ssh"
-    elif not validation_fresh and pending:
-        refresh_required = "local"
-    elif pending and pending.get("patched_at") and not validation.get("deploy_ready"):
-        refresh_required = "ssh"
-    elif not validation_fresh:
-        refresh_required = "full"
-    else:
-        refresh_required = "none"
-    capability = "coding_ready" if refresh_required == "local" else "deploy_ready" if refresh_required == "ssh" else "full"
-    validation_next_call = None if refresh_required == "none" else {
-        "tool": "client.check",
-        "arguments": {
-            "client_name": client_name,
-            "validate": True,
-            "force_refresh": True,
-            "required_capability": capability,
-        },
-    }
-    ephemeral_state_warning = str(settings.state_path).replace("\\", "/").startswith("/tmp/")
-    return _timed_workflow_result("workflow.resume_context", {
-        "status": "ok",
-        "resume_mode": "fast_local" if validation_fresh else "capability_refresh_required",
-        "client_name": client_name,
-        "project_path": str(project_path) if project_path else None,
-        "checkout_exists": checkout_exists,
-        "branch": branch,
-        "branch_ok": branch_ok,
-        "validation": {
-            "fresh": validation_fresh,
-            "age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
-            "lease_seconds": settings.client_validation_ttl_seconds,
-            "coding_ready": bool(validation.get("coding_ready")),
-            "deploy_ready": bool(validation.get("deploy_ready")),
-            "ssh_ready": bool(validation.get("ssh_ready")),
-        },
-        "pending_change": pending,
-        "last_changed_files": list(pending.get("changed_files") or []) if pending else [],
-        "active_job": active_job,
-        "recent_jobs": recent_jobs,
-        "next_call": next_call,
-        "network_checks_performed": False,
-        "validation_refresh_required": refresh_required,
-        "validation_next_call": validation_next_call,
-        "ephemeral_state_warning": ephemeral_state_warning,
-    }, started, client_name)
-
-
-def _workflow_intent_plan(payload: IntentPlanRequest) -> dict[str, Any]:
-    started = time.perf_counter()
-    text = payload.task_description.lower()
-    paths = [path.lower().replace("\\", "/") for path in payload.known_paths]
-    if payload.operation != "auto":
-        operation = payload.operation
-    else:
-        resume = any(term in text for term in ("resume", "continue", "reconnect", "job status"))
-        deploy = any(term in text for term in ("deploy", "push", "upgrade", "release"))
-        write = any(term in text for term in ("fix", "add", "change", "update", "patch", "implement", "remove", "refactor"))
-        read = any(term in text for term in ("show", "find", "read", "inspect", "list", "status"))
-        if resume:
-            operation = "resume"
-        elif deploy:
-            operation = "deploy"
-        elif write:
-            operation = "write"
-        elif read:
-            operation = "read"
-        else:
-            operation = "ambiguous"
-
-    frontend = payload.target_surface == "frontend" or any(
-        marker in text or any(marker in path for path in paths)
-        for marker in ("owl", "javascript", "scss", "css", "qweb", "pos", "website", "/static/src/")
-    )
-    deep_markers = (
-        "migration", "security", "access rights", "accounting", "payment", "large refactor",
-        "rewrite", "multi module", "architecture", "repeated failure", "race condition",
-    )
-    quick_markers = ("label", "text", "color", "spacing", "small", "exact file", "one field", "one xpath")
-    if any(marker in text for marker in deep_markers):
-        complexity = "deep"
-    elif operation in {"resume", "read"} or (any(marker in text for marker in quick_markers) and len(paths) <= 2):
-        complexity = "quick"
-    else:
-        complexity = "standard"
-    confidence = "low" if operation == "ambiguous" else "high" if payload.operation != "auto" or operation in {"resume", "deploy", "write"} else "medium"
-    clarification_required = operation == "ambiguous"
-    if operation == "resume":
-        steps = ["workflow.resume_context"]
-    elif operation == "read":
-        steps = ["workflow.resume_context"] if "status" in text and not payload.module_hint else ["workflow.prepare_change_context"] if payload.module_hint or paths else ["workflow.resume_context"]
-    elif operation in {"write", "deploy"}:
-        steps = ["workflow.prepare_change_context", "repo.patch_change", "git.diff", "workflow.safe_deploy_module"]
-    else:
-        steps = ["workflow.resume_context"]
-    return _timed_workflow_result("workflow.intent_plan", {
-        "status": "ok",
-        "normalized_intent": operation,
-        "complexity": complexity,
-        "confidence": confidence,
-        "clarification_required": clarification_required,
-        "target_surface": "frontend" if frontend else payload.target_surface if payload.target_surface != "auto" else "backend",
-        "required_proofs": ["custom_source_read", "odoo_core_evidence", "changed_diff_verified", "terminal_deploy_proof"] if operation in {"write", "deploy"} else [],
-        "steps": steps,
-        "thinking_policy": "act_immediately" if complexity == "quick" else "brief_internal_plan" if complexity == "standard" else "demonstrate_deep_approach",
-    }, started, payload.client_name)
-
-
-async def _workflow_prepare_change_context(payload: PrepareChangeContextRequest) -> dict[str, Any]:
-    started = time.perf_counter()
-    inspection = await _workflow_odoo_code_change(OdooCodeChangeRequest(
-        client_name=payload.client_name,
-        project_path=payload.project_path,
-        module_name=payload.module_name,
-        create_module=payload.create_module,
-        task_description=payload.task_description,
-        search_patterns=payload.search_patterns,
-        target_files=payload.target_files,
-        task_type=payload.task_type,
-        intent=payload.intent,
-        target_hint=payload.target_hint,
-        patch_strategy="inspect_only",
-        max_search_matches=payload.max_search_matches,
-        auto_deploy=False,
-    ))
-    if inspection.get("status") not in {"needs_writes", "ready_to_deploy"}:
-        return _timed_workflow_result("workflow.prepare_change_context", inspection, started, payload.client_name)
-
-    change_id = f"chg_{uuid4().hex}"
-    client_name = inspection.get("client_name") or payload.client_name
-    module_name = inspection.get("module_name") or payload.module_name
-    module_path = inspection.get("module_path") or module_name
-    project_path = inspection.get("project_path") or payload.project_path
-    repo_prepare_step = next((step for step in inspection.get("steps", []) if step.get("step") == "repo.prepare"), {})
-    prepared_identity = HybridChangeService.checkout_identity(str(project_path))
-    permitted_paths = list(dict.fromkeys(
-        str(item.get("relative_path"))
-        for item in inspection.get("custom_reads", [])
-        if item.get("relative_path")
-    ))
-    context = {
-        "change_id": change_id,
-        "client_name": client_name,
-        "project_path": project_path,
-        "module_name": module_name,
-        "module_path": module_path,
-        "task_description": payload.task_description,
-        "task_type": payload.task_type,
-        "intent": payload.intent,
-        "permitted_prefix": f"{str(module_path).rstrip('/')}/",
-        "permitted_paths": permitted_paths,
-        "prepared_branch": str(repo_prepare_step.get("branch") or prepared_identity["branch"]),
-        "prepared_sha": str(repo_prepare_step.get("sha") or prepared_identity["sha"]),
-        "prepared_at": datetime.now(timezone.utc).isoformat(),
-        "evidence_ready": True,
-        "target_files": [item.get("relative_path") for item in inspection.get("custom_reads", []) if item.get("status") == "read"],
-    }
-    HybridChangeService().save(change_id, context, client_name)
-    return _timed_workflow_result("workflow.prepare_change_context", {
-        "status": "prepared",
-        "change_id": change_id,
-        "client_name": client_name,
-        "project_path": project_path,
-        "module_name": module_name,
-        "module_path": module_path,
-        "permitted_prefix": context["permitted_prefix"],
-        "permitted_paths": context["permitted_paths"],
-        "prepared_branch": context["prepared_branch"],
-        "prepared_sha": context["prepared_sha"],
-        "custom_reads": inspection.get("custom_reads", [])[:20],
-        "search_results": inspection.get("search_results", [])[:10],
-        "core_reads": inspection.get("core_reads", [])[:30],
-        "scope_advice": inspection.get("scope_advice"),
-        "frontend_preflight": inspection.get("frontend_preflight"),
-        "cache_hits": [step.get("step") for step in inspection.get("steps", []) if step.get("status") == "cached"],
-        "next_call": {"tool": "repo.patch_change", "arguments": {"change_id": change_id, "edits": []}},
-    }, started, client_name)
-
-
-def _repo_patch_change(payload: PatchChangeRequest) -> dict[str, Any]:
-    started = time.perf_counter()
-    service = HybridChangeService()
-    context, stored_client_name = service.load(payload.change_id, payload.client_name)
-    client_name = context.get("client_name") or stored_client_name or payload.client_name
-    project_path = str(context.get("project_path") or "")
-    module_name = str(context.get("module_name") or "")
-    module_path = str(context.get("module_path") or module_name)
-    ClientGateService().require_validated_client(client_name, "repo.patch_change")
-    project = Path(project_path).resolve()
-    service.validate_checkout_identity(context, project_path)
-
-    if not payload.edits:
-        return _timed_workflow_result("repo.patch_change", {
-            "status": "awaiting_edits",
-            "change_id": payload.change_id,
-            "client_name": client_name,
-            "project_path": project_path,
-            "module_name": module_name,
-            "module_path": module_path,
-            "permitted_paths": list(context.get("permitted_paths") or []),
-            "permitted_prefix": context.get("permitted_prefix"),
-            "required_input": "Call repo.patch_change again with one or more exact full-content or search/replace edits inside permitted_paths.",
-            "next_call": None,
-            "cache_hits": ["prepared_context"],
-        }, started, client_name)
-
-    request_digest = hashlib.sha256(
-        json.dumps([edit.model_dump(mode="json") for edit in payload.edits], sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    requested_paths = [_safe_module_relative(module_name, edit.relative_path, module_path) for edit in payload.edits]
-    permitted_paths = {str(path) for path in context.get("permitted_paths") or []}
-    if permitted_paths:
-        outside_scope = sorted(set(requested_paths) - permitted_paths)
-        if outside_scope:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "status": "patch_scope_mismatch",
-                    "message": "Patch paths were not included in workflow.prepare_change_context. Prepare again with those target_files.",
-                    "outside_scope": outside_scope,
-                    "permitted_paths": sorted(permitted_paths),
-                },
-            )
-    if context.get("last_request_digest") == request_digest:
-        current_hashes = service.file_hashes(project_path, requested_paths, include_missing=True)
-        if current_hashes == context.get("file_hashes"):
-            return _timed_workflow_result("repo.patch_change", {
-                "status": "already_applied",
-                "idempotent": True,
-                "change_id": payload.change_id,
-                "changed_files": requested_paths,
-                "diff_sha256": context.get("diff_sha256"),
-                "next_call": {"tool": "git.diff", "arguments": {"project_path": project_path, "client_name": client_name}},
-                "cache_hits": ["idempotent_patch"],
-            }, started, client_name)
-
-    write_items: list[RepoWriteItem] = []
-    canonical_edits: list[dict[str, Any]] = []
-    for edit in payload.edits:
-        relative_path = _safe_module_relative(module_name, edit.relative_path, module_path)
-        if edit.content is not None and (edit.search is not None or edit.replace is not None):
-            raise HTTPException(status_code=400, detail=f"Provide either content or search/replace, not both, for {relative_path}")
-        if edit.content is not None:
-            new_content = edit.content
-        else:
-            if edit.search is None or edit.replace is None:
-                raise HTTPException(status_code=400, detail=f"Missing content or search+replace for {relative_path}")
-            target = project / relative_path
-            if not target.is_file():
-                raise HTTPException(status_code=404, detail=f"Search/replace target does not exist: {relative_path}")
-            old_content = target.read_text(encoding="utf-8")
-            if edit.regex:
-                new_content, replaced = re.subn(edit.search, edit.replace, old_content, count=edit.count or 0)
-            else:
-                occurrences = old_content.count(edit.search)
-                replaced = occurrences if edit.count == 0 else min(occurrences, edit.count)
-                new_content = old_content.replace(edit.search, edit.replace, edit.count or -1)
-            if replaced <= 0:
-                raise HTTPException(status_code=409, detail=f"Search text not found in {relative_path}")
-        write_items.append(RepoWriteItem(relative_path=relative_path, content=new_content))
-        canonical_edits.append({"relative_path": relative_path, "content_sha256": hashlib.sha256(new_content.encode("utf-8")).hexdigest()})
-
-    patch_digest = hashlib.sha256(json.dumps(canonical_edits, sort_keys=True).encode("utf-8")).hexdigest()
-    changed_files = [item.relative_path for item in write_items]
-    current_hashes = service.file_hashes(project_path, changed_files, include_missing=True)
-    if context.get("last_patch_digest") == patch_digest and current_hashes == context.get("file_hashes"):
-        return _timed_workflow_result("repo.patch_change", {
-            "status": "already_applied",
-            "idempotent": True,
-            "change_id": payload.change_id,
-            "changed_files": changed_files,
-            "diff_sha256": context.get("diff_sha256"),
-            "next_call": {"tool": "git.diff", "arguments": {"project_path": project_path, "client_name": client_name}},
-            "cache_hits": ["idempotent_patch"],
-        }, started, client_name)
-
-    result = repo_write_many_smart(RepoWriteManySmartRequest(
-        client_name=client_name,
-        project_path=project_path,
-        files=write_items,
-        check_only=payload.check_only,
-        strategy=payload.strategy,
-        timeout_seconds=60,
-    ))
-    if result.exit_code != 0:
-        raise HTTPException(status_code=409, detail=result.stderr or result.stdout or "Patch transaction failed")
-    diff_sha256, diff_text = service.diff_fingerprint(project_path)
-    if not payload.check_only:
-        context.update({
-            "patched_at": datetime.now(timezone.utc).isoformat(),
-            "last_request_digest": request_digest,
-            "last_patch_digest": patch_digest,
-            "changed_files": changed_files,
-            "file_hashes": service.file_hashes(project_path, changed_files, include_missing=True),
-            "diff_sha256": diff_sha256,
-        })
-        service.save(payload.change_id, context, client_name)
-    return _timed_workflow_result("repo.patch_change", {
-        "status": "checked" if payload.check_only else "patched",
-        "idempotent": False,
-        "change_id": payload.change_id,
-        "changed_files": changed_files,
-        "diff_sha256": diff_sha256,
-        "diff_preview": diff_text[-12000:],
-        "write_strategy": payload.strategy,
-        "next_call": {"tool": "git.diff", "arguments": {"project_path": project_path, "client_name": client_name}},
-        "deploy_call": {
-            "tool": "workflow.safe_deploy_module",
-            "arguments": {
-                "change_id": payload.change_id,
-                "client_name": client_name,
-                "project_path": project_path,
-                "module_name": module_name,
-                "module_path": module_path,
-                "commit_message": f"Update {module_name}: {str(context.get('task_description') or 'hybrid change')[:180]}",
-                "paths": changed_files,
-            },
-        },
-        "cache_hits": [],
-    }, started, client_name)
-
 async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
-    """Backward-compatible composite implemented through the hybrid primitives."""
-    if not payload.writes:
-        return await _workflow_odoo_code_change_legacy(payload)
-
-    prepared = await _workflow_prepare_change_context(PrepareChangeContextRequest(
-        client_name=payload.client_name,
-        project_path=payload.project_path,
-        module_name=payload.module_name,
-        create_module=payload.create_module,
-        task_description=payload.task_description,
-        target_files=list(dict.fromkeys(payload.target_files + [write.relative_path for write in payload.writes])),
-        search_patterns=payload.search_patterns,
-        task_type=payload.task_type,
-        intent=payload.intent,
-        target_hint=payload.target_hint,
-        max_search_matches=payload.max_search_matches,
-    ))
-    if prepared.get("status") != "prepared":
-        return prepared
-
-    patched = _repo_patch_change(PatchChangeRequest(
-        change_id=prepared["change_id"],
-        client_name=prepared.get("client_name"),
-        edits=payload.writes,
-        strategy="auto",
-    ))
-    result: dict[str, Any] = {
-        "status": "ready_to_deploy" if not payload.auto_deploy else "deploy_starting",
-        "message": "Compatibility workflow used prepare, patch, and diff-fingerprint primitives.",
-        "client_name": prepared.get("client_name"),
-        "project_path": prepared.get("project_path"),
-        "module_name": prepared.get("module_name"),
-        "module_path": prepared.get("module_path"),
-        "change_id": prepared["change_id"],
-        "prepared_context": prepared,
-        "patch_result": patched,
-        "changed_files": patched.get("changed_files") or [],
-        "diff_sha256": patched.get("diff_sha256"),
-        "success_allowed": False,
-        "completion_required": True,
-        "next_call": patched.get("deploy_call") if payload.auto_deploy else patched.get("next_call"),
-    }
-    if not payload.auto_deploy:
-        return result
-
-    deploy_arguments = dict((patched.get("deploy_call") or {}).get("arguments") or {})
-    deploy_arguments["commit_message"] = payload.commit_message or deploy_arguments.get("commit_message")
-    deploy_arguments.update({"run_qa": True, "wait_for_result": False, "wait_timeout_seconds": 0})
-    try:
-        deploy = await safe_deploy_module(SafeDeployModuleRequest.model_validate(deploy_arguments))
-    except HTTPException as exc:
-        result.update({
-            "status": "deploy_blocked",
-            "message": "The hybrid patch is preserved, but safe deploy requires refreshed deploy capability or corrected evidence.",
-            "deploy_validation": exc.detail,
-            "next_call": {"tool": "client.check", "arguments": {"client_name": prepared.get("client_name"), "required_capability": "deploy_ready"}},
-        })
-        return result
-    deploy_struct = deploy.model_dump(mode="json")
-    result.update({
-        "status": "deploy_started" if deploy.status in {"running", "already_running", "already_in_progress", "resumable_existing_job"} else deploy.status,
-        "safe_deploy": deploy_struct,
-        "job_id": deploy.job_id,
-        "next_call": deploy.summary.get("next_call"),
-    })
-    return result
-
-
-async def _workflow_odoo_code_change_legacy(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     """Provider-safe composite Odoo code-change workflow.
 
     This is intentionally server-owned to remove MCP provider overhead/confusion:
@@ -2203,11 +1629,11 @@ async def _workflow_odoo_code_change_legacy(payload: OdooCodeChangeRequest) -> d
     # 3) Read custom manifest + target/custom files.  This also records gate evidence.
     custom_rel_paths: list[str] = [manifest_rel]
     for raw in payload.target_files:
-        rel = _safe_module_relative(effective_module_name, raw, module.path)
+        rel = _safe_module_relative(effective_module_name, raw)
         if rel not in custom_rel_paths:
             custom_rel_paths.append(rel)
     for write in payload.writes:
-        rel = _safe_module_relative(effective_module_name, write.relative_path, module.path)
+        rel = _safe_module_relative(effective_module_name, write.relative_path)
         if rel not in custom_rel_paths:
             custom_rel_paths.append(rel)
 
@@ -2226,7 +1652,7 @@ async def _workflow_odoo_code_change_legacy(payload: OdooCodeChangeRequest) -> d
     if not payload.writes:
         generated_writes, generated_autopatch_strategy, generated_autopatch_reason = _build_safe_generic_autopatch(project, module.path, payload, custom_rel_paths)
         for write in generated_writes:
-            rel = _safe_module_relative(effective_module_name, write.relative_path, module.path)
+            rel = _safe_module_relative(effective_module_name, write.relative_path)
             if rel not in custom_rel_paths:
                 custom_rel_paths.append(rel)
 
@@ -2241,13 +1667,7 @@ async def _workflow_odoo_code_change_legacy(payload: OdooCodeChangeRequest) -> d
             content = _read_text_safe(target)
             gate.record_repo_inspection(project_path=project_path, relative_path=rel, client_name=client_name, action="workflow.odoo_code_change.read_custom", is_content_read=True)
             custom_file_paths_abs.append(str(target.resolve()))
-            custom_reads.append({
-                "relative_path": rel,
-                "status": "read",
-                "size": target.stat().st_size,
-                "preview": _file_preview(content, 3000),
-                **_line_bounded_context(content),
-            })
+            custom_reads.append({"relative_path": rel, "status": "read", "size": target.stat().st_size, "preview": _file_preview(content, 3000)})
         except UnicodeDecodeError:
             custom_reads.append({"relative_path": rel, "status": "binary_skipped"})
     steps.append({"step": "repo.read_custom", "status": "ok", "count": len([r for r in custom_reads if r.get("status") == "read"])})
@@ -2267,7 +1687,7 @@ async def _workflow_odoo_code_change_legacy(payload: OdooCodeChangeRequest) -> d
     # passes; inspection mode keeps the focused search files.
     scope_file_paths = list(custom_file_paths_abs)
     if payload.writes or generated_writes:
-        write_abs = {str((project / _safe_module_relative(effective_module_name, w.relative_path, module.path)).resolve()) for w in (payload.writes or generated_writes)}
+        write_abs = {str((project / _safe_module_relative(effective_module_name, w.relative_path)).resolve()) for w in (payload.writes or generated_writes)}
         manifest_resolved = str(manifest_abs.resolve()) if manifest_abs.exists() else ""
         scope_file_paths = [path for path in custom_file_paths_abs if path == manifest_resolved or path in write_abs]
         if not scope_file_paths:
@@ -2288,7 +1708,7 @@ async def _workflow_odoo_code_change_legacy(payload: OdooCodeChangeRequest) -> d
         steps.append({"step": "workflow.scope_advice", "status": "ok", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level)})
 
     frontend_preflight = None
-    frontend_paths = list(dict.fromkeys(custom_rel_paths + [_safe_module_relative(effective_module_name, w.relative_path, module.path) for w in payload.writes]))
+    frontend_paths = list(dict.fromkeys(custom_rel_paths + [_safe_module_relative(effective_module_name, w.relative_path) for w in payload.writes]))
     if _looks_like_frontend_code_change(payload, frontend_paths):
         if cached_evidence and cached_evidence.get("frontend_preflight"):
             from ..schemas import FrontendPatternPreflightResult
@@ -2334,60 +1754,41 @@ async def _workflow_odoo_code_change_legacy(payload: OdooCodeChangeRequest) -> d
                 mandatory_paths.append(item.path)
 
     core_reads: list[dict[str, Any]] = []
-    cached_core_hashes = cached_evidence.get("core_file_hashes") if isinstance(cached_evidence, dict) else None
-    core_cache_valid = bool(cached_core_hashes)
-    if isinstance(cached_core_hashes, dict):
-        for raw_path, expected_hash in cached_core_hashes.items():
-            path = Path(str(raw_path)).expanduser()
-            if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != expected_hash:
-                core_cache_valid = False
-                break
-    if core_cache_valid and isinstance(cached_core_hashes, dict):
-        for raw_path in cached_core_hashes:
-            resolved = Path(raw_path).expanduser().resolve()
-            gate.record_repo_inspection(project_path=str(resolved.parent), relative_path=resolved.name, client_name=client_name, action="workflow.odoo_code_change.cached_core", is_content_read=True)
-            core_reads.append({"path": str(resolved), "status": "cached"})
-        steps.append({"step": "repo.read_core", "status": "cached", "count": len(core_reads)})
-    else:
-        for raw_path in mandatory_paths[:60]:
-            path = Path(str(raw_path)).expanduser()
-            try:
-                resolved = path.resolve()
-            except Exception:
-                resolved = path
-            if resolved.is_dir():
-                # Read a small number of files from mandatory dirs so the gate sees the dir satisfied.
-                files = [p for p in resolved.rglob("*.py") if p.is_file()][:10]
-                if not files:
-                    core_reads.append({"path": str(resolved), "status": "dir_no_readable_files"})
-                    continue
-                for file_path in files:
-                    try:
-                        _ = _read_text_safe(file_path, 100_000)
-                        gate.record_repo_inspection(project_path=str(file_path.parent), relative_path=file_path.name, client_name=client_name, action="workflow.odoo_code_change.read_core", is_content_read=True)
-                        core_reads.append({"path": str(file_path), "status": "read"})
-                    except Exception as exc:  # noqa: BLE001
-                        core_reads.append({"path": str(file_path), "status": "failed", "error": str(exc)})
+    for raw_path in mandatory_paths[:60]:
+        path = Path(str(raw_path)).expanduser()
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        if resolved.is_dir():
+            # Read a small number of files from mandatory dirs so the gate sees the dir satisfied.
+            files = [p for p in resolved.rglob("*.py") if p.is_file()][:10]
+            if not files:
+                core_reads.append({"path": str(resolved), "status": "dir_no_readable_files"})
                 continue
-            if not resolved.exists() or not resolved.is_file():
-                core_reads.append({"path": str(resolved), "status": "missing"})
-                continue
-            try:
-                _ = _read_text_safe(resolved, 200_000)
-                gate.record_repo_inspection(project_path=str(resolved.parent), relative_path=resolved.name, client_name=client_name, action="workflow.odoo_code_change.read_core", is_content_read=True)
-                core_reads.append({"path": str(resolved), "status": "read"})
-            except Exception as exc:  # noqa: BLE001
-                core_reads.append({"path": str(resolved), "status": "failed", "error": str(exc)})
-        steps.append({"step": "repo.read_core", "status": "ok", "count": len([r for r in core_reads if r.get("status") == "read"])})
+            for file_path in files:
+                try:
+                    _ = _read_text_safe(file_path, 100_000)
+                    gate.record_repo_inspection(project_path=str(file_path.parent), relative_path=file_path.name, client_name=client_name, action="workflow.odoo_code_change.read_core", is_content_read=True)
+                    core_reads.append({"path": str(file_path), "status": "read"})
+                except Exception as exc:  # noqa: BLE001
+                    core_reads.append({"path": str(file_path), "status": "failed", "error": str(exc)})
+            continue
+        if not resolved.exists() or not resolved.is_file():
+            core_reads.append({"path": str(resolved), "status": "missing"})
+            continue
+        try:
+            _ = _read_text_safe(resolved, 200_000)
+            gate.record_repo_inspection(project_path=str(resolved.parent), relative_path=resolved.name, client_name=client_name, action="workflow.odoo_code_change.read_core", is_content_read=True)
+            core_reads.append({"path": str(resolved), "status": "read"})
+        except Exception as exc:  # noqa: BLE001
+            core_reads.append({"path": str(resolved), "status": "failed", "error": str(exc)})
+    steps.append({"step": "repo.read_core", "status": "ok", "count": len([r for r in core_reads if r.get("status") == "read"])})
     cache = dict(evidence_cache) if isinstance(evidence_cache, dict) else {}
     cache[evidence_signature] = {
         "scope": scope.model_dump(mode="json"),
         "frontend_preflight": frontend_preflight.model_dump(mode="json") if frontend_preflight is not None else None,
         "core_paths": [r.get("path") for r in core_reads if r.get("status") == "read"],
-        "core_file_hashes": {
-            str(r.get("path")): hashlib.sha256(Path(str(r.get("path"))).read_bytes()).hexdigest()
-            for r in core_reads if r.get("status") in {"read", "cached"} and Path(str(r.get("path"))).is_file()
-        },
         "task_profile": _task_profile(payload, frontend_paths),
     }
     if len(cache) > 20:
@@ -2443,7 +1844,6 @@ async def _workflow_odoo_code_change_legacy(payload: OdooCodeChangeRequest) -> d
                 "client_name": client_name,
                 "project_path": project_path,
                 "module_name": effective_module_name,
-                "module_path": module.path,
                 "task_description": payload.task_description,
                 "task_type": _normalized_task_type(payload),
                 "intent": payload.intent,
@@ -2458,7 +1858,6 @@ async def _workflow_odoo_code_change_legacy(payload: OdooCodeChangeRequest) -> d
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
-            "module_path": module.path,
             "steps": steps,
             "custom_reads": custom_reads[:20],
             "search_results": search_results[:10],
@@ -2489,13 +1888,11 @@ async def _workflow_odoo_code_change_legacy(payload: OdooCodeChangeRequest) -> d
             },
         }
 
-    # 5) Build complete file contents, then apply one smart transaction. This
-    # preserves the pre-write gate while avoiding lock/backup overhead per file.
+    # 5) Apply writes through normal repo.write so the pre-write gate is still enforced.
     written_files_abs: list[str] = []
     write_results: list[dict[str, Any]] = []
-    write_items: list[RepoWriteItem] = []
     for change in writes_to_apply:
-        rel = _safe_module_relative(effective_module_name, change.relative_path, module.path)
+        rel = _safe_module_relative(effective_module_name, change.relative_path)
         if change.content is not None and (change.search is not None or change.replace is not None):
             raise HTTPException(status_code=400, detail=f"Provide either content or search/replace, not both, for {rel}")
         if change.content is not None:
@@ -2512,22 +1909,11 @@ async def _workflow_odoo_code_change_legacy(payload: OdooCodeChangeRequest) -> d
                 new_content = old.replace(change.search, change.replace, change.count or -1)
             if replaced <= 0:
                 raise HTTPException(status_code=409, detail=f"Search text not found in {rel}")
-        write_items.append(RepoWriteItem(relative_path=rel, content=new_content))
+        result = repo_write(RepoWriteRequest(project_path=project_path, client_name=client_name, relative_path=rel, content=new_content))
         written_abs = str((project / rel).resolve())
         written_files_abs.append(written_abs)
-        write_results.append({"relative_path": rel, "status": "pending", "size": len(new_content.encode("utf-8"))})
-    write_command = repo_write_many_smart(RepoWriteManySmartRequest(
-        project_path=project_path,
-        client_name=client_name,
-        files=write_items,
-        strategy="auto",
-        timeout_seconds=60,
-    ))
-    if write_command.exit_code != 0:
-        raise HTTPException(status_code=409, detail=write_command.stderr or write_command.stdout or "Smart write transaction failed")
-    for item in write_results:
-        item["status"] = "written"
-    steps.append({"step": "repo.write_many_smart", "status": "ok", "written_count": len(written_files_abs)})
+        write_results.append({"relative_path": rel, "status": "written", "size": result.size, "extra": result.extra})
+    steps.append({"step": "repo.write", "status": "ok", "written_count": len(written_files_abs)})
 
     # 6) Diff, QA, verify against core before deploy.
     diff = GitService().diff(project_path, staged=False, timeout_seconds=60)
@@ -2652,7 +2038,7 @@ async def _workflow_odoo_code_change_legacy(payload: OdooCodeChangeRequest) -> d
         "core_verified": not verify.push_blocked,
         "frontend_touched": frontend_touched,
         "allowed_summary": "Code was written and verified; deploy is running. Do not claim pushed/deployed/upgraded until jobs.get returns terminal passed with deploy_confirmed=true.",
-        "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}} if job_id else None,
+        "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}} if job_id else None,
     }
 
 
@@ -2731,7 +2117,7 @@ async def _dispatch(name: str, args: dict) -> object:
         return JsonStore().read_artifact(req.artifact_id, req.offset, req.max_chars)
     if name == "client.check":
         req = ClientCheckRequest.model_validate(args)
-        return ClientGateService().check(req.client_name, req.run_validation, req.force_refresh, req.required_capability)
+        return ClientGateService().check(req.client_name, req.run_validation, req.force_refresh)
     if name == "workflow.agent_instructions":
         try:
             from ..main import agent_instructions
@@ -2739,14 +2125,6 @@ async def _dispatch(name: str, args: dict) -> object:
             return agent_instructions()
         except Exception as exc:
             return {"error": str(exc), "fallback": "Call workflow.coding_task_plan for workflow guidance"}
-    if name == "workflow.resume_context":
-        return _workflow_resume_context(ResumeContextRequest.model_validate(args))
-    if name == "workflow.intent_plan":
-        return _workflow_intent_plan(IntentPlanRequest.model_validate(args))
-    if name == "workflow.prepare_change_context":
-        return await _workflow_prepare_change_context(PrepareChangeContextRequest.model_validate(args))
-    if name == "repo.patch_change":
-        return _repo_patch_change(PatchChangeRequest.model_validate(args))
     if name == "workflow.capability_check":
         EmptyRequest.model_validate(args)
         return capability_check()
@@ -3151,23 +2529,6 @@ def _persist_resume_result(store: JsonStore, job, resume_results: dict, original
     )
     resume_results["job_status_after_resume"] = finished.status.value
     resume_results["deploy_confirmed"] = finished.deploy_confirmed
-    change_id = original_request.get("change_id")
-    if change_id:
-        try:
-            HybridChangeService().update(
-                str(change_id),
-                {
-                    "deploy_status": finished.status.value,
-                    "deploy_terminal": finished.status not in {JobStatus.queued, JobStatus.running},
-                    "deploy_succeeded": finished.status == JobStatus.passed and bool(
-                        finished.deploy_confirmed or finished.already_deployed_confirmed
-                    ),
-                    "deploy_finished_at": finished.finished_at,
-                },
-                original_request.get("client_name"),
-            )
-        except Exception:
-            pass
     return resume_results
 
 
@@ -3208,12 +2569,9 @@ def _start_and_wait_module_deploy_for_resume(original_request: dict, module_name
             "completion_required": True,
             "success_allowed": False,
             "tool_exit_allowed": False,
-            "current_step": waited.current_step,
-            "elapsed_seconds": waited.elapsed_seconds,
-            "last_progress_at": waited.last_progress_at,
-            "poll_after_seconds": waited.poll_after_seconds,
+            "poll_after_seconds": 10,
             "message": f"Odoo module deploy is still running after {timeout_seconds}s. Safe deploy is not complete and final success is blocked.",
-            "next_call": {"tool": "jobs.get", "arguments": {"job_id": waited.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}},
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": waited.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
         },
     )
 
@@ -3262,16 +2620,6 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
         job = store.get_job(job_id)
     except Exception:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    worker_instance_id = (job.request or {}).get("worker_instance_id")
-    if job.status in {JobStatus.queued, JobStatus.running} and worker_instance_id and worker_instance_id != SAFE_DEPLOY_WORKER_INSTANCE_ID:
-        job = store.finish_job(
-            job,
-            JobStatus.warning,
-            {
-                "status": "worker_restart_resume_required",
-                "message": "The original background worker ended during a server restart; resume from persisted safe-deploy steps.",
-            },
-        )
     job = mark_stale_safe_deploy_running_job(job, store)
     if job.status in {JobStatus.queued, JobStatus.running}:
         return {
@@ -3282,11 +2630,8 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
             "completion_required": True,
             "success_allowed": False,
             "tool_exit_allowed": False,
-            "current_step": job.current_step,
-            "elapsed_seconds": job.elapsed_seconds,
-            "last_progress_at": job.last_progress_at,
-            "poll_after_seconds": job.poll_after_seconds,
-            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}},
+            "poll_after_seconds": 10,
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
         }
 
     completed_set = {s.name for s in (job.steps or []) if s.status in _RESUME_COMPLETED_STATUSES}
@@ -3584,10 +2929,7 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                     resume_results["success_allowed"] = False
                     resume_results["tool_exit_allowed"] = False
                     resume_results["poll_after_seconds"] = 5
-                    resume_results["current_step"] = nested.get("current_step")
-                    resume_results["elapsed_seconds"] = nested.get("elapsed_seconds")
-                    resume_results["last_progress_at"] = nested.get("last_progress_at")
-                    resume_results["next_call"] = nested.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": nested.get("job_id"), "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}}
+                    resume_results["next_call"] = nested.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": nested.get("job_id"), "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
                     return _persist_resume_result(store, job, resume_results, original_request)
                 if result.status != "ok":
                     resume_results["status"] = "failed"

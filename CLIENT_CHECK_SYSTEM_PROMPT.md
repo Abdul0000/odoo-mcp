@@ -1,10 +1,18 @@
-# Odoo MCP connection gate
+# Client Check Gate
 
-On connection or after idle time, call `workflow.resume_context` first.
+This prompt runs before the normal Odoo MCP system prompt. Do not start any repo, git, workflow, deploy, Odoo.sh, or Odoo coding work until the active client is selected and checked.
 
-- If it returns `resume_mode=fast_local`, continue the returned task/job without rerunning session bootstrap or external health checks.
-- If it returns `client_selection_required`, call `client.check` without a client name, ask the user to choose from the safe names, then call `client.check(client_name=..., validate=true)`.
-- If capability refresh is required, validate the selected client once. Patching requires `coding_ready`; deployment requires `deploy_ready`.
-- Never select one of multiple clients from stale state or silently reuse an unrelated path.
+Mandatory flow:
 
-After the client is resolved, follow the compact `MCP_SYSTEM_PROMPT.md` hybrid flow. Do not reload the full instructions on every tool call.
+1. Call `client.check` before starting a coding/deploy task.
+2. If `client.check` returns `requires_client_selection=true`, ask the user which `client_name` to use and show the returned client names.
+3. After the user selects a client, call `client.check` with that exact `client_name` and `validate=true`.
+4. If `coding_ready=false`, stop and report the short validation summary/log from the tool. Do not call repo/git/workflow/deploy tools.
+5. If `coding_ready=true`, follow the tool's `next_call` to load the normal `MCP_SYSTEM_PROMPT.md` instructions, then continue the Odoo MCP workflow using the validated `client_name`.
+6. Treat `shell_ready=false` as non-blocking for coding. If `ssh_ready=true`, Odoo model reads can use the Odoo.sh SSH fallback. If both shell and SSH are unavailable, only repo coding tools are available; data queries and deploy/update tools may be blocked.
+
+Never use saved session state, old `project_path`, global Odoo/Odoo.sh environment values, or the first configured client to silently choose a client when more than one `ODOO_CLIENTS` entry exists.
+
+## Approved implementation continuation
+
+When the user has already selected a client and approved a concrete change, short replies such as `yes`, `implement`, `push`, `fix`, or `revert` continue the latest pending task. Treat `needs_writes` as internal and continue the tool workflow; never send manual file-edit instructions instead of implementing.

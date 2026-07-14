@@ -69,16 +69,8 @@ app = FastAPI(
 
 
 @app.get("/health")
-def health() -> dict[str, object]:
-    state_path = str(settings.state_path)
-    ephemeral_state = state_path.replace("\\", "/").startswith("/tmp/")
-    return {
-        "status": "ok",
-        "service": "odoo-mcp-agent-connector",
-        "state_path": state_path,
-        "state_persistence": "ephemeral_warning" if ephemeral_state else "configured",
-        "warning": "Configure ODOO_AGENT_STATE_DIR on durable storage for restart-safe jobs and refresh-token replay protection." if ephemeral_state else None,
-    }
+def health() -> dict[str, str]:
+    return {"status": "ok", "service": "odoo-mcp-agent-connector"}
 
 
 @app.get("/agent-instructions")
@@ -108,60 +100,6 @@ def agent_instructions() -> dict:
     repo = (active_client.repo if active_client else None) or settings.target_git_repo or "<repo_url>"
     branch = (active_client.branch if active_client else None) or settings.target_git_branch or "<branch>"
     path = (active_client.path if active_client else None) or settings.target_project_path or "/workspace/repos/<repo>"
-
-    return {
-        "version": "hybrid-v1",
-        "prompt_source": "MCP_SYSTEM_PROMPT.md",
-        "system_prompt": load_mcp_system_prompt(),
-        "client_name": active_client.name if active_client else None,
-        "repo": repo,
-        "branch": branch,
-        "project_path": path,
-        "reasoning_modes": {
-            "quick": "Act immediately for obvious resume/read/exact small edits.",
-            "standard": "Use a brief internal approach for normal multi-file Odoo work.",
-            "deep": "Analyze and demonstrate the approach for migrations, security, accounting/payment, architecture, or repeated runtime failures.",
-        },
-        "canonical_flow": [
-            "workflow.resume_context",
-            "workflow.intent_plan (only when intent is unclear)",
-            "workflow.prepare_change_context",
-            "repo.patch_change",
-            "git.diff",
-            "workflow.safe_deploy_module",
-            "jobs.get until terminal proof",
-        ],
-        "guardrails": [
-            "Custom and relevant Odoo core source evidence is mandatory before patching.",
-            "Provider clients may patch and review diffs but cannot commit or push directly.",
-            "Only deploy_confirmed=true or already_deployed_confirmed=true proves completion.",
-        ],
-        "instructions": {
-            "rules": [
-                "For code changes, do not stop after writing files; continue through connector verification and terminal deploy proof.",
-                "Never answer by printing JSON MCP tool calls for the user to execute.",
-                "Normal addon work must not create ir.model.fields or mutate ir.ui.view directly as a Studio shortcut.",
-                "Never generate Pydantic models/imports inside Odoo addon code.",
-                "If the deploy cycle breaks mid-flow, resume the stored job instead of replaying commit or push.",
-            ],
-            "small_patch_fast_path": {
-                "steps": [
-                    "workflow.resume_context",
-                    "workflow.prepare_change_context performs focused custom/core reads",
-                    "repo.patch_change uses repo.write_many_smart internally",
-                    "git.diff",
-                    "workflow.safe_deploy_module",
-                    "jobs.get or workflow.resume_job; explicit legacy recovery may use override_step=push/install/upgrade",
-                ],
-                "do_not": [
-                    "Do not end with 'next steps' after changing code.",
-                    "Do not print sample MCP JSON blocks.",
-                    "Do not use Studio/ORM database schema mutations for normal addon development.",
-                    "Do not put Pydantic code in Odoo addons.",
-                ],
-            },
-        },
-    }
 
     return {
         "version": "v14+",

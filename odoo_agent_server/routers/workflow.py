@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from threading import Lock
-from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, status
 
@@ -88,7 +87,6 @@ from ..services.workflow_guard_service import (
     safe_deploy_block_payload,
 )
 from ..services.checkout_guard_service import ensure_module_exists_or_sync, maybe_ensure_known_module_current
-from ..services.hybrid_change_service import HybridChangeService
 from .qa import self_run
 from .odoo import start_odoo_module_deploy_job
 
@@ -99,7 +97,6 @@ router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDepe
 # first JobRecord is persisted. JsonStore still provides the durable state; this
 # lock closes the in-process check/create window.
 _SAFE_DEPLOY_ENTRY_LOCK = Lock()
-SAFE_DEPLOY_WORKER_INSTANCE_ID = uuid4().hex
 
 
 def _odoosh_service_for_client(client=None):
@@ -629,7 +626,8 @@ def _wait_workflow_job_until_terminal(store: JsonStore, job_id: str, poll_interv
 
 @router.post("/safe-deploy-module", response_model=WorkflowReport)
 async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport:
-    started = time.perf_counter()
+    ClientGateService().require_validated_client(payload.client_name, "workflow.safe_deploy_module")
+
     """Start the single owner deploy pipeline for one project/module.
 
     This entry point is intentionally idempotent for the same
@@ -655,7 +653,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                 "project_path + module_name. No new deploy thread was started; "
                 "poll the existing job instead of replaying commit/push/upgrade or resume."
             )
-            next_call = {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}}
+            next_call = {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
             blocking_reason = "active_job"
         elif job.status == JobStatus.warning:
             report_status = "resumable_existing_job"
@@ -683,7 +681,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             # Defensive fallback; find_blocking_safe_deploy should only return
             # active/resumable safe deploy jobs.
             message = block_payload.get("message") or "Existing safe deploy job found."
-            next_call = block_payload.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}}
+            next_call = block_payload.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
             blocking_reason = "existing_job"
 
         return WorkflowReport(
@@ -708,43 +706,12 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                 "completion_required": job.status in {JobStatus.queued, JobStatus.running},
                 "success_allowed": bool(job.deploy_confirmed or job.already_deployed_confirmed),
                 "tool_exit_allowed": job.status not in {JobStatus.queued, JobStatus.running},
-                "poll_after_seconds": job.poll_after_seconds,
-                "current_step": job.current_step,
-                "elapsed_seconds": job.elapsed_seconds,
-                "last_progress_at": job.last_progress_at,
-                "timings_ms": {"total": round((time.perf_counter() - started) * 1000, 3)},
-                "resume_mode": "existing_job",
+                "poll_after_seconds": 10 if job.status in {JobStatus.queued, JobStatus.running} else None,
                 "next_call": next_call,
             },
         )
 
     try:
-        # Retried provider calls must rejoin their already-running/resumable job
-        # before inspecting a diff that may already have been committed.
-        if not payload.force_new_deploy:
-            with _SAFE_DEPLOY_ENTRY_LOCK:
-                existing_job = find_blocking_safe_deploy(
-                    project_path=payload.project_path,
-                    module_name=payload.module_name,
-                    client_name=payload.client_name,
-                )
-            if existing_job is not None:
-                return _existing_job_report(existing_job)
-
-        ClientGateService().require_validated_client(payload.client_name, "workflow.safe_deploy_module")
-        if payload.change_id:
-            change_context = HybridChangeService().validate_for_deploy(
-                change_id=payload.change_id,
-                client_name=payload.client_name,
-                project_path=payload.project_path,
-                module_name=payload.module_name,
-                expected_paths=payload.paths or None,
-            )
-            payload = payload.model_copy(update={
-                "module_path": change_context.get("module_path") or payload.module_name,
-                "paths": payload.paths or list(change_context.get("changed_files") or []),
-            })
-
         approval = ApprovalService()
         approval.ensure_allowed("workflow.safe_deploy_module", payload.approval_id, payload.model_dump(exclude={"approval_id"}, mode="json"))
 
@@ -760,12 +727,10 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                 return _existing_job_report(existing_job)
 
             store = JsonStore()
-            request_payload = payload.model_dump(mode="json")
-            request_payload["worker_instance_id"] = SAFE_DEPLOY_WORKER_INSTANCE_ID
             job = store.create_job(JobRecord(
                 job_type="safe_deploy_module",
                 status=JobStatus.running,
-                request=request_payload,
+                request=payload.model_dump(mode="json"),
             ))
             store.save_session_state({
                 "last_safe_deploy_job_id": job.id,
@@ -775,26 +740,6 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                 "client_name": payload.client_name,
                 "safe_deploy_status": "running",
             }, client_name=payload.client_name)
-            if payload.change_id:
-                HybridChangeService().update(
-                    payload.change_id,
-                    {"deploy_job_id": job.id, "deploy_status": "running", "deploy_started_at": datetime.now(timezone.utc).isoformat()},
-                    payload.client_name,
-                )
-            kickoff_ms = round((time.perf_counter() - started) * 1000, 3)
-            store.log_audit(
-                "workflow.safe_deploy_module",
-                "running",
-                "Safe deploy job started",
-                {
-                    "job_id": job.id,
-                    "change_id": payload.change_id,
-                    "client_name": payload.client_name,
-                    "timings_ms": {"kickoff": kickoff_ms},
-                    "resume_mode": "new_job",
-                    "cache_hits": [],
-                },
-            )
 
         def _background():
             try:
@@ -809,26 +754,6 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                     # The foreground response already returned the job id. Avoid
                     # leaking background exception handling back to the MCP stream.
                     pass
-            finally:
-                if payload.change_id:
-                    try:
-                        terminal_job = JsonStore().get_job(job.id)
-                        if terminal_job.status not in {JobStatus.queued, JobStatus.running}:
-                            succeeded = terminal_job.status == JobStatus.passed and bool(
-                                terminal_job.deploy_confirmed or terminal_job.already_deployed_confirmed
-                            )
-                            HybridChangeService().update(
-                                payload.change_id,
-                                {
-                                    "deploy_status": terminal_job.status.value,
-                                    "deploy_terminal": True,
-                                    "deploy_succeeded": succeeded,
-                                    "deploy_finished_at": terminal_job.finished_at,
-                                },
-                                payload.client_name,
-                            )
-                    except Exception:
-                        pass
 
         submit_background(_background)
     except HTTPException:
@@ -883,12 +808,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                     "poll_after_seconds": 10,
                     "job_id": job.id,
                     "module_name": payload.module_name,
-                    "current_step": waited.current_step,
-                    "elapsed_seconds": waited.elapsed_seconds,
-                    "last_progress_at": waited.last_progress_at,
-                    "timings_ms": {"total": round((time.perf_counter() - started) * 1000, 3)},
-                    "resume_mode": "waited_job",
-                    "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}},
+                    "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
                 },
             )
         final_status: Literal["passed", "failed", "warning", "running"] = "passed" if waited.status == JobStatus.passed else "failed" if waited.status == JobStatus.failed else "warning"
@@ -908,8 +828,6 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                 "success_allowed": bool(waited.deploy_confirmed or waited.already_deployed_confirmed),
                 "tool_exit_allowed": True,
                 "message": result.get("message") or f"Safe deploy job finished with status {waited.status.value}.",
-                "timings_ms": {"total": round((time.perf_counter() - started) * 1000, 3)},
-                "resume_mode": "waited_terminal",
             },
         )
 
@@ -929,12 +847,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             "poll_after_seconds": 10,
             "job_id": job.id,
             "module_name": payload.module_name,
-            "current_step": job.current_step,
-            "elapsed_seconds": job.elapsed_seconds,
-            "last_progress_at": job.last_progress_at,
-            "timings_ms": {"total": round((time.perf_counter() - started) * 1000, 3)},
-            "resume_mode": "new_job",
-            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}},
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
         },
     )
 
@@ -1162,7 +1075,7 @@ def _verify_registry_fields(fields_by_model: dict[str, list[str]], client=None) 
 
 
 
-def _normalise_safe_deploy_paths(project: Path, module_path: str, paths: list[str]) -> list[str]:
+def _normalise_safe_deploy_paths(project: Path, module_name: str, paths: list[str]) -> list[str]:
     """Validate deploy paths against the exact checkout safe_deploy will commit/push.
 
     This prevents the failure mode where the agent edits one checkout (for example
@@ -1199,10 +1112,10 @@ def _normalise_safe_deploy_paths(project: Path, module_path: str, paths: list[st
             raise ValueError("Deploy path inside .git is blocked")
         # Safe deploy is module-scoped. Refuse accidental unrelated files unless the
         # caller intentionally passes no paths and lets git add -A capture all changes.
-        if module_path and not (rel == module_path or rel.startswith(f"{module_path}/")):
+        if module_name and not (rel == module_name or rel.startswith(f"{module_name}/")):
             raise ValueError(
                 "DEPLOY_PATH_OUTSIDE_MODULE: safe_deploy_module received a path outside the target module. "
-                f"module_path={module_path}; path={rel}. Use the correct module or split the deploy."
+                f"module_name={module_name}; path={rel}. Use the correct module or split the deploy."
             )
         if rel not in seen:
             seen.add(rel)
@@ -1226,7 +1139,7 @@ def _paths_touch_changed_files(deploy_paths: list[str], changed_files: set[str])
     return False
 
 
-def _deploy_request_has_module_changes(module_path: str, deploy_paths: list[str], changed_files: set[str]) -> bool:
+def _deploy_request_has_module_changes(module_name: str, deploy_paths: list[str], changed_files: set[str]) -> bool:
     """Return True when the safe-deploy request has local changes for this module scope.
 
     Empty ``paths`` means the caller did not name a specific file, not that a
@@ -1235,8 +1148,8 @@ def _deploy_request_has_module_changes(module_path: str, deploy_paths: list[str]
     """
     if deploy_paths:
         return _paths_touch_changed_files(deploy_paths, changed_files)
-    module_prefix = module_path.rstrip("/") + "/"
-    return any(rel == module_path or rel.startswith(module_prefix) for rel in changed_files)
+    module_prefix = module_name.rstrip("/") + "/"
+    return any(rel == module_name or rel.startswith(module_prefix) for rel in changed_files)
 
 
 def _safe_deploy_already_deployed_result(
@@ -1666,12 +1579,10 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         return
 
     branch = payload.branch or (client.branch if client else None) or settings.target_git_branch
-    module_scope = payload.module_path or payload.module_name
-    module_path = project_path / module_scope
+    module_path = project_path / payload.module_name
     checkout_guard = ensure_module_exists_or_sync(
         project_path=project_path,
         module_name=payload.module_name,
-        module_relative_path=module_scope,
         branch=branch,
         remote=payload.remote,
         git=git,
@@ -1700,7 +1611,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module checkout/module guard failed")
         return
     try:
-        deploy_paths = _normalise_safe_deploy_paths(project_path, module_scope, payload.paths)
+        deploy_paths = _normalise_safe_deploy_paths(project_path, payload.module_name, payload.paths)
     except Exception as exc:  # noqa: BLE001
         _fail("deploy_path_gate", error=str(exc))
         return
@@ -1721,14 +1632,14 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     if hasattr(git, "changed_files"):
         changed_files_result = git.changed_files(str(project_path))
     else:
-        fallback_paths = deploy_paths or [f"{module_scope}/__manifest__.py"]
+        fallback_paths = deploy_paths or [f"{payload.module_name}/__manifest__.py"]
         changed_files_result = CommandResult(command=["git", "changed-files", "legacy-fake"], cwd=str(project_path), exit_code=0, stdout="\n".join(fallback_paths) + "\n")
     if changed_files_result.exit_code != 0:
         _fail("git_changed_files", changed_files_result)
         return
     changed_files = _changed_file_set(changed_files_result)
     _step("git_changed_files", "passed", changed_files_result)
-    no_changes_detected = not _deploy_request_has_module_changes(module_scope, deploy_paths, changed_files)
+    no_changes_detected = not _deploy_request_has_module_changes(payload.module_name, deploy_paths, changed_files)
     if no_changes_detected:
         try:
             verify_result = verify_deployed_module(DeployedModuleVerifyRequest(
@@ -1871,71 +1782,45 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
 
     idempotent_clean_retry = False
     idempotent_head_path_gate: CommandResult | None = None
-    verify_files = _pre_push_verify_files(project_path, module_scope, deploy_paths, status_result.stdout)
-    verification_service = HybridChangeService() if payload.change_id else None
-    verification_fingerprint = None
-    cached_verification = None
-    if verification_service and payload.change_id:
-        relative_verify_files = [
-            Path(path).resolve().relative_to(project_path.resolve()).as_posix()
-            for path in verify_files
-        ]
-        verification_fingerprint = verification_service.verification_fingerprint(
-            str(project_path), relative_verify_files, payload.run_qa
-        )
-        cached_verification = verification_service.cached_verification(
-            payload.change_id, verification_fingerprint, client.name if client else payload.client_name
-        )
 
-    if cached_verification:
-        if payload.run_qa:
-            _step("qa_self_run", "cached", {"message": "Reused verification for the unchanged checkout SHA, diff, and file hashes."})
-        _step("verify_against_core_pre_push", "cached", cached_verification)
+    if payload.run_qa:
+        qa_report = self_run(SelfRunRequest(
+            project_path=str(project_path),
+            module_name=payload.module_name,
+            run_pytest=True,
+            include_git_status=True,
+            timeout_seconds=min(payload.timeout_seconds, 600),
+        ))
+        _step("qa_self_run", qa_report.status, qa_report)
+        if qa_report.status == "failed":
+            _fail("qa_self_run", qa_report)
+            return
+
+    verify_files = _pre_push_verify_files(project_path, payload.module_name, deploy_paths, status_result.stdout)
+    if verify_files:
+        verify_result = SyntaxVerifierService().verify(SyntaxVerifyRequest(
+            written_files=verify_files,
+            fix_cycle=0,
+            project_path=str(project_path),
+            client_name=client.name if client else payload.client_name,
+        ))
+        _step("verify_against_core_pre_push", "failed" if verify_result.push_blocked else "passed", verify_result)
+        if verify_result.push_blocked:
+            _fail("verify_against_core_pre_push", verify_result)
+            return
     else:
-        if payload.run_qa:
-            qa_report = self_run(SelfRunRequest(
-                project_path=str(project_path),
-                module_name=payload.module_name,
-                run_pytest=True,
-                include_git_status=True,
-                timeout_seconds=min(payload.timeout_seconds, 600),
-            ))
-            _step("qa_self_run", qa_report.status, qa_report)
-            if qa_report.status == "failed":
-                _fail("qa_self_run", qa_report)
-                return
-
-        if verify_files:
-            verify_result = SyntaxVerifierService().verify(SyntaxVerifyRequest(
-                written_files=verify_files,
-                fix_cycle=0,
-                project_path=str(project_path),
-                client_name=client.name if client else payload.client_name,
-            ))
-            _step("verify_against_core_pre_push", "failed" if verify_result.push_blocked else "passed", verify_result)
-            if verify_result.push_blocked:
-                _fail("verify_against_core_pre_push", verify_result)
-                return
-        else:
-            _step(
-                "verify_against_core_pre_push",
-                "warning",
-                {
-                    "message": (
-                        "No changed module .py/.xml/.js/.scss/.css/.csv/__manifest__.py files were detected for pre-push verification. "
-                        "Push gate passed only because there were no verifiable code files in this deploy request."
-                    )
-                },
-            )
-        if verification_service and payload.change_id and verification_fingerprint:
-            verification_service.store_verification(
-                payload.change_id,
-                verification_fingerprint,
-                {"verified_files": len(verify_files), "run_qa": payload.run_qa},
-                client.name if client else payload.client_name,
-            )
+        _step(
+            "verify_against_core_pre_push",
+            "warning",
+            {
+                "message": (
+                    "No changed module .py/.xml/.js/.scss/.css/.csv/__manifest__.py files were detected for pre-push verification. "
+                    "Push gate passed only because there were no verifiable code files in this deploy request."
+                )
+            },
+        )
     expected_user_hashes = _expected_user_file_hashes(project_path, verify_files)
-    expected_registry_fields = _normalise_expected_registry_fields(payload.expected_registry_fields) or _infer_registry_fields_from_python(project_path, module_scope, verify_files)
+    expected_registry_fields = _normalise_expected_registry_fields(payload.expected_registry_fields) or _infer_registry_fields_from_python(project_path, payload.module_name, verify_files)
 
     identity_result = git.configure_identity(str(project_path))
     if identity_result.exit_code != 0:
@@ -2232,9 +2117,9 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         if remote_head.exit_code != 0 or remote_sha != pushed_sha:
             return False
 
-        verify_files = _pre_push_verify_files(project_path, module_scope, retry_paths, git.status(str(project_path)).stdout if hasattr(git, "status") else "") or implicated_files
+        verify_files = _pre_push_verify_files(project_path, payload.module_name, retry_paths, git.status(str(project_path)).stdout if hasattr(git, "status") else "") or implicated_files
         expected_user_hashes = _expected_user_file_hashes(project_path, verify_files)
-        expected_registry_fields = _normalise_expected_registry_fields(payload.expected_registry_fields) or _infer_registry_fields_from_python(project_path, module_scope, verify_files)
+        expected_registry_fields = _normalise_expected_registry_fields(payload.expected_registry_fields) or _infer_registry_fields_from_python(project_path, payload.module_name, verify_files)
         job = store.get_job(job_id)
         job.request["push_started_epoch"] = push_started_epoch
         job.request["last_sha"] = pushed_sha

@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
-from odoo_agent_server.services.oauth_service import OAuthStore
 
 
 def _challenge(verifier: str) -> str:
@@ -111,74 +109,6 @@ def test_dynamic_client_registration_pkce_authorization_code_and_mcp_access(tmp_
     )
     assert refreshed.status_code == 200
     assert refreshed.json()["access_token"] != access_token
-    assert refreshed.json()["refresh_token"] == refresh_token
-
-    reused = client.post(
-        "/oauth/token",
-        data={"grant_type": "refresh_token", "client_id": client_id, "refresh_token": refresh_token, "resource": "https://agent.example.com/mcp"},
-    )
-    assert reused.status_code == 200
-    assert reused.json()["refresh_token"] == refresh_token
-
-    other_resource_client = TestClient(app, base_url="https://different.example.com")
-    wrong_audience = other_resource_client.get(
-        "/tools/list",
-        headers={"Authorization": f"Bearer {refreshed.json()['access_token']}"},
-    )
-    assert wrong_audience.status_code == 200
-
-    reusable_token = refreshed.json()["refresh_token"]
-    store = OAuthStore()
-
-    def refresh_once():
-        try:
-            return store.refresh_access_token(
-                refresh_token=reusable_token,
-                client_id=client_id,
-                resource="https://agent.example.com/mcp",
-            )
-        except Exception as exc:
-            return exc
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        outcomes = list(pool.map(lambda _: refresh_once(), range(2)))
-    assert all(isinstance(item, dict) for item in outcomes)
-    assert all(item["refresh_token"] == reusable_token for item in outcomes)
-
-
-def test_oauth_legacy_compatibility_ignores_optional_resource(tmp_path, monkeypatch):
-    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
-    monkeypatch.setattr(settings, "oauth_auto_approve", True)
-    client = TestClient(app, base_url="https://agent.example.com")
-    verifier = "resource-verifier-abcdefghijklmnopqrstuvwxyz1234567890"
-    authorize = client.get(
-        "/oauth/authorize",
-        params={
-            "response_type": "code",
-            "client_id": settings.oauth_static_client_id,
-            "redirect_uri": "https://chatgpt.com/connector_platform_oauth_redirect",
-            "scope": "odoo.agent",
-            "code_challenge": _challenge(verifier),
-            "code_challenge_method": "S256",
-        },
-        follow_redirects=False,
-    )
-    assert authorize.status_code == 302
-
-    wrong = client.get(
-        "/oauth/authorize",
-        params={
-            "response_type": "code",
-            "client_id": settings.oauth_static_client_id,
-            "redirect_uri": "https://chatgpt.com/connector_platform_oauth_redirect",
-            "scope": "odoo.agent",
-            "code_challenge": _challenge(verifier),
-            "code_challenge_method": "S256",
-            "resource": "https://other.example.com/mcp",
-        },
-        follow_redirects=False,
-    )
-    assert wrong.status_code == 302
 
 
 def test_manual_consent_requires_connector_token(tmp_path, monkeypatch):
@@ -194,7 +124,6 @@ def test_manual_consent_requires_connector_token(tmp_path, monkeypatch):
         "scope": "odoo.agent",
         "code_challenge": _challenge(verifier),
         "code_challenge_method": "S256",
-        "resource": "https://agent.example.com/mcp",
     }
     page = client.get("/oauth/authorize", params=params)
     assert page.status_code == 200

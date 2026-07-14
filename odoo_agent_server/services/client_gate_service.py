@@ -23,6 +23,7 @@ PLACEHOLDER_RE = re.compile(r"^(CHANGE_ME|YOUR_|CLIENT_2_|ODOO_|ODOOSH_|GITHUB_|
 class ClientGateService:
     """Client selection and validation gate for multi-client MCP deployments."""
 
+    VALIDATION_TTL_SECONDS = 1800
     SESSION_VALIDATED_KEY = "client_validated"
     SESSION_ACTIVE_KEY = "active_client_name"
 
@@ -30,7 +31,7 @@ class ClientGateService:
         self.store = store or JsonStore()
         self.resolver = ClientResolverService()
 
-    def check(self, client_name: str | None = None, validate: bool = False, force_refresh: bool = False, required_capability: str = "full") -> dict[str, Any]:
+    def check(self, client_name: str | None = None, validate: bool = False, force_refresh: bool = False) -> dict[str, Any]:
         clients = [normalise_client(item) for item in get_odoo_clients()]
         public_clients = [safe_client_public(item) for item in clients]
         names = [item.get("name") or f"ODOO_CLIENTS[{idx}]" for idx, item in enumerate(clients)]
@@ -51,7 +52,7 @@ class ClientGateService:
                 selected = clients[0]
                 selected_name = selected.get("name") or "ODOO_CLIENTS[0]"
                 if validate:
-                    return self._validate_and_save(selected_name, force_refresh=force_refresh, required_capability=required_capability)
+                    return self._validate_and_save(selected_name, force_refresh=force_refresh)
                 existing = self.validation_state(selected_name)
                 return {
                     "ok": bool(existing.get("validated")),
@@ -82,7 +83,7 @@ class ClientGateService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Client not found or incomplete: {client_name}")
 
         if validate:
-            return self._validate_and_save(resolved.name, force_refresh=force_refresh, required_capability=required_capability)
+            return self._validate_and_save(resolved.name, force_refresh=force_refresh)
 
         existing = self.validation_state(resolved.name)
         return {
@@ -145,7 +146,7 @@ class ClientGateService:
                         "message": (
                             f"Client '{resolved_name}' was previously validated, but that validation is stale: "
                             f"{stale_reason}. Run client.check(client_name='{resolved_name}', "
-                            f"validate=true, force_refresh=true, required_capability='{requirement}') before {action}."
+                            f"validate=true, force_refresh=true) before {action}."
                         ),
                         "validation": validation,
                     },
@@ -160,7 +161,7 @@ class ClientGateService:
                 "required_capability": requirement,
                 "message": (
                     f"Client '{resolved_name}' has not passed {requirement} validation for this session. "
-                    f"Run client.check(client_name='{resolved_name}', validate=true, required_capability='{requirement}') before {action}."
+                    f"Run client.check(client_name='{resolved_name}', validate=true) before {action}."
                 ),
                 "validation": validation,
             },
@@ -199,8 +200,8 @@ class ClientGateService:
         if project_path and not Path(project_path).expanduser().is_dir():
             return f"repo checkout no longer exists at {project_path}"
         age_seconds = self._validation_age_seconds(validation)
-        if age_seconds is not None and age_seconds > settings.client_validation_ttl_seconds:
-            minutes = settings.client_validation_ttl_seconds // 60
+        if age_seconds is not None and age_seconds > self.VALIDATION_TTL_SECONDS:
+            minutes = self.VALIDATION_TTL_SECONDS // 60
             return f"validation is older than {minutes} minutes"
         return None
 
@@ -246,14 +247,13 @@ class ClientGateService:
                 return {"client_name": name, "validation": state}
         return None
 
-    def _validate_and_save(self, client_name: str, force_refresh: bool = False, required_capability: str = "full") -> dict[str, Any]:
+    def _validate_and_save(self, client_name: str, force_refresh: bool = False) -> dict[str, Any]:
         resolved = self.resolver.resolve_client(client_name=client_name, require_complete=True)
         if not resolved:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Client not found or incomplete: {client_name}")
 
         existing = self.validation_state(resolved.name)
-        required_key = "full_validation_passed" if required_capability == "full" else required_capability
-        if existing.get("validated") and self._validation_satisfies(existing, required_key) and not force_refresh:
+        if existing.get("validated") and not force_refresh:
             cached_path = self._validated_project_path(resolved.name, existing)
             if self._validation_stale_reason(existing, cached_path):
                 force_refresh = True
@@ -261,12 +261,6 @@ class ClientGateService:
                 return {
                     "ok": True,
                     "validated": True,
-                    "coding_ready": bool(existing.get("coding_ready")),
-                    "deploy_ready": bool(existing.get("deploy_ready")),
-                    "data_query_ready": bool(existing.get("data_query_ready")),
-                    "shell_ready": bool(existing.get("shell_ready")),
-                    "ssh_ready": bool(existing.get("ssh_ready")),
-                    "validation_scope": existing.get("validation_scope") or required_capability,
                     "requires_client_selection": False,
                     "requires_validation": False,
                     "client_name": resolved.name,
@@ -297,46 +291,38 @@ class ClientGateService:
             checks[check] = "ok"
             log.append(message)
 
-        reuse_coding_base = required_capability in {"deploy_ready", "data_query_ready"} and self._local_coding_base_matches(existing, resolved)
-        if reuse_coding_base:
-            checks.update(existing.get("checks") or {})
-            checks["coding_base"] = "cached"
-            log.append("Reused the validated local checkout and branch; skipped remote Git and repo preparation for capability-only refresh.")
+        config_errors = self._config_errors(resolved)
+        if config_errors:
+            checks["config"] = "failed"
+            base_ok = False
+            error_type = "config_error"
+            log.extend(config_errors)
         else:
-            config_errors = self._config_errors(resolved)
-            if config_errors:
-                checks["config"] = "failed"
+            pass_check("config", "Required client coding settings are present and do not look like placeholders.")
+
+        if base_ok:
+            repo_result = self._check_repo_branch(resolved)
+            checks["github"] = repo_result["status"]
+            checks["branch"] = repo_result["status"] if repo_result.get("branch_ok") else ("failed" if repo_result["status"] == "failed" else "skipped")
+            log.extend(repo_result["log"])
+            if repo_result["status"] != "ok":
                 base_ok = False
-                error_type = "config_error"
-                log.extend(config_errors)
-            else:
-                pass_check("config", "Required client coding settings are present and do not look like placeholders.")
+                error_type = repo_result.get("error_type") or "github_error"
 
-            if base_ok:
-                repo_result = self._check_repo_branch(resolved)
-                checks["github"] = repo_result["status"]
-                checks["branch"] = repo_result["status"] if repo_result.get("branch_ok") else ("failed" if repo_result["status"] == "failed" else "skipped")
-                log.extend(repo_result["log"])
-                if repo_result["status"] != "ok":
-                    base_ok = False
-                    error_type = repo_result.get("error_type") or "github_error"
-
-            if base_ok:
-                checkout_result = self._check_checkout(resolved)
-                checks["checkout"] = checkout_result["status"]
-                log.extend(checkout_result["log"])
-                if checkout_result["status"] != "ok":
-                    base_ok = False
-                    error_type = checkout_result.get("error_type") or "checkout_error"
+        if base_ok:
+            checkout_result = self._check_checkout(resolved)
+            checks["checkout"] = checkout_result["status"]
+            log.extend(checkout_result["log"])
+            if checkout_result["status"] != "ok":
+                base_ok = False
+                error_type = checkout_result.get("error_type") or "checkout_error"
 
         coding_ready = bool(base_ok)
 
         # Odoo shell is useful for data/model operations, but it is not required
         # for coding work. It runs through the selected client's Odoo.sh SSH
         # settings; no process-wide environment is mutated.
-        need_shell = required_capability in {"full", "data_query_ready"}
-        need_ssh = required_capability in {"full", "deploy_ready"}
-        if coding_ready and need_shell:
+        if coding_ready:
             if self._has_shell_config(resolved):
                 odoo_result = self._check_odoo_shell(resolved)
                 checks["odoo_shell"] = odoo_result["status"]
@@ -346,7 +332,7 @@ class ClientGateService:
                 checks["odoo_shell"] = "skipped"
                 log.append("Odoo shell skipped: Odoo.sh SSH/db/path settings are missing or placeholders.")
 
-        if coding_ready and need_ssh:
+        if coding_ready:
             if self._has_odoosh_config(resolved):
                 ssh_result = self._check_odoosh(resolved)
                 checks["odoosh_ssh"] = ssh_result["status"]
@@ -391,7 +377,6 @@ class ClientGateService:
             "shell_ready": shell_ok,
             "ssh_ready": ssh_ok,
             "full_validation_passed": full_validation_passed,
-            "validation_scope": required_capability,
             "read_only_ssh_available": ssh_ok,
             "deploy_blocker": None if deploy_ready else ("Odoo.sh SSH is required for safe deploy/source verification/module upgrade." if coding_ready else None),
             "client_name": resolved.name,
@@ -424,7 +409,6 @@ class ClientGateService:
             "shell_ready": shell_ok,
             "ssh_ready": ssh_ok,
             "full_validation_passed": full_validation_passed,
-            "validation_scope": required_capability,
             "requires_client_selection": False,
             "requires_validation": not coding_ready,
             "client_name": resolved.name,
@@ -437,26 +421,6 @@ class ClientGateService:
             "validation_log": log[-30:],
             "next_call": {"tool": "workflow.agent_instructions", "arguments": {}} if coding_ready else None,
         }
-
-    @staticmethod
-    def _local_coding_base_matches(existing: dict[str, Any], resolved: ResolvedClient) -> bool:
-        if not existing.get("coding_ready"):
-            return False
-        project = Path(resolved.path).expanduser()
-        if not project.is_dir() or not (project / ".git").exists():
-            return False
-        try:
-            branch = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=project,
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return False
-        return branch.returncode == 0 and branch.stdout.strip() == resolved.branch
 
     def _config_errors(self, client: ResolvedClient) -> list[str]:
         """Validate only the minimum settings needed to choose a coding target.

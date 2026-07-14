@@ -76,10 +76,6 @@ class ClientCheckRequest(BaseModel):
         description="When true, verify repo/token/branch, checkout, Odoo shell, and Odoo.sh SSH before enabling write/deploy tools.",
     )
     force_refresh: bool = Field(default=False, description="Re-run validation even if this client was already validated in session state.")
-    required_capability: Literal["coding_ready", "deploy_ready", "data_query_ready", "full"] = Field(
-        default="full",
-        description="Validate only the capability needed by the next operation.",
-    )
 
 
 class LimitRequest(BaseModel):
@@ -94,7 +90,7 @@ class JobGetRequest(BaseModel):
     job_id: str = Field(..., min_length=1)
     wait_for_result: bool = Field(default=True, description="Wait server-side for a short bounded poll window; running is not success")
     wait_timeout_seconds: int = Field(
-        default=20,
+        default=600,
         ge=0,
         le=2400,
         description="Maximum server-side wait for this poll call. Use 0 only for CLI/internal integrations that can safely wait indefinitely.",
@@ -208,47 +204,6 @@ class OdooCodeFileChange(BaseModel):
     replace: str | None = Field(default=None, description="Replacement text when search is provided.")
     regex: bool = Field(default=False, description="Treat search as a Python regular expression.")
     count: int = Field(default=0, ge=0, le=1000, description="Maximum replacements. 0 means replace all occurrences.")
-
-
-class ResumeContextRequest(BaseModel):
-    client_name: str | None = Field(default=None, description="Client to resume. Omit only when zero or one client is configured.")
-    project_path: str | None = Field(default=None, description="Known checkout path used to disambiguate a client.")
-    include_recent_jobs: int = Field(default=5, ge=1, le=20, description="Maximum recent jobs to inspect without network calls.")
-
-
-class IntentPlanRequest(BaseModel):
-    task_description: str = Field(..., min_length=1, max_length=4000)
-    client_name: str | None = None
-    operation: Literal["auto", "read", "write", "deploy", "resume"] = "auto"
-    target_surface: Literal["auto", "backend", "frontend", "data", "infrastructure"] = "auto"
-    module_hint: str | None = Field(default=None, max_length=200)
-    known_paths: list[str] = Field(default_factory=list, max_length=50)
-
-
-class PrepareChangeContextRequest(BaseModel):
-    client_name: str | None = Field(default=None, description="Client from ODOO_CLIENTS.")
-    project_path: str | None = Field(default=None, description="Existing checkout path when already resolved.")
-    module_name: str = Field(..., min_length=1, max_length=200, description="Custom module name or safe human hint.")
-    task_description: str = Field(..., min_length=3, max_length=2000)
-    target_files: list[str] = Field(default_factory=list, max_length=50)
-    search_patterns: list[str] = Field(default_factory=list, max_length=10)
-    task_type: str = Field(default="auto", max_length=80)
-    intent: str | None = Field(default=None, max_length=160)
-    target_hint: str | None = Field(default=None, max_length=500)
-    create_module: bool = False
-    max_search_matches: int = Field(default=20, ge=1, le=100)
-
-
-class PatchChangeRequest(BaseModel):
-    change_id: str = Field(..., pattern=r"^chg_[a-f0-9]{32}$")
-    client_name: str | None = None
-    edits: list[OdooCodeFileChange] = Field(
-        default_factory=list,
-        max_length=20,
-        description="Exact edits to apply. An empty list is a callable continuation probe that returns the prepared scope without mutating files.",
-    )
-    check_only: bool = False
-    strategy: Literal["auto", "fast_safe", "atomic"] = "auto"
 
 
 class OdooCodeChangeRequest(BaseModel):
@@ -958,32 +913,7 @@ class JobRecord(BaseModel):
     @computed_field  # type: ignore[misc]
     @property
     def poll_after_seconds(self) -> int | None:
-        return 5 if self.completion_required else None
-
-    @computed_field  # type: ignore[misc]
-    @property
-    def current_step(self) -> str | None:
-        if not self.steps:
-            return None
-        return self.steps[-1].name
-
-    @computed_field  # type: ignore[misc]
-    @property
-    def last_progress_at(self) -> str:
-        if self.steps:
-            return self.steps[-1].finished_at or self.steps[-1].started_at
-        return self.created_at
-
-    @computed_field  # type: ignore[misc]
-    @property
-    def elapsed_seconds(self) -> float:
-        try:
-            started = datetime.fromisoformat(self.created_at.replace("Z", "+00:00"))
-            end_raw = self.finished_at or datetime.now(timezone.utc).isoformat()
-            ended = datetime.fromisoformat(end_raw.replace("Z", "+00:00"))
-            return max(round((ended - started).total_seconds(), 3), 0.0)
-        except (TypeError, ValueError):
-            return 0.0
+        return 10 if self.completion_required else None
 
     @computed_field  # type: ignore[misc]
     @property
@@ -995,8 +925,8 @@ class JobRecord(BaseModel):
             "arguments": {
                 "job_id": self.id,
                 "wait_for_result": True,
-                "wait_timeout_seconds": 20,
-                "poll_interval_seconds": 2.0,
+                "wait_timeout_seconds": 600,
+                "poll_interval_seconds": 10.0,
             },
         }
 
@@ -1006,8 +936,6 @@ class ToolDescriptor(BaseModel):
     description: str
     read_only: bool = False
     requires_approval: bool = False
-    idempotent: bool = False
-    open_world: bool = False
     deprecated: bool = Field(
         default=False,
         description=(
@@ -1045,10 +973,8 @@ class CapabilityCheckResult(BaseModel):
 
 
 class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
-    change_id: str | None = Field(default=None, pattern=r"^chg_[a-f0-9]{32}$", description="Hybrid workflow change id. Required for provider-initiated deploys and optional for backward-compatible REST/internal calls.")
     client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. When omitted, resolves from project_path when possible.")
     module_name: str = Field(..., description="Technical module folder/name to deploy and update")
-    module_path: str | None = Field(default=None, description="Repo-relative addon directory. Defaults to module_name for root-level addons.")
     commit_message: str = Field(..., min_length=3, max_length=300)
     paths: list[str] = Field(default_factory=list, description="Relative paths to add before commit. Empty means git add -A.")
     remote: str = Field(default="origin")
@@ -1066,7 +992,7 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
         ),
     )
     wait_timeout_seconds: int = Field(
-        default=20,
+        default=600,
         ge=0,
         le=2400,
         description="Maximum server-side wait before returning job_id/next_call. Use 0 only for CLI/internal integrations that can safely wait indefinitely.",

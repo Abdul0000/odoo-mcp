@@ -32,8 +32,7 @@ def test_stateless_oauth_refresh_survives_state_directory_loss(tmp_path, monkeyp
             'state': 'redeploy-state',
             'scope': 'odoo.agent',
             'code_challenge': _challenge(verifier),
-                'code_challenge_method': 'S256',
-                'resource': 'https://agent.example.com/mcp',
+            'code_challenge_method': 'S256',
         },
         follow_redirects=False,
     )
@@ -47,14 +46,13 @@ def test_stateless_oauth_refresh_survives_state_directory_loss(tmp_path, monkeyp
             'redirect_uri': 'https://chatgpt.com/connector_platform_oauth_redirect',
             'code': code,
             'code_verifier': verifier,
-            'resource': 'https://agent.example.com/mcp',
         },
     )
     assert token.status_code == 200
     refresh_token = token.json()['refresh_token']
 
-    # Original connector compatibility: the signed refresh token remains
-    # usable after a restart even if the durable state directory changes.
+    # Simulate Koyeb redeploy with empty /tmp-backed state directory. The
+    # refresh token must still work because it is signed and self-validating.
     monkeypatch.setattr(settings, 'state_dir', str(second_state))
     refreshed = client.post(
         '/oauth/token',
@@ -62,9 +60,7 @@ def test_stateless_oauth_refresh_survives_state_directory_loss(tmp_path, monkeyp
             'grant_type': 'refresh_token',
             'client_id': settings.oauth_static_client_id,
             'refresh_token': refresh_token,
-            'resource': 'https://agent.example.com/mcp',
         },
     )
     assert refreshed.status_code == 200
     assert refreshed.json()['access_token'].startswith('sat_')
-    assert refreshed.json()['refresh_token'] == refresh_token

@@ -4,14 +4,11 @@ import base64
 import hashlib
 import hmac
 import json
-import os
 import secrets
-import tempfile
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from threading import RLock
+from threading import Lock
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
@@ -90,7 +87,7 @@ class OAuthStore:
     Replace with PostgreSQL/Redis for multi-worker production deployments.
     """
 
-    _lock = RLock()
+    _lock = Lock()
 
     def __init__(self) -> None:
         self.root = settings.state_path
@@ -98,7 +95,7 @@ class OAuthStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _default_state(self) -> dict[str, Any]:
-        return {"clients": {}, "codes": {}, "access_tokens": {}, "refresh_tokens": {}, "used_refresh_tokens": {}}
+        return {"clients": {}, "codes": {}, "access_tokens": {}, "refresh_tokens": {}}
 
     def _read(self) -> dict[str, Any]:
         with self._lock:
@@ -116,47 +113,7 @@ class OAuthStore:
     def _write(self, state: dict[str, Any]) -> None:
         with self._lock:
             self.root.mkdir(parents=True, exist_ok=True)
-            payload = json.dumps(state, indent=2, sort_keys=True)
-            handle = tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.root, prefix="oauth-", suffix=".tmp", delete=False)
-            temp_name = handle.name
-            try:
-                with handle:
-                    handle.write(payload)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                os.replace(temp_name, self.file)
-            finally:
-                try:
-                    Path(temp_name).unlink(missing_ok=True)
-                except OSError:
-                    pass
-
-    @contextmanager
-    def _process_lock(self):
-        """Serialize OAuth read/modify/write cycles across server workers."""
-        self.root.mkdir(parents=True, exist_ok=True)
-        lock_path = self.root / "oauth.lock"
-        with lock_path.open("a+b") as handle:
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"0")
-                handle.flush()
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-                try:
-                    yield
-                finally:
-                    handle.seek(0)
-                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            self.file.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
 
     def register_client(self, metadata: dict[str, Any]) -> dict[str, Any]:
         redirect_uris = metadata.get("redirect_uris") or []
@@ -177,10 +134,9 @@ class OAuthStore:
             "scope": metadata.get("scope") or settings.oauth_default_scope,
             "token_endpoint_auth_method": metadata.get("token_endpoint_auth_method") or "none",
         }
-        with self._lock, self._process_lock():
-            state = self._read()
-            state["clients"][client_id] = record
-            self._write(state)
+        state = self._read()
+        state["clients"][client_id] = record
+        self._write(state)
         return record
 
     def get_client(self, client_id: str) -> OAuthClient:
@@ -229,7 +185,6 @@ class OAuthStore:
         scope: str,
         code_challenge: str,
         code_challenge_method: str,
-        resource: str | None = None,
     ) -> str:
         client = self.get_client(client_id)
         _validate_redirect_for_client(client, redirect_uri)
@@ -237,18 +192,17 @@ class OAuthStore:
             raise HTTPException(status_code=400, detail="PKCE S256 code_challenge is required")
 
         code = "code_" + secrets.token_urlsafe(32)
-        with self._lock, self._process_lock():
-            state = self._read()
-            state["codes"][code] = {
-                "client_id": client_id,
-                "redirect_uri": redirect_uri,
-                "scope": scope or settings.oauth_default_scope,
-                "code_challenge": code_challenge,
-                "code_challenge_method": code_challenge_method,
-                "expires_at": int(time.time()) + settings.oauth_authorization_code_ttl_seconds,
-                "used": False,
-            }
-            self._write(state)
+        state = self._read()
+        state["codes"][code] = {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "scope": scope or settings.oauth_default_scope,
+            "code_challenge": code_challenge,
+            "code_challenge_method": code_challenge_method,
+            "expires_at": int(time.time()) + settings.oauth_authorization_code_ttl_seconds,
+            "used": False,
+        }
+        self._write(state)
         return code
 
     def exchange_code(
@@ -259,27 +213,6 @@ class OAuthStore:
         redirect_uri: str,
         code_verifier: str,
         client_secret: str | None = None,
-        resource: str | None = None,
-    ) -> dict[str, Any]:
-        with self._lock, self._process_lock():
-            return self._exchange_code_locked(
-                code=code,
-                client_id=client_id,
-                redirect_uri=redirect_uri,
-                code_verifier=code_verifier,
-                client_secret=client_secret,
-                resource=resource,
-            )
-
-    def _exchange_code_locked(
-        self,
-        *,
-        code: str,
-        client_id: str,
-        redirect_uri: str,
-        code_verifier: str,
-        client_secret: str | None,
-        resource: str | None,
     ) -> dict[str, Any]:
         client = self.get_client(client_id)
         _validate_client_secret(client, client_secret)
@@ -296,13 +229,10 @@ class OAuthStore:
             raise HTTPException(status_code=400, detail="Authorization code client or redirect mismatch")
         if not _verify_pkce_s256(code_verifier, record.get("code_challenge", "")):
             raise HTTPException(status_code=400, detail="Invalid PKCE code_verifier")
+
         record["used"] = True
         state["codes"][code] = record
-        token_payload = self._issue_tokens(
-            state,
-            client_id=client_id,
-            scope=record.get("scope") or settings.oauth_default_scope,
-        )
+        token_payload = self._issue_tokens(state, client_id=client_id, scope=record.get("scope") or settings.oauth_default_scope)
         self._write(state)
         return token_payload
 
@@ -312,36 +242,16 @@ class OAuthStore:
         refresh_token: str,
         client_id: str,
         client_secret: str | None = None,
-        resource: str | None = None,
     ) -> dict[str, Any]:
-        with self._lock, self._process_lock():
-            return self._refresh_access_token_locked(
-                refresh_token=refresh_token,
-                client_id=client_id,
-                client_secret=client_secret,
-                resource=resource,
-            )
-
-    def _refresh_access_token_locked(
-        self,
-        *,
-        refresh_token: str,
-        client_id: str,
-        client_secret: str | None,
-        resource: str | None,
-    ) -> dict[str, Any]:
-        # Compatibility mode from the original connector: signed refresh tokens
-        # remain usable across restarts/state loss and are reused by the client.
+        # Prefer stateless refresh tokens so MCP clients remain connected across
+        # Koyeb/container redeploys even when the file-backed state directory is
+        # reset. The client_id check prevents a token issued for one client from
+        # being replayed by another.
         stateless = _decode_signed_token(refresh_token, "srt")
         if stateless:
             if stateless.get("client_id") != client_id:
                 raise HTTPException(status_code=400, detail="Invalid refresh_token client")
-            return self._issue_tokens(
-                self._read(),
-                client_id=client_id,
-                scope=stateless.get("scope") or settings.oauth_default_scope,
-                reuse_refresh_token=refresh_token,
-            )
+            return self._issue_tokens(self._read(), client_id=client_id, scope=stateless.get("scope") or settings.oauth_default_scope, reuse_refresh_token=refresh_token)
 
         client = self.get_client(client_id)
         _validate_client_secret(client, client_secret)
@@ -351,12 +261,7 @@ class OAuthStore:
             raise HTTPException(status_code=400, detail="Invalid refresh_token")
         if int(record.get("expires_at", 0)) < int(time.time()):
             raise HTTPException(status_code=400, detail="Refresh token expired")
-        token_payload = self._issue_tokens(
-            state,
-            client_id=client_id,
-            scope=record.get("scope") or settings.oauth_default_scope,
-            reuse_refresh_token=refresh_token,
-        )
+        token_payload = self._issue_tokens(state, client_id=client_id, scope=record.get("scope") or settings.oauth_default_scope, reuse_refresh_token=refresh_token)
         self._write(state)
         return token_payload
 
@@ -366,7 +271,6 @@ class OAuthStore:
         *,
         client_id: str,
         scope: str,
-        resource: str | None = None,
         reuse_refresh_token: str | None = None,
     ) -> dict[str, Any]:
         now = int(time.time())
@@ -413,7 +317,7 @@ class OAuthStore:
             "scope": scope,
         }
 
-    def validate_access_token(self, token: str, resource: str | None = None) -> dict[str, Any] | None:
+    def validate_access_token(self, token: str) -> dict[str, Any] | None:
         if not token:
             return None
         stateless = _decode_signed_token(token, "sat")
@@ -432,20 +336,6 @@ class OAuthStore:
         if int(record.get("expires_at", 0)) < int(time.time()):
             return None
         return record
-
-
-def _default_resource() -> str:
-    base = (settings.public_base_url or settings.oauth_issuer or "").rstrip("/")
-    return f"{base}/mcp" if base else "/mcp"
-
-
-def _canonical_resource(resource: str) -> str:
-    value = str(resource or "").strip()
-    parsed = urlparse(value)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc or parsed.fragment:
-        raise HTTPException(status_code=400, detail="resource must be an absolute HTTP(S) MCP URI without a fragment")
-    path = parsed.path.rstrip("/")
-    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}" + (f"?{parsed.query}" if parsed.query else "")
 
 
 def _validate_client_secret(client: OAuthClient, client_secret: str | None) -> None:
