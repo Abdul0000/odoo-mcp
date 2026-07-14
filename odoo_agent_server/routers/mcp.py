@@ -420,6 +420,7 @@ _claude_schema = _remote_compatible_schema
 
 def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
     title = getattr(tool, "title", None) or _humanize_tool_name(tool.name)
+    security_schemes = [{"type": "oauth2", "scopes": [settings.oauth_default_scope]}]
     if profile in {"provider", "claude", "chatgpt", "grok", "qwen"}:
         # Some remote-MCP builds are strict and can fail while
         # validating the initial tool list. For ChatGPT, keep initialize/tools/list
@@ -429,6 +430,8 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
             "name": _mcp_safe_tool_name(tool.name),
             "description": str(tool.description)[:900],
             "inputSchema": _remote_compatible_schema(tool_input_schema(tool.name)),
+            "securitySchemes": security_schemes,
+            "_meta": {"securitySchemes": security_schemes},
             "annotations": {
                 "readOnlyHint": bool(tool.read_only),
                 "destructiveHint": bool(tool.requires_approval),
@@ -445,6 +448,8 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
             f"{tool.description}"
         ),
         "inputSchema": tool_input_schema(tool.name),
+        "securitySchemes": security_schemes,
+        "_meta": {"securitySchemes": security_schemes},
         "annotations": {
             "title": title,
             "readOnlyHint": bool(tool.read_only),

@@ -125,3 +125,17 @@ def test_root_provider_tools_metadata_matches_mcp_surface():
     assert root.status_code == 200
     assert set(root.json()["provider_tools"]) == _PROVIDER_TOOLS
 
+
+def test_provider_tools_declare_oauth_security_schemes_for_chatgpt_linking():
+    client = TestClient(app)
+    response = client.post(
+        "/mcp",
+        headers=_auth(),
+        json=_mcp("tools/list", {}),
+    )
+    assert response.status_code == 200
+    expected = [{"type": "oauth2", "scopes": [settings.oauth_default_scope]}]
+    for tool in response.json()["result"]["tools"]:
+        assert tool["securitySchemes"] == expected
+        assert tool["_meta"]["securitySchemes"] == expected
+
