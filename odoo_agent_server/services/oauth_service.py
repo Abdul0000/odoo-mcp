@@ -245,7 +245,6 @@ class OAuthStore:
                 "scope": scope or settings.oauth_default_scope,
                 "code_challenge": code_challenge,
                 "code_challenge_method": code_challenge_method,
-                "resource": resource or _default_resource(),
                 "expires_at": int(time.time()) + settings.oauth_authorization_code_ttl_seconds,
                 "used": False,
             }
@@ -297,17 +296,12 @@ class OAuthStore:
             raise HTTPException(status_code=400, detail="Authorization code client or redirect mismatch")
         if not _verify_pkce_s256(code_verifier, record.get("code_challenge", "")):
             raise HTTPException(status_code=400, detail="Invalid PKCE code_verifier")
-        expected_resource = _canonical_resource(str(record.get("resource") or _default_resource()))
-        if resource and _canonical_resource(resource) != expected_resource:
-            raise HTTPException(status_code=400, detail="Authorization code resource mismatch")
-
         record["used"] = True
         state["codes"][code] = record
         token_payload = self._issue_tokens(
             state,
             client_id=client_id,
             scope=record.get("scope") or settings.oauth_default_scope,
-            resource=str(expected_resource),
         )
         self._write(state)
         return token_payload
@@ -336,46 +330,18 @@ class OAuthStore:
         client_secret: str | None,
         resource: str | None,
     ) -> dict[str, Any]:
-        # The token is signed, but rotation is stateful by design: accepting a
-        # signed refresh token that is absent from durable state would allow an
-        # already-rotated token to become reusable after state loss.
+        # Compatibility mode from the original connector: signed refresh tokens
+        # remain usable across restarts/state loss and are reused by the client.
         stateless = _decode_signed_token(refresh_token, "srt")
         if stateless:
             if stateless.get("client_id") != client_id:
                 raise HTTPException(status_code=400, detail="Invalid refresh_token client")
-            expected_resource = _canonical_resource(str(stateless.get("aud") or _default_resource()))
-            if resource and _canonical_resource(resource) != expected_resource:
-                raise HTTPException(status_code=400, detail="Invalid refresh_token resource")
-            state = self._read()
-            now = int(time.time())
-            state["used_refresh_tokens"] = {
-                key: value for key, value in state.setdefault("used_refresh_tokens", {}).items()
-                if int((value or {}).get("expires_at") or 0) >= now
-            }
-            jti = str(stateless.get("jti") or "")
-            if jti and jti in state.setdefault("used_refresh_tokens", {}):
-                raise HTTPException(status_code=400, detail="Refresh token already used")
-            issued_record = state.setdefault("refresh_tokens", {}).get(refresh_token)
-            if not issued_record or issued_record.get("client_id") != client_id:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid or already rotated refresh_token; durable OAuth state is required",
-                )
-            if int(issued_record.get("expires_at") or 0) < now:
-                raise HTTPException(status_code=400, detail="Refresh token expired")
-            if _canonical_resource(str(issued_record.get("resource") or _default_resource())) != expected_resource:
-                raise HTTPException(status_code=400, detail="Invalid refresh_token resource")
-            if jti:
-                state["used_refresh_tokens"][jti] = {"used_at": now, "expires_at": stateless.get("exp")}
-            state["refresh_tokens"].pop(refresh_token, None)
-            token_payload = self._issue_tokens(
-                state,
+            return self._issue_tokens(
+                self._read(),
                 client_id=client_id,
                 scope=stateless.get("scope") or settings.oauth_default_scope,
-                resource=expected_resource,
+                reuse_refresh_token=refresh_token,
             )
-            self._write(state)
-            return token_payload
 
         client = self.get_client(client_id)
         _validate_client_secret(client, client_secret)
@@ -389,9 +355,8 @@ class OAuthStore:
             state,
             client_id=client_id,
             scope=record.get("scope") or settings.oauth_default_scope,
-            resource=str(record.get("resource") or _default_resource()),
+            reuse_refresh_token=refresh_token,
         )
-        state["refresh_tokens"].pop(refresh_token, None)
         self._write(state)
         return token_payload
 
@@ -402,6 +367,7 @@ class OAuthStore:
         client_id: str,
         scope: str,
         resource: str | None = None,
+        reuse_refresh_token: str | None = None,
     ) -> dict[str, Any]:
         now = int(time.time())
         access_payload = {
@@ -411,7 +377,6 @@ class OAuthStore:
             "iat": now,
             "exp": now + settings.oauth_access_token_ttl_seconds,
             "jti": secrets.token_urlsafe(12),
-            "aud": _canonical_resource(resource or _default_resource()),
         }
         refresh_payload = {
             "typ": "refresh",
@@ -420,10 +385,9 @@ class OAuthStore:
             "iat": now,
             "exp": now + settings.oauth_refresh_token_ttl_seconds,
             "jti": secrets.token_urlsafe(12),
-            "aud": _canonical_resource(resource or _default_resource()),
         }
         access_token = _encode_signed_token("sat", access_payload)
-        refresh_token = _encode_signed_token("srt", refresh_payload)
+        refresh_token = reuse_refresh_token or _encode_signed_token("srt", refresh_payload)
 
         # Keep a legacy copy in the state store for observability and backwards
         # compatibility with older tests/tools. Validation does not depend on it
@@ -433,15 +397,14 @@ class OAuthStore:
             "scope": scope,
             "issued_at": now,
             "expires_at": access_payload["exp"],
-            "resource": access_payload["aud"],
         }
-        state.setdefault("refresh_tokens", {})[refresh_token] = {
-            "client_id": client_id,
-            "scope": scope,
-            "resource": refresh_payload["aud"],
-            "issued_at": now,
-            "expires_at": refresh_payload["exp"],
-        }
+        if not reuse_refresh_token:
+            state.setdefault("refresh_tokens", {})[refresh_token] = {
+                "client_id": client_id,
+                "scope": scope,
+                "issued_at": now,
+                "expires_at": refresh_payload["exp"],
+            }
         return {
             "access_token": access_token,
             "token_type": "Bearer",
@@ -455,18 +418,11 @@ class OAuthStore:
             return None
         stateless = _decode_signed_token(token, "sat")
         if stateless and stateless.get("typ") == "access":
-            raw_audience = stateless.get("aud")
-            if not raw_audience:
-                return None
-            audience = _canonical_resource(str(raw_audience))
-            if resource and audience != _canonical_resource(resource):
-                return None
             return {
                 "client_id": stateless.get("client_id"),
                 "scope": stateless.get("scope") or settings.oauth_default_scope,
                 "issued_at": stateless.get("iat"),
                 "expires_at": stateless.get("exp"),
-                "resource": audience,
             }
 
         state = self._read()
@@ -475,10 +431,6 @@ class OAuthStore:
             return None
         if int(record.get("expires_at", 0)) < int(time.time()):
             return None
-        if resource:
-            recorded_resource = record.get("resource")
-            if not recorded_resource or _canonical_resource(str(recorded_resource)) != _canonical_resource(resource):
-                return None
         return record
 
 

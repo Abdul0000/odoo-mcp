@@ -14,7 +14,7 @@ def _challenge(verifier: str) -> str:
     return base64.urlsafe_b64encode(hashlib.sha256(verifier.encode('ascii')).digest()).rstrip(b'=').decode('ascii')
 
 
-def test_stateless_oauth_refresh_rejects_state_directory_loss_to_prevent_replay(tmp_path, monkeypatch):
+def test_stateless_oauth_refresh_survives_state_directory_loss(tmp_path, monkeypatch):
     first_state = tmp_path / 'state1'
     second_state = tmp_path / 'state2'
     monkeypatch.setattr(settings, 'state_dir', str(first_state))
@@ -53,8 +53,8 @@ def test_stateless_oauth_refresh_rejects_state_directory_loss_to_prevent_replay(
     assert token.status_code == 200
     refresh_token = token.json()['refresh_token']
 
-    # Losing durable state must not make an already-rotated signed token
-    # reusable. A restart with the same state directory remains supported.
+    # Original connector compatibility: the signed refresh token remains
+    # usable after a restart even if the durable state directory changes.
     monkeypatch.setattr(settings, 'state_dir', str(second_state))
     refreshed = client.post(
         '/oauth/token',
@@ -65,5 +65,6 @@ def test_stateless_oauth_refresh_rejects_state_directory_loss_to_prevent_replay(
             'resource': 'https://agent.example.com/mcp',
         },
     )
-    assert refreshed.status_code == 400
-    assert 'durable OAuth state is required' in refreshed.json()['detail']
+    assert refreshed.status_code == 200
+    assert refreshed.json()['access_token'].startswith('sat_')
+    assert refreshed.json()['refresh_token'] == refresh_token

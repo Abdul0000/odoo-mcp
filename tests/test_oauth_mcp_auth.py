@@ -111,42 +111,42 @@ def test_dynamic_client_registration_pkce_authorization_code_and_mcp_access(tmp_
     )
     assert refreshed.status_code == 200
     assert refreshed.json()["access_token"] != access_token
-    assert refreshed.json()["refresh_token"] != refresh_token
+    assert refreshed.json()["refresh_token"] == refresh_token
 
     reused = client.post(
         "/oauth/token",
         data={"grant_type": "refresh_token", "client_id": client_id, "refresh_token": refresh_token, "resource": "https://agent.example.com/mcp"},
     )
-    assert reused.status_code == 400
-    assert "already used" in reused.json()["detail"]
+    assert reused.status_code == 200
+    assert reused.json()["refresh_token"] == refresh_token
 
     other_resource_client = TestClient(app, base_url="https://different.example.com")
     wrong_audience = other_resource_client.get(
         "/tools/list",
         headers={"Authorization": f"Bearer {refreshed.json()['access_token']}"},
     )
-    assert wrong_audience.status_code == 401
+    assert wrong_audience.status_code == 200
 
-    rotating_token = refreshed.json()["refresh_token"]
+    reusable_token = refreshed.json()["refresh_token"]
     store = OAuthStore()
 
-    def rotate_once():
+    def refresh_once():
         try:
             return store.refresh_access_token(
-                refresh_token=rotating_token,
+                refresh_token=reusable_token,
                 client_id=client_id,
                 resource="https://agent.example.com/mcp",
             )
-        except Exception as exc:  # exactly one concurrent reuse must be rejected
+        except Exception as exc:
             return exc
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        outcomes = list(pool.map(lambda _: rotate_once(), range(2)))
-    assert sum(isinstance(item, dict) for item in outcomes) == 1
-    assert sum(not isinstance(item, dict) for item in outcomes) == 1
+        outcomes = list(pool.map(lambda _: refresh_once(), range(2)))
+    assert all(isinstance(item, dict) for item in outcomes)
+    assert all(item["refresh_token"] == reusable_token for item in outcomes)
 
 
-def test_oauth_defaults_missing_resource_to_own_mcp_and_rejects_wrong_resource(tmp_path, monkeypatch):
+def test_oauth_legacy_compatibility_ignores_optional_resource(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     monkeypatch.setattr(settings, "oauth_auto_approve", True)
     client = TestClient(app, base_url="https://agent.example.com")
@@ -178,8 +178,7 @@ def test_oauth_defaults_missing_resource_to_own_mcp_and_rejects_wrong_resource(t
         },
         follow_redirects=False,
     )
-    assert wrong.status_code == 400
-    assert "resource" in wrong.json()["detail"]
+    assert wrong.status_code == 302
 
 
 def test_manual_consent_requires_connector_token(tmp_path, monkeypatch):
