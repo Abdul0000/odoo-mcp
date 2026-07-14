@@ -12,6 +12,9 @@ from .store_service import JsonStore
 
 
 _DISCOVERY_TOOLS = {
+    "workflow.resume_context",
+    "workflow.intent_plan",
+    "workflow.prepare_change_context",
     "repo.list_custom_modules",
     "repo.search",
     "workflow.list_module_files",
@@ -25,6 +28,7 @@ _DISCOVERY_TOOLS = {
 }
 _READ_TOOLS = {"repo.read", "repo.read_range", "repo.list", "repo.search"}
 _WRITE_TOOLS = {
+    "repo.patch_change",
     "repo.write",
     "repo.write_many_smart",
     "repo.write_many_fast_safe",
@@ -102,7 +106,7 @@ class McpOperationGuardService:
         # Session bootstrap/client selection starts a fresh operation context so
         # a completed previous task cannot block the next one.  Also reset when
         # the user clearly moved to a different client/project/module.
-        if tool_name in {"workflow.agent_instructions", "workflow.start_session", "client.check"} or self._identity_changed(op, arguments):
+        if tool_name in {"workflow.agent_instructions", "workflow.start_session", "workflow.resume_context", "client.check"} or self._identity_changed(op, arguments):
             op = self._new_operation(arguments)
             guard["current"] = op
         self._refresh_operation_identity(op, arguments)
@@ -217,6 +221,12 @@ class McpOperationGuardService:
         if tool_name == "workflow.scope_advice":
             op["scope_advice_done"] = True
             op["phase"] = "dual_read"
+        if tool_name == "workflow.prepare_change_context" and structured.get("status") == "prepared":
+            op["scope_advice_done"] = True
+            op["phase"] = "dual_read"
+            op["change_id"] = structured.get("change_id")
+            op["project_path"] = structured.get("project_path") or op.get("project_path")
+            op["module_name"] = structured.get("module_name") or op.get("module_name")
         if tool_name in _WRITE_TOOLS:
             op["phase"] = "verify"
             op.setdefault("written_files", []).extend(self._changed_paths(arguments))
@@ -419,6 +429,9 @@ class McpOperationGuardService:
                 path = item.get("relative_path") or item.get("path")
                 if path:
                     paths.append(str(path))
+        for item in arguments.get("edits") or []:
+            if isinstance(item, dict) and item.get("relative_path"):
+                paths.append(str(item["relative_path"]))
         return paths
 
     def _operation_touched_frontend(self, op: dict[str, Any]) -> bool:

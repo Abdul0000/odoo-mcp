@@ -1,7 +1,28 @@
-from odoo_agent_server.schemas import FrontendPatternPreflightRequest, OdooCodeChangeRequest, SmartToolRouteRequest
+from odoo_agent_server.schemas import FrontendPatternPreflightRequest, IntentPlanRequest, OdooCodeChangeRequest, SmartToolRouteRequest
 from odoo_agent_server.routers.workflow import smart_tool_router
 from odoo_agent_server.services.frontend_pattern_service import FrontendPatternService
-from odoo_agent_server.routers.tools import _looks_like_frontend_code_change
+from odoo_agent_server.routers.tools import _looks_like_frontend_code_change, _workflow_intent_plan
+
+
+def test_intent_plan_uses_quick_mode_for_exact_small_change():
+    result = _workflow_intent_plan(IntentPlanRequest(
+        task_description="Change the exact label spacing in this file",
+        operation="write",
+        target_surface="frontend",
+        known_paths=["x_module/static/src/scss/main.scss"],
+    ))
+    assert result["normalized_intent"] == "write"
+    assert result["complexity"] == "quick"
+    assert result["thinking_policy"] == "act_immediately"
+    assert result["steps"][-1] == "workflow.safe_deploy_module"
+
+
+def test_intent_plan_uses_deep_mode_for_security_migration():
+    result = _workflow_intent_plan(IntentPlanRequest(
+        task_description="Migrate access rights and accounting workflow across modules",
+    ))
+    assert result["complexity"] == "deep"
+    assert result["thinking_policy"] == "demonstrate_deep_approach"
 
 
 def test_product_word_does_not_trigger_pos():

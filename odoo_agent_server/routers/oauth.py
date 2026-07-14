@@ -121,7 +121,7 @@ def _authorization_form(params: dict[str, str], error: str | None = None) -> str
 """
 
 
-def _authorize_redirect(params: dict[str, str]) -> RedirectResponse:
+def _authorize_redirect(params: dict[str, str], resource_default: str) -> RedirectResponse:
     response_type = params.get("response_type")
     client_id = params.get("client_id")
     redirect_uri = params.get("redirect_uri")
@@ -129,16 +129,22 @@ def _authorize_redirect(params: dict[str, str]) -> RedirectResponse:
     code_challenge_method = params.get("code_challenge_method")
     scope = params.get("scope") or settings.oauth_default_scope
     state = params.get("state")
+    resource = params.get("resource")
     if response_type != "code":
         raise HTTPException(status_code=400, detail="Only response_type=code is supported")
     if not client_id or not redirect_uri:
         raise HTTPException(status_code=400, detail="client_id and redirect_uri are required")
+    if not resource:
+        raise HTTPException(status_code=400, detail=f"resource is required and must equal {resource_default}")
+    if resource.rstrip("/") != resource_default.rstrip("/"):
+        raise HTTPException(status_code=400, detail="resource must identify this MCP endpoint")
     code = OAuthStore().create_code(
         client_id=client_id,
         redirect_uri=redirect_uri,
         scope=scope,
         code_challenge=code_challenge or "",
         code_challenge_method=code_challenge_method or "",
+        resource=resource,
     )
     return RedirectResponse(build_redirect(redirect_uri, {"code": code, "state": state}), status_code=302)
 
@@ -147,7 +153,7 @@ def _authorize_redirect(params: dict[str, str]) -> RedirectResponse:
 def oauth_authorize_get(request: Request):
     params = _query_params_to_dict(request)
     if settings.oauth_auto_approve:
-        return _authorize_redirect(params)
+        return _authorize_redirect(params, f"{_base(request)}/mcp")
     return HTMLResponse(_authorization_form(params))
 
 
@@ -158,7 +164,7 @@ async def oauth_authorize_post(request: Request):
     connector_token = parsed.pop("connector_token", "")
     if connector_token != settings.api_token:
         return HTMLResponse(_authorization_form(parsed, error="Invalid connector admin token"), status_code=403)
-    return _authorize_redirect(parsed)
+    return _authorize_redirect(parsed, f"{_base(request)}/mcp")
 
 
 async def _parse_token_request(request: Request) -> dict[str, str]:
@@ -180,17 +186,23 @@ async def oauth_token(request: Request) -> dict[str, Any]:
     if not client_id:
         raise HTTPException(status_code=400, detail="client_id is required")
     if grant_type == "authorization_code":
+        if not body.get("resource"):
+            raise HTTPException(status_code=400, detail="resource is required for authorization_code token requests")
         return OAuthStore().exchange_code(
             code=body.get("code") or "",
             client_id=client_id,
             redirect_uri=body.get("redirect_uri") or "",
             code_verifier=body.get("code_verifier") or "",
             client_secret=client_secret,
+            resource=body.get("resource"),
         )
     if grant_type == "refresh_token":
+        if not body.get("resource"):
+            raise HTTPException(status_code=400, detail="resource is required for refresh_token requests")
         return OAuthStore().refresh_access_token(
             refresh_token=body.get("refresh_token") or "",
             client_id=client_id,
             client_secret=client_secret,
+            resource=body.get("resource"),
         )
     raise HTTPException(status_code=400, detail="Unsupported grant_type")

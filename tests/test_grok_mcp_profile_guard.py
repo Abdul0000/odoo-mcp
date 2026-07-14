@@ -44,7 +44,10 @@ def test_grok_profile_exposes_only_curated_non_bypass_tools():
     assert "workflow_resume_job" in names
     assert "odoosh_error_pack" in names
     assert "jobs_list" in names
-    assert "workflow_safe_deploy_module" not in names
+    assert "workflow_safe_deploy_module" in names
+    assert "repo_patch_change" in names
+    assert "git_diff" in names
+    assert "git_push" not in names
     assert "workflow_scope_advice" not in names
     assert "repo_read" not in names
     assert "repo_write" not in names

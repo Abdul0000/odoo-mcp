@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Body, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 
 from ..auth import AuthDependency
@@ -211,8 +213,11 @@ def _arguments_for_profile(tool_name: str, arguments: dict[str, Any], profile: s
         if "wait_for_result" not in adjusted:
             adjusted["wait_for_result"] = True
         if adjusted.get("wait_for_result") is True:
-            adjusted["wait_timeout_seconds"] = min(max(int(adjusted.get("wait_timeout_seconds", 600) or 600), 1), 600)
-            adjusted["poll_interval_seconds"] = min(max(float(adjusted.get("poll_interval_seconds", 10.0) or 10.0), 0.25), 10.0)
+            adjusted["wait_timeout_seconds"] = min(
+                max(int(adjusted.get("wait_timeout_seconds", settings.provider_job_wait_max_seconds) or settings.provider_job_wait_max_seconds), 1),
+                settings.provider_job_wait_max_seconds,
+            )
+            adjusted["poll_interval_seconds"] = min(max(float(adjusted.get("poll_interval_seconds", 2.0) or 2.0), 0.25), 2.0)
             return adjusted
         if profile not in {"provider", "claude", "chatgpt", "grok", "qwen"} or "wait_for_result" not in adjusted:
             return adjusted
@@ -250,6 +255,12 @@ _PROVIDER_TOOL_NAMES = {
     "connector.health",
     "client.check",
     "workflow.agent_instructions",
+    "workflow.resume_context",
+    "workflow.intent_plan",
+    "workflow.prepare_change_context",
+    "repo.patch_change",
+    "git.diff",
+    "workflow.safe_deploy_module",
     "workflow.odoo_code_change",
     "workflow.frontend_visual_implement",
     # Read-only source discovery tools exposed so provider agents can inspect
@@ -421,7 +432,8 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
             "annotations": {
                 "readOnlyHint": bool(tool.read_only),
                 "destructiveHint": bool(tool.requires_approval),
-                "openWorldHint": not bool(tool.read_only),
+                "idempotentHint": bool(getattr(tool, "idempotent", False)),
+                "openWorldHint": bool(getattr(tool, "open_world", False)),
             },
         }
         return item
@@ -437,28 +449,144 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
             "title": title,
             "readOnlyHint": bool(tool.read_only),
             "destructiveHint": bool(tool.requires_approval),
+            "idempotentHint": bool(getattr(tool, "idempotent", False)),
+            "openWorldHint": bool(getattr(tool, "open_world", False)),
         },
     }
+
+
+_SUPPORTED_PROTOCOL_VERSIONS = {"2025-03-26", "2025-06-18"}
+
+
+def _origin_value(value: str) -> str | None:
+    parsed = urlparse(value)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def _origin_allowed(request: Request) -> bool:
+    """Validate browser Origin while allowing non-browser MCP clients without it."""
+    origin = request.headers.get("origin")
+    if origin is None:
+        return True
+    candidate = _origin_value(origin)
+    if candidate is None:
+        return False
+    allowed = {
+        _origin_value(value)
+        for value in (settings.public_base_url, settings.oauth_issuer)
+        if value
+    }
+    allowed.update(_origin_value(item) for item in settings.mcp_allowed_origins)
+    # In local development there may be no configured public origin. Only the
+    # actual local ASGI host is a safe fallback; never trust Host/X-Forwarded-Host
+    # to define an allowlisted production browser origin.
+    hostname = (request.url.hostname or "").lower()
+    if not {item for item in allowed if item} and hostname in {"localhost", "127.0.0.1", "::1", "testserver"}:
+        allowed.add(_origin_value(str(request.base_url)))
+    return candidate in {item for item in allowed if item}
+
+
+def _message_kind(payload: Any) -> str:
+    if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0":
+        return "invalid"
+    method = payload.get("method")
+    if isinstance(method, str):
+        return "request" if "id" in payload else "notification"
+    if "method" not in payload and ("result" in payload or "error" in payload):
+        return "response"
+    return "invalid"
+
+
+def _negotiated_protocol(request: Request, payload: Any) -> str:
+    header = request.headers.get("mcp-protocol-version")
+    if header:
+        return header
+    messages = payload if isinstance(payload, list) else [payload]
+    for item in messages:
+        if isinstance(item, dict) and item.get("method") == "initialize":
+            requested = (item.get("params") or {}).get("protocolVersion")
+            if requested in _SUPPORTED_PROTOCOL_VERSIONS:
+                return str(requested)
+    return "2025-03-26"
+
+
+async def _streamable_http_response(request: Request, payload: Any, profile: str) -> Response:
+    """Serve stateless Streamable HTTP with compatibility for JSON-only clients."""
+    accept = request.headers.get("accept", "*/*").lower()
+    protocol = request.headers.get("mcp-protocol-version")
+    if protocol and protocol not in _SUPPORTED_PROTOCOL_VERSIONS:
+        return JSONResponse(
+            {"error": f"Unsupported MCP-Protocol-Version: {protocol}"},
+            status_code=400,
+            headers={"MCP-Protocol-Version": "2025-06-18"},
+        )
+    if protocol == "2025-06-18" and not all(value in accept for value in ("application/json", "text/event-stream")):
+        return JSONResponse(
+            {"error": "MCP 2025-06-18 POST requires Accept: application/json, text/event-stream"},
+            status_code=406,
+            headers={"MCP-Protocol-Version": protocol},
+        )
+    if not any(value in accept for value in ("*/*", "application/json", "text/event-stream")):
+        return JSONResponse({"error": "MCP endpoint requires application/json or text/event-stream"}, status_code=406)
+
+    if not _origin_allowed(request):
+        return JSONResponse({"error": "Untrusted Origin for MCP endpoint"}, status_code=403)
+
+    negotiated = _negotiated_protocol(request, payload)
+    headers = {"MCP-Protocol-Version": negotiated, "Cache-Control": "no-store"}
+    if isinstance(payload, list):
+        if not payload:
+            return JSONResponse({"error": "MCP batch must not be empty"}, status_code=400, headers=headers)
+        responses: list[dict[str, Any]] = []
+        for item in payload:
+            kind = _message_kind(item)
+            if kind == "invalid":
+                return JSONResponse({"error": "Invalid JSON-RPC 2.0 message"}, status_code=400, headers=headers)
+            if kind in {"notification", "response"}:
+                continue
+            response = await _handle_shell(item, profile=profile, request=request)
+            if response is not None:
+                responses.append(response)
+        if not responses:
+            return Response(status_code=202, headers=headers)
+        return JSONResponse(responses, headers=headers)
+
+    kind = _message_kind(payload)
+    if kind == "invalid":
+        return JSONResponse({"error": "Invalid JSON-RPC 2.0 message"}, status_code=400, headers=headers)
+    if kind in {"notification", "response"}:
+        return Response(status_code=202, headers=headers)
+    response = await _handle_shell(payload, profile=profile, request=request)
+    if response is None:
+        return Response(status_code=202, headers=headers)
+    return JSONResponse(response, headers=headers)
+
+
+def _streamable_http_get_not_supported() -> Response:
+    return Response(
+        status_code=405,
+        headers={"Allow": "POST", "MCP-Protocol-Version": "2025-06-18", "Cache-Control": "no-store"},
+    )
+
+
+@router.get("")
+def mcp_get_not_supported() -> Response:
+    return _streamable_http_get_not_supported()
 
 
 
 
 
 @router.post("")
-async def mcp_shell(request: Request, payload: Any = Body(...)) -> dict[str, Any] | list[dict[str, Any]] | None:
+async def mcp_shell(request: Request, payload: Any = Body(...)) -> Response:
     """Lightweight JSON-RPC MCP-compatible endpoint.
 
     It exposes initialize, tools/list, and tools/call over one HTTPS POST route.
     The same service functions are used by REST/OpenAPI and this MCP-style bridge.
     """
-    if isinstance(payload, list):
-        responses = []
-        for item in payload:
-            response = await _handle_shell(item, profile="provider", request=request)
-            if response is not None:
-                responses.append(response)
-        return responses
-    return await _handle_shell(payload, profile="provider", request=request)
+    return await _streamable_http_response(request, payload, "provider")
 
 
 async def _handle_shell(payload: dict[str, Any], profile: str | None = None, request: Request | None = None) -> dict[str, Any] | None:
@@ -469,10 +597,16 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
     if method == "notifications/initialized":
         return None
     if method == "initialize":
+        requested_protocol = params.get("protocolVersion")
+        if not requested_protocol and request is not None:
+            requested_protocol = request.headers.get("mcp-protocol-version")
+        requested_protocol = requested_protocol or "2025-03-26"
+        if requested_protocol not in _SUPPORTED_PROTOCOL_VERSIONS:
+            return _shell_response(request_id, error={"code": -32602, "message": f"Unsupported protocolVersion: {requested_protocol}"})
         return _shell_response(
             request_id,
             {
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": requested_protocol,
                 "capabilities": {
                     "tools": {"listChanged": False},
                     "prompts": {"listChanged": False},
@@ -558,6 +692,25 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                     },
                 )
             arguments = _arguments_for_profile(internal_name, arguments, profile)
+            if (
+                profile in {"provider", "claude", "chatgpt", "grok", "qwen"}
+                and internal_name == "workflow.safe_deploy_module"
+                and not arguments.get("change_id")
+            ):
+                structured = {
+                    "status": "change_context_required",
+                    "error": "Provider deploys require change_id from workflow.prepare_change_context/repo.patch_change.",
+                    "success_allowed": False,
+                    "next_call": {"tool": "workflow.prepare_change_context", "arguments": {}},
+                }
+                return _shell_response(
+                    request_id,
+                    {
+                        "content": [{"type": "text", "text": json.dumps(structured)}],
+                        "structuredContent": _provider_safe_next_calls(structured),
+                        "isError": True,
+                    },
+                )
             if settings.mcp_operation_guard_enabled and profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and isinstance(arguments, dict):
                 op_guard = McpOperationGuardService()
                 arguments = op_guard.canonicalize_arguments(internal_name, arguments)
@@ -622,30 +775,18 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
 
 
 @claude_router.get("/mcp")
-def claude_mcp_health() -> dict[str, Any]:
-    return {"status": "ok", "endpoint": "unified-provider-mcp", "transport": "http-post-json-rpc", "tools_profile": "unified-provider-safe"}
+def claude_mcp_health() -> Response:
+    return _streamable_http_get_not_supported()
 
 
 @claude_router.post("/mcp")
-async def claude_mcp_shell(payload: Any = Body(...)) -> dict[str, Any] | list[dict[str, Any]] | None:
-    if isinstance(payload, list):
-        responses = []
-        for item in payload:
-            response = await _handle_shell(item, profile="claude")
-            if response is not None:
-                responses.append(response)
-        return responses
-    return await _handle_shell(payload, profile="claude")
+async def claude_mcp_shell(request: Request, payload: Any = Body(...)) -> Response:
+    return await _streamable_http_response(request, payload, "claude")
 
 
 @chatgpt_router.get("/mcp")
-def chatgpt_mcp_health() -> dict[str, Any]:
-    return {
-        "status": "ok",
-        "endpoint": "unified-provider-mcp",
-        "transport": "http-post-json-rpc",
-        "tool_names": "strict_regex_safe",
-    }
+def chatgpt_mcp_health() -> Response:
+    return _streamable_http_get_not_supported()
 
 
 @chatgpt_router.get("/tools-debug")
@@ -661,26 +802,13 @@ def chatgpt_tools_debug() -> dict[str, Any]:
 
 
 @chatgpt_router.post("/mcp")
-async def chatgpt_mcp_shell(request: Request, payload: Any = Body(...)) -> dict[str, Any] | list[dict[str, Any]] | None:
-    if isinstance(payload, list):
-        responses = []
-        for item in payload:
-            response = await _handle_shell(item, profile="chatgpt")
-            if response is not None:
-                responses.append(response)
-        return responses
-    return await _handle_shell(payload, profile="chatgpt")
+async def chatgpt_mcp_shell(request: Request, payload: Any = Body(...)) -> Response:
+    return await _streamable_http_response(request, payload, "chatgpt")
 
 
 @grok_router.get("/mcp")
-def grok_mcp_health() -> dict[str, Any]:
-    return {
-        "status": "ok",
-        "endpoint": "grok-mcp",
-        "transport": "http-post-json-rpc",
-        "tool_names": "strict_regex_safe",
-        "profile": "unified-provider-safe",
-    }
+def grok_mcp_health() -> Response:
+    return _streamable_http_get_not_supported()
 
 
 @grok_router.get("/tools-debug")
@@ -697,17 +825,10 @@ def grok_tools_debug() -> dict[str, Any]:
 
 
 @grok_router.post("/mcp")
-async def grok_mcp_shell(request: Request, payload: Any = Body(...)) -> dict[str, Any] | list[dict[str, Any]] | None:
+async def grok_mcp_shell(request: Request, payload: Any = Body(...)) -> Response:
     # Keep Grok on the same hybrid-safe contract as ChatGPT: short bounded waits,
     # OAuth/tool-call auth, strict tool names, and success_allowed=false until terminal proof.
-    if isinstance(payload, list):
-        responses = []
-        for item in payload:
-            response = await _handle_shell(item, profile="grok")
-            if response is not None:
-                responses.append(response)
-        return responses
-    return await _handle_shell(payload, profile="grok")
+    return await _streamable_http_response(request, payload, "grok")
 
 
 @router.get("/system-prompt")
@@ -799,38 +920,24 @@ def qwen_system_prompt_query(access_token: str = Query(default="")) -> dict[str,
 
 
 @qwen_router.get("/mcp/{access_token}")
-def qwen_mcp_path_health(access_token: str) -> dict[str, Any]:
+def qwen_mcp_path_health(access_token: str) -> Response:
     _validate_qwen_url_token(access_token)
-    return {"status": "ok", "endpoint": "qwen-url-token-mcp", "transport": "http-post-json-rpc"}
+    return _streamable_http_get_not_supported()
 
 
 @qwen_router.get("/mcp")
-def qwen_mcp_query_health(access_token: str = Query(default="")) -> dict[str, Any]:
+def qwen_mcp_query_health(access_token: str = Query(default="")) -> Response:
     _validate_qwen_url_token(access_token)
-    return {"status": "ok", "endpoint": "qwen-url-token-mcp", "transport": "http-post-json-rpc"}
+    return _streamable_http_get_not_supported()
 
 
 @qwen_router.post("/mcp/{access_token}")
-async def qwen_mcp_path_shell(access_token: str, payload: Any = Body(...)) -> dict[str, Any] | list[dict[str, Any]] | None:
+async def qwen_mcp_path_shell(request: Request, access_token: str, payload: Any = Body(...)) -> Response:
     _validate_qwen_url_token(access_token)
-    if isinstance(payload, list):
-        responses = []
-        for item in payload:
-            response = await _handle_shell(item, profile="qwen")
-            if response is not None:
-                responses.append(response)
-        return responses
-    return await _handle_shell(payload, profile="qwen")
+    return await _streamable_http_response(request, payload, "qwen")
 
 
 @qwen_router.post("/mcp")
-async def qwen_mcp_query_shell(payload: Any = Body(...), access_token: str = Query(default="")) -> dict[str, Any] | list[dict[str, Any]] | None:
+async def qwen_mcp_query_shell(request: Request, payload: Any = Body(...), access_token: str = Query(default="")) -> Response:
     _validate_qwen_url_token(access_token)
-    if isinstance(payload, list):
-        responses = []
-        for item in payload:
-            response = await _handle_shell(item, profile="qwen")
-            if response is not None:
-                responses.append(response)
-        return responses
-    return await _handle_shell(payload, profile="qwen")
+    return await _streamable_http_response(request, payload, "qwen")

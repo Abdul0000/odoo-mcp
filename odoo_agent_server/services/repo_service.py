@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
 import re
 import shutil
@@ -26,8 +27,9 @@ class RepoService:
     """Safe local repository operations constrained by configured allowed roots."""
 
     _module_cache_lock = RLock()
-    _module_cache: dict[tuple[str, int, bool, int, float], tuple[float, list[CustomModuleItem]]] = {}
+    _module_cache: dict[tuple[str, int, bool, int, str], tuple[float, list[CustomModuleItem]]] = {}
     _module_cache_ttl_seconds = 30.0
+    _prepare_cache: dict[str, tuple[float, str, str, str]] = {}
 
     def project(self, project_path: str) -> Path:
         project = resolve_allowed_path(project_path)
@@ -118,27 +120,49 @@ class RepoService:
             expected_remote = plain_repo_url
             if expected_remote and not self._remote_matches(configured_remote, expected_remote):
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Configured remote mismatch: {configured_remote} != {expected_remote}")
-            # Speed: dry-run fetch first — skip full fetch if nothing changed
-            dry = self._run(["git", "fetch", "--dry-run", remote], project, 10, env=env)
-            if dry.stdout.strip() or dry.stderr.strip():
-                fetch = self._run(["git", "fetch", remote], project, timeout_seconds, env=env)
+            current_branch = self._run(["git", "branch", "--show-current"], project, 30, env=env)
+            current_sha = self._run(["git", "rev-parse", "HEAD"], project, 30, env=env)
+            current_fingerprint = self._checkout_fingerprint(project, env)
+            cached_prepare = self._prepare_cache.get(str(project))
+            cache_age = time.monotonic() - cached_prepare[0] if cached_prepare else float("inf")
+            fresh_local = (
+                settings.repo_prepare_cache_seconds > 0
+                and cache_age <= settings.repo_prepare_cache_seconds
+                and current_branch.exit_code == 0
+                and current_branch.stdout.strip() == resolved_branch
+                and current_sha.exit_code == 0
+                and cached_prepare is not None
+                and cached_prepare[1:] == (current_sha.stdout.strip(), current_fingerprint, resolved_branch)
+            )
+            if fresh_local:
+                steps.append(CommandResult(
+                    command=["git", "prepare", "--cached"],
+                    cwd=str(project),
+                    exit_code=0,
+                    stdout=f"Local checkout freshness cache hit ({round(cache_age, 1)}s old); remote fetch/pull skipped.\n",
+                ))
             else:
-                fetch = CommandResult(command=["git", "fetch", "--skipped"], cwd=str(project), exit_code=0, stdout="Already up to date — fetch skipped.\n")
-            steps.append(fetch)
-            if fetch.exit_code != 0:
-                raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=fetch.stderr or fetch.stdout or "git fetch failed")
-            checkout = self._run(["git", "checkout", resolved_branch], project, timeout_seconds, env=env)
-            steps.append(checkout)
-            if checkout.exit_code != 0:
-                # Create a local tracking branch when it only exists on the remote.
-                checkout = self._run(["git", "checkout", "-B", resolved_branch, f"{remote}/{resolved_branch}"], project, timeout_seconds, env=env)
+                # Speed: dry-run fetch first — skip full fetch if nothing changed.
+                dry = self._run(["git", "fetch", "--dry-run", remote], project, 10, env=env)
+                if dry.stdout.strip() or dry.stderr.strip():
+                    fetch = self._run(["git", "fetch", remote], project, timeout_seconds, env=env)
+                else:
+                    fetch = CommandResult(command=["git", "fetch", "--skipped"], cwd=str(project), exit_code=0, stdout="Already up to date — fetch skipped.\n")
+                steps.append(fetch)
+                if fetch.exit_code != 0:
+                    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=fetch.stderr or fetch.stdout or "git fetch failed")
+                checkout = self._run(["git", "checkout", resolved_branch], project, timeout_seconds, env=env)
                 steps.append(checkout)
                 if checkout.exit_code != 0:
-                    raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=checkout.stderr or checkout.stdout or "git checkout failed")
-            pull = self._run(["git", "pull", "--ff-only", remote, resolved_branch], project, timeout_seconds, env=env)
-            steps.append(pull)
-            if pull.exit_code != 0:
-                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=pull.stderr or pull.stdout or "git pull --ff-only failed")
+                    # Create a local tracking branch when it only exists on the remote.
+                    checkout = self._run(["git", "checkout", "-B", resolved_branch, f"{remote}/{resolved_branch}"], project, timeout_seconds, env=env)
+                    steps.append(checkout)
+                    if checkout.exit_code != 0:
+                        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=checkout.stderr or checkout.stdout or "git checkout failed")
+                pull = self._run(["git", "pull", "--ff-only", remote, resolved_branch], project, timeout_seconds, env=env)
+                steps.append(pull)
+                if pull.exit_code != 0:
+                    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=pull.stderr or pull.stdout or "git pull --ff-only failed")
         else:
             project.parent.mkdir(parents=True, exist_ok=True)
             clone = self._run(["git", "clone", "--branch", resolved_branch, "--single-branch", resolved_repo_url, str(project)], workspace, timeout_seconds, env=env)
@@ -152,6 +176,12 @@ class RepoService:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=sha.stderr or sha.stdout or "Unable to read HEAD SHA")
         git_status = self._run(["git", "status", "--short", "--branch"], project, 30, env=env)
         steps.append(git_status)
+        self._prepare_cache[str(project)] = (
+            time.monotonic(),
+            sha.stdout.strip(),
+            self._checkout_fingerprint(project, env),
+            resolved_branch,
+        )
 
         return RepoPrepareResult(
             project_path=str(project),
@@ -226,21 +256,35 @@ class RepoService:
             if "__manifest__.py" in files and depth <= max_depth:
                 yield current_path / "__manifest__.py"
 
-    def _manifest_cache_stamp(self, project: Path, max_depth: int) -> tuple[int, float]:
+    def _manifest_cache_stamp(self, project: Path, max_depth: int) -> tuple[int, str]:
         skip_dirs = {
             ".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
             "node_modules", ".venv", "venv", "env", "odoo", "enterprise",
             "src/odoo", "src/enterprise", "static/lib",
         }
         count = 0
-        latest = 0.0
+        hashes: list[tuple[str, str]] = []
         for manifest in self._iter_manifest_files(project, max_depth, skip_dirs):
             count += 1
             try:
-                latest = max(latest, manifest.stat().st_mtime)
+                hashes.append((manifest.relative_to(project).as_posix(), hashlib.sha256(manifest.read_bytes()).hexdigest()))
             except OSError:
                 pass
-        return count, latest
+        return count, hashlib.sha256(repr(sorted(hashes)).encode("utf-8")).hexdigest()
+
+    def _checkout_fingerprint(self, project: Path, env: dict[str, str]) -> str:
+        status_result = self._run(["git", "status", "--porcelain", "-z"], project, 30, env=env)
+        if status_result.exit_code != 0:
+            return "status-error"
+        rows: list[tuple[str, str]] = []
+        for entry in status_result.stdout.split("\x00"):
+            if not entry:
+                continue
+            rel = entry[3:].strip().split(" -> ")[-1]
+            path = (project / rel).resolve()
+            digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "<deleted>"
+            rows.append((rel.replace("\\", "/"), digest))
+        return hashlib.sha256(repr(sorted(rows)).encode("utf-8")).hexdigest()
 
     def list_files(self, project_path: str, relative_path: str = ".", max_depth: int = 3, max_items: int = 500) -> list[FileListItem]:
         root = self.target(project_path, relative_path)

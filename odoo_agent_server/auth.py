@@ -72,7 +72,7 @@ def require_token(
 
     if token and secrets.compare_digest(token, settings.api_token):
         return
-    if token and OAuthStore().validate_access_token(token):
+    if token and OAuthStore().validate_access_token(token, resource=f"{external_base_url(request)}/mcp"):
         return
 
     raise HTTPException(

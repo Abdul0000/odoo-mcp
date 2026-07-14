@@ -84,3 +84,7 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
     ]
     for marker in required_markers:
         assert marker in text
+    assert len(text) < 5000
+    assert "workflow.resume_context" in text
+    assert "repo.patch_change" in text
+    assert "Quick:" in text and "Deep:" in text

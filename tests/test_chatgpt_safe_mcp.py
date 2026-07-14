@@ -16,6 +16,12 @@ _PROVIDER_TOOLS = {
     "connector_health",
     "client_check",
     "workflow_agent_instructions",
+    "workflow_resume_context",
+    "workflow_intent_plan",
+    "workflow_prepare_change_context",
+    "repo_patch_change",
+    "git_diff",
+    "workflow_safe_deploy_module",
     "workflow_odoo_code_change",
     "workflow_frontend_visual_implement",
     "workflow_find_core_file",
@@ -46,14 +52,15 @@ def test_all_provider_mcp_endpoints_use_same_safe_core_read_surface():
         assert _tool_names(path) == _PROVIDER_TOOLS
 
 
-def test_provider_profile_hides_direct_repo_git_and_deploy_tools():
+def test_provider_profile_exposes_guarded_patch_diff_deploy_but_hides_git_bypass():
     names = _tool_names("/chatgpt/mcp")
     forbidden = {
         "repo_read", "repo_search", "repo_write", "repo_read_range",
-        "workflow_scope_advice", "workflow_safe_deploy_module",
+        "workflow_scope_advice",
         "git_push", "odoo_module_deploy", "odoosh_module_update",
     }
     assert not (names & forbidden)
+    assert {"repo_patch_change", "git_diff", "workflow_safe_deploy_module"} <= names
 
 
 def test_hidden_direct_tool_call_is_blocked_with_next_action():
@@ -76,7 +83,7 @@ def test_hidden_direct_tool_call_is_blocked_with_next_action():
     assert structured["next_call"]["tool"] == "workflow.odoo_code_change"
 
 
-def test_jobs_get_uses_single_bounded_ten_minute_poll(monkeypatch):
+def test_jobs_get_uses_single_bounded_twenty_second_poll(monkeypatch):
     captured = {}
 
     async def fake_dispatch(name, arguments):
@@ -94,8 +101,22 @@ def test_jobs_get_uses_single_bounded_ten_minute_poll(monkeypatch):
     assert response.status_code == 200
     assert captured["name"] == "jobs.get"
     assert captured["arguments"]["wait_for_result"] is True
-    assert captured["arguments"]["wait_timeout_seconds"] == 600
-    assert captured["arguments"]["poll_interval_seconds"] == 10.0
+    assert captured["arguments"]["wait_timeout_seconds"] == 20
+    assert captured["arguments"]["poll_interval_seconds"] == 2.0
+
+
+def test_provider_safe_deploy_requires_prepared_change_id():
+    client = TestClient(app)
+    response = client.post(
+        "/mcp",
+        headers=_auth(),
+        json=_mcp("tools/call", {"name": "workflow_safe_deploy_module", "arguments": {}}),
+    )
+    assert response.status_code == 200
+    result = response.json()["result"]
+    assert result["isError"] is True
+    assert result["structuredContent"]["status"] == "change_context_required"
+    assert result["structuredContent"]["next_call"]["tool"] == "workflow_prepare_change_context"
 
 
 def test_root_provider_tools_metadata_matches_mcp_surface():
