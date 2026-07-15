@@ -33,7 +33,7 @@ _WRITE_TOOLS = {
     "repo.apply_patch_atomic",
 }
 _VERIFY_TOOLS = {"git.diff", "qa.self_run", "workflow.verify_against_core"}
-_DEPLOY_TOOLS = {"workflow.safe_deploy_module"}
+_DEPLOY_TOOLS = {"workflow.safe_deploy_module", "odoo.module_deploy"}
 _POLL_TOOLS = {"jobs.get", "jobs.list", "workflow.resume_job"}
 _ALLOWED_REPEAT_TOOLS = {"jobs.get", "jobs.list", "artifacts.read"}
 _UNIQUE_ONCE_TOOLS = {"repo.list_custom_modules", "workflow.list_module_files", "workflow.scope_advice", "workflow.find_similar_view"}
@@ -102,10 +102,26 @@ class McpOperationGuardService:
         # Session bootstrap/client selection starts a fresh operation context so
         # a completed previous task cannot block the next one.  Also reset when
         # the user clearly moved to a different client/project/module.
-        if tool_name in {"workflow.agent_instructions", "workflow.start_session", "client.check"} or self._identity_changed(op, arguments):
+        if (
+            tool_name in {"workflow.start_session"}
+            or self._identity_changed(op, arguments)
+            or (tool_name == "odoo.module_deploy" and str(op.get("phase") or "") == "final")
+        ):
             op = self._new_operation(arguments)
             guard["current"] = op
         self._refresh_operation_identity(op, arguments)
+
+        # Validation is a conversation bootstrap, not a workflow phase. Once a
+        # selected client has passed it, reuse the persisted result instead of
+        # rerunning repo/checkout/SSH health checks on later provider retries.
+        validation_requested = bool(arguments.get("validate") or arguments.get("run_validation"))
+        if tool_name == "client.check" and validation_requested and op.get("client_validation_done"):
+            return self._guard_payload(
+                status="client_already_validated",
+                message="Client validation already passed for this conversation; continue with workflow.odoo_code_change.",
+                operation=op,
+                next_call={"tool": "workflow.odoo_code_change", "arguments_hint": "Submit the requested Odoo change."},
+            )
 
         sig = self._signature(tool_name, arguments)
         phase = str(op.get("phase") or "discovery")
@@ -127,7 +143,7 @@ class McpOperationGuardService:
 
         # Terminal state takes precedence over duplicate status: the model should
         # stop and answer instead of doing more work.
-        if phase == "final" and tool_name not in {"client.check", "workflow.start_session", "workflow.agent_instructions", "jobs.get"}:
+        if phase == "final" and tool_name not in {"client.check", "workflow.start_session", "jobs.get"}:
             return self._guard_payload(
                 status="final_guard",
                 message="This operation is terminal. Stop and answer with verified facts only, or start a new session for a new change.",
@@ -211,6 +227,11 @@ class McpOperationGuardService:
         counts = op.setdefault("tool_counts", {})
         counts[tool_name] = int(counts.get(tool_name, 0) or 0) + 1
 
+        validation_requested = bool(arguments.get("validate") or arguments.get("run_validation"))
+        if tool_name == "client.check" and validation_requested and bool(structured.get("validated") or structured.get("ok")):
+            op["client_validation_done"] = True
+            op["client_validation_at"] = now
+
         if tool_name in _READ_TOOLS:
             op.setdefault("read_tools", []).append(tool_name)
             op["phase"] = op.get("phase") or "discovery"
@@ -229,7 +250,7 @@ class McpOperationGuardService:
         elif tool_name == "workflow.verify_against_core":
             op["core_verified"] = True
             op["phase"] = "deploy"
-        elif tool_name == "workflow.safe_deploy_module":
+        elif tool_name in {"workflow.safe_deploy_module", "odoo.module_deploy"}:
             op["phase"] = "poll"
             job_id = self._find_job_id(structured)
             if job_id:
@@ -261,9 +282,14 @@ class McpOperationGuardService:
         out = dict(structured)
         status_value = str(out.get("status") or out.get("state") or "").lower()
         result = out.get("result")
-        if isinstance(result, dict) and not status_value:
-            status_value = str(result.get("status") or result.get("state") or "").lower()
-        if tool_name in {"workflow.safe_deploy_module", "jobs.get"}:
+        if isinstance(result, dict):
+            nested_status = str(result.get("status") or result.get("state") or "").lower()
+            # Async module deploy intentionally uses top-level status=failed to
+            # prevent a started job from sounding successful. Its nested status
+            # is the actual lifecycle state and must remain poll/running.
+            if nested_status and (not status_value or tool_name == "odoo.module_deploy"):
+                status_value = nested_status
+        if tool_name in {"workflow.safe_deploy_module", "odoo.module_deploy", "jobs.get"}:
             if status_value in {"running", "queued", "pending", "active"}:
                 out.setdefault("completion_required", True)
                 out.setdefault("success_allowed", False)
@@ -455,7 +481,7 @@ class McpOperationGuardService:
             return {"tool": "workflow.safe_deploy_module", "arguments_hint": "Use current client/module; then poll jobs.get."}
         if phase == "poll":
             job_id = op.get("job_id")
-            return {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+            return {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}}
         if phase == "final":
             return {"tool": "final_answer", "arguments_hint": "Report only verified facts; do not claim visible UI unless browser verification passed."}
         if not op.get("scope_advice_done"):

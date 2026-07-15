@@ -20,6 +20,7 @@ def test_prompt_files_keep_original_mcp_and_separate_client_gate():
     root = Path(__file__).resolve().parents[1]
     assert (root / "MCP_SYSTEM_PROMPT.md").is_file()
     assert (root / "CLIENT_CHECK_SYSTEM_PROMPT.md").is_file()
+    assert (root / "OPENCODE_SYSTEM_PROMPT.md").is_file()
     assert not (root / "CHATGPT_SYSTEM_PROMPT.md").exists()
 
 
@@ -72,14 +73,53 @@ def test_initialize_uses_client_gate_prompt_then_mcp_prompt_is_fetchable_for_eve
         assert fetched_mcp.json()["result"]["messages"][0]["content"]["text"] == expected_mcp
 
 
+def test_opencode_profile_uses_local_checkout_prompt_after_client_gate():
+    root = Path(__file__).resolve().parents[1]
+    expected = (root / "OPENCODE_SYSTEM_PROMPT.md").read_text(encoding="utf-8")
+    client = TestClient(app)
+
+    init = client.post("/opencode/mcp", headers=_auth(), json=_mcp("initialize"))
+    assert init.status_code == 200
+    assert init.json()["result"]["next_prompt_source_after_client_validation"] == "OPENCODE_SYSTEM_PROMPT.md"
+    assert expected in init.json()["result"]["instructions"]
+
+    listed = client.post("/opencode/mcp", headers=_auth(), json=_mcp("prompts/list", request_id=2))
+    assert [row["name"] for row in listed.json()["result"]["prompts"]] == [
+        "client_check_system_prompt",
+        "opencode_system_prompt",
+    ]
+
+    fetched = client.post(
+        "/opencode/mcp",
+        headers=_auth(),
+        json=_mcp("prompts/get", {"name": "opencode_system_prompt"}, request_id=3),
+    )
+    assert fetched.json()["result"]["source"] == "OPENCODE_SYSTEM_PROMPT.md"
+    assert fetched.json()["result"]["messages"][0]["content"]["text"] == expected
+
+    direct = client.get("/opencode/system-prompt", headers=_auth())
+    assert direct.json()["text"] == expected
+    for required in (
+        "selected local repository folder",
+        "compare local `HEAD` with its upstream",
+        "only when the branch is behind",
+        "only inside the selected local",
+        "successfully pushed local `HEAD` SHA",
+        "Hand the local push back to the MCP flow",
+    ):
+        assert required in expected
+
+
 def test_mcp_system_prompt_keeps_required_generic_contract():
     root = Path(__file__).resolve().parents[1]
     text = (root / "MCP_SYSTEM_PROMPT.md").read_text(encoding="utf-8")
 
     required_markers = [
-        "MANDATORY DUAL READ",
-        "workflow.verify_against_core",
-        "workflow.safe_deploy_module",
+        "Connector-owned internal phases",
+        "adaptive Odoo core/enterprise scope discovery",
+        "mandatory QA, and compatibility verification",
+        "required module upgrade/install checks",
+        "registry smoke verification",
         "jobs.get",
     ]
     for marker in required_markers:

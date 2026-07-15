@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
-from odoo_agent_server.routers.odoo import start_odoo_module_deploy_job
+from odoo_agent_server.routers.odoo import _module_deploy_with_timeout_recovery, start_odoo_module_deploy_job
 from odoo_agent_server.schemas import CommandResult, OdooResult
 from odoo_agent_server.schemas import OdooModuleRequest
 from odoo_agent_server.services.approval_service import ApprovalService
@@ -78,6 +78,47 @@ def test_module_deploy_falls_back_to_ssh_when_module_missing_after_update_list(m
     assert result.result["ssh"]["stdout"] == "SSH_DEPLOY_OK"
 
 
+def test_module_deploy_timeout_is_confirmed_from_live_installed_state():
+    class Service:
+        def module_deploy(self, module_name, timeout_seconds=600):
+            return OdooResult(status="failed", error="SSH command timed out")
+
+        def module_status(self, module_name):
+            return OdooResult(status="ok", result=[{"name": module_name, "state": "installed"}])
+
+    result = _module_deploy_with_timeout_recovery(
+        Service(),
+        OdooModuleRequest(module_name="x_module"),
+    )
+
+    assert result.status == "ok"
+    assert result.result["timeout_recovered"] is True
+    assert result.result["attempts"] == 1
+
+
+def test_module_deploy_timeout_retries_once_after_uninstalled_status():
+    class Service:
+        def __init__(self):
+            self.deploy_calls = 0
+
+        def module_deploy(self, module_name, timeout_seconds=600):
+            self.deploy_calls += 1
+            if self.deploy_calls == 1:
+                return OdooResult(status="failed", error="operation timeout")
+            return OdooResult(status="ok", result={"module_name": module_name})
+
+        def module_status(self, module_name):
+            return OdooResult(status="ok", result=[{"name": module_name, "state": "uninstalled"}])
+
+    service = Service()
+    result = _module_deploy_with_timeout_recovery(service, OdooModuleRequest(module_name="x_module"))
+
+    assert result.status == "ok"
+    assert service.deploy_calls == 2
+    assert result.result["timeout_recovered"] is True
+    assert result.result["attempts"] == 2
+
+
 def test_internal_module_deploy_job_does_not_require_second_approval(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     monkeypatch.setattr(settings, "require_approval", True)
@@ -134,7 +175,7 @@ def test_public_module_deploy_blocks_after_manual_push_until_sha_deployed(monkey
     assert result.status == "failed"
     assert result.result["job_status"] == "failed"
     assert "stale code" in result.error
-    assert result.result["job"]["result"]["result"]["status"] == "deploy_failed_or_timeout"
+    assert result.result["job"]["result"]["result"]["status"] == "deployment_waiting"
 
 
 def test_public_module_deploy_blocks_when_manual_push_hash_mismatches(monkeypatch, tmp_path):
@@ -232,6 +273,76 @@ def test_public_module_deploy_runs_after_manual_push_guard_passes(monkeypatch, t
     assert JsonStore().load_session_state()["last_git_push"]["verified_for_module_deploy"] is True
 
 
+def test_opencode_expected_sha_blocks_stale_odoosh_source(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr("odoo_agent_server.routers.odoo._prepare_validated_client", lambda payload, action: None)
+    monkeypatch.setattr(
+        OdooShService,
+        "check_commit_deployed",
+        lambda self, sha: CommandResult(
+            command=["odoosh", "check", sha], cwd="odoosh:ssh", exit_code=1, stdout='{"deployed": false}'
+        ),
+    )
+    monkeypatch.setattr(
+        OdooService,
+        "module_deploy",
+        lambda self, module_name, **kwargs: (_ for _ in ()).throw(
+            AssertionError("module deploy must wait for the exact OpenCode push")
+        ),
+    )
+
+    result = start_odoo_module_deploy_job(
+        OdooModuleRequest(
+            module_name="x_module",
+            expected_sha="abc1234",
+            wait_timeout_seconds=2,
+            poll_interval_seconds=0.25,
+            deploy_guard_timeout_seconds=0,
+        ),
+        enforce_deploy_guard=True,
+    )
+
+    assert result.status == "failed"
+    terminal = result.result["job"]["result"]["result"]
+    assert terminal["status"] == "deployment_waiting"
+    assert terminal["sha"] == "abc1234"
+    assert terminal["next_call"]["arguments"]["expected_sha"] == "abc1234"
+
+
+def test_opencode_expected_sha_allows_deploy_only_after_exact_commit(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr("odoo_agent_server.routers.odoo._prepare_validated_client", lambda payload, action: None)
+    checks = []
+    deploys = []
+
+    def fake_check(self, sha):
+        checks.append(sha)
+        return CommandResult(command=["odoosh", "check", sha], cwd="odoosh:ssh", exit_code=0, stdout='{"deployed": true}')
+
+    def fake_deploy(self, module_name, timeout_seconds=600):
+        deploys.append(module_name)
+        return OdooResult(status="ok", result={"module_name": module_name})
+
+    monkeypatch.setattr(OdooShService, "check_commit_deployed", fake_check)
+    monkeypatch.setattr(OdooService, "module_deploy", fake_deploy)
+
+    result = start_odoo_module_deploy_job(
+        OdooModuleRequest(
+            module_name="x_module",
+            expected_sha="def5678",
+            wait_timeout_seconds=2,
+            poll_interval_seconds=0.25,
+            deploy_guard_timeout_seconds=0,
+        ),
+        enforce_deploy_guard=True,
+    )
+
+    assert result.status == "ok"
+    assert checks == ["def5678"]
+    assert deploys == ["x_module"]
+    assert JsonStore().load_session_state()["opencode_expected_sha"]["deployed"] is True
+
+
 def test_odoosh_module_deploy_ssh_uses_upgrade_for_installed_module(monkeypatch):
     def fake_module_status(self, module_name):
         return OdooResult(status="ok", result=[{"name": module_name, "state": "installed"}])
@@ -273,3 +384,53 @@ def test_odoosh_module_deploy_ssh_uses_install_for_uninstalled_module(monkeypatc
     assert result.exit_code == 0
     assert called["flag"] == "-i"
     assert "mode=install" in result.stdout
+
+
+def test_odoosh_module_deploy_reuses_dependency_probe_module_state(monkeypatch):
+    calls = {"dependencies": 0, "module_status": 0}
+
+    def fake_dependencies(self, module_name):
+        calls["dependencies"] += 1
+        return OdooResult(
+            status="ok",
+            result={"module": module_name, "state": "installed", "missing": []},
+        )
+
+    def unexpected_module_status(self, module_name):
+        calls["module_status"] += 1
+        raise AssertionError("module state should be reused from dependency preflight")
+
+    def fake_run_module_cli(self, module_name, flag, timeout_seconds):
+        return CommandResult(command=["odoo-bin", flag, module_name], cwd="odoosh:ssh", exit_code=0, stdout="OK")
+
+    monkeypatch.setattr(OdooService, "module_dependencies_status", fake_dependencies)
+    monkeypatch.setattr(OdooService, "module_status", unexpected_module_status)
+    monkeypatch.setattr(OdooShService, "_run_module_cli", fake_run_module_cli)
+
+    result = OdooShService().module_deploy_ssh("sample_custom_module")
+
+    assert result.exit_code == 0
+    assert result.command == ["odoosh.module_deploy_ssh", "sample_custom_module", "-u"]
+    assert calls == {"dependencies": 1, "module_status": 0}
+
+
+def test_non_strict_registry_smoke_reuses_status_without_model_discovery(monkeypatch):
+    status = OdooResult(status="ok", result=[{"name": "x_module", "state": "installed"}])
+
+    def unexpected_query(*args, **kwargs):
+        raise AssertionError("non-strict empty smoke test must not start discovery queries")
+
+    monkeypatch.setattr(OdooService, "module_status", unexpected_query)
+    monkeypatch.setattr(OdooService, "search_read", unexpected_query)
+
+    result = OdooService().registry_smoke_test(
+        "x_module",
+        [],
+        [],
+        strict=False,
+        module_status_result=status,
+    )
+
+    assert result.status == "ok"
+    assert result.result["module_status"]["result"][0]["state"] == "installed"
+    assert result.result["models"] == []

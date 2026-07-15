@@ -74,11 +74,12 @@ from ..services.path_service import resolve_allowed_path
 from ..services.browser_cdp_service import CdpBrowserService
 from ..services.repo_service import RepoService
 from ..services.store_service import JsonStore
-from ..services.background_executor import submit_background
+from ..services.background_executor import background_task, submit_background
 from ..services.core_finder_service import CoreFinderService          # V14
 from ..services.prewrite_gate_service import PreWriteGateService
 from ..services.syntax_verifier_service import SyntaxVerifierService  # V14+
 from ..services.frontend_pattern_service import FrontendPatternService  # V15
+from ..services.failure_policy_service import FailurePolicyService
 from ..services.repo_index_service import RepoIndexService  # V16
 from ..services.workflow_guard_service import (
     _ACTIVE_JOB_STATUSES,
@@ -441,6 +442,7 @@ def registry_smoke_test(payload: RegistrySmokeTestRequest) -> OdooResult:
 
 @router.post("/restore-last-good-commit", response_model=WorkflowReport)
 def restore_last_good_commit(payload: RestoreLastGoodCommitRequest) -> WorkflowReport:
+    """Deterministically revert a Git commit without reconstructing parent files through LLM writes."""
     store = JsonStore()
     job = store.create_job(JobRecord(job_type="restore_last_good_commit", status=JobStatus.running, request=payload.model_dump(mode="json")))
     git = GitService()
@@ -449,31 +451,171 @@ def restore_last_good_commit(payload: RestoreLastGoodCommitRequest) -> WorkflowR
         current = store.get_job(job.id)
         store.add_step(current, JobStep(name=name, status=status_, finished_at=datetime.now(timezone.utc).isoformat(), result=result.model_dump(mode="json") if hasattr(result, "model_dump") else result, error=error))
 
+    revert_started = False
+    raw_project_path = payload.project_path
     try:
-        project_path = str(resolve_allowed_path(payload.project_path))
+        if payload.client_name:
+            ClientGateService().require_validated_client(payload.client_name, "workflow.restore_last_good_commit")
+        client = (
+            ClientResolverService().resolve_client(client_name=payload.client_name, require_complete=True)
+            if payload.client_name
+            else None
+        )
+        raw_project_path = payload.project_path or (client.path if client else None)
+        if not raw_project_path:
+            raise ValueError("project_path or a validated client_name is required")
+        if not payload.bad_sha and not payload.revert_latest:
+            raise ValueError("Provide bad_sha or set revert_latest=true")
+        if (payload.manifest_version or payload.bump_manifest_version or payload.deploy_module) and not payload.module_name:
+            raise ValueError("module_name is required for manifest_version or deploy_module")
+
+        project_path = str(resolve_allowed_path(raw_project_path))
         step("resolve_project", "passed", {"project_path": project_path})
+        status_result = git.status(project_path)
+        dirty = [line for line in (status_result.stdout or "").splitlines() if line and not line.startswith("##")]
+        step("git_clean_guard", "passed" if status_result.exit_code == 0 and not dirty else "failed", status_result)
+        if status_result.exit_code != 0 or dirty:
+            finished = store.finish_job(store.get_job(job.id), JobStatus.failed, {"failed_step": "git_clean_guard", "dirty": dirty})
+            return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={"failed_step": "git_clean_guard", "dirty": dirty})
         target = git.validate_target(project_path, payload.branch or settings.target_git_branch, payload.remote)
         step("git_validate_target", "passed" if target.exit_code == 0 else "failed", target)
         if target.exit_code != 0:
             finished = store.finish_job(store.get_job(job.id), JobStatus.failed, {"failed_step": "git_validate_target"})
             return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={"failed_step": "git_validate_target"})
-        revert = git.revert_commit(project_path, payload.bad_sha, payload.timeout_seconds)
+        requested_ref = payload.bad_sha or "HEAD"
+        resolved = git.resolve_commit(project_path, requested_ref, min(payload.timeout_seconds, 30))
+        step("git_resolve_bad_commit", "passed" if resolved.exit_code == 0 else "failed", resolved)
+        if resolved.exit_code != 0:
+            finished = store.finish_job(store.get_job(job.id), JobStatus.failed, {"failed_step": "git_resolve_bad_commit"})
+            return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={"failed_step": "git_resolve_bad_commit"})
+        bad_sha = resolved.stdout.strip()
+
+        revert = git.revert_commit_no_commit(project_path, bad_sha, payload.timeout_seconds)
+        revert_started = revert.exit_code == 0
         step("git_revert_bad_sha", "passed" if revert.exit_code == 0 else "failed", revert)
         if revert.exit_code != 0:
+            git.abort_revert(project_path, 30)
             finished = store.finish_job(store.get_job(job.id), JobStatus.failed, {"failed_step": "git_revert_bad_sha"})
             return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={"failed_step": "git_revert_bad_sha"})
+        target_manifest_version = payload.manifest_version
+        manifest_path = None
+        if payload.manifest_version or payload.bump_manifest_version:
+            modules = RepoService().list_custom_modules(project_path, max_depth=5, include_uninstallable=True)
+            module = next((item for item in modules if item.module_name == payload.module_name), None)
+            if module is None:
+                raise ValueError(f"Module not found in checkout: {payload.module_name}")
+            manifest_path = Path(project_path) / module.manifest_path
+            content = manifest_path.read_text(encoding="utf-8")
+            version_pattern = re.compile(r"(?P<prefix>['\"]version['\"]\s*:\s*['\"])[^'\"]+(?P<suffix>['\"])")
+            current_version_match = re.search(r"['\"]version['\"]\s*:\s*['\"](?P<version>\d+(?:\.\d+){2,5})['\"]", content)
+            if payload.bump_manifest_version and not target_manifest_version:
+                if current_version_match is None:
+                    raise ValueError(f"Could not parse manifest version in {module.manifest_path}")
+                version_parts = current_version_match.group("version").split(".")
+                version_parts[-1] = str(int(version_parts[-1]) + 1)
+                target_manifest_version = ".".join(version_parts)
+            updated, count = version_pattern.subn(
+                rf"\g<prefix>{target_manifest_version}\g<suffix>",
+                content,
+                count=1,
+            )
+            if count != 1:
+                raise ValueError(f"Could not find one manifest version key in {module.manifest_path}")
+            manifest_path.write_text(updated, encoding="utf-8")
+            step("manifest_version", "passed", {"path": module.manifest_path, "version": target_manifest_version})
+
+        staged = git.stage_all(project_path, min(payload.timeout_seconds, 60))
+        step("git_stage_revert", "passed" if staged.exit_code == 0 else "failed", staged)
+        if staged.exit_code != 0:
+            raise RuntimeError(staged.stderr or "Could not stage revert")
+        diff_check = git.diff_check(project_path, staged=True, timeout_seconds=min(payload.timeout_seconds, 60))
+        step("git_diff_check", "passed" if diff_check.exit_code == 0 else "failed", diff_check)
+        if diff_check.exit_code != 0:
+            raise RuntimeError(diff_check.stderr or "Revert diff check failed")
+
+        if payload.module_name:
+            qa = self_run(SelfRunRequest(
+                project_path=project_path,
+                client_name=payload.client_name,
+                module_name=payload.module_name,
+                run_pytest=False,
+                include_git_status=True,
+            ))
+            step("qa_self_run", "passed" if qa.status != "failed" else "failed", qa)
+            if qa.status == "failed":
+                raise RuntimeError("Reverted module failed local QA")
+
+        commit_message = payload.commit_message or f"Revert {bad_sha[:10]}" + (
+            f" and release {target_manifest_version}" if target_manifest_version else ""
+        )
+        committed = git.commit_staged(project_path, commit_message, min(payload.timeout_seconds, 120))
+        step("git_commit_restore", "passed" if committed.exit_code == 0 else "failed", committed)
+        if committed.exit_code != 0:
+            raise RuntimeError(committed.stderr or "Could not commit revert")
+        revert_started = False
+        head = git.head_sha(project_path)
+        restored_sha = head.stdout.strip() if head.exit_code == 0 else ""
+        step("git_restored_head", "passed" if restored_sha else "failed", head)
+        if not restored_sha:
+            raise RuntimeError("Could not resolve restored HEAD SHA")
+
         if payload.push:
             pushed = git.push(project_path, payload.remote, payload.branch or settings.target_git_branch, True, payload.timeout_seconds)
             step("git_push_restore", "passed" if pushed.exit_code == 0 else "failed", pushed)
             if pushed.exit_code != 0:
                 finished = store.finish_job(store.get_job(job.id), JobStatus.failed, {"failed_step": "git_push_restore"})
-                return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={"failed_step": "git_push_restore"})
+                return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={"failed_step": "git_push_restore", "restored_sha": restored_sha})
+
+        result_summary = {
+            "bad_sha": bad_sha,
+            "restored_sha": restored_sha,
+            "pushed": payload.push,
+            "module_name": payload.module_name,
+            "manifest_version": target_manifest_version,
+            "deterministic_git_revert": True,
+            "parent_file_reconstruction": False,
+        }
+        finished = store.finish_job(store.get_job(job.id), JobStatus.passed, result_summary)
+        if payload.deploy_module and payload.push and payload.module_name:
+            deploy = start_odoo_module_deploy_job(
+                OdooModuleRequest(
+                    client_name=payload.client_name,
+                    project_path=project_path,
+                    module_name=payload.module_name,
+                    expected_sha=restored_sha,
+                    wait_for_result=False,
+                    wait_timeout_seconds=0,
+                ),
+                enforce_deploy_guard=True,
+            )
+            deploy_data = deploy.model_dump(mode="json")
+            nested = deploy_data.get("result") if isinstance(deploy_data.get("result"), dict) else {}
+            deploy_job_id = nested.get("job_id")
+            if not deploy_job_id:
+                return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={**result_summary, "deploy_start": deploy_data})
+            return WorkflowReport(
+                status="running",
+                job_id=deploy_job_id,
+                steps=finished.steps,
+                summary={
+                    **result_summary,
+                    "status": "deploy_running",
+                    "deploy_job_id": deploy_job_id,
+                    "completion_required": True,
+                    "success_allowed": False,
+                    "next_call": {"tool": "jobs.get", "arguments": {"job_id": deploy_job_id, "wait_for_result": False}},
+                },
+            )
+        return WorkflowReport(status="passed", job_id=job.id, steps=finished.steps, summary=result_summary)
     except Exception as exc:  # noqa: BLE001
+        if revert_started:
+            try:
+                git.abort_revert(str(raw_project_path), 30)
+            except Exception:
+                pass
         step("exception", "failed", error=str(exc))
         finished = store.finish_job(store.get_job(job.id), JobStatus.failed, {"error": str(exc)})
         return WorkflowReport(status="failed", job_id=job.id, steps=finished.steps, summary={"error": str(exc)})
-    finished = store.finish_job(store.get_job(job.id), JobStatus.passed, {"bad_sha": payload.bad_sha, "pushed": payload.push})
-    return WorkflowReport(status="passed", job_id=job.id, steps=finished.steps, summary={"bad_sha": payload.bad_sha, "pushed": payload.push})
 
 
 @router.post("/browser-menu-crawl", response_model=WorkflowReport)
@@ -653,8 +795,18 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                 "project_path + module_name. No new deploy thread was started; "
                 "poll the existing job instead of replaying commit/push/upgrade or resume."
             )
-            next_call = {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+            next_call = {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}}
             blocking_reason = "active_job"
+        elif job.status == JobStatus.warning and result_status == "deployment_waiting":
+            report_status = "resumable_existing_job"
+            message = (
+                "The existing deployment is paused at a safe bounded-wait checkpoint "
+                "while Odoo.sh finishes activating the pushed commit. Continue that "
+                "job; this is expected continuation, not a failed deployment, and no "
+                "commit or push will be replayed."
+            )
+            next_call = {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}}
+            blocking_reason = "expected_continuation"
         elif job.status == JobStatus.warning:
             report_status = "resumable_existing_job"
             message = (
@@ -681,7 +833,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             # Defensive fallback; find_blocking_safe_deploy should only return
             # active/resumable safe deploy jobs.
             message = block_payload.get("message") or "Existing safe deploy job found."
-            next_call = block_payload.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+            next_call = block_payload.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}}
             blocking_reason = "existing_job"
 
         return WorkflowReport(
@@ -755,7 +907,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                     # leaking background exception handling back to the MCP stream.
                     pass
 
-        submit_background(_background)
+        submit_background(background_task(_background, "orchestration"))
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -808,7 +960,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                     "poll_after_seconds": 10,
                     "job_id": job.id,
                     "module_name": payload.module_name,
-                    "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
+                    "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}},
                 },
             )
         final_status: Literal["passed", "failed", "warning", "running"] = "passed" if waited.status == JobStatus.passed else "failed" if waited.status == JobStatus.failed else "warning"
@@ -847,7 +999,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             "poll_after_seconds": 10,
             "job_id": job.id,
             "module_name": payload.module_name,
-            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}},
         },
     )
 
@@ -1246,6 +1398,7 @@ def _start_and_wait_module_deploy(payload: SafeDeployModuleRequest) -> OdooResul
         wait_for_result=True,
         wait_timeout_seconds=min(max(int(payload.odoo_module_deploy_timeout_seconds or 1), 1), 25),
         poll_interval_seconds=max(min(float(payload.odoo_module_deploy_poll_interval_seconds or 10.0), 10.0), 0.25),
+        operation_timeout_seconds=max(int(payload.odoo_module_deploy_timeout_seconds or 1), 1),
     ))
     started_payload = started.model_dump(mode="json") if hasattr(started, "model_dump") else started
     result_payload = started_payload.get("result") if isinstance(started_payload, dict) and isinstance(started_payload.get("result"), dict) else {}
@@ -1299,16 +1452,26 @@ def _poll_odoosh_deployed(
     timeout_seconds: int,
     interval_seconds: float,
     progress_cb=None,
+    failure_check=None,
 ) -> CommandResult:
     """Compatibility wrapper around the shared Odoo.sh commit polling loop."""
     poller = getattr(odoosh, "poll_deployed_commit", None)
     if callable(poller):
-        return poller(
-            expected_sha=pushed_sha,
-            timeout_seconds=timeout_seconds,
-            interval_seconds=interval_seconds,
-            progress_cb=progress_cb,
-        )
+        try:
+            return poller(
+                expected_sha=pushed_sha,
+                timeout_seconds=timeout_seconds,
+                interval_seconds=interval_seconds,
+                progress_cb=progress_cb,
+                failure_check=failure_check,
+            )
+        except TypeError:
+            return poller(
+                expected_sha=pushed_sha,
+                timeout_seconds=timeout_seconds,
+                interval_seconds=interval_seconds,
+                progress_cb=progress_cb,
+            )
     # Test fakes and older service-like adapters may only implement
     # check_commit_deployed(); still exercise the same shared loop.
     from ..services.odoosh_service import OdooShService as SharedOdooShService
@@ -1319,6 +1482,7 @@ def _poll_odoosh_deployed(
         timeout_seconds=timeout_seconds,
         interval_seconds=interval_seconds,
         progress_cb=progress_cb,
+        failure_check=failure_check,
     )
 
 
@@ -1663,6 +1827,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         _step("verify_deployed_module_no_changes", "passed" if verified else "failed", verify_result)
         previous_state = store.load_session_state(client_name=client.name if client else payload.client_name or None)
         pending_statuses = {
+            "deployment_waiting",
             "deploy_failed",
             "deploy_code_mismatch",
             "deploy_failed_or_timeout",
@@ -1905,6 +2070,32 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     pushed_job.request["expected_registry_fields"] = expected_registry_fields
     store.update_job(pushed_job)
 
+    validation_name = client.name if client else payload.client_name
+    validation = ClientGateService().validation_state(validation_name) if validation_name else {}
+    if payload.wait_for_odoosh and validation and not bool(validation.get("deploy_ready")):
+        job = store.get_job(job_id)
+        result = {
+            "status": "deployment_waiting",
+            "message": (
+                "Commit and push completed successfully, but Odoo.sh SSH is currently unavailable. "
+                "The source SHA is safely published; resume only the deploy/upgrade phase after SSH recovers."
+            ),
+            "display_message": "Source pushed; deployment is waiting for Odoo.sh SSH without replaying code, commit, or push.",
+            "continuation_required": True,
+            "interruption_expected": True,
+            "source_pushed": True,
+            "source_deployed": False,
+            "module_upgraded": False,
+            "module_name": payload.module_name,
+            "sha": pushed_sha,
+            "deploy_blocker": validation.get("deploy_blocker") or "Odoo.sh SSH is unavailable.",
+            "next_call": {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}},
+        }
+        store.finish_job(job, JobStatus.warning, result)
+        _save_state("deployment_waiting", {"source_pushed": True, "deploy_blocker": result["deploy_blocker"]})
+        approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module source pushed; runtime deploy waiting for SSH")
+        return
+
     def _wait_for_odoosh_deployment(step_prefix: str = "") -> bool:
         nonlocal odoosh_deploy_confirmation, push_started_epoch
         if not payload.wait_for_odoosh:
@@ -1919,22 +2110,39 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             payload.odoosh_deploy_timeout_seconds,
             payload.odoosh_deploy_poll_interval_seconds,
             progress_cb=_odoosh_poll_progress,
+            failure_check=(
+                (lambda: odoosh.recent_build_failure(push_started_epoch))
+                if callable(getattr(odoosh, "recent_build_failure", None))
+                else None
+            ),
         )
         deployed = check_result.exit_code == 0 and '"deployed": true' in (check_result.stdout or "").lower()
-        _step(f"{step_prefix}odoosh_check_commit", "passed" if deployed else "failed", check_result)
+        build_failed = '"build_failed": true' in (check_result.stdout or "").lower()
+        _step(f"{step_prefix}odoosh_check_commit", "passed" if deployed else "failed" if build_failed else "warning", check_result)
         if not deployed:
             job = store.get_job(job_id)
             result = {
-                "status": "deploy_failed_or_timeout",
-                "message": "Odoo.sh did not report the pushed commit as deployed within the polling window. Module upgrade was not attempted.",
+                "status": "deploy_failed" if build_failed else "deployment_waiting",
+                "message": (
+                    "Odoo.sh reported a build failure while waiting for the pushed commit. Module upgrade was not attempted."
+                    if build_failed
+                    else "Deployment is progressing normally but the bounded confirmation window ended before Odoo.sh activated the commit. Continue this job later; completed commit/push work will be reused."
+                ),
+                "display_message": (
+                    "Deployment failed because Odoo.sh reported a build error."
+                    if build_failed
+                    else "Deployment paused at a safe checkpoint while Odoo.sh finishes activating the commit."
+                ),
+                "continuation_required": not build_failed,
+                "interruption_expected": not build_failed,
                 "module_name": payload.module_name,
                 "sha": pushed_sha,
                 "poll_timeout_seconds": payload.odoosh_deploy_timeout_seconds,
                 "poll_interval_seconds": payload.odoosh_deploy_poll_interval_seconds,
                 "next_call": {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}},
             }
-            store.finish_job(job, JobStatus.failed, result)
-            _save_state("deploy_failed_or_timeout")
+            store.finish_job(job, JobStatus.failed if build_failed else JobStatus.warning, result)
+            _save_state("deploy_failed" if build_failed else "deployment_waiting")
             return False
         try:
             raw_payload = json.loads(check_result.stdout or "{}")
@@ -2181,21 +2389,30 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 break
             fixed = _run_fix_cycle(attempt, deploy_result, last_error_pack)
             if not fixed:
-                if fix_cycle_blocked_by_verifier:
-                    break
-                continue
+                # Never repeat an unchanged failing upgrade. A new attempt is
+                # valid only when the fix cycle produced and pushed a real
+                # corrective commit; otherwise return the error to the unified
+                # code-change workflow for an evidence-based correction.
+                break
 
         if not upgrade_passed:
             job = store.get_job(job_id)
             attempts_text = f"{attempts_made} attempt" if attempts_made == 1 else f"{attempts_made} attempts"
+            final_error = last_real_error or _safe_deploy_error_text(last_deploy_result, last_error_pack)
+            failure_policy = FailurePolicyService().decide(
+                stage="module_upgrade",
+                error=final_error,
+                attempt=attempts_made,
+            ).as_dict()
             result = {
                 "status": "upgrade_failed_after_retries",
-                "message": f"Upgrade failed after {attempts_text}, last error: {last_real_error or _safe_deploy_error_text(last_deploy_result, last_error_pack)}",
+                "message": f"Upgrade failed after {attempts_text}, last error: {final_error}",
                 "module_name": payload.module_name,
                 "sha": pushed_sha,
                 "attempts": attempts_made,
                 "max_fix_cycles": max_fix_cycles,
-                "last_real_error": last_real_error or _safe_deploy_error_text(last_deploy_result, last_error_pack),
+                "last_real_error": final_error,
+                "failure_policy": failure_policy,
                 "last_upgrade_result": _safe_deploy_payload(last_deploy_result) if last_deploy_result is not None else None,
                 "last_error_pack": last_error_pack.model_dump(mode="json") if hasattr(last_error_pack, "model_dump") else None,
                 "module_upgrade": {
@@ -2206,13 +2423,24 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 },
                 "odoosh_check_commit": odoosh_deploy_confirmation,
                 "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+                "recovery": {
+                    "action": failure_policy["action"],
+                    "retryable": failure_policy["retryable"],
+                    "correction_required": failure_policy["correction_required"],
+                    "circuit_open": failure_policy["circuit_open"],
+                    "message": (
+                        "Submit an evidence-based minimal correction through workflow.odoo_code_change; "
+                        "do not replay the same upgrade against unchanged code."
+                    ),
+                },
             }
             store.finish_job(job, JobStatus.failed, result)
             _save_state("upgrade_failed_after_retries", {"last_upgrade_error": result["last_real_error"]})
             approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module module upgrade failed after retries")
             return
 
-    module_status = _odoo_service_for_client(client).module_status(payload.module_name)
+    live_odoo = _odoo_service_for_client(client)
+    module_status = live_odoo.module_status(payload.module_name)
     status_ = "passed" if module_status.status == "ok" else "warning"
     _step("odoo_module_status", status_, module_status)
 
@@ -2221,6 +2449,12 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         _step("registry_field_verify", "passed" if field_verify.status == "ok" else "failed", field_verify)
         if field_verify.status != "ok":
             job = store.get_job(job_id)
+            registry_error = field_verify.error or str(field_verify.result or "Live registry is missing expected fields")
+            failure_policy = FailurePolicyService().decide(
+                stage="registry_verification",
+                error=registry_error,
+                attempt=1,
+            ).as_dict()
             result = {
                 "status": "registry_field_missing",
                 "message": "Module upgrade finished but the live Odoo registry is missing expected fields. Do not claim success.",
@@ -2228,6 +2462,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 "sha": pushed_sha,
                 "expected_registry_fields": expected_registry_fields,
                 "registry_field_verify": field_verify.model_dump(mode="json"),
+                "failure_policy": failure_policy,
                 "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
             }
             store.finish_job(job, JobStatus.failed, result)
@@ -2236,7 +2471,18 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     else:
         _step("registry_field_verify", "skipped", {"message": "No expected Python field additions were inferred or provided."})
 
-    smoke = _odoo_service_for_client(client).registry_smoke_test(payload.module_name, [], [], strict=False)
+    try:
+        smoke = live_odoo.registry_smoke_test(
+            payload.module_name,
+            [],
+            [],
+            strict=False,
+            module_status_result=module_status,
+        )
+    except TypeError:
+        # Compatibility for injected/client adapters with the previous method
+        # signature. Production OdooService takes the zero-startup fast path.
+        smoke = live_odoo.registry_smoke_test(payload.module_name, [], [], strict=False)
     _step("registry_smoke_test", "passed" if smoke.status == "ok" else "warning", smoke)
 
     fresh_job = store.get_job(job_id)
@@ -2290,6 +2536,7 @@ def find_core_file(payload: FindCoreFileRequest) -> FindCoreFileResult:
         keyword=payload.keyword,
         search_roots=payload.search_roots or None,
         client_name=payload.client_name,
+        allow_remote_core_sync=payload.allow_remote_core_sync,
     )
 
 

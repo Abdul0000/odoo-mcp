@@ -147,7 +147,11 @@ class FrontendPatternService:
         if is_frontend_task:
             plan = list(_AREA_PLANS.get(area, []))
             # If the caller gives a target module, browse its static/views too, before generic core examples.
-            if request.target_module_name:
+            target_is_custom = bool(
+                request.target_module_name
+                and any(request.target_module_name in Path(path).parts for path in request.custom_file_paths)
+            )
+            if request.target_module_name and not target_is_custom:
                 plan.insert(0, (request.target_module_name, "static/src", "Target module frontend source and local conventions"))
                 plan.insert(1, (request.target_module_name, "views", "Target module asset/template/view declaration conventions"))
 
@@ -155,7 +159,13 @@ class FrontendPatternService:
             for module, subdir, reason in plan:
                 explorer_calls.append({"tool": "workflow.list_module_files", "module_name": module, "subdir": subdir})
                 try:
-                    result = finder.list_module_files(module, subdir, request.search_roots or None, client_name=request.client_name)
+                    result = finder.list_module_files(
+                        module,
+                        subdir,
+                        request.search_roots or None,
+                        client_name=request.client_name,
+                        allow_remote_core_sync=request.allow_remote_core_sync,
+                    )
                 except Exception:  # noqa: BLE001 - preflight must never crash the agent session
                     result = None
 

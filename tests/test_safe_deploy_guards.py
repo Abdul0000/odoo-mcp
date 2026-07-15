@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
@@ -178,6 +179,61 @@ def test_odoosh_module_update_parser_fails_on_skipped_module():
     assert "MCP_CLASSIFIED_FAILURE" in classified.stderr
 
 
+def test_recent_build_failure_ignores_old_and_filestore_runtime_tracebacks(monkeypatch):
+    push_time = int(datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc).timestamp())
+    logs = """__ODOO_MCP_LOG_FILE__:/home/odoo/logs/odoo.log
+2026-07-15 11:30:00,000 ERROR db odoo.http: request failed
+Traceback (most recent call last):
+  File "/home/odoo/src/odoo/odoo/http.py", line 1, in call
+FileNotFoundError: [Errno 2] No such file or directory: '/home/odoo/data/filestore/db/ab/cd'
+2026-07-15 12:00:30,000 ERROR db odoo.http: attachment request failed
+Traceback (most recent call last):
+  File "/home/odoo/src/odoo/odoo/http.py", line 1, in call
+FileNotFoundError: [Errno 2] No such file or directory: '/home/odoo/data/filestore/db/ef/gh'
+"""
+    monkeypatch.setattr(
+        OdooShService,
+        "run_shell",
+        lambda self, script, timeout_seconds=45: CommandResult(
+            command=["ssh", "logs"], cwd="odoosh:ssh", exit_code=0, stdout=logs,
+        ),
+    )
+
+    result = OdooShService().recent_build_failure(push_time)
+    payload = json.loads(result.stdout)
+
+    assert result.exit_code == 0
+    assert payload["failed"] is False
+    assert payload["ignored_non_blocking_blocks"] >= 1
+
+
+def test_recent_build_failure_blocks_only_post_push_code_failure(monkeypatch):
+    push_time = int(datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc).timestamp())
+    logs = """__ODOO_MCP_LOG_FILE__:/home/odoo/logs/build.log
+2026-07-15 11:30:00,000 ERROR old build
+ParseError: old unrelated XML error
+2026-07-15 12:00:20,000 CRITICAL db odoo.service.server: Failed to load registry
+Traceback (most recent call last):
+  File "/home/odoo/src/user/x_module/views/view.xml", line 4, in load
+odoo.tools.convert.ParseError: while parsing x_module/views/view.xml:4
+"""
+    monkeypatch.setattr(
+        OdooShService,
+        "run_shell",
+        lambda self, script, timeout_seconds=45: CommandResult(
+            command=["ssh", "logs"], cwd="odoosh:ssh", exit_code=0, stdout=logs,
+        ),
+    )
+
+    result = OdooShService().recent_build_failure(push_time)
+    payload = json.loads(result.stdout)
+
+    assert result.exit_code == 1
+    assert payload["failed"] is True
+    assert payload["ignored_historical_blocks"] >= 1
+    assert any("x_module/views/view.xml" in block for block in payload["failure_blocks"])
+
+
 def test_approval_failed_command_is_not_consumed(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     monkeypatch.setattr(settings, "require_approval", True)
@@ -273,11 +329,92 @@ def test_safe_deploy_fails_without_upgrade_when_sha_is_not_deployed(tmp_path, mo
     )
 
     finished = store.get_job(job.id)
-    assert finished.status == JobStatus.failed
-    assert finished.result["status"] == "deploy_failed_or_timeout"
+    assert finished.status == JobStatus.warning
+    assert finished.result["status"] == "deployment_waiting"
+    assert finished.result["interruption_expected"] is True
+    assert "paused at a safe checkpoint" in finished.result["display_message"].lower()
     assert finished.result["next_call"] == {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}}
     assert "odoosh_wait_for_commit" not in {step.name for step in finished.steps}
-    assert any(step.name == "odoosh_check_commit" and step.status == "failed" for step in finished.steps)
+    assert any(step.name == "odoosh_check_commit" and step.status == "warning" for step in finished.steps)
+
+
+def test_safe_deploy_commits_and_pushes_before_waiting_for_unavailable_ssh(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    (project / "x_module").mkdir(parents=True)
+    store = JsonStore()
+    store.save_session_state({"client_validation": {
+        "validated": True,
+        "coding_ready": True,
+        "deploy_ready": False,
+        "deploy_blocker": "SSH refused",
+    }}, client_name="Alpha")
+    job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running))
+    calls = {"commit": 0, "push": 0, "odoosh": 0}
+
+    class FakeGit:
+        def status(self, project_path):
+            return CommandResult(command=["git", "status"], cwd=project_path, exit_code=0, stdout=" M x_module/__manifest__.py\n")
+
+        def diff(self, project_path, staged=False, timeout_seconds=30):
+            return CommandResult(command=["git", "diff"], cwd=project_path, exit_code=0, stdout="version change")
+
+        def changed_files(self, project_path):
+            return CommandResult(command=["git", "changed-files"], cwd=project_path, exit_code=0, stdout="x_module/__manifest__.py\n")
+
+        def configure_identity(self, project_path):
+            return CommandResult(command=["git", "config"], cwd=project_path, exit_code=0)
+
+        def validate_target(self, project_path, branch=None, remote="origin"):
+            return CommandResult(command=["git", "validate-target"], cwd=project_path, exit_code=0)
+
+        def commit(self, project_path, message, paths, timeout_seconds=60):
+            calls["commit"] += 1
+            return CommandResult(command=["git", "commit"], cwd=project_path, exit_code=0)
+
+        def head_changed_files(self, project_path, timeout_seconds=20):
+            return CommandResult(command=["git", "diff-tree"], cwd=project_path, exit_code=0, stdout="x_module/__manifest__.py\n")
+
+        def head_sha(self, project_path):
+            return CommandResult(command=["git", "rev-parse", "HEAD"], cwd=project_path, exit_code=0, stdout="abc1234\n")
+
+        def push(self, project_path, remote="origin", branch=None, set_upstream=True, timeout_seconds=120):
+            calls["push"] += 1
+            return CommandResult(command=["git", "push"], cwd=project_path, exit_code=0, stdout="PUSH_OK\nsha=abc1234\n")
+
+        def remote_head_sha(self, project_path, remote="origin", branch=None, timeout_seconds=30):
+            return CommandResult(command=["git", "remote-head-sha"], cwd=project_path, exit_code=0, stdout="abc1234\n")
+
+    class FakeOdooSh:
+        def check_commit_deployed(self, sha):
+            calls["odoosh"] += 1
+            raise AssertionError("SSH must not be called after validation already marked it unavailable")
+
+    monkeypatch.setattr(workflow, "GitService", lambda: FakeGit())
+    monkeypatch.setattr(workflow, "OdooShService", lambda *args, **kwargs: FakeOdooSh())
+    monkeypatch.setattr(workflow.SyntaxVerifierService, "verify", lambda self, payload: type("Verify", (), {"push_blocked": False, "model_dump": lambda self, mode=None: {"push_blocked": False}})())
+
+    workflow._run_safe_deploy(
+        SafeDeployModuleRequest(
+            client_name="Alpha",
+            project_path=str(project),
+            module_name="x_module",
+            commit_message="Release manifest",
+            paths=["x_module/__manifest__.py"],
+            run_qa=False,
+            wait_for_odoosh=True,
+            upgrade_module=True,
+        ),
+        job.id,
+    )
+
+    finished = store.get_job(job.id)
+    assert calls == {"commit": 1, "push": 1, "odoosh": 0}
+    assert finished.status == JobStatus.warning
+    assert finished.result["status"] == "deployment_waiting"
+    assert finished.result["source_pushed"] is True
+    assert finished.result["sha"] == "abc1234"
 
 
 def test_safe_deploy_polls_odoosh_until_deployed_before_upgrade(tmp_path, monkeypatch):
@@ -809,7 +946,7 @@ def test_resume_job_active_job_returns_poll_instruction_without_replay(tmp_path,
     result = asyncio.run(tools._resume_job(ResumeJobRequest(job_id=job.id)))
 
     assert result["status"] == "active_job"
-    assert result["next_call"] == {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+    assert result["next_call"] == {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}}
     assert JsonStore().get_job(job.id).status == JobStatus.running
 
 
@@ -852,7 +989,7 @@ def test_safe_deploy_wait_for_result_positive_timeout_returns_running(tmp_path, 
     )))
 
     assert result.status == "running"
-    assert result.summary["next_call"] == {"tool": "jobs.get", "arguments": {"job_id": result.job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+    assert result.summary["next_call"] == {"tool": "jobs.get", "arguments": {"job_id": result.job_id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}}
 
 
 def test_safe_deploy_wait_loop_does_not_sleep_past_timeout(tmp_path, monkeypatch):
@@ -1880,7 +2017,7 @@ class _SafeDeployRetryOdooService:
         return OdooResult(status="ok", result={"module": module_name})
 
 
-def _retry_project(tmp_path, monkeypatch, success_on=None, max_fix_cycles=5):
+def _retry_project(tmp_path, monkeypatch, success_on=None, max_fix_cycles=5, correction_commit_succeeds=True):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     project = tmp_path / "repo"
@@ -1900,6 +2037,20 @@ def _retry_project(tmp_path, monkeypatch, success_on=None, max_fix_cycles=5):
         "manifest": 0,
     }
     git = _SafeDeployRetryGit(calls)
+    original_commit = git.commit
+
+    def controlled_commit(project_path, message, paths, timeout_seconds=60):
+        if not correction_commit_succeeds and calls["commit"] >= 1:
+            calls["commit"] += 1
+            return CommandResult(
+                command=["git", "commit"],
+                cwd=project_path,
+                exit_code=1,
+                stderr="nothing to commit",
+            )
+        return original_commit(project_path, message, paths, timeout_seconds)
+
+    git.commit = controlled_commit
     odoosh = _SafeDeployRetryOdooSh(calls)
 
     def fake_deploy(req):
@@ -2005,6 +2156,28 @@ def test_safe_deploy_stops_retry_loop_when_fix_cycle_is_blocked(tmp_path, monkey
     assert finished.result["attempts"] == 1
     assert calls["deploy"] == 1
     assert calls["commit"] == 1
+    assert calls["push"] == 1
+    assert "fix_cycle_1" in step_names
+    assert "upgrade_attempt_2" not in step_names
+
+
+def test_safe_deploy_does_not_retry_unchanged_code(tmp_path, monkeypatch):
+    store, job, payload, calls = _retry_project(
+        tmp_path,
+        monkeypatch,
+        success_on=None,
+        max_fix_cycles=5,
+        correction_commit_succeeds=False,
+    )
+
+    workflow._run_safe_deploy(payload, job.id)
+
+    finished = store.get_job(job.id)
+    step_names = [step.name for step in finished.steps]
+    assert finished.status == JobStatus.failed
+    assert finished.result["attempts"] == 1
+    assert calls["deploy"] == 1
+    assert calls["commit"] == 2
     assert calls["push"] == 1
     assert "fix_cycle_1" in step_names
     assert "upgrade_attempt_2" not in step_names

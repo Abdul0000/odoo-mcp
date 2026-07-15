@@ -26,6 +26,7 @@ Safety:
 from __future__ import annotations
 
 import re
+import logging
 import subprocess
 import time
 from pathlib import Path
@@ -37,7 +38,11 @@ from .client_resolver_service import ClientResolverService, ResolvedClient
 _registry_lock = Lock()
 _module_locks: dict[str, Lock] = {}
 _sha_cache: dict[str, tuple[str | None, float]] = {}
+_negative_cache: dict[str, float] = {}
 _SHA_CACHE_TTL = 30.0  # don't hit odoosh.deployed_sha more than once per 30s
+_NEGATIVE_CACHE_TTL = 300.0
+_INTERACTIVE_SYNC_TIMEOUT_SECONDS = 8
+logger = logging.getLogger(__name__)
 
 
 def _module_lock(remote_root: str, module_name: str) -> Lock:
@@ -57,7 +62,7 @@ def _safe_name(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", value)
 
 
-def _deployed_sha(client: ResolvedClient | None = None) -> str | None:
+def _deployed_sha(client: ResolvedClient | None = None, timeout_seconds: int = _INTERACTIVE_SYNC_TIMEOUT_SECONDS) -> str | None:
     """Best-effort fetch of the currently deployed commit sha on Odoo.sh.
 
     Cached briefly so a burst of ensure_module_synced() calls in one
@@ -73,7 +78,7 @@ def _deployed_sha(client: ResolvedClient | None = None) -> str | None:
     try:
         from .odoosh_service import OdooShService
 
-        result = OdooShService(client).deployed_sha()
+        result = OdooShService(client).deployed_sha(timeout_seconds=max(1, timeout_seconds))
         if result.exit_code == 0 and result.stdout:
             lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
             sha = lines[-1] if lines else None
@@ -125,7 +130,7 @@ def _normalise_root(remote_root: str, client: ResolvedClient | None) -> str:
         return f"{root}/addons"
     return root
 
-def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: int = 45, *, client_name: str | None = None, client: ResolvedClient | None = None) -> bool:
+def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: int = _INTERACTIVE_SYNC_TIMEOUT_SECONDS, *, client_name: str | None = None, client: ResolvedClient | None = None) -> bool:
     """Best-effort: make sure {remote_root}/{module_name} exists and is fresh locally.
 
     remote_root must be one of the existing hardcoded roots
@@ -148,11 +153,18 @@ def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: in
     source_root = _normalise_root(remote_root, selected_client)
     local_dir = Path(source_root) / module_name
     marker = local_dir / ".synced_sha"
-    sha = _deployed_sha(selected_client)
+    cache_key = f"{target.user}@{target.host}:{target.port}:{source_root}:{module_name}"
 
     with _module_lock(remote_root, module_name):
+        has_content = local_dir.exists() and local_dir.is_dir() and any(local_dir.iterdir())
+        negative_until = _negative_cache.get(cache_key, 0.0)
+        if negative_until > time.time() and not has_content:
+            logger.info("core_sync negative-cache hit", extra={"module": module_name, "root": source_root})
+            return False
+
+        timeout_seconds = max(1, min(int(timeout_seconds or _INTERACTIVE_SYNC_TIMEOUT_SECONDS), _INTERACTIVE_SYNC_TIMEOUT_SECONDS))
+        sha = _deployed_sha(selected_client, timeout_seconds=timeout_seconds)
         if local_dir.exists() and local_dir.is_dir():
-            has_content = any(local_dir.iterdir())
             if sha and has_content:
                 try:
                     cached_sha = marker.read_text(encoding="utf-8").strip() if marker.exists() else None
@@ -190,18 +202,26 @@ def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: in
             remote, str(local_dir) + "/",
         ]
         try:
+            started = time.monotonic()
+            logger.info("core_sync started", extra={"module": module_name, "root": source_root, "timeout_seconds": timeout_seconds})
             completed = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout_seconds + 5,
             )
         except (subprocess.TimeoutExpired, OSError):
+            _negative_cache[cache_key] = time.time() + _NEGATIVE_CACHE_TTL
+            logger.warning("core_sync timed out or unavailable", extra={"module": module_name, "root": source_root, "timeout_seconds": timeout_seconds})
             return local_dir.exists() and any(local_dir.iterdir()) if local_dir.exists() else False
 
         if completed.returncode != 0:
             # Sync failed (module may genuinely not exist on that root, or
             # transient network issue) — leave whatever was there before and
             # let the caller's normal not-found path handle it.
+            _negative_cache[cache_key] = time.time() + _NEGATIVE_CACHE_TTL
+            logger.info("core_sync unavailable", extra={"module": module_name, "root": source_root, "exit_code": completed.returncode})
             return local_dir.exists() and any(local_dir.iterdir()) if local_dir.exists() else False
 
+        _negative_cache.pop(cache_key, None)
+        logger.info("core_sync completed", extra={"module": module_name, "root": source_root, "elapsed_ms": int((time.monotonic() - started) * 1000)})
         if sha:
             try:
                 marker.write_text(sha, encoding="utf-8")

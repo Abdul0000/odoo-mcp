@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,7 +21,34 @@ from .repo_service import RepoService
 from .store_service import JsonStore
 
 
-PLACEHOLDER_RE = re.compile(r"^(CHANGE_ME|YOUR_|CLIENT_2_|ODOO_|ODOOSH_|GITHUB_|PRIVATE_KEY|TOKEN|PASSWORD)|example\.com|client-2", re.I)
+_PLACEHOLDER_VALUES = {
+    "change_me",
+    "<branch>",
+    "<git_branch_name>",
+    "your_branch",
+    "placeholder",
+    "token",
+    "password",
+    "private_key",
+    "github_token",
+    "odoo_url",
+    "odoo_db",
+    "odoosh_ssh_host",
+}
+_PLACEHOLDER_PREFIXES = ("change_me_", "your_", "client_2_")
+
+
+def _looks_like_placeholder(value: object) -> bool:
+    """Reject explicit template values, never substrings inside real identifiers."""
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return (
+        text in _PLACEHOLDER_VALUES
+        or text.startswith(_PLACEHOLDER_PREFIXES)
+        or "example.com" in text
+        or "client-2" in text
+    )
 
 
 class ClientGateService:
@@ -31,7 +62,13 @@ class ClientGateService:
         self.store = store or JsonStore()
         self.resolver = ClientResolverService()
 
-    def check(self, client_name: str | None = None, validate: bool = False, force_refresh: bool = False) -> dict[str, Any]:
+    def check(
+        self,
+        client_name: str | None = None,
+        validate: bool = False,
+        force_refresh: bool = False,
+        user_confirmed: bool = False,
+    ) -> dict[str, Any]:
         clients = [normalise_client(item) for item in get_odoo_clients()]
         public_clients = [safe_client_public(item) for item in clients]
         names = [item.get("name") or f"ODOO_CLIENTS[{idx}]" for idx, item in enumerate(clients)]
@@ -44,7 +81,7 @@ class ClientGateService:
                 "mode": "legacy_env",
                 "summary": "No ODOO_CLIENTS entries configured; using legacy single-client environment fallback.",
                 "clients": [],
-                "next_call": {"tool": "workflow.agent_instructions", "arguments": {}},
+                "next_call": {"tool": "workflow.odoo_code_change", "arguments": {}},
             }
 
         if not client_name:
@@ -52,7 +89,7 @@ class ClientGateService:
                 selected = clients[0]
                 selected_name = selected.get("name") or "ODOO_CLIENTS[0]"
                 if validate:
-                    return self._validate_and_save(selected_name, force_refresh=force_refresh)
+                    return self._validate_and_save(selected_name, force_refresh=force_refresh, user_confirmed=True)
                 existing = self.validation_state(selected_name)
                 return {
                     "ok": bool(existing.get("validated")),
@@ -66,7 +103,7 @@ class ClientGateService:
                         else "Single client found. Run client.check with validate=true to validate before coding/deploying."
                     ),
                     "validation": existing,
-                    "next_call": {"tool": "workflow.agent_instructions", "arguments": {}} if existing.get("validated") else None,
+                    "next_call": {"tool": "workflow.odoo_code_change", "arguments": {}} if existing.get("validated") else None,
                 }
             return {
                 "ok": False,
@@ -83,7 +120,13 @@ class ClientGateService:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Client not found or incomplete: {client_name}")
 
         if validate:
-            return self._validate_and_save(resolved.name, force_refresh=force_refresh)
+            # Reaching this call with an explicit client_name is the provider's
+            # assertion that the user's immediately preceding selection named
+            # this client. The server cannot inspect chat messages itself, so a
+            # second verbal confirmation would add friction without adding
+            # enforceable security. The public action gate remains strict until
+            # this validation succeeds.
+            return self._validate_and_save(resolved.name, force_refresh=force_refresh, user_confirmed=True)
 
         existing = self.validation_state(resolved.name)
         return {
@@ -94,7 +137,7 @@ class ClientGateService:
             "client": resolved.public,
             "summary": "Client is validated." if existing.get("validated") else "Client selected but not validated. Run client.check(validate=true).",
             "validation": existing,
-            "next_call": {"tool": "workflow.agent_instructions", "arguments": {}} if existing.get("validated") else None,
+            "next_call": {"tool": "workflow.odoo_code_change", "arguments": {}} if existing.get("validated") else None,
         }
 
     def validation_state(self, client_name: str | None) -> dict[str, Any]:
@@ -133,7 +176,8 @@ class ClientGateService:
         requirement = self._requirement_for_action(action)
         if self._validation_satisfies(validation, requirement):
             project_path = self._validated_project_path(resolved_name, validation)
-            stale_reason = self._validation_stale_reason(validation, project_path)
+            resolved = self.resolver.resolve_client(client_name=resolved_name, require_complete=False)
+            stale_reason = self._validation_stale_reason(validation, project_path, resolved)
             if stale_reason:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
@@ -196,14 +240,34 @@ class ClientGateService:
         resolved = self.resolver.resolve_client(client_name=client_name, require_complete=False)
         return resolved.path if resolved else None
 
-    def _validation_stale_reason(self, validation: dict[str, Any], project_path: str | None) -> str | None:
+    def _validation_stale_reason(
+        self,
+        validation: dict[str, Any],
+        project_path: str | None,
+        resolved: ResolvedClient | None = None,
+    ) -> str | None:
         if project_path and not Path(project_path).expanduser().is_dir():
             return f"repo checkout no longer exists at {project_path}"
+        saved_fingerprint = validation.get("config_fingerprint")
+        if resolved is not None and saved_fingerprint:
+            current_fingerprint = self._client_config_fingerprint(resolved)
+            if current_fingerprint != saved_fingerprint:
+                return "client repository, credentials, or deployment configuration changed"
         age_seconds = self._validation_age_seconds(validation)
-        if age_seconds is not None and age_seconds > self.VALIDATION_TTL_SECONDS:
-            minutes = self.VALIDATION_TTL_SECONDS // 60
+        ttl_seconds = max(
+            30,
+            int(getattr(settings, "client_validation_ttl_seconds", self.VALIDATION_TTL_SECONDS)),
+        )
+        if age_seconds is not None and age_seconds > ttl_seconds:
+            minutes = max(1, ttl_seconds // 60)
             return f"validation is older than {minutes} minutes"
         return None
+
+    @staticmethod
+    def _client_config_fingerprint(resolved: ResolvedClient) -> str:
+        """Hash all target and credential values without persisting secrets."""
+        payload = json.dumps(asdict(resolved), sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _validation_age_seconds(validation: dict[str, Any]) -> float | None:
@@ -219,9 +283,19 @@ class ClientGateService:
             return None
 
     def _requirement_for_action(self, action: str) -> str:
+        if action in {"odoo.query", "odoo.search_read"}:
+            return "data_query_ready"
+        if action == "workflow.odoo_code_change":
+            return "coding_ready"
         if action.startswith("odoosh."):
             return "ssh_ready"
-        if action in {"workflow.safe_deploy_module", "workflow.resume_job"}:
+        # safe_deploy owns commit/push as well as Odoo.sh activation. Source
+        # publication only needs a validated checkout; SSH availability is
+        # checked after the pushed SHA is proven on the Git remote. Resume is
+        # the runtime/deploy half and still requires deploy_ready.
+        if action == "workflow.safe_deploy_module":
+            return "coding_ready"
+        if action == "workflow.resume_job":
             return "deploy_ready"
         if action.startswith("odoo.module"):
             return "deploy_ready"
@@ -247,17 +321,24 @@ class ClientGateService:
                 return {"client_name": name, "validation": state}
         return None
 
-    def _validate_and_save(self, client_name: str, force_refresh: bool = False) -> dict[str, Any]:
+    def _validate_and_save(
+        self,
+        client_name: str,
+        force_refresh: bool = False,
+        user_confirmed: bool = False,
+    ) -> dict[str, Any]:
         resolved = self.resolver.resolve_client(client_name=client_name, require_complete=True)
         if not resolved:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Client not found or incomplete: {client_name}")
 
         existing = self.validation_state(resolved.name)
-        if existing.get("validated") and not force_refresh:
+        if existing.get("validated"):
             cached_path = self._validated_project_path(resolved.name, existing)
-            if self._validation_stale_reason(existing, cached_path):
-                force_refresh = True
-            else:
+            stale_reason = self._validation_stale_reason(existing, cached_path, resolved)
+            if not stale_reason:
+                if user_confirmed and not existing.get("user_confirmed"):
+                    existing = {**existing, "user_confirmed": True}
+                    self.store.save_session_state({"client_validation": existing}, client_name=resolved.name)
                 return {
                     "ok": True,
                     "validated": True,
@@ -266,10 +347,23 @@ class ClientGateService:
                     "client_name": resolved.name,
                     "client": resolved.public,
                     "summary": "Client already validated.",
+                    "cache_hit": True,
+                    "force_refresh_requested": bool(force_refresh),
+                    "force_refresh_ignored": bool(force_refresh),
+                    "message": (
+                        "Healthy cached validation reused; accidental force_refresh was ignored. Continue directly with the requested query/workflow."
+                        if force_refresh
+                        else "Healthy cached validation reused. Continue directly with the requested query/workflow."
+                    ),
                     "checks": existing.get("checks", {}),
                     "validation_log": existing.get("validation_log", []),
-                    "next_call": {"tool": "workflow.agent_instructions", "arguments": {}},
+                    "next_call": {"tool": "workflow.odoo_code_change", "arguments": {}},
                 }
+            # Stale/expired/config-changed validation always refreshes, even
+            # when the provider omitted force_refresh. Conversely, a provider
+            # cannot turn a healthy cached check into an expensive network
+            # validation merely by guessing force_refresh=true.
+            force_refresh = True
 
         self.resolver.apply_odoo_env(resolved)
         checks: dict[str, str] = {}
@@ -319,30 +413,40 @@ class ClientGateService:
 
         coding_ready = bool(base_ok)
 
-        # Odoo shell is useful for data/model operations, but it is not required
-        # for coding work. It runs through the selected client's Odoo.sh SSH
-        # settings; no process-wide environment is mutated.
-        if coding_ready:
-            if self._has_shell_config(resolved):
-                odoo_result = self._check_odoo_shell(resolved)
-                checks["odoo_shell"] = odoo_result["status"]
-                log.extend(odoo_result["log"])
-                shell_ok = odoo_result["status"] == "ok"
-            else:
-                checks["odoo_shell"] = "skipped"
-                log.append("Odoo shell skipped: Odoo.sh SSH/db/path settings are missing or placeholders.")
+        # Odoo shell and Odoo.sh SSH are independent read-only probes. Run them
+        # together so a fresh client validation pays the slower latency once.
+        shell_configured = coding_ready and self._has_shell_config(resolved)
+        ssh_configured = coding_ready and self._has_odoosh_config(resolved)
+        probe_results: dict[str, dict[str, Any]] = {}
+        if coding_ready and (shell_configured or ssh_configured):
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="client_check") as executor:
+                futures = {}
+                if shell_configured:
+                    futures["odoo_shell"] = executor.submit(self._check_odoo_shell, resolved)
+                if ssh_configured:
+                    futures["odoosh_ssh"] = executor.submit(self._check_odoosh, resolved)
+                for name, future in futures.items():
+                    probe_results[name] = future.result()
 
-        if coding_ready:
-            if self._has_odoosh_config(resolved):
-                ssh_result = self._check_odoosh(resolved)
-                checks["odoosh_ssh"] = ssh_result["status"]
-                checks["addons_path"] = ssh_result.get("addons_path_status", "skipped")
-                log.extend(ssh_result["log"])
-                ssh_ok = ssh_result["status"] == "ok"
-            else:
-                checks["odoosh_ssh"] = "skipped"
-                checks["addons_path"] = "skipped"
-                log.append("Odoo.sh SSH skipped: SSH host/user/key/db/path settings are missing or placeholders.")
+        if shell_configured:
+            odoo_result = probe_results["odoo_shell"]
+            checks["odoo_shell"] = odoo_result["status"]
+            log.extend(odoo_result["log"])
+            shell_ok = odoo_result["status"] == "ok"
+        elif coding_ready:
+            checks["odoo_shell"] = "skipped"
+            log.append("Odoo shell skipped: Odoo.sh SSH/db/path settings are missing or placeholders.")
+
+        if ssh_configured:
+            ssh_result = probe_results["odoosh_ssh"]
+            checks["odoosh_ssh"] = ssh_result["status"]
+            checks["addons_path"] = ssh_result.get("addons_path_status", "skipped")
+            log.extend(ssh_result["log"])
+            ssh_ok = ssh_result["status"] == "ok"
+        elif coding_ready:
+            checks["odoosh_ssh"] = "skipped"
+            checks["addons_path"] = "skipped"
+            log.append("Odoo.sh SSH skipped: SSH host/user/key/db/path settings are missing or placeholders.")
 
         # Safe deploy/module upgrade needs Odoo.sh SSH because the pipeline must
         # verify the pushed SHA, check /home/odoo/src/user file hashes, read
@@ -371,6 +475,7 @@ class ClientGateService:
 
         validation = {
             "validated": coding_ready,
+            "user_confirmed": bool(user_confirmed),
             "coding_ready": coding_ready,
             "deploy_ready": deploy_ready,
             "data_query_ready": data_query_ready,
@@ -381,6 +486,7 @@ class ClientGateService:
             "deploy_blocker": None if deploy_ready else ("Odoo.sh SSH is required for safe deploy/source verification/module upgrade." if coding_ready else None),
             "client_name": resolved.name,
             "project_path": str(resolved.path),
+            "config_fingerprint": self._client_config_fingerprint(resolved),
             "validated_at": now,
             "checks": checks,
             "summary": summary,
@@ -419,7 +525,7 @@ class ClientGateService:
             "deploy_blocker": None if deploy_ready else ("Odoo.sh SSH is required for safe deploy/source verification/module upgrade." if coding_ready else None),
             "checks": checks,
             "validation_log": log[-30:],
-            "next_call": {"tool": "workflow.agent_instructions", "arguments": {}} if coding_ready else None,
+            "next_call": {"tool": "workflow.odoo_code_change", "arguments": {}} if coding_ready else None,
         }
 
     def _config_errors(self, client: ResolvedClient) -> list[str]:
@@ -438,7 +544,7 @@ class ClientGateService:
         for key, value in required.items():
             if value is None or str(value).strip() == "":
                 errors.append(f"Missing required client setting: {key}.")
-            elif PLACEHOLDER_RE.search(str(value).strip()):
+            elif _looks_like_placeholder(value):
                 errors.append(f"Placeholder value detected for {key}; replace it in ODOO_CLIENTS.")
         return errors
 
@@ -469,7 +575,7 @@ class ClientGateService:
         text = str(value).strip()
         if not text:
             return False
-        return PLACEHOLDER_RE.search(text) is None
+        return not _looks_like_placeholder(text)
 
     def _check_repo_branch(self, client: ResolvedClient) -> dict[str, Any]:
         command = ["git", "ls-remote", "--heads", client.authenticated_repo, client.branch]

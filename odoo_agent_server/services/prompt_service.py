@@ -28,6 +28,13 @@ def load_client_check_system_prompt() -> str:
     return prompt_path.read_text(encoding="utf-8")
 
 
+@lru_cache(maxsize=1)
+def load_opencode_system_prompt() -> str:
+    """Return the OpenCode contract for native local-checkout source work."""
+    prompt_path = _project_root() / "OPENCODE_SYSTEM_PROMPT.md"
+    return prompt_path.read_text(encoding="utf-8")
+
+
 def shared_prompt_payload() -> dict[str, str]:
     prompt = load_mcp_system_prompt()
     return {
@@ -43,6 +50,16 @@ def client_check_prompt_payload() -> dict[str, str]:
     return {
         "source": "CLIENT_CHECK_SYSTEM_PROMPT.md",
         "name": "client_check_system_prompt",
+        "text": prompt,
+        "content": prompt,
+    }
+
+
+def opencode_prompt_payload() -> dict[str, str]:
+    prompt = load_opencode_system_prompt()
+    return {
+        "source": "OPENCODE_SYSTEM_PROMPT.md",
+        "name": "opencode_system_prompt",
         "text": prompt,
         "content": prompt,
     }

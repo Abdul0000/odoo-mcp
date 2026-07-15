@@ -26,7 +26,7 @@ from ..services.approval_service import ApprovalService
 from ..services.odoosh_service import OdooShService
 from ..services.store_service import JsonStore
 from ..services.workflow_guard_service import safe_deploy_command_block
-from ..services.background_executor import submit_background
+from ..services.background_executor import background_task, submit_background
 from ..services.git_service import GitService
 from ..services.client_gate_service import ClientGateService
 from ..services.client_resolver_service import ClientResolverService
@@ -198,7 +198,7 @@ def _background_command_job(
             approval.mark_failed(approval_id, f"{name} failed")
             store.log_audit(name, "failed", request.get("module_name", name), {"job_id": job.id, "error": str(exc)})
 
-    submit_background(_bg)
+    submit_background(background_task(_bg, "deploy"))
     if wait_for_result:
         waited = store.wait_job(job.id, wait_timeout_seconds, poll_interval_seconds)
         payload = {
@@ -437,5 +437,4 @@ def odoosh_module_update(payload: OdooShModuleUpdateRequest) -> CommandResult:
         payload.wait_timeout_seconds,
         payload.poll_interval_seconds,
     )
-
 

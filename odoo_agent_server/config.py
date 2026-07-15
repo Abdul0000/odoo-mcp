@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     state_dir: str = Field(default="/tmp/odoo_agent_state", alias="ODOO_AGENT_STATE_DIR")
     screenshot_dir: str = Field(default="/tmp/odoo_agent_screenshots", alias="ODOO_AGENT_SCREENSHOT_DIR")
     cdp_url: str | None = Field(default=None, alias="ODOO_AGENT_CDP_URL")
+    build_revision: str | None = Field(default=None, alias="RENDER_GIT_COMMIT")
 
     # Approval gating is disabled in this build so MCP tools can write, commit, push, and deploy directly.
     require_approval: bool = Field(default=False, alias="ODOO_AGENT_REQUIRE_APPROVAL")
@@ -74,13 +75,32 @@ class Settings(BaseSettings):
     repo_index_enabled: bool = Field(default=True, alias="ODOO_AGENT_REPO_INDEX_ENABLED")
     repo_index_cache_seconds: int = Field(default=3600, alias="ODOO_AGENT_REPO_INDEX_CACHE_SECONDS")
     verify_impact_aware_default: bool = Field(default=True, alias="ODOO_AGENT_VERIFY_IMPACT_AWARE_DEFAULT")
+    client_validation_ttl_seconds: int = Field(
+        default=900,
+        ge=30,
+        le=86400,
+        alias="ODOO_AGENT_CLIENT_VALIDATION_TTL_SECONDS",
+    )
 
     # Best-effort deploy follow-through for raw git.push fallback paths.
     auto_upgrade_on_push: bool = Field(default=True, alias="ODOO_AGENT_AUTO_UPGRADE_ON_PUSH")
     safe_deploy_stale_running_seconds: int = Field(default=7200, alias="ODOO_AGENT_SAFE_DEPLOY_STALE_RUNNING_SECONDS")
-    # Two workers are the safe minimum: safe-deploy can wait for a nested
-    # module-deploy job submitted to the same bounded executor.
+    # Legacy total-worker setting retained for compatibility. New deployments
+    # isolate orchestration from slow Odoo/Odoo.sh work so a parent safe-deploy
+    # job cannot starve the nested module-deploy job it is waiting for.
     background_max_workers: int = Field(default=2, ge=1, le=4, alias="ODOO_AGENT_BACKGROUND_MAX_WORKERS")
+    background_orchestrator_workers: int | None = Field(
+        default=None,
+        ge=1,
+        le=8,
+        alias="ODOO_AGENT_BACKGROUND_ORCHESTRATOR_WORKERS",
+    )
+    background_deploy_workers: int | None = Field(
+        default=None,
+        ge=1,
+        le=8,
+        alias="ODOO_AGENT_BACKGROUND_DEPLOY_WORKERS",
+    )
     mcp_operation_guard_enabled: bool = Field(default=False, alias="ODOO_AGENT_OPERATION_GUARD_ENABLED")
 
     # Qwen URL-token fallback hardening. Qwen app may not pass headers, so the

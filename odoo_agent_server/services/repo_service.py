@@ -50,6 +50,7 @@ class RepoService:
         timeout_seconds: int = 180,
         project_path: str | None = None,
         client_name: str | None = None,
+        preserve_dirty: bool = False,
     ) -> RepoPrepareResult:
         """Clone or refresh the target repository before any coding task.
 
@@ -118,6 +119,37 @@ class RepoService:
             expected_remote = plain_repo_url
             if expected_remote and not self._remote_matches(configured_remote, expected_remote):
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Configured remote mismatch: {configured_remote} != {expected_remote}")
+            if preserve_dirty:
+                dirty_status = self._run(["git", "status", "--short", "--branch"], project, 30, env=env)
+                steps.append(dirty_status)
+                dirty_lines = [line for line in (dirty_status.stdout or "").splitlines() if line and not line.startswith("##")]
+                if dirty_lines:
+                    current_branch = self._run(["git", "branch", "--show-current"], project, 30, env=env)
+                    steps.append(current_branch)
+                    branch_name = (current_branch.stdout or "").strip()
+                    if current_branch.exit_code != 0 or branch_name != resolved_branch:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=(
+                                f"Checkout has uncommitted work on branch '{branch_name or '<unknown>'}', "
+                                f"but '{resolved_branch}' was requested. The workflow preserved every file and "
+                                "refused to restore, reset, switch branches, or create a clean checkout. Continue "
+                                "with the correct client/branch or ask the user before changing checkout state."
+                            ),
+                        )
+                    sha = self._run(["git", "rev-parse", "HEAD"], project, 30, env=env)
+                    steps.append(sha)
+                    if sha.exit_code != 0:
+                        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=sha.stderr or sha.stdout or "Unable to read HEAD SHA")
+                    return RepoPrepareResult(
+                        project_path=str(project),
+                        repo_url=plain_repo_url or resolved_repo_url,
+                        branch=resolved_branch,
+                        sha=sha.stdout.strip(),
+                        status=dirty_status.stdout,
+                        already_cloned=True,
+                        steps=steps,
+                    )
             # Speed: dry-run fetch first — skip full fetch if nothing changed
             dry = self._run(["git", "fetch", "--dry-run", remote], project, 10, env=env)
             if dry.stdout.strip() or dry.stderr.strip():

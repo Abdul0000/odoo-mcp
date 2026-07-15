@@ -10,9 +10,17 @@ from pydantic import ValidationError
 from ..auth import AuthDependency
 from ..config import settings
 from ..services.oauth_service import OAuthStore
-from ..services.prompt_service import load_mcp_system_prompt, load_client_check_system_prompt, shared_prompt_payload, client_check_prompt_payload
+from ..services.prompt_service import (
+    client_check_prompt_payload,
+    load_client_check_system_prompt,
+    load_mcp_system_prompt,
+    load_opencode_system_prompt,
+    opencode_prompt_payload,
+    shared_prompt_payload,
+)
 from ..services.qwen_token_service import QwenTokenService
 from ..services.store_service import JsonStore
+from ..services.client_gate_service import ClientGateService
 from ..services.mcp_operation_guard_service import McpOperationGuardService
 from .tools import _dispatch, format_tool_validation_error, internal_tool_name, list_tools, strict_safe_tool_name, tool_input_schema
 
@@ -21,6 +29,9 @@ qwen_router = APIRouter(prefix="/qwen", tags=["mcp-qwen"] )
 claude_router = APIRouter(prefix="/claude", tags=["mcp-claude"], dependencies=[AuthDependency])
 chatgpt_router = APIRouter(prefix="/chatgpt", tags=["mcp-chatgpt"], dependencies=[AuthDependency])
 grok_router = APIRouter(prefix="/grok", tags=["mcp-grok"], dependencies=[AuthDependency])
+opencode_router = APIRouter(prefix="/opencode", tags=["mcp-opencode"], dependencies=[AuthDependency])
+
+_REMOTE_PROFILES = {"provider", "claude", "chatgpt", "grok", "qwen", "opencode"}
 
 
 def _shell_response(request_id: Any, result: Any = None, error: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -117,6 +128,15 @@ def _provider_safe_next_calls(value: Any) -> Any:
                 out[key] = child
             continue
         out[key] = _provider_safe_next_calls(child)
+    if out.get("tool") == strict_safe_tool_name("jobs.get") and isinstance(out.get("arguments"), dict):
+        # Remote MCP clients commonly enforce a shorter HTTP timeout than our
+        # server-side long poll. Keep every advertised follow-up immediately
+        # responsive; the background job remains the source of truth.
+        out["arguments"] = {
+            **out["arguments"],
+            "wait_for_result": False,
+            "wait_timeout_seconds": 0,
+        }
     return out
 
 
@@ -193,6 +213,11 @@ def _normalize_remote_structured(value: Any, tool_name: str) -> dict[str, Any]:
 def _arguments_for_profile(tool_name: str, arguments: dict[str, Any], profile: str | None) -> dict[str, Any]:
     adjusted = dict(arguments)
 
+    if tool_name in {"odoo.module_deploy", "odoo.module_install", "odoo.module_update"}:
+        adjusted["wait_for_result"] = False
+        adjusted["wait_timeout_seconds"] = 0
+        return adjusted
+
     if tool_name == "workflow.safe_deploy_module":
         # Hybrid safety contract for MCP browser clients (Grok/ChatGPT/Claude/Qwen):
         # preserve the full safe-deploy pipeline in a connector-owned background
@@ -205,22 +230,18 @@ def _arguments_for_profile(tool_name: str, arguments: dict[str, Any], profile: s
         return adjusted
 
     if tool_name == "jobs.get":
-        # Poll briefly so the UI never hangs. A running response carries
-        # completion_required=true and success_allowed=false, so providers cannot
-        # honestly exit early or report success until a terminal job result is read.
-        if "wait_for_result" not in adjusted:
-            adjusted["wait_for_result"] = True
-        if adjusted.get("wait_for_result") is True:
-            adjusted["wait_timeout_seconds"] = min(max(int(adjusted.get("wait_timeout_seconds", 600) or 600), 1), 600)
-            adjusted["poll_interval_seconds"] = min(max(float(adjusted.get("poll_interval_seconds", 10.0) or 10.0), 0.25), 10.0)
-            return adjusted
-        if profile not in {"provider", "claude", "chatgpt", "grok", "qwen"} or "wait_for_result" not in adjusted:
+        if profile in _REMOTE_PROFILES:
+            # Never hold a remote MCP request open while a background job runs.
+            # Some clients terminate the call before our old 20/90 second wait,
+            # producing JSON-RPC -32001 even though the job itself is healthy.
+            adjusted["wait_for_result"] = False
+            adjusted["wait_timeout_seconds"] = 0
             return adjusted
 
     # Keep the legacy ChatGPT-only quick-wait clamp for non-safe-deploy tools.
     # Other MCP clients keep their previous behaviour unless they explicitly use
     # safe_deploy/jobs.get above.
-    if profile not in {"provider", "claude", "chatgpt", "grok", "qwen"} or tool_name not in _CHATGPT_QUICK_WAIT_TOOLS:
+    if profile not in _REMOTE_PROFILES or tool_name not in _CHATGPT_QUICK_WAIT_TOOLS:
         return adjusted
 
     adjusted["wait_for_result"] = False
@@ -249,29 +270,141 @@ def _mcp_name_to_internal(name: str) -> str:
 _PROVIDER_TOOL_NAMES = {
     "connector.health",
     "client.check",
-    "workflow.agent_instructions",
+    # Read-only functional data path. Keep the natural-language helper first
+    # for common business questions and expose search_read for precise/custom
+    # model queries without forcing providers into shell commands.
+    "odoo.query",
+    "odoo.search_read",
+    # Existing module lifecycle requests are not source-code changes. Expose the
+    # dedicated idempotent smart install/upgrade workflow directly.
+    "odoo.module_deploy",
     "workflow.odoo_code_change",
-    "workflow.frontend_visual_implement",
-    # Read-only source discovery tools exposed so provider agents can inspect
-    # native Odoo/Odoo.sh source before complex POS/OWL/XML work instead of
-    # guessing or relying on workflow verifier fallbacks.
-    "workflow.find_core_file",
-    "workflow.list_module_files",
-    "workflow.frontend_pattern_preflight",
-    "workflow.verify_pos_change",
-    "workflow.verify_against_core",
-    "odoosh.read_core_file",
-    "odoosh.list_core_files",
+    "workflow.restore_last_good_commit",
     # Recovery/continuation tools that provider responses may legitimately return
     # in next_call.  Exposing them keeps the MCP contract honest and prevents
     # agents from retrying the heavy code-change workflow just to read logs or
-    # resume a failed safe-deploy step.
+    # continue a paused or recoverable safe-deploy checkpoint.
     "artifacts.read",
     "workflow.resume_job",
     "jobs.list",
     "jobs.get",
     "odoosh.error_pack",
 }
+
+# OpenCode owns the user's local filesystem and Git checkout. Do not expose the
+# server-checkout code workflow on this profile, otherwise custom source could be
+# inspected or edited in a different machine/worktree than the one OpenCode sees.
+_OPENCODE_TOOL_NAMES = {
+    "connector.health",
+    "client.check",
+    "odoo.query",
+    "odoo.search_read",
+    "odoo.module_deploy",
+    "artifacts.read",
+    "jobs.list",
+    "jobs.get",
+    "odoosh.error_pack",
+}
+
+_CLIENT_GATED_PROVIDER_TOOLS = {
+    "odoo.query",
+    "odoo.search_read",
+    "odoo.module_deploy",
+    "workflow.odoo_code_change",
+    "workflow.restore_last_good_commit",
+}
+
+_MODULE_LIFECYCLE_RE = re.compile(
+    r"^\s*(?:please\s+)?(?:install|upgrade|update)\b",
+    re.I,
+)
+_SOURCE_CHANGE_TERMS_RE = re.compile(
+    r"\b(?:fix|change|modify|add|remove|refactor|code|source|field|button|view|menu|method|class|xml|javascript|python|scss|css|label)\b",
+    re.I,
+)
+_COMMIT_REVERT_INTENT_RE = re.compile(r"\b(?:revert|rollback|roll\s+back|undo|restore)\b", re.I)
+_COMMIT_REVERT_TARGET_RE = re.compile(r"\b(?:commit|revision|release|version|previous|latest|last)\b", re.I)
+_SHA_RE = re.compile(r"\b[0-9a-fA-F]{7,64}\b")
+_ODOO_VERSION_RE = re.compile(r"\b\d+(?:\.\d+){2,5}\b")
+
+
+def _provider_commit_revert_route(tool_name: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Bypass expensive source reconstruction for explicit commit/version reverts."""
+    if tool_name != "workflow.odoo_code_change" or not isinstance(arguments, dict) or arguments.get("writes"):
+        return tool_name, arguments
+    text = " ".join(
+        str(arguments.get(key) or "")
+        for key in ("task_description", "intent", "target_hint")
+    )
+    if not (_COMMIT_REVERT_INTENT_RE.search(text) and _COMMIT_REVERT_TARGET_RE.search(text)):
+        return tool_name, arguments
+    sha_match = _SHA_RE.search(text)
+    version_match = _ODOO_VERSION_RE.search(text)
+    routed = {
+        key: arguments[key]
+        for key in ("client_name", "project_path", "module_name", "commit_message")
+        if arguments.get(key) not in {None, ""}
+    }
+    routed.update({
+        "bad_sha": sha_match.group(0) if sha_match else None,
+        "revert_latest": sha_match is None,
+        "manifest_version": version_match.group(0) if version_match else None,
+        "bump_manifest_version": bool(re.search(r"\b(?:manifest|version|release)\b", text, re.I)) and version_match is None,
+        "push": True,
+        "deploy_module": bool(arguments.get("module_name")),
+    })
+    return "workflow.restore_last_good_commit", routed
+
+
+def _provider_lifecycle_route(tool_name: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Route install-only requests away from the source code-change pipeline.
+
+    This also protects clients that cached an older MCP tool list and still send
+    an install request through workflow.odoo_code_change.
+    """
+    if tool_name != "workflow.odoo_code_change" or not isinstance(arguments, dict):
+        return tool_name, arguments
+    text = str(arguments.get("task_description") or "").strip()
+    module_name = str(arguments.get("module_name") or "").strip().lower()
+    lifecycle_target_named = bool(
+        (module_name and module_name in text.lower())
+        or re.search(r"\b(?:module|addon|app)\b", text, re.I)
+    )
+    if (
+        arguments.get("create_module")
+        or arguments.get("writes")
+        or not _MODULE_LIFECYCLE_RE.search(text)
+        or not lifecycle_target_named
+        or _SOURCE_CHANGE_TERMS_RE.search(text)
+    ):
+        return tool_name, arguments
+    routed = {
+        key: arguments[key]
+        for key in ("client_name", "project_path", "module_name")
+        if arguments.get(key) not in {None, ""}
+    }
+    routed.update({
+        "wait_for_result": False,
+        "wait_timeout_seconds": 0,
+    })
+    return "odoo.module_deploy", routed
+
+_FORBIDDEN_RECORD_MUTATION_RE = re.compile(r"\b(delete|remove|unlink|erase|purge|destroy|archive|deactivate)\b", re.I)
+_ODOO_RECORD_TERMS_RE = re.compile(
+    r"\b(record|records|data|database|customer|customers|employee|employees|contract|contracts|invoice|invoices|order|orders|product|products|partner|partners)\b",
+    re.I,
+)
+_CODE_SURFACE_TERMS_RE = re.compile(r"\b(field|button|view|menu|method|file|class|xml|javascript|python|scss|css|label)\b", re.I)
+
+
+def _forbidden_odoo_record_mutation(tool_name: str, arguments: dict[str, Any]) -> bool:
+    if tool_name != "workflow.odoo_code_change":
+        return False
+    text = " ".join(str(arguments.get(key) or "") for key in ("task_description", "intent", "target_hint"))
+    if not _FORBIDDEN_RECORD_MUTATION_RE.search(text) or not _ODOO_RECORD_TERMS_RE.search(text):
+        return False
+    explicit_data_target = bool(re.search(r"\b(record|records|data|database)\b", text, re.I))
+    return explicit_data_target or not bool(_CODE_SURFACE_TERMS_RE.search(text))
 
 # Backward-compatible names retained for tests/imports; all provider routes use
 # the same minimal flow.
@@ -355,7 +488,8 @@ def _tools_for_profile(profile: str | None = None) -> list[Any]:
     # All remote/provider MCP endpoints intentionally expose the same tiny tool
     # surface.  Full low-level tools remain available through REST /tools for
     # debugging/admin use, but not to provider agents.
-    return [tool for tool in tools if tool.name in _PROVIDER_TOOL_NAMES]
+    allowed = _OPENCODE_TOOL_NAMES if profile == "opencode" else _PROVIDER_TOOL_NAMES
+    return [tool for tool in tools if tool.name in allowed]
 
 
 def _remote_compatible_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -409,7 +543,7 @@ _claude_schema = _remote_compatible_schema
 
 def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
     title = getattr(tool, "title", None) or _humanize_tool_name(tool.name)
-    if profile in {"provider", "claude", "chatgpt", "grok", "qwen"}:
+    if profile in _REMOTE_PROFILES:
         # Some remote-MCP builds are strict and can fail while
         # validating the initial tool list. For ChatGPT, keep initialize/tools/list
         # anonymous but mark every tool call as OAuth-protected so the client can
@@ -469,6 +603,10 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
     if method == "notifications/initialized":
         return None
     if method == "initialize":
+        next_prompt_source = "OPENCODE_SYSTEM_PROMPT.md" if profile == "opencode" else "MCP_SYSTEM_PROMPT.md"
+        initialize_instructions = load_client_check_system_prompt()
+        if profile == "opencode":
+            initialize_instructions = f"{initialize_instructions}\n\n{load_opencode_system_prompt()}"
         return _shell_response(
             request_id,
             {
@@ -478,12 +616,15 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                     "prompts": {"listChanged": False},
                 },
                 "serverInfo": {"name": "odoo-mcp-agent-connector", "version": "1.1.0"},
-                "instructions": load_client_check_system_prompt(),
+                "instructions": initialize_instructions,
                 "prompt_source": "CLIENT_CHECK_SYSTEM_PROMPT.md",
-                "next_prompt_source_after_client_validation": "MCP_SYSTEM_PROMPT.md",
+                "next_prompt_source_after_client_validation": next_prompt_source,
             },
         )
     if method == "prompts/list":
+        workflow_prompt_name = "opencode_system_prompt" if profile == "opencode" else "mcp_system_prompt"
+        workflow_prompt_title = "OpenCode Local Checkout Prompt" if profile == "opencode" else "Original MCP System Prompt"
+        workflow_prompt_source = "OPENCODE_SYSTEM_PROMPT.md" if profile == "opencode" else "MCP_SYSTEM_PROMPT.md"
         return _shell_response(
             request_id,
             {
@@ -495,9 +636,9 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                         "arguments": [],
                     },
                     {
-                        "name": "mcp_system_prompt",
-                        "title": "Original MCP System Prompt",
-                        "description": "Exact content from MCP_SYSTEM_PROMPT.md. Load after client.check validation passes.",
+                        "name": workflow_prompt_name,
+                        "title": workflow_prompt_title,
+                        "description": f"Exact content from {workflow_prompt_source}. Load after client.check validation passes.",
                         "arguments": [],
                     },
                 ]
@@ -520,20 +661,24 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                     "source": "CLIENT_CHECK_SYSTEM_PROMPT.md",
                 },
             )
-        if name not in {"mcp_system_prompt", "system_prompt", "MCP_SYSTEM_PROMPT"}:
+        opencode_prompt_names = {"opencode_system_prompt", "system_prompt", "OPENCODE_SYSTEM_PROMPT"}
+        normal_prompt_names = {"mcp_system_prompt", "system_prompt", "MCP_SYSTEM_PROMPT"}
+        accepted_prompt_names = opencode_prompt_names if profile == "opencode" else normal_prompt_names
+        if name not in accepted_prompt_names:
             return _shell_response(request_id, error={"code": -32602, "message": f"Unknown prompt: {name}"})
-        prompt = load_mcp_system_prompt()
+        prompt = load_opencode_system_prompt() if profile == "opencode" else load_mcp_system_prompt()
+        prompt_source = "OPENCODE_SYSTEM_PROMPT.md" if profile == "opencode" else "MCP_SYSTEM_PROMPT.md"
         return _shell_response(
             request_id,
             {
-                "description": "Exact content from MCP_SYSTEM_PROMPT.md. Load after client.check validation passes.",
+                "description": f"Exact content from {prompt_source}. Load after client.check validation passes.",
                 "messages": [
                     {
                         "role": "user",
                         "content": {"type": "text", "text": prompt},
                     }
                 ],
-                "source": "MCP_SYSTEM_PROMPT.md",
+                "source": prompt_source,
             },
         )
     if method == "tools/list":
@@ -546,7 +691,11 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
             return _shell_response(request_id, error={"code": -32602, "message": "tools/call requires params.name"})
         internal_name = _mcp_name_to_internal(name)
         try:
-            if profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and internal_name not in _PROVIDER_TOOL_NAMES:
+            if isinstance(arguments, dict) and profile in _REMOTE_PROFILES:
+                internal_name, arguments = _provider_commit_revert_route(internal_name, arguments)
+                internal_name, arguments = _provider_lifecycle_route(internal_name, arguments)
+            allowed_tools = _OPENCODE_TOOL_NAMES if profile == "opencode" else _PROVIDER_TOOL_NAMES
+            if profile in _REMOTE_PROFILES and internal_name not in allowed_tools:
                 guard_structured = McpOperationGuardService().tool_profile_block(internal_name, arguments if isinstance(arguments, dict) else {})
                 text = json.dumps(guard_structured, ensure_ascii=False, default=str)
                 return _shell_response(
@@ -558,7 +707,36 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                     },
                 )
             arguments = _arguments_for_profile(internal_name, arguments, profile)
-            if settings.mcp_operation_guard_enabled and profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and isinstance(arguments, dict):
+            if isinstance(arguments, dict) and _forbidden_odoo_record_mutation(internal_name, arguments):
+                structured = {
+                    "status": "blocked",
+                    "error_type": "odoo_record_delete_guard",
+                    "read_only_enforced": True,
+                    "success_allowed": False,
+                    "message": "Destructive Odoo record deletion/archive requests cannot be routed through the query or code-change workflow.",
+                    "next_call": None,
+                }
+                text = json.dumps(structured, ensure_ascii=False)
+                return _shell_response(request_id, {
+                    "content": [{"type": "text", "text": text}],
+                    "structuredContent": structured,
+                    "isError": False,
+                })
+            if (
+                profile in _REMOTE_PROFILES
+                and internal_name in _CLIENT_GATED_PROVIDER_TOOLS
+                and isinstance(arguments, dict)
+                and (
+                    internal_name in {
+                        "workflow.odoo_code_change",
+                        "workflow.restore_last_good_commit",
+                        "odoo.module_deploy",
+                    }
+                    or not str(arguments.get("client_name") or "").strip()
+                )
+            ):
+                ClientGateService().require_validated_client(arguments.get("client_name"), internal_name)
+            if settings.mcp_operation_guard_enabled and profile in _REMOTE_PROFILES and isinstance(arguments, dict):
                 op_guard = McpOperationGuardService()
                 arguments = op_guard.canonicalize_arguments(internal_name, arguments)
                 guarded = op_guard.before_tool_call(internal_name, arguments)
@@ -574,20 +752,56 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                     )
             result = await _dispatch(internal_name, arguments)
             structured = _to_structured_content(result, tool_name=internal_name)
-            if profile in {"provider", "claude", "chatgpt", "grok", "qwen"}:
+            if profile in _REMOTE_PROFILES:
                 structured = _provider_safe_next_calls(structured)
-            if settings.mcp_operation_guard_enabled and profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and isinstance(arguments, dict):
+            if settings.mcp_operation_guard_enabled and profile in _REMOTE_PROFILES and isinstance(arguments, dict):
                 op_guard = McpOperationGuardService()
                 op_guard.after_tool_call(internal_name, arguments, structured if isinstance(structured, dict) else {"result": structured})
                 structured = op_guard.annotate_result(internal_name, arguments, structured if isinstance(structured, dict) else {"result": structured})
-            if profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and internal_name != "artifacts.read":
+            if profile in _REMOTE_PROFILES and internal_name != "artifacts.read":
                 structured = _normalize_remote_structured(structured, internal_name)
                 structured = _provider_safe_next_calls(structured)
             text = json.dumps(structured, ensure_ascii=False, default=str)
             # Context-bloat guard: in long sessions, oversized tool outputs (large diffs,
             # logs, file reads) compound across many calls and slow down/derail the model.
             # Compatibility profiles also receive bounded structuredContent with artifact refs.
-            text = _cap_text(text, max_chars=12000 if profile in {"provider", "claude", "chatgpt", "grok", "qwen"} else 24000)
+            text = _cap_text(text, max_chars=12000 if profile in _REMOTE_PROFILES else 24000)
+            return _shell_response(
+                request_id,
+                {
+                    "content": [{"type": "text", "text": text}],
+                    "structuredContent": structured,
+                    "isError": False,
+                },
+            )
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+            is_client_gate = bool(detail.get("requires_client_selection") or detail.get("requires_validation"))
+            if not is_client_gate:
+                structured = {
+                    "status": "failed",
+                    "error_type": "http_error",
+                    "http_status": exc.status_code,
+                    **detail,
+                    "success_allowed": False,
+                }
+                text = json.dumps(structured, ensure_ascii=False, default=str)
+                return _shell_response(
+                    request_id,
+                    {
+                        "content": [{"type": "text", "text": text}],
+                        "structuredContent": structured,
+                        "isError": True,
+                    },
+                )
+            structured = {
+                "status": "client_selection_required" if detail.get("requires_client_selection") else "client_validation_required",
+                **detail,
+                "success_allowed": False,
+                "must_ask_user": bool(detail.get("requires_client_selection")),
+                "next_call": None if detail.get("requires_client_selection") else detail.get("next_call"),
+            }
+            text = json.dumps(structured, ensure_ascii=False, default=str)
             return _shell_response(
                 request_id,
                 {
@@ -710,6 +924,32 @@ async def grok_mcp_shell(request: Request, payload: Any = Body(...)) -> dict[str
     return await _handle_shell(payload, profile="grok")
 
 
+@opencode_router.get("/mcp")
+def opencode_mcp_health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "endpoint": "opencode-local-checkout-mcp",
+        "transport": "http-post-json-rpc",
+        "profile": "local-checkout-first",
+        "custom_module_source": "opencode-native-local-filesystem",
+        "odoosh_custom_source_reads": False,
+        "git_sync": "opencode-native-fetch-and-pull-if-behind",
+        "git_push": "opencode-native-then-mcp-expected-sha-handoff",
+    }
+
+
+@opencode_router.post("/mcp")
+async def opencode_mcp_shell(request: Request, payload: Any = Body(...)) -> dict[str, Any] | list[dict[str, Any]] | None:
+    if isinstance(payload, list):
+        responses = []
+        for item in payload:
+            response = await _handle_shell(item, profile="opencode", request=request)
+            if response is not None:
+                responses.append(response)
+        return responses
+    return await _handle_shell(payload, profile="opencode", request=request)
+
+
 @router.get("/system-prompt")
 def mcp_system_prompt() -> dict[str, str]:
     return shared_prompt_payload()
@@ -742,6 +982,16 @@ def grok_system_prompt() -> dict[str, str]:
 
 @grok_router.get("/client-check-prompt")
 def grok_client_check_prompt() -> dict[str, str]:
+    return client_check_prompt_payload()
+
+
+@opencode_router.get("/system-prompt")
+def opencode_system_prompt() -> dict[str, str]:
+    return opencode_prompt_payload()
+
+
+@opencode_router.get("/client-check-prompt")
+def opencode_client_check_prompt() -> dict[str, str]:
     return client_check_prompt_payload()
 
 

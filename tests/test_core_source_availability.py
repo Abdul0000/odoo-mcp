@@ -53,6 +53,27 @@ def test_core_source_available_is_true_when_sync_configured(monkeypatch):
     assert svs._core_source_available() is True
 
 
+def test_composite_qa_can_disable_remote_core_sync_per_request(tmp_path, monkeypatch):
+    monkeypatch.setattr(svs, "_SRC_ROOTS", [tmp_path / "missing_user", tmp_path / "missing_core"])
+    monkeypatch.setattr(settings, "core_sync_enabled", True)
+    monkeypatch.setattr(settings, "odoosh_ssh_host", "live-build.dev.odoo.com")
+    monkeypatch.setattr(
+        svs.core_sync_service,
+        "ensure_module_synced",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("composite QA must remain local")),
+    )
+    manifest = tmp_path / "__manifest__.py"
+    manifest.write_text("{'name': 'X', 'depends': ['website']}\n", encoding="utf-8")
+
+    result = svs.SyntaxVerifierService().verify(SyntaxVerifyRequest(
+        written_files=[str(manifest)],
+        allow_remote_core_sync=False,
+    ))
+
+    assert result.push_blocked is False
+    assert any(finding.check == "core_source_unavailable" for finding in result.findings)
+
+
 def test_comodel_check_downgrades_to_warning_when_source_unreachable(tmp_path, core_source_unreachable):
     """This is the exact false-positive: a real comodel_name in a model
     file, checked with no way to reach core source, must not be CRITICAL.
@@ -85,6 +106,34 @@ def test_manifest_depends_downgrades_to_warning_when_source_unreachable(tmp_path
     depends_findings = [f for f in result.findings if f.check == "manifest_depends"]
     assert depends_findings, "Expected a manifest_depends finding"
     assert all(f.severity != VerifySeverity.CRITICAL for f in depends_findings)
+    assert result.push_blocked is False
+
+
+def test_related_manifest_skips_unchanged_dependency_sync_for_scss(tmp_path, monkeypatch):
+    module = tmp_path / "x_module"
+    scss = module / "static" / "src" / "scss" / "theme.scss"
+    scss.parent.mkdir(parents=True)
+    scss.write_text(".card { border-color: #333; }\n", encoding="utf-8")
+    manifest = module / "__manifest__.py"
+    manifest.write_text(
+        "{'name': 'X', 'depends': ['slow_custom_dependency'], "
+        "'assets': {'web.assets_backend': ['x_module/static/src/scss/theme.scss']}}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        svs,
+        "_module_exists_in_src",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("dependency sync must be skipped")),
+    )
+
+    result = svs.SyntaxVerifierService().verify(SyntaxVerifyRequest(
+        written_files=[str(scss)],
+        project_path=str(tmp_path),
+        impact_aware=True,
+    ))
+
+    assert str(manifest) in result.files_checked
+    assert not [finding for finding in result.findings if finding.check == "manifest_depends"]
     assert result.push_blocked is False
 
 

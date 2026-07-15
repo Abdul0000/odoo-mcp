@@ -75,7 +75,11 @@ class ClientCheckRequest(BaseModel):
         serialization_alias="validate",
         description="When true, verify repo/token/branch, checkout, Odoo shell, and Odoo.sh SSH before enabling write/deploy tools.",
     )
-    force_refresh: bool = Field(default=False, description="Re-run validation even if this client was already validated in session state.")
+    force_refresh: bool = Field(default=False, description="Recovery hint for stale/expired/config-changed validation only. Healthy cached validation is always reused even if true; never set this for an ordinary query or retry.")
+    user_confirmed: bool = Field(
+        default=False,
+        description="Optional explicit signal that the latest user reply selected this client. The selection reply itself is final confirmation; never ask the user to confirm the same client a second time. Kept optional for clients with cached/older schemas.",
+    )
 
 
 class LimitRequest(BaseModel):
@@ -90,12 +94,12 @@ class JobGetRequest(BaseModel):
     job_id: str = Field(..., min_length=1)
     wait_for_result: bool = Field(default=True, description="Wait server-side for a short bounded poll window; running is not success")
     wait_timeout_seconds: int = Field(
-        default=600,
+        default=20,
         ge=0,
         le=2400,
         description="Maximum server-side wait for this poll call. Use 0 only for CLI/internal integrations that can safely wait indefinitely.",
     )
-    poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
+    poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
 
 
 class ArtifactReadRequest(BaseModel):
@@ -198,7 +202,11 @@ class OdooCodeFileChange(BaseModel):
     connector reads custom + core context, applies the edit, verifies, and starts
     safe deploy as one server-owned operation.
     """
-    relative_path: str = Field(..., description="File path inside project_path, normally <module>/...")
+    relative_path: str = Field(
+        ...,
+        validation_alias=AliasChoices("relative_path", "path"),
+        description="File path inside project_path, normally <module>/.... The alias 'path' is accepted for MCP-provider compatibility.",
+    )
     content: str | None = Field(default=None, description="Complete replacement file content. Use only when the whole file is intentionally rewritten.")
     search: str | None = Field(default=None, description="Literal or regex text to replace in the existing file.")
     replace: str | None = Field(default=None, description="Replacement text when search is provided.")
@@ -225,6 +233,8 @@ class OdooCodeChangeRequest(BaseModel):
     # the universal path for any Odoo task (Python, XML, QWeb, JS/OWL/POS, SCSS, CSV, data).
     module_hint: str | None = Field(default=None, max_length=200, description="Optional human module hint used by the fuzzy resolver, e.g. 'customer portal'.")
     task_type: str = Field(default="auto", max_length=80, description="Generic task type hint: auto, python_model, xml_view, qweb_template, js_owl, pos_owl, controller, security_csv, manifest, data_xml, scss_css, text_replace, style, etc.")
+    complexity: Literal["auto", "fast", "normal", "long"] = Field(default="auto", description="Adaptive inspection hint, not an authoritative lane. Use auto normally; the server classifies any Odoo task from scope, target precision, write/file count, and risk evidence.")
+    force_complexity: bool = Field(default=False, description="Honor an explicit fast/normal/long hint when a caller deliberately requires that inspection budget. Safety-sensitive or intrinsically broad work can still be promoted to long.")
     intent: str | None = Field(default=None, max_length=160, description="Optional generic intent such as add_field, fix_bug, add_button, change_style, refactor, optimize, add_security, update_report, or modify_existing_feature.")
     target_hint: str | None = Field(default=None, max_length=500, description="Optional generic target hint for search/autopatch, such as a visible label, method, class, XML id, field, route, or file clue.")
     change_request: dict[str, Any] = Field(default_factory=dict, description="Optional structured generic change request. Safe autopatch currently supports style/text replacement shortcuts; all other task types fall back to inspection + writes.")
@@ -233,10 +243,10 @@ class OdooCodeChangeRequest(BaseModel):
     # Backward-compatible convenience fields for simple style/text tasks. They are
     # normalized into target_hint/change_request internally and do not limit the workflow.
     target_text: str | None = Field(default=None, max_length=500, description="Backward-compatible exact visible text for focused inspection/autopatch. Prefer target_hint for new clients.")
-    style: dict[str, Any] = Field(default_factory=dict, description="Backward-compatible style patch request. Supported keys: color, font_style/fontStyle, font_weight/fontWeight.")
+    style: dict[str, Any] = Field(default_factory=dict, description="Deterministic style patch request. Supported keys: color/text_color, background, background_color/backgroundColor, border_color/borderColor, fill, font_style/fontStyle, and font_weight/fontWeight.")
     allow_autopatch: bool = Field(default=False, description="When true, the connector may apply a safe generated patch when the task maps to a supported deterministic autopatch; otherwise it returns focused inspection context and asks for writes.")
     target_files: list[str] = Field(default_factory=list, max_length=50, description="Candidate/target files inside the module to read and use for scope advice")
-    writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=20, description="Actual file edits to apply. If empty, the tool returns focused inspection context or can autopatch when allow_autopatch/style/target_text are provided.")
+    writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=100, description="Actual complete-file edits to apply. For create_module, send the entire installable addon file set in one call; an incomplete new-module batch is rejected without touching the checkout. If empty for an existing module, the tool returns focused inspection context or can autopatch when allow_autopatch/style/target_text are provided.")
     commit_message: str | None = Field(default=None, max_length=300, description="Commit message for safe deploy. Defaults to a concise message from task_description.")
     auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
     deploy_mode: Literal["auto", "always_upgrade", "source_only"] = Field(default="auto", description="Automatic impact classification by default. always_upgrade forces -u; source_only is allowed only for verified non-structural changes.")
@@ -575,7 +585,7 @@ class OdooModuleRequest(ApprovalMixin):
     project_path: str | None = Field(default=None, description="Optional local checkout path used by manual Odoo.sh SSH install to prove local HEAD is pushed before running. If omitted, session state is used when available.")
     remote: str = Field(default="origin", description="Git remote used for the local-vs-remote HEAD safety check")
     branch: str | None = Field(default=None, description="Git branch used for the local-vs-remote HEAD safety check. Defaults to current branch.")
-    expected_sha: str | None = Field(default=None, description="Optional pushed Git SHA that must be deployed on Odoo.sh before manual SSH install/update. If omitted, local HEAD must match remote branch HEAD.")
+    expected_sha: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{7,64}$", description="Optional pushed Git SHA that must be deployed on Odoo.sh before manual SSH install/update. OpenCode local-checkout workflows must pass their pushed local HEAD SHA. If omitted, local HEAD must match remote branch HEAD.")
     wait_for_result: bool = Field(default=True, description="For background install/upgrade/deploy, wait server-side until the job finishes or times out")
     wait_timeout_seconds: int = Field(
         default=900,
@@ -584,6 +594,7 @@ class OdooModuleRequest(ApprovalMixin):
         description="Maximum server-side wait for final job result. Use 0 to wait indefinitely until terminal pass/fail/warning.",
     )
     poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
+    operation_timeout_seconds: int = Field(default=600, ge=1, le=900, description="Hard timeout for the underlying Odoo install/upgrade command")
     deploy_guard_timeout_seconds: int = Field(default=300, ge=0, le=600, description="Maximum server-side wait for a recent manual git.push SHA to appear on Odoo.sh before install/upgrade")
     deploy_guard_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for the deploy guard used by direct module install/upgrade calls")
 
@@ -640,7 +651,7 @@ class OdooShQueryRequest(BaseModel):
 
 class OdooFunctionalQueryRequest(BaseModel):
     client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. If omitted, odoo.query tries to infer an exact client name from the text.")
-    query: str = Field(..., min_length=1, description="Natural-language Odoo functional read query, e.g. list users, draft invoices, unpaid invoices, top customers")
+    query: str = Field(..., min_length=1, description="Complete natural-language read-only Odoo question. The dynamic planner discovers installed models/modules and fields, supports rankings and relative dates, and hard-blocks delete/unlink/write/create/update/archive intent.")
     limit: int = Field(default=10, ge=1, le=100, description="Maximum records to return")
 
 
@@ -893,13 +904,15 @@ class JobRecord(BaseModel):
     @computed_field  # type: ignore[misc]
     @property
     def completion_required(self) -> bool:
-        """True while safe deploy still requires follow-up polling."""
-        return self.job_type == "safe_deploy_module" and self.status in {JobStatus.queued, JobStatus.running}
+        """True while a provider-owned workflow still requires polling."""
+        return self.job_type in {"safe_deploy_module", "odoo_code_change"} and self.status in {JobStatus.queued, JobStatus.running}
 
     @computed_field  # type: ignore[misc]
     @property
     def success_allowed(self) -> bool:
         """Hard success gate for deploy jobs; running/warning/failed is not success."""
+        if self.job_type == "odoo_code_change":
+            return self.status == JobStatus.passed and (self.deploy_confirmed or self.already_deployed_confirmed)
         if self.job_type != "safe_deploy_module":
             return self.status == JobStatus.passed
         return self.status == JobStatus.passed and (self.deploy_confirmed or self.already_deployed_confirmed)
@@ -925,8 +938,8 @@ class JobRecord(BaseModel):
             "arguments": {
                 "job_id": self.id,
                 "wait_for_result": True,
-                "wait_timeout_seconds": 600,
-                "poll_interval_seconds": 10.0,
+                "wait_timeout_seconds": 90 if self.job_type == "odoo_code_change" else 20,
+                "poll_interval_seconds": 2.0,
             },
         }
 
@@ -992,17 +1005,17 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
         ),
     )
     wait_timeout_seconds: int = Field(
-        default=600,
+        default=20,
         ge=0,
         le=2400,
         description="Maximum server-side wait before returning job_id/next_call. Use 0 only for CLI/internal integrations that can safely wait indefinitely.",
     )
-    poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=10.0, description="Delay between safe deploy job polls while waiting")
-    odoosh_deploy_timeout_seconds: int = Field(default=600, ge=0, le=600, description="Maximum time to poll Odoo.sh after git push for the pushed SHA to become deployed")
+    poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=10.0, description="Delay between safe deploy job polls while waiting")
+    odoosh_deploy_timeout_seconds: int = Field(default=240, ge=0, le=600, description="Maximum time to poll Odoo.sh after git push for the pushed SHA to become deployed")
     odoosh_deploy_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for Odoo.sh deployed SHA checks")
-    odoo_module_deploy_timeout_seconds: int = Field(default=600, ge=0, le=900, description="Maximum time for the internal Odoo module install/upgrade job to finish before returning a non-success resumable state")
-    odoo_module_deploy_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for the internal Odoo module install/upgrade job")
-    max_fix_cycles: int = Field(default=5, ge=1, le=5, description="Maximum safe-deploy upgrade/fix retry cycles before failing with upgrade_failed_after_retries")
+    odoo_module_deploy_timeout_seconds: int = Field(default=300, ge=0, le=900, description="Maximum time for the internal Odoo module install/upgrade job to finish before returning a non-success resumable state")
+    odoo_module_deploy_poll_interval_seconds: float = Field(default=2.0, ge=0.25, le=60.0, description="Polling interval for the internal Odoo module install/upgrade job")
+    max_fix_cycles: int = Field(default=1, ge=1, le=5, description="Maximum upgrade attempts. A new attempt is allowed only after a correction produced a real commit.")
     expected_registry_fields: dict[str, list[str]] = Field(default_factory=dict, description="Optional live registry fields to verify after upgrade, e.g. {'purchase.order': ['custom_reference']}. If omitted, safe_deploy infers Python fields from changed addon files.")
     force_new_deploy: bool = Field(
         default=False,
@@ -1010,7 +1023,7 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
             "When False, duplicate workflow.safe_deploy_module calls for the same "
             "project_path + module_name return the existing running/resumable job instead "
             "of spawning a concurrent commit/push/upgrade. Set True only to intentionally "
-            "restart after a resumable deploy failure."
+            "restart after a resumable deploy interruption."
         ),
     )
     timeout_seconds: int = Field(default=900, ge=60, le=2400)
@@ -1074,8 +1087,16 @@ class RegistrySmokeTestRequest(BaseModel):
         return value
 
 
-class RestoreLastGoodCommitRequest(BaseProjectRequest, ApprovalMixin):
-    bad_sha: str = Field(..., min_length=7, description="Bad pushed commit to revert")
+class RestoreLastGoodCommitRequest(ApprovalMixin):
+    client_name: str | None = Field(default=None, description="Validated client used to resolve the server checkout when project_path is omitted.")
+    project_path: str | None = Field(default=None, description="Absolute checked-out repo path. Defaults to the validated client's configured checkout.")
+    bad_sha: str | None = Field(default=None, pattern=r"^[0-9a-fA-F]{7,64}$", description="Exact bad pushed commit to revert. Omit only when revert_latest=true.")
+    revert_latest: bool = Field(default=False, description="Resolve and revert the current HEAD commit without asking the model to reconstruct parent-revision files.")
+    module_name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_]+$", description="Technical module name. Required for manifest_version or deploy_module.")
+    manifest_version: str | None = Field(default=None, pattern=r"^\d+(?:\.\d+){2,5}$", description="Optional exact restored release version to write into the module manifest in the same revert commit.")
+    bump_manifest_version: bool = Field(default=False, description="Increment the final numeric component of the post-revert manifest version when an exact manifest_version was not supplied.")
+    deploy_module: bool = Field(default=False, description="After push, start the normal SHA-guarded module install/upgrade flow and return its jobs.get continuation.")
+    commit_message: str | None = Field(default=None, max_length=300, description="Commit message for the combined Git revert and optional manifest-version update.")
     remote: str = Field(default="origin")
     branch: str | None = Field(default=None, description="Defaults to current branch or TARGET_GIT_BRANCH")
     push: bool = Field(default=True, description="Push the revert commit after creating it")
@@ -1332,16 +1353,16 @@ class ListModuleFilesResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ResumeJobRequest(BaseModel):
-    """Fix 3: Resume a safe_deploy_module job from its last successful step.
+    """Continue a safe_deploy_module job from its last successful checkpoint.
 
-    Useful when a long multi-step pipeline (10+ steps) fails partway through.
-    Instead of starting over from step 1, the agent calls workflow.resume_job
-    with the job_id from the failed run.
+    Useful when a long pipeline intentionally pauses at a bounded wait,
+    is interrupted, or encounters a recoverable condition. This does not imply
+    failure unless the returned result explicitly contains a terminal error.
     """
     job_id: str | None = Field(
         default=None,
         description=(
-            "Job ID returned by a previous safe_deploy_module or start_session call. "
+            "Job ID returned by a paused, interrupted, or recoverable safe_deploy_module or start_session call. "
             "When omitted, the connector uses the last saved safe-deploy job from session state, "
             "or the latest matching safe_deploy_module job."
         ),
@@ -1455,6 +1476,10 @@ class ScopeAdviceRequest(BaseModel):
         description="Override search roots. Defaults to odoo/addons → enterprise → user fallback.",
     )
     client_name: str | None = Field(default=None, description="Optional ODOO_CLIENTS client used to save pre-write scope evidence in the isolated session state.")
+    allow_remote_core_sync: bool = Field(
+        default=True,
+        description="Allow bounded SSH/rsync discovery. Composite code-change workflows use local/cache-only scope to remain responsive.",
+    )
 
 
 class ScopeAdviceResult(BaseModel):
@@ -1549,6 +1574,10 @@ class SyntaxVerifyRequest(BaseModel):
         default=None,
         description="Optional ODOO_CLIENTS client context used by core-source sync/verification.",
     )
+    allow_remote_core_sync: bool = Field(
+        default=True,
+        description="Allow bounded SSH/rsync core-source fetches. Composite code-change QA disables this because core evidence is collected earlier.",
+    )
     impact_aware: bool | None = Field(
         default=None,
         description="Default true via env. Adds only related companion files for template/assets checks; does not scan the full repo.",
@@ -1640,6 +1669,10 @@ class FrontendPatternPreflightRequest(BaseModel):
     search_roots: list[str] = Field(
         default_factory=list,
         description="Override source roots. Defaults to odoo/addons → enterprise → user fallback.",
+    )
+    allow_remote_core_sync: bool = Field(
+        default=True,
+        description="Allow bounded SSH/rsync source discovery. Composite code-change workflows use local/cache-only preflight.",
     )
 
 

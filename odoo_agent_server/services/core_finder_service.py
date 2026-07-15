@@ -142,6 +142,7 @@ class CoreFinderService:
         keyword: str,
         search_roots: Sequence[str] | None = None,
         client_name: str | None = None,
+        allow_remote_core_sync: bool = True,
     ) -> FindCoreFileResult:
         """Locate files matching module+type+keyword across priority roots."""
         roots = self._resolve_roots(search_roots, client_name=client_name)
@@ -151,7 +152,11 @@ class CoreFinderService:
 
         for priority, root in roots:
             root_path = Path(root)
-            module_dir = self._module_dir_with_sync(root_path, root, module_name, client_name=client_name)
+            module_dir = self._module_dir_with_sync(
+                root_path, root, module_name,
+                client_name=client_name,
+                allow_remote_core_sync=allow_remote_core_sync,
+            )
             if not module_dir:
                 continue
 
@@ -176,6 +181,12 @@ class CoreFinderService:
                     priority=priority,
                     size=size,
                 ))
+
+            # Roots are priority ordered. Once the requested file exists in a
+            # higher-priority source tree, do not pay SSH/rsync cost probing
+            # enterprise/user fallbacks that cannot improve best_match.
+            if all_matches:
+                break
 
         all_matches.sort(key=lambda m: (m.priority, len(m.path)))
         best = all_matches[0].path if all_matches else None
@@ -282,6 +293,7 @@ class CoreFinderService:
         task_description: str,
         search_roots: Sequence[str] | None = None,
         client_name: str | None = None,
+        allow_remote_core_sync: bool = True,
     ) -> ScopeAdviceResult:
         """Analyse custom module files and return adaptive mandatory read instructions.
 
@@ -372,7 +384,7 @@ class CoreFinderService:
         # current custom module manifest and XML refs.  Search priority is core
         # /home/odoo/src/odoo/addons first, then enterprise fallback, then user.
         for dep_module in sorted(related_modules):
-            result = self.find_core_file(dep_module, "manifest", dep_module, search_roots, client_name=client_name)
+            result = self.find_core_file(dep_module, "manifest", dep_module, search_roots, client_name=client_name, allow_remote_core_sync=allow_remote_core_sync)
             if result.best_match:
                 add_instruction(ScopeReadInstruction(
                     level=ScopeLevel.L0,
@@ -400,7 +412,7 @@ class CoreFinderService:
             for model in sorted(set(inherit_models)):
                 core_module = model.split(".")[0]
                 keyword = model.split(".")[-1] if "." in model else model
-                result = self.find_core_file(core_module, "model", keyword, search_roots, client_name=client_name)
+                result = self.find_core_file(core_module, "model", keyword, search_roots, client_name=client_name, allow_remote_core_sync=allow_remote_core_sync)
                 if result.best_match:
                     add_instruction(ScopeReadInstruction(
                         level=ScopeLevel.L1,
@@ -422,7 +434,7 @@ class CoreFinderService:
         if has_mixin:
             reached_level = ScopeLevel.L2
             for mixin_module, mixin_type, mixin_kw in _KNOWN_MIXINS:
-                result = self.find_core_file(mixin_module, mixin_type, mixin_kw, search_roots, client_name=client_name)
+                result = self.find_core_file(mixin_module, mixin_type, mixin_kw, search_roots, client_name=client_name, allow_remote_core_sync=allow_remote_core_sync)
                 if result.best_match:
                     add_instruction(ScopeReadInstruction(
                         level=ScopeLevel.L2,
@@ -439,7 +451,7 @@ class CoreFinderService:
             for _, root in roots:
                 root_path = Path(root)
                 module_dir = self._find_module_dir(root_path, target_module)
-                if not module_dir:
+                if not module_dir and allow_remote_core_sync:
                     try:
                         core_sync_service.ensure_module_synced(root, target_module, client_name=client_name)
                     except TypeError:
@@ -463,7 +475,7 @@ class CoreFinderService:
         if cross_modules:
             reached_level = ScopeLevel.L4
             for dep_module in sorted(cross_modules):
-                result = self.find_core_file(dep_module, "manifest", dep_module, search_roots, client_name=client_name)
+                result = self.find_core_file(dep_module, "manifest", dep_module, search_roots, client_name=client_name, allow_remote_core_sync=allow_remote_core_sync)
                 if result.best_match:
                     add_instruction(ScopeReadInstruction(
                         level=ScopeLevel.L4,
@@ -495,6 +507,7 @@ class CoreFinderService:
         subdir: str = "",
         search_roots: Sequence[str] | None = None,
         client_name: str | None = None,
+        allow_remote_core_sync: bool = True,
     ) -> "ListModuleFilesResult":
         """List all files in a module directory (or subdir) across priority roots.
 
@@ -506,7 +519,11 @@ class CoreFinderService:
         roots = self._resolve_roots(search_roots, client_name=client_name)
         for priority, root in roots:
             root_path = Path(root)
-            module_dir = self._module_dir_with_sync(root_path, root, module_name, client_name=client_name)
+            module_dir = self._module_dir_with_sync(
+                root_path, root, module_name,
+                client_name=client_name,
+                allow_remote_core_sync=allow_remote_core_sync,
+            )
             if not module_dir:
                 continue
 
@@ -577,16 +594,24 @@ class CoreFinderService:
             return [(i + 1, root) for i, root in enumerate(resolver.search_roots(client))]
         return _DEFAULT_ROOTS
 
-    def _module_dir_with_sync(self, root_path: Path, root: str, module_name: str, client_name: str | None = None) -> Path | None:
+    def _module_dir_with_sync(
+        self,
+        root_path: Path,
+        root: str,
+        module_name: str,
+        client_name: str | None = None,
+        allow_remote_core_sync: bool = True,
+    ) -> Path | None:
         module_dir = self._find_module_dir(root_path, module_name) if root_path.exists() else None
         if module_dir:
             return module_dir
-        try:
-            core_sync_service.ensure_module_synced(root, module_name, client_name=client_name)
-        except TypeError:
-            # Backward compatibility for tests/extensions monkeypatching the old
-            # two-argument ensure_module_synced(root, module_name) signature.
-            core_sync_service.ensure_module_synced(root, module_name)
+        if allow_remote_core_sync:
+            try:
+                core_sync_service.ensure_module_synced(root, module_name, client_name=client_name)
+            except TypeError:
+                # Backward compatibility for tests/extensions monkeypatching the old
+                # two-argument ensure_module_synced(root, module_name) signature.
+                core_sync_service.ensure_module_synced(root, module_name)
         return self._find_module_dir(root_path, module_name) if root_path.exists() else None
 
     @staticmethod

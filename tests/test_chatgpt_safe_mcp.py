@@ -2,6 +2,8 @@ from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
+from odoo_agent_server.schemas import JobRecord, JobStatus
+from odoo_agent_server.services.store_service import JsonStore
 
 
 def _auth():
@@ -15,16 +17,11 @@ def _mcp(method, params=None, request_id=1):
 _PROVIDER_TOOLS = {
     "connector_health",
     "client_check",
-    "workflow_agent_instructions",
+    "odoo_query",
+    "odoo_search_read",
+    "odoo_module_deploy",
     "workflow_odoo_code_change",
-    "workflow_frontend_visual_implement",
-    "workflow_find_core_file",
-    "workflow_list_module_files",
-    "workflow_frontend_pattern_preflight",
-    "workflow_verify_pos_change",
-    "workflow_verify_against_core",
-    "odoosh_read_core_file",
-    "odoosh_list_core_files",
+    "workflow_restore_last_good_commit",
     "artifacts_read",
     "workflow_resume_job",
     "jobs_list",
@@ -51,7 +48,7 @@ def test_provider_profile_hides_direct_repo_git_and_deploy_tools():
     forbidden = {
         "repo_read", "repo_search", "repo_write", "repo_read_range",
         "workflow_scope_advice", "workflow_safe_deploy_module",
-        "git_push", "odoo_module_deploy", "odoosh_module_update",
+        "git_push", "odoosh_module_update",
     }
     assert not (names & forbidden)
 
@@ -76,7 +73,7 @@ def test_hidden_direct_tool_call_is_blocked_with_next_action():
     assert structured["next_call"]["tool"] == "workflow.odoo_code_change"
 
 
-def test_jobs_get_uses_single_bounded_ten_minute_poll(monkeypatch):
+def test_jobs_get_is_forced_non_blocking_for_remote_mcp(monkeypatch):
     captured = {}
 
     async def fake_dispatch(name, arguments):
@@ -93,9 +90,36 @@ def test_jobs_get_uses_single_bounded_ten_minute_poll(monkeypatch):
     )
     assert response.status_code == 200
     assert captured["name"] == "jobs.get"
-    assert captured["arguments"]["wait_for_result"] is True
-    assert captured["arguments"]["wait_timeout_seconds"] == 600
-    assert captured["arguments"]["poll_interval_seconds"] == 10.0
+    assert captured["arguments"]["wait_for_result"] is False
+    assert captured["arguments"]["wait_timeout_seconds"] == 0
+
+
+def test_jobs_get_never_long_polls_code_change_parent(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    job = JsonStore().create_job(JobRecord(
+        job_type="odoo_code_change",
+        status=JobStatus.running,
+        request={"module_name": "x_module"},
+    ))
+    captured = {}
+
+    async def fake_dispatch(name, arguments):
+        captured["arguments"] = arguments
+        return {"status": "running", "job_id": arguments["job_id"]}
+
+    monkeypatch.setattr("odoo_agent_server.routers.mcp._dispatch", fake_dispatch)
+    response = TestClient(app).post(
+        "/chatgpt/mcp",
+        headers=_auth(),
+        json=_mcp("tools/call", {
+            "name": "jobs_get",
+            "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 20},
+        }),
+    )
+
+    assert response.status_code == 200
+    assert captured["arguments"]["wait_for_result"] is False
+    assert captured["arguments"]["wait_timeout_seconds"] == 0
 
 
 def test_root_provider_tools_metadata_matches_mcp_surface():

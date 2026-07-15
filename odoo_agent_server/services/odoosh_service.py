@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ..config import get_odoo_clients, settings
@@ -251,19 +252,18 @@ class OdooShService:
         script = "set -e; cd ~/src/user; git status --short --branch; git rev-parse --abbrev-ref HEAD || true; git rev-parse HEAD"
         return self.run_shell(script, timeout_seconds=30)
 
-    def deployed_sha(self) -> CommandResult:
+    def deployed_sha(self, timeout_seconds: int = 30) -> CommandResult:
         script = "set -e; cd ~/src/user; git rev-parse HEAD"
-        return self.run_shell(script, timeout_seconds=30)
+        return self.run_shell(script, timeout_seconds=max(1, timeout_seconds))
 
     # NON-BLOCKING single check — MCP agents poll this instead of blocking wait
     def adaptive_poll_interval(self, attempt: int) -> float:
-        """Adaptive polling: fast early, slower later to reduce SSH calls."""
-        if attempt < 3:
-            return 5.0   # first 3 checks: every 5s
-        elif attempt < 8:
-            return 10.0  # next 5 checks: every 10s
-        else:
-            return 15.0  # remaining: every 15s
+        """Poll quickly at first, then back off without delaying completion."""
+        if attempt < 5:
+            return 2.0
+        if attempt < 12:
+            return 5.0
+        return 10.0
 
     def check_commit_deployed(self, expected_sha: str) -> CommandResult:
         """Return immediately with deployed=true/false. Never blocks.
@@ -303,6 +303,7 @@ class OdooShService:
         timeout_seconds: int = 300,
         interval_seconds: float = 10.0,
         progress_cb=None,
+        failure_check=None,
     ) -> CommandResult:
         """Poll Odoo.sh until ``expected_sha`` is active in ``~/src/user``.
 
@@ -314,7 +315,7 @@ class OdooShService:
         """
         expected = expected_sha.strip()
         timeout_seconds = max(int(timeout_seconds), 0)
-        interval_seconds = max(float(interval_seconds), 0.0)
+        max_interval_seconds = max(float(interval_seconds), 0.0)
         started = time.monotonic()
         deadline = started + timeout_seconds
         attempts: list[dict[str, object]] = []
@@ -322,6 +323,12 @@ class OdooShService:
 
         while True:
             attempt += 1
+            adaptive_interval = OdooShService.adaptive_poll_interval(self, attempt - 1)
+            current_interval = (
+                min(adaptive_interval, max_interval_seconds)
+                if max_interval_seconds > 0
+                else 0.0
+            )
             check_result = self.check_commit_deployed(expected)
             deployed = OdooShService._check_result_deployed(check_result)
             elapsed_seconds = round(time.monotonic() - started, 3)
@@ -332,7 +339,7 @@ class OdooShService:
                 "stderr": check_result.stderr,
                 "deployed": deployed,
                 "expected_sha": expected,
-                "poll_interval_seconds": interval_seconds,
+                "poll_interval_seconds": current_interval,
                 "elapsed_seconds": elapsed_seconds,
             }
             attempts.append(attempt_payload)
@@ -349,12 +356,36 @@ class OdooShService:
                         "deployed": True,
                         "expected_sha": expected,
                         "attempts": attempt,
-                        "poll_interval_seconds": interval_seconds,
+                        "poll_interval_seconds": current_interval,
                         "elapsed_seconds": elapsed_seconds,
                         "message": "Odoo.sh deployed the pushed commit. Proceeding to module upgrade.",
                         "last_check": check_result.stdout,
                     }),
                 })
+
+            # Detect failed Odoo.sh builds while waiting for the source SHA.
+            # Previously this guard ran only after deployment polling, wasting
+            # the entire timeout on a build that had already failed.
+            if failure_check is not None and (attempt == 1 or attempt % 3 == 0):
+                try:
+                    failure_result = failure_check()
+                except Exception:
+                    failure_result = None
+                if failure_result is not None and failure_result.exit_code == 1:
+                    return CommandResult(
+                        command=["odoosh.check_commit_poll", expected],
+                        cwd="odoosh:ssh",
+                        exit_code=1,
+                        stdout=json.dumps({
+                            "deployed": False,
+                            "build_failed": True,
+                            "expected_sha": expected,
+                            "attempts": attempt,
+                            "elapsed_seconds": elapsed_seconds,
+                            "failure_check": failure_result.model_dump(mode="json"),
+                        }, ensure_ascii=False),
+                        stderr="Odoo.sh build failure detected before the pushed commit became active.",
+                    )
 
             now = time.monotonic()
             if now >= deadline:
@@ -367,7 +398,7 @@ class OdooShService:
                         "deployed": False,
                         "expected_sha": expected,
                         "attempts": attempt,
-                        "poll_interval_seconds": interval_seconds,
+                        "poll_interval_seconds": current_interval,
                         "elapsed_seconds": elapsed_seconds,
                         "timeout_seconds": timeout_seconds,
                         "recent_checks": attempts[-10:],
@@ -376,7 +407,7 @@ class OdooShService:
                     timed_out=True,
                 )
 
-            sleep_for = min(interval_seconds, max(deadline - now, 0.0))
+            sleep_for = min(current_interval, max(deadline - now, 0.0))
             if sleep_for > 0:
                 time.sleep(sleep_for)
 
@@ -759,18 +790,12 @@ class OdooShService:
             return result
         text = result.stdout or ""
         raw_blocks = self._extract_error_blocks(text)
-        blocks = [block for block in raw_blocks if self._is_actionable_build_failure(block)]
-        failure_trigger = re.compile(
-            r"(Test:\s*Failed|Build\s+failed|Failed to load registry|"
-            r"Traceback \(most recent call last\)|ParseError|ValidationError|"
-            r"ModuleNotFoundError|ImportError|CRITICAL)",
-            re.I,
-        )
-        if not blocks and failure_trigger.search(text) and self._is_actionable_build_failure(text[-8000:]):
-            blocks = ["Recent Odoo.sh log failure marker found:\n" + text[-8000:]]
+        recent_blocks = [block for block in raw_blocks if self._error_block_is_after(block, safe_since)]
+        blocks = [block for block in recent_blocks if self._is_actionable_build_failure(block)]
         payload = {
             "failed": bool(blocks),
-            "ignored_non_blocking_blocks": max(0, len(raw_blocks) - len(blocks)),
+            "ignored_historical_blocks": max(0, len(raw_blocks) - len(recent_blocks)),
+            "ignored_non_blocking_blocks": max(0, len(recent_blocks) - len(blocks)),
             "since_epoch": safe_since,
             "message": (
                 "Recent Odoo.sh failure evidence found. Do not upgrade this build."
@@ -786,6 +811,25 @@ class OdooShService:
             stdout=json.dumps(payload, ensure_ascii=False)[-20000:],
         )
 
+    @staticmethod
+    def _error_block_is_after(block: str, since_epoch: int) -> bool:
+        """Attribute an extracted error block to this push using log timestamps."""
+        if since_epoch <= 0:
+            return True
+        stamps = re.findall(r"\b(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:[,.]\d{1,6})?)\b", block or "")
+        if not stamps:
+            # Some build/test logs have no per-line timestamp. Their file mtime
+            # was already checked by the remote shell, so retain them.
+            return True
+        epochs: list[float] = []
+        for raw in stamps:
+            try:
+                parsed = datetime.fromisoformat(raw.replace(",", ".")).replace(tzinfo=timezone.utc)
+                epochs.append(parsed.timestamp())
+            except ValueError:
+                continue
+        return bool(epochs and max(epochs) >= max(0, since_epoch - 5))
+
     def _is_actionable_build_failure(self, block: str) -> bool:
         """Return True only for deploy/build blockers, not noisy runtime warnings.
 
@@ -797,6 +841,19 @@ class OdooShService:
         """
         text = block or ""
         lowered = text.lower()
+        hard_build_markers = re.search(
+            r"Failed to load registry|CRITICAL|Build\s+failed|Test:\s*Failed",
+            text,
+            re.I,
+        )
+        if (
+            ("filenotfounderror" in lowered or "no such file or directory" in lowered)
+            and ("/filestore/" in lowered or "/data/filestore/" in lowered)
+            and not hard_build_markers
+        ):
+            # Missing attachment blobs are runtime/data-health noise, unrelated
+            # to source activation, asset builds, upgrades, or registry proof.
+            return False
         benign_patterns = [
             "/web/assets/",
             "undefined http/",
@@ -828,7 +885,7 @@ class OdooShService:
         blocks: list[str] = []
         current_file = "unknown"
         i = 0
-        trigger = re.compile(r"(Traceback \(most recent call last\)|ERROR|CRITICAL|ParseError|ValidationError|ModuleNotFoundError|ImportError|Failed to load registry|Exception)", re.I)
+        trigger = re.compile(r"(Traceback \(most recent call last\)|ERROR|CRITICAL|ParseError|ValidationError|ModuleNotFoundError|ImportError|Failed to load registry|Build\s+failed|Test:\s*Failed|Exception)", re.I)
         while i < len(lines):
             line = lines[i]
             if line.startswith("__ODOO_MCP_LOG_FILE__:"):
@@ -849,8 +906,20 @@ class OdooShService:
                 i = j
                 continue
             if trigger.search(line):
-                start = max(0, i - 6)
-                end = min(len(lines), i + 18)
+                start = i
+                for candidate in range(i, max(-1, i - 7), -1):
+                    if lines[candidate].startswith("__ODOO_MCP_LOG_FILE__:"):
+                        break
+                    start = candidate
+                    if re.match(r"^\d{4}-\d{2}-\d{2} ", lines[candidate]):
+                        break
+                end = i + 1
+                while end < len(lines):
+                    if lines[end].startswith("__ODOO_MCP_LOG_FILE__:"):
+                        break
+                    if re.match(r"^\d{4}-\d{2}-\d{2} ", lines[end]):
+                        break
+                    end += 1
                 blocks.append(f"### {current_file}\n" + "\n".join(lines[start:end]))
                 i = end
                 continue
@@ -874,6 +943,11 @@ class OdooShService:
         file_matches = sorted(set(re.findall(r"File \"([^\"]+)\"", text)))
         xml_matches = sorted(set(re.findall(r"while parsing ([^:]+):(\d+)", text, flags=re.I)))
         missing_model = sorted(set(re.findall(r"(?:Object|Model|KeyError: )['\"]?([a-zA-Z_][a-zA-Z0-9_]*\.[a-zA-Z0-9_]+)['\"]?", text)))
+        invalid_fields = sorted(set(re.findall(
+            r"Invalid\s+field\s+['\"]([A-Za-z_][A-Za-z0-9_]*)['\"]\s+on\s+model\s+['\"]([A-Za-z_][A-Za-z0-9_.]*)['\"]",
+            text,
+            flags=re.I,
+        )))
         if "ModuleNotFoundError" in text or "ImportError" in text:
             hints.append("Python import failure: check __init__.py imports, renamed files, and manifest dependencies.")
         if "ParseError" in text or xml_matches:
@@ -882,11 +956,21 @@ class OdooShService:
             hints.append("Access rights failure: use SSH module update or add missing ir.model.access.csv rows/groups.")
         if missing_model:
             hints.append("Missing registry model: module likely failed to load/upgrade; fix earlier traceback then rerun odoosh.module_update.")
+        if invalid_fields:
+            hints.append(
+                "Invalid registry field: do not change the XML value syntax or add eval. Inspect every Python "
+                "_name/_inherit declaration for the model, models/__init__.py import order, and deployed source; "
+                "then fix model composition or the actual field name."
+            )
         pack = {
             "summary": "Odoo.sh traceback/error pack",
             "files": file_matches[-20:],
             "xml_locations": [f"{f}:{line}" for f, line in xml_matches[-20:]],
             "models_mentioned": missing_model[-20:],
+            "invalid_fields": [
+                {"field": field_name, "model": model_name}
+                for field_name, model_name in invalid_fields[-20:]
+            ],
             "hints": hints or ["No strong pattern detected; inspect traceback blocks below."],
         }
         stdout = "MCP_ERROR_PACK\n" + json.dumps(pack, indent=2) + "\n\nTRACEBACK_BLOCKS\n" + base.stdout
@@ -972,8 +1056,9 @@ class OdooShService:
         result = self.run_shell(script, timeout_seconds=timeout_seconds)
         payload_line = ""
         for line in reversed((result.stdout or "").splitlines()):
-            if line.startswith(marker):
-                payload_line = line[len(marker):]
+            marker_at = line.find(marker)
+            if marker_at >= 0:
+                payload_line = line[marker_at + len(marker):].strip()
                 break
         if not payload_line:
             return OdooResult(
@@ -983,7 +1068,7 @@ class OdooShService:
                 result={"ssh": result.model_dump(mode="json")},
             )
         try:
-            parsed = json.loads(payload_line)
+            parsed, _end = json.JSONDecoder().raw_decode(payload_line)
         except Exception as exc:
             return OdooResult(
                 status="failed",
@@ -991,7 +1076,10 @@ class OdooShService:
                 error=f"Could not parse Odoo.sh SSH query JSON: {exc}",
                 result={"raw": payload_line[-4000:], "ssh": result.model_dump(mode="json")},
             )
-        if parsed.get("status") != "ok" or result.exit_code != 0:
+        # A complete marker is authoritative for this read-only operation.
+        # Odoo startup/shutdown warnings can make the wrapper shell non-zero
+        # after search_read already returned valid JSON.
+        if parsed.get("status") != "ok":
             return OdooResult(
                 status="failed",
                 database=self._db_name(),
@@ -1004,6 +1092,102 @@ class OdooShService:
             result=parsed.get("result") or [],
         )
 
+    def workforce_presence_report(
+        self,
+        report_date: str,
+        limit: int = 100,
+        timeout_seconds: int = 45,
+    ) -> OdooResult:
+        """Calculate scheduled/present/leave/absent employees in one Odoo shell."""
+        try:
+            datetime.strptime(report_date, "%Y-%m-%d")
+        except ValueError:
+            return OdooResult(status="failed", database=self._db_name(), error="report_date must use YYYY-MM-DD")
+        payload = {"date": report_date, "limit": max(1, min(int(limit or 100), 200))}
+        payload_b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+        safe_db = shlex.quote(self._db_name() or "")
+        odoo_path = shlex.quote(self._odoo_path())
+        safe_addons = shlex.quote(self._addons_path())
+        marker = "MCP_ODOOSH_ANALYTICS_JSON:"
+        script = (
+            "set +e; "
+            f"cd {odoo_path}; "
+            f"./odoo-bin shell -d {safe_db} --addons-path={safe_addons} --no-http --log-level=error <<'PY'\n"
+            "import base64, datetime, json, pytz, traceback\n"
+            f"payload = json.loads(base64.b64decode({payload_b64!r}).decode('utf-8'))\n"
+            f"marker = {marker!r}\n"
+            "try:\n"
+            "    day = datetime.datetime.strptime(payload['date'], '%Y-%m-%d').date()\n"
+            "    limit = int(payload.get('limit') or 100)\n"
+            "    required = {'hr.employee', 'hr.attendance'}\n"
+            "    missing = sorted(required - set(env.registry.models))\n"
+            "    if missing:\n"
+            "        raise ValueError('Required installed models not found: %s' % ', '.join(missing))\n"
+            "    Employee = env['hr.employee'].with_context(active_test=False)\n"
+            "    employee_fields = Employee._fields\n"
+            "    emp_domain = [('active', '=', True)] if 'active' in employee_fields else []\n"
+            "    employees = Employee.search(emp_domain, order='name asc')\n"
+            "    bounds = {}\n"
+            "    scheduled_ids = set()\n"
+            "    unknown_schedule_ids = set()\n"
+            "    for emp in employees:\n"
+            "        calendar = (emp.resource_calendar_id if 'resource_calendar_id' in employee_fields else False) or emp.company_id.resource_calendar_id\n"
+            "        if not calendar:\n"
+            "            unknown_schedule_ids.add(emp.id)\n"
+            "            continue\n"
+            "        zone = pytz.timezone(calendar.tz or env.user.tz or 'UTC')\n"
+            "        start_local = zone.localize(datetime.datetime.combine(day, datetime.time.min))\n"
+            "        end_local = start_local + datetime.timedelta(days=1)\n"
+            "        start_utc = start_local.astimezone(pytz.UTC).replace(tzinfo=None)\n"
+            "        end_utc = end_local.astimezone(pytz.UTC).replace(tzinfo=None)\n"
+            "        bounds[emp.id] = (start_utc, end_utc)\n"
+            "        if calendar.get_work_hours_count(start_utc, end_utc, compute_leaves=False) > 0:\n"
+            "            scheduled_ids.add(emp.id)\n"
+            "    broad_start = datetime.datetime.combine(day - datetime.timedelta(days=1), datetime.time.min)\n"
+            "    broad_end = datetime.datetime.combine(day + datetime.timedelta(days=2), datetime.time.min)\n"
+            "    attendances = env['hr.attendance'].search([('employee_id', 'in', employees.ids), ('check_in', '<', broad_end), '|', ('check_out', '=', False), ('check_out', '>=', broad_start)])\n"
+            "    present_ids = set()\n"
+            "    for att in attendances:\n"
+            "        start_utc, end_utc = bounds.get(att.employee_id.id, (broad_start, broad_end))\n"
+            "        att_end = att.check_out or broad_end\n"
+            "        if att.check_in < end_utc and att_end >= start_utc:\n"
+            "            present_ids.add(att.employee_id.id)\n"
+            "    leave_ids = set()\n"
+            "    if 'hr.leave' in env.registry.models:\n"
+            "        Leave = env['hr.leave']\n"
+            "        lf = Leave._fields\n"
+            "        if {'employee_id', 'state', 'request_date_from', 'request_date_to'} <= set(lf):\n"
+            "            leaves = Leave.search([('employee_id', 'in', employees.ids), ('state', '=', 'validate'), ('request_date_from', '<=', day), ('request_date_to', '>=', day)])\n"
+            "            leave_ids.update(leaves.mapped('employee_id').ids)\n"
+            "    absent_ids = scheduled_ids - present_ids - leave_ids\n"
+            "    def rows(ids):\n"
+            "        result = []\n"
+            "        for emp in employees.filtered(lambda rec: rec.id in ids)[:limit]:\n"
+            "            result.append({'id': emp.id, 'name': emp.name, 'department': emp.department_id.display_name if 'department_id' in employee_fields and emp.department_id else None, 'job': emp.job_id.display_name if 'job_id' in employee_fields and emp.job_id else None})\n"
+            "        return result\n"
+            "    data = {'status': 'ok', 'report_date': payload['date'], 'timezone_basis': 'employee work calendar', 'absent': rows(absent_ids), 'present': rows(present_ids & scheduled_ids), 'approved_leave': rows(leave_ids & scheduled_ids), 'not_scheduled': rows(set(employees.ids) - scheduled_ids - unknown_schedule_ids), 'unknown_schedule': rows(unknown_schedule_ids), 'counts': {'active_employees': len(employees), 'scheduled': len(scheduled_ids), 'present': len(present_ids & scheduled_ids), 'approved_leave': len(leave_ids & scheduled_ids), 'absent': len(absent_ids), 'unknown_schedule': len(unknown_schedule_ids)}, 'evidence_models': ['hr.employee', 'hr.attendance'] + (['hr.leave'] if 'hr.leave' in env.registry.models else []), 'classification': 'scheduled minus attendance overlap minus approved leave'}\n"
+            "except Exception as exc:\n"
+            "    data = {'status': 'failed', 'error': str(exc), 'traceback': traceback.format_exc()[-4000:]}\n"
+            "print(marker + json.dumps(data, ensure_ascii=False, default=str))\n"
+            "PY\n"
+        )
+        result = self.run_shell(script, timeout_seconds=timeout_seconds)
+        payload_line = ""
+        for line in reversed((result.stdout or "").splitlines()):
+            marker_at = line.find(marker)
+            if marker_at >= 0:
+                payload_line = line[marker_at + len(marker):].strip()
+                break
+        if not payload_line:
+            return OdooResult(status="failed", database=self._db_name(), error=(result.stderr or result.stdout or "Analytics query returned no marker.")[-4000:])
+        try:
+            parsed, _end = json.JSONDecoder().raw_decode(payload_line)
+        except Exception as exc:
+            return OdooResult(status="failed", database=self._db_name(), error=f"Could not parse analytics result: {exc}")
+        if not isinstance(parsed, dict) or parsed.get("status") != "ok":
+            return OdooResult(status="failed", database=self._db_name(), error=str(parsed.get("error") if isinstance(parsed, dict) else "Invalid analytics payload"), result=parsed)
+        return OdooResult(status="ok", database=self._db_name(), result=parsed)
+
     def _dependency_guard(self, module_name: str) -> CommandResult | None:
         try:
             from .odoo_service import OdooService
@@ -1013,6 +1197,13 @@ class OdooShService:
             return None
         if deps.status != "ok" or not isinstance(deps.result, dict):
             return None
+        states = getattr(self, "_dependency_module_states", None)
+        if not isinstance(states, dict):
+            states = {}
+            self._dependency_module_states = states
+        state = str(deps.result.get("state") or "").strip()
+        if state:
+            states[module_name] = state
         missing = deps.result.get("missing") or []
         if missing:
             names = ", ".join(sorted({str(row.get("name")) for row in missing}))
@@ -1058,7 +1249,13 @@ class OdooShService:
         dep_error = self._dependency_guard(module_name)
         if dep_error:
             return dep_error
-        state = self._module_state_best_effort(module_name)
+        # module_dependencies_status now returns the target module state too,
+        # so the normal deploy path reuses the same preflight shell startup.
+        # Keep the old probe only as a compatibility/failure fallback.
+        states = getattr(self, "_dependency_module_states", {})
+        state = states.get(module_name) if isinstance(states, dict) else None
+        if not state:
+            state = self._module_state_best_effort(module_name)
         flag = "-u" if state in {"installed", "to upgrade", "to remove"} else "-i"
         result = self._run_module_cli(module_name, flag, timeout_seconds)
         prefix = f"MCP_SSH_DEPLOY mode={'upgrade' if flag == '-u' else 'install'} state={state or 'unknown'} module={module_name}\n"

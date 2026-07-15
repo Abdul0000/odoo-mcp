@@ -33,6 +33,33 @@ def test_real_frontend_file_still_triggers_preflight():
     )
     assert _looks_like_frontend_code_change(payload, payload.target_files)
 
+
+def test_frontend_preflight_does_not_resync_custom_target_module(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "pattern_cache_enabled", False)
+    calls = []
+
+    def fake_list(self, module_name, subdir="", search_roots=None, client_name=None, allow_remote_core_sync=True):
+        calls.append((module_name, subdir))
+        return SimpleNamespace(found=False, files=[])
+
+    monkeypatch.setattr(
+        "odoo_agent_server.services.frontend_pattern_service.CoreFinderService.list_module_files",
+        fake_list,
+    )
+    custom_file = tmp_path / "nexus_operations_hub" / "static" / "src" / "scss" / "dashboard.scss"
+    custom_file.parent.mkdir(parents=True)
+    custom_file.write_text(".card { border-color: #333; }\n", encoding="utf-8")
+
+    FrontendPatternService().preflight(FrontendPatternPreflightRequest(
+        task_description="Fix backend dark mode SCSS borders",
+        target_module_name="nexus_operations_hub",
+        custom_file_paths=[str(custom_file)],
+        planned_file_paths=["nexus_operations_hub/static/src/scss/dashboard.scss"],
+    ))
+
+    assert calls
+    assert all(module != "nexus_operations_hub" for module, _ in calls)
+
 from odoo_agent_server.routers.tools import _task_profile
 
 
@@ -146,3 +173,6 @@ def test_smart_router_explicit_write_and_file_evidence_win():
     assert result.frontend_required is True
     assert result.confidence == "high"
     assert result.clarification_required is False
+from types import SimpleNamespace
+
+from odoo_agent_server.config import settings

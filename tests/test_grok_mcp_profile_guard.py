@@ -30,15 +30,18 @@ def test_grok_profile_exposes_only_curated_non_bypass_tools():
 
     # Hidden because they created Grok loops/bypasses in screenshots.
     assert "git_push" not in names
-    assert "odoo_module_deploy" not in names
+    assert "odoo_module_deploy" in names
     assert "odoosh_module_update" not in names
     assert "odoosh_read_user_file" not in names
     assert "workflow_verify_deployed_module" not in names
-    # Native source read-only tools are now exposed so Grok can inspect POS/OWL core before coding.
-    assert "workflow_list_module_files" in names
-    assert "workflow_find_core_file" in names
-    assert "workflow_frontend_pattern_preflight" in names
-    assert "odoosh_read_core_file" in names
+    # Inspection, preflight, and compatibility verification are internal phases
+    # of the single composite workflow and are not provider-callable.
+    assert "workflow_list_module_files" not in names
+    assert "workflow_find_core_file" not in names
+    assert "workflow_frontend_pattern_preflight" not in names
+    assert "workflow_verify_against_core" not in names
+    assert "workflow_verify_pos_change" not in names
+    assert "odoosh_read_core_file" not in names
     assert "repo_read_range" not in names
     assert "artifacts_read" in names
     assert "workflow_resume_job" in names
@@ -48,6 +51,23 @@ def test_grok_profile_exposes_only_curated_non_bypass_tools():
     assert "workflow_scope_advice" not in names
     assert "repo_read" not in names
     assert "repo_write" not in names
+
+
+def test_async_module_deploy_nested_running_status_is_not_marked_terminal(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    svc = McpOperationGuardService()
+    arguments = {"client_name": "ClientA", "module_name": "x_module"}
+    structured = {
+        "status": "failed",
+        "error": "Job started but is not complete",
+        "result": {"status": "running", "job_id": "job-1"},
+    }
+
+    result = svc.annotate_result("odoo.module_deploy", arguments, structured)
+
+    assert result["completion_required"] is True
+    assert result["success_allowed"] is False
+    assert result.get("source_deploy_terminal") is not True
 
 
 def test_grok_operation_guard_blocks_duplicate_scope_and_backwards_reads(tmp_path, monkeypatch):
@@ -104,3 +124,17 @@ def test_grok_operation_guard_blocks_tools_after_terminal_pass(tmp_path, monkeyp
     assert blocked is not None
     assert blocked["status"] == "final_guard"
     assert blocked["next_call"]["tool"] == "final_answer"
+
+
+def test_client_validation_runs_once_per_conversation(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    svc = McpOperationGuardService()
+    args = {"client_name": "Test", "validate": True}
+
+    assert svc.before_tool_call("client.check", args) is None
+    svc.after_tool_call("client.check", args, {"ok": True, "validated": True})
+
+    duplicate = svc.before_tool_call("client.check", args)
+    assert duplicate is not None
+    assert duplicate["status"] == "client_already_validated"
+    assert duplicate["next_call"]["tool"] == "workflow.odoo_code_change"

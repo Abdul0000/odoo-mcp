@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 from odoo_agent_server.schemas import CodingTaskPlanRequest, RepoPrepareRequest
 from odoo_agent_server.routers.tools import _TOOL_DESCRIPTORS, tool_input_schema
@@ -51,3 +52,33 @@ def test_repo_write_single_pass_threshold_is_1000_lines(tmp_path: Path, monkeypa
     assert "1000 lines" in over_1000.extra["large_file_warning"]
     assert "large_file_warning" not in chunk_start.extra
     assert "large_file_warning" not in chunk_next.extra
+
+
+def test_composite_prepare_preserves_dirty_checkout_without_refresh(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    remote = tmp_path / "remote.git"
+    project = tmp_path / "repo"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "init", "-b", "main", str(project)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(project), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(project), "config", "user.email", "test@example.com"], check=True)
+    target = project / "style.scss"
+    target.write_text(".panel { color: black; }\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(project), "add", "style.scss"], check=True)
+    subprocess.run(["git", "-C", str(project), "commit", "-m", "base"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(project), "remote", "add", "origin", str(remote)], check=True)
+    subprocess.run(["git", "-C", str(project), "push", "-u", "origin", "main"], check=True, capture_output=True, text=True)
+    target.write_text(".panel { color: white; }\n", encoding="utf-8")
+
+    prepared = RepoService().prepare_repo(
+        repo_url=str(remote),
+        branch="main",
+        project_path=str(project),
+        preserve_dirty=True,
+    )
+
+    assert target.read_text(encoding="utf-8") == ".panel { color: white; }\n"
+    assert "style.scss" in prepared.status
+    commands = [step.command for step in prepared.steps]
+    assert not any(command[:2] == ["git", "checkout"] for command in commands)
+    assert not any(command[:2] == ["git", "pull"] for command in commands)
