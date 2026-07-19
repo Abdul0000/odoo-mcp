@@ -55,6 +55,7 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
     rules = "\n".join(instructions["rules"])
     small_flow = "\n".join(instructions["small_patch_fast_path"]["steps"])
     do_not = "\n".join(instructions["small_patch_fast_path"]["do_not"])
+    skills = instructions["skills"]
 
     assert "do not stop after writing files" in rules
     assert "printing JSON MCP tool calls" in rules
@@ -70,3 +71,13 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
     assert "Do not print sample MCP JSON blocks" in do_not
     assert "Do not use Studio/ORM database schema mutations" in do_not
     assert "Do not put Pydantic code in Odoo addons" in do_not
+    assert skills["routing"]["mode"] == "conditional"
+    assert {
+        "odoo_accounting_development",
+        "odoo_manufacturing_development",
+        "odoo_inventory_development",
+        "odoo_sales_development",
+        "odoo_hr_payroll_development",
+        "odoo_crm_pipeline_development",
+        "odoo_helpdesk_development",
+    }.issubset(skills)

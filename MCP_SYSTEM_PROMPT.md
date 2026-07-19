@@ -165,6 +165,48 @@ Declare `point_of_sale` and only the actually used POS add-ons in `depends`. Con
 
 **Quality checklist:** exact POS source/preflight read; asset/import/template paths valid; backend loader and frontend data contract aligned; offline/reload path preserved; payment/refund/idempotency considered; receipt renders; session open/close unaffected; changed files verified against core; safe deploy terminal confirmation received.
 
+### odoo-accounting-development
+
+**Use for:** invoices, journal entries, payments, reconciliation, taxes, fiscal positions, multi-currency, lock dates, assets, analytic accounting, financial reports, and multi-company accounting.
+
+**Required rules:** read installed `account`, related enterprise modules, and the active `l10n_*` localization before coding. Preserve balanced moves, posted-move immutability/reversal flows, company/currency precision, tax repartition lines, reconciliation links, fiscal locks, and audit trails. Never hardcode tax rates, chart-of-account codes, withholding rules, exchange rates, or country compliance assumptions. Use native posting/payment/reversal/reconciliation APIs rather than directly forcing states or editing move lines after posting.
+
+### odoo-manufacturing-development
+
+**Use for:** BoMs, manufacturing orders, work orders, work centers, routings/operations, component moves, by-products, scrap, quality, subcontracting, planning/MPS, and production costing.
+
+**Required rules:** inspect installed `mrp`, `stock`, `purchase`, `quality`, and subcontracting/planning modules actually present. Preserve recursive BoM behavior, UoM conversions, procurement groups, reservations, lot/serial tracking, work-order transitions, by-product cost allocation, valuation moves, and company/warehouse boundaries. Do not delete or rewrite confirmed production stock moves directly; use native MO/work-order/stock transition methods confirmed in source.
+
+### odoo-inventory-development
+
+**Use for:** warehouses, locations, routes/rules, pickings, stock moves/move lines, reservations, backorders, lots/serials, packages, putaway, replenishment, inventory adjustments, valuation, barcode, and multi-step flows.
+
+**Required rules:** inspect installed `stock`, `stock_account`, `purchase_stock`, `sale_stock`, `delivery`, and `barcodes` source as applicable. Preserve source/destination balance, picking/move lifecycle, reservation ownership, UoM rounding, lots/serials/packages, backorders, procurement routes, valuation layers, and company/warehouse isolation. Never write `stock.quant.quantity` or `reserved_quantity` directly for business operations; use native move/reservation/inventory-adjustment APIs.
+
+### odoo-sales-development
+
+**Use for:** quotations, sales orders/lines, pricing, pricelists, discounts, down payments, deliveries, invoicing policy, subscriptions, commissions, portal/signatures, and customer credit controls.
+
+**Required rules:** inspect installed `sale`, `sale_management`, `sale_stock`, `sale_account`, `website_sale`, subscription, and localization modules actually present. Preserve quotation/order transitions, price computation context, taxes/fiscal positions, UoM, delivery/invoice quantities, down-payment links, portal access tokens, signatures, credit controls, and multi-company/currency behavior. Do not create invoices or stock moves by hand when the native sales workflow owns them.
+
+### odoo-hr-payroll-development
+
+**Use for:** employees, contracts, salary structures/rules, payslips/batches, worked days, attendance, leave, timesheets, loans/advances, payroll accounting, payments, and statutory deductions.
+
+**Required rules:** first confirm which HR/payroll modules and country localization are installed. Preserve employee privacy/access rules, contract date/company/currency boundaries, work-entry conflict handling, leave balances, salary-rule sequence/categories, payslip lifecycle, accounting links, and locked/paid records. Never hardcode tax brackets, EOBI/social-security rates, allowances, or deductions; derive them from the active localization/configuration and require explicit compliance evidence for statutory logic.
+
+### odoo-crm-pipeline-development
+
+**Use for:** leads/opportunities, stages, teams, assignment, scoring, probability/forecasting, activities, sources/campaigns, automation, integrations, dashboards, and kanban pipeline behavior.
+
+**Required rules:** inspect installed `crm`, `sale_crm`, `mail`, marketing/UTM, and predictive modules actually present. Preserve lead-vs-opportunity configuration, stage/team ownership, automated probability rules, expected revenue/currency, activity scheduling, chatter tracking, attribution, archive/lost/won semantics, record rules, and multi-company boundaries. Use native conversion, stage, activity, and assignment APIs rather than forcing fields without side effects.
+
+### odoo-helpdesk-development
+
+**Use for:** tickets, teams, stages, assignment, SLAs, escalation, email/chatter, portal, knowledge/FAQ, canned responses, routing/automation, merging, surveys, and analytics.
+
+**Required rules:** first confirm installed `helpdesk`, `mail`, `portal`, `website`, `knowledge`, SLA, and survey modules because availability differs by edition/version. Preserve team/stage rules, SLA deadline computation and calendars, assignment ownership, follower/chatter/mail threading, portal tokens/record rules, customer privacy, escalation idempotency, and satisfaction links. Use native ticket transitions and messaging APIs; never expose internal tickets or attachments through unrestricted public/sudo routes.
+
 ---
 
 

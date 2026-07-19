@@ -173,6 +173,48 @@ def agent_instructions() -> dict:
                     "hard_rule": "Never use legacy load_fields('pos.config', ...), models.load_fields, or legacy odoo.define/Registries patterns unless the selected installed version actually uses them.",
                     "deployment": "Verify backend/frontend contracts and changed files against core, use workflow.safe_deploy_module, and stop immediately after terminal deploy confirmation.",
                 },
+                "odoo_accounting_development": {
+                    "name": "odoo-accounting-development",
+                    "activation": "accounting, invoice, journal, payment, reconciliation, tax, currency, fiscal position, asset, analytic, or financial-report task",
+                    "source_modules": ["account", "account_accountant", "account_asset", "active l10n_* localization"],
+                    "hard_rules": ["balanced moves", "reverse rather than mutate posted moves", "never hardcode taxes, COA codes, rates, or compliance rules"],
+                },
+                "odoo_manufacturing_development": {
+                    "name": "odoo-manufacturing-development",
+                    "activation": "MRP, BoM, manufacturing/work order, workcenter, quality, byproduct, scrap, subcontracting, or production-planning task",
+                    "source_modules": ["mrp", "stock", "purchase", "quality", "subcontracting/planning modules when installed"],
+                    "hard_rules": ["preserve recursive BoMs and UoM", "use native production/stock transitions", "preserve reservations, tracking, valuation, and company boundaries"],
+                },
+                "odoo_inventory_development": {
+                    "name": "odoo-inventory-development",
+                    "activation": "warehouse, location, picking, stock move, reservation, lot/serial, route, replenishment, valuation, adjustment, or barcode task",
+                    "source_modules": ["stock", "stock_account", "purchase_stock", "sale_stock", "delivery", "barcodes"],
+                    "hard_rules": ["never directly mutate stock.quant for business operations", "preserve move lifecycle and reservations", "preserve tracking, UoM, valuation, and warehouse/company isolation"],
+                },
+                "odoo_sales_development": {
+                    "name": "odoo-sales-development",
+                    "activation": "quotation, sales order, pricing, pricelist, discount, down payment, delivery/invoice policy, subscription, portal, signature, or credit-control task",
+                    "source_modules": ["sale", "sale_management", "sale_stock", "sale_account", "website_sale", "subscription modules when installed"],
+                    "hard_rules": ["preserve native pricing/tax/UoM context", "use native delivery and invoice creation workflows", "preserve portal tokens and multi-company/currency behavior"],
+                },
+                "odoo_hr_payroll_development": {
+                    "name": "odoo-hr-payroll-development",
+                    "activation": "employee, contract, payroll, payslip, salary rule, work entry, attendance, leave, timesheet, loan, payroll accounting, or statutory task",
+                    "source_modules": ["hr", "hr_contract", "hr_payroll", "hr_work_entry", "hr_attendance", "hr_holidays", "country payroll localization"],
+                    "hard_rules": ["protect employee/payroll privacy", "preserve contracts, work entries, salary-rule order, and payslip lifecycle", "never hardcode statutory rates or tax brackets"],
+                },
+                "odoo_crm_pipeline_development": {
+                    "name": "odoo-crm-pipeline-development",
+                    "activation": "lead, opportunity, CRM stage/team, scoring, probability, forecast, activity, attribution, automation, or CRM kanban task",
+                    "source_modules": ["crm", "sale_crm", "mail", "utm", "predictive/marketing modules when installed"],
+                    "hard_rules": ["preserve lead/opportunity configuration", "use native conversion/stage/activity APIs", "preserve attribution, access rules, and multi-company behavior"],
+                },
+                "odoo_helpdesk_development": {
+                    "name": "odoo-helpdesk-development",
+                    "activation": "helpdesk ticket/team/stage, SLA, escalation, routing, portal, knowledge, canned response, merge, survey, or support analytics task",
+                    "source_modules": ["helpdesk", "mail", "portal", "website", "knowledge", "survey/SLA modules when installed"],
+                    "hard_rules": ["preserve SLA calendar/deadline semantics", "use native ticket and mail-thread APIs", "protect portal tokens, tickets, messages, and attachments"],
+                },
             },
             "small_patch_fast_path": {
                 "when": "Use for small tasks like adding one field, one xpath, one notebook page, or a tiny label/view change in a known module.",
