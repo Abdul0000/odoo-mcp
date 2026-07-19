@@ -34,11 +34,11 @@ def test_grok_profile_exposes_only_curated_non_bypass_tools():
     assert "odoosh_module_update" not in names
     assert "odoosh_read_user_file" not in names
     assert "workflow_verify_deployed_module" not in names
-    # Native source read-only tools are now exposed so Grok can inspect POS/OWL core before coding.
-    assert "workflow_list_module_files" in names
-    assert "workflow_find_core_file" in names
-    assert "workflow_frontend_pattern_preflight" in names
-    assert "odoosh_read_core_file" in names
+    # Native source discovery/preflight is server-owned by the composite workflow.
+    assert "workflow_list_module_files" not in names
+    assert "workflow_find_core_file" not in names
+    assert "workflow_frontend_pattern_preflight" not in names
+    assert "odoosh_read_core_file" not in names
     assert "repo_read_range" not in names
     assert "artifacts_read" in names
     assert "workflow_resume_job" in names

@@ -254,16 +254,9 @@ _PROVIDER_TOOL_NAMES = {
     "workflow.agent_instructions",
     "workflow.odoo_code_change",
     "workflow.frontend_visual_implement",
-    # Read-only source discovery tools exposed so provider agents can inspect
-    # native Odoo/Odoo.sh source before complex POS/OWL/XML work instead of
-    # guessing or relying on workflow verifier fallbacks.
-    "workflow.find_core_file",
-    "workflow.list_module_files",
-    "workflow.frontend_pattern_preflight",
-    "workflow.verify_pos_change",
-    "workflow.verify_against_core",
-    "odoosh.read_core_file",
-    "odoosh.list_core_files",
+    # Source discovery and verification are server-owned steps inside the
+    # composite workflows. Keeping them off the provider surface avoids extra
+    # planning loops and repeated input-schema payloads.
     # Recovery/continuation tools that provider responses may legitimately return
     # in next_call.  Exposing them keeps the MCP contract honest and prevents
     # agents from retrying the heavy code-change workflow just to read logs or
@@ -380,13 +373,22 @@ def _remote_compatible_schema(schema: dict[str, Any]) -> dict[str, Any]:
             if len(non_null) == 1:
                 base = clean(non_null[0])
                 if "description" in value and isinstance(base, dict):
-                    base.setdefault("description", value["description"])
+                    base.setdefault("description", " ".join(str(value["description"]).split())[:80])
                 return base
-            return {"type": "string", "description": value.get("description", "JSON value")}
+            return {
+                "type": "string",
+                "description": " ".join(str(value.get("description", "JSON value")).split())[:80],
+            }
 
         out: dict[str, Any] = {}
         for key, child in value.items():
             if key in {"$defs", "title", "default", "examples", "computed_fields"}:
+                continue
+            if key == "description":
+                # Tool descriptions carry the workflow contract. Field docs only
+                # need a compact hint; long examples materially inflate every
+                # tools/list response and the provider's planning context.
+                out[key] = " ".join(str(child).split())[:80]
                 continue
             if key == "additionalProperties":
                 # Keep strict false, but drop complex schemas under additionalProperties.

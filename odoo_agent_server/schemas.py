@@ -233,7 +233,6 @@ class OdooCodeChangeRequest(BaseModel):
     target_hint: str | None = Field(default=None, max_length=500, description="Optional generic target hint for search/autopatch, such as a visible label, method, class, XML id, field, route, or file clue.")
     change_request: dict[str, Any] = Field(default_factory=dict, description="Optional structured generic change request. Safe autopatch currently supports style/text replacement shortcuts; all other task types fall back to inspection + writes.")
     patch_strategy: str = Field(default="auto", max_length=80, description="Patch strategy hint: auto, inspect_only, explicit_writes, safe_autopatch, text_replace, style_rule, inline_style, etc.")
-    verify_targets: list[str] = Field(default_factory=list, max_length=20, description="Generic verification hints such as model names, menus, methods, or CSS selectors.")
     # Backward-compatible convenience fields for simple style/text tasks. They are
     # normalized into target_hint/change_request internally and do not limit the workflow.
     target_text: str | None = Field(default=None, max_length=500, description="Backward-compatible exact visible text for focused inspection/autopatch. Prefer target_hint for new clients.")
@@ -1731,11 +1730,3 @@ class RepoIndexResult(BaseModel):
     manifest_files: list[str] = Field(default_factory=list)
     template_names: dict[str, str] = Field(default_factory=dict, description="template name -> file path")
     notes: list[str] = Field(default_factory=list)
-
-
-class QwenShortTokenResult(BaseModel):
-    token: str
-    expires_at: str
-    ttl_seconds: int
-    qwen_mcp_url: str
-    note: str

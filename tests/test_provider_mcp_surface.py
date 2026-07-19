@@ -12,13 +12,6 @@ _PROVIDER_TOOLS = {
     "workflow_agent_instructions",
     "workflow_odoo_code_change",
     "workflow_frontend_visual_implement",
-    "workflow_find_core_file",
-    "workflow_list_module_files",
-    "workflow_frontend_pattern_preflight",
-    "workflow_verify_pos_change",
-    "workflow_verify_against_core",
-    "odoosh_read_core_file",
-    "odoosh_list_core_files",
     "artifacts_read",
     "workflow_resume_job",
     "jobs_list",
@@ -60,9 +53,15 @@ def test_provider_mcp_workflow_schema_contains_autopatch_fields():
         "target_hint",
         "change_request",
         "patch_strategy",
-        "verify_targets",
         "target_text",
         "style",
         "allow_autopatch",
     ):
         assert field in properties
+
+    descriptions = [
+        value.get("description", "")
+        for value in properties.values()
+        if isinstance(value, dict)
+    ]
+    assert all(len(description) <= 80 for description in descriptions)
