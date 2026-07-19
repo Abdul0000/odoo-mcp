@@ -438,7 +438,9 @@ class ClientGateService:
         for key, value in required.items():
             if value is None or str(value).strip() == "":
                 errors.append(f"Missing required client setting: {key}.")
-            elif PLACEHOLDER_RE.search(str(value).strip()):
+            elif PLACEHOLDER_RE.search(str(value).strip()) and not (
+                key == "branch" and str(value).strip().lower().startswith("odoo_")
+            ):
                 errors.append(f"Placeholder value detected for {key}; replace it in ODOO_CLIENTS.")
         return errors
 
