@@ -248,6 +248,8 @@ def _mcp_name_to_internal(name: str) -> str:
 # repo/scope/deploy loops and prevents direct push/module-deploy bypasses.
 _PROVIDER_TOOL_NAMES = {
     "connector.health",
+    "skills.list",
+    "skills.read",
     "client.check",
     "workflow.agent_instructions",
     "workflow.odoo_code_change",

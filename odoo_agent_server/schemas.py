@@ -61,6 +61,10 @@ class EmptyRequest(BaseModel):
     """Empty argument object for no-input tools."""
 
 
+class SkillReadRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100, description="Exact skill name or supported short alias from skills.list.")
+
+
 class ClientOnlyRequest(BaseModel):
     """Optional client selector for tools that otherwise have no inputs."""
     client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when more than one client exists.")

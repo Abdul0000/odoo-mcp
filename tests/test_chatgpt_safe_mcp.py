@@ -14,6 +14,8 @@ def _mcp(method, params=None, request_id=1):
 
 _PROVIDER_TOOLS = {
     "connector_health",
+    "skills_list",
+    "skills_read",
     "client_check",
     "workflow_agent_instructions",
     "workflow_odoo_code_change",

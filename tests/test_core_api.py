@@ -35,6 +35,8 @@ def test_tools_are_exposed_for_direct_chatgpt():
     assert "odoosh_read_user_file" in names
     assert "workflow_verify_deployed_module" in names
     assert "browser_screenshot" in names
+    assert "skills_list" in names
+    assert "skills_read" in names
 
 
 def test_capability_check_loads():
@@ -71,13 +73,17 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
     assert "Do not print sample MCP JSON blocks" in do_not
     assert "Do not use Studio/ORM database schema mutations" in do_not
     assert "Do not put Pydantic code in Odoo addons" in do_not
-    assert skills["routing"]["mode"] == "conditional"
+    assert skills["mode"] == "on_demand"
+    assert skills["list_tool"] == "skills.list"
+    assert skills["read_tool"] == "skills.read"
     assert {
-        "odoo_accounting_development",
-        "odoo_manufacturing_development",
-        "odoo_inventory_development",
-        "odoo_sales_development",
-        "odoo_hr_payroll_development",
-        "odoo_crm_pipeline_development",
-        "odoo_helpdesk_development",
-    }.issubset(skills)
+        "odoo-accounting-development",
+        "odoo-manufacturing-development",
+        "odoo-inventory-development",
+        "odoo-sales-development",
+        "odoo-hr-payroll-development",
+        "odoo-crm-pipeline-development",
+        "odoo-helpdesk-development",
+        "odoo-pos-development",
+        "odoo-website-development",
+    }.issubset(skills["available"])

@@ -78,7 +78,9 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
 
     required_markers = [
         "IMPACT-BASED SOURCE READ",
-        "## SKILLS",
+        "## ON-DEMAND SKILLS",
+        "skills.list",
+        "skills.read",
         "odoo-website-development",
         "odoo-pos-development",
         "odoo-accounting-development",
@@ -88,7 +90,6 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "odoo-hr-payroll-development",
         "odoo-crm-pipeline-development",
         "odoo-helpdesk-development",
-        "never use legacy `load_fields('pos.config', ...)`",
         "workflow.frontend_pattern_preflight",
         "workflow.verify_against_core",
         "workflow.safe_deploy_module",

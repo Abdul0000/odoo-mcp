@@ -33,6 +33,7 @@ from ..schemas import (
     OdooCodeChangeRequest,
     FrontendVisualImplementRequest,
     EmptyRequest,
+    SkillReadRequest,
     FullVerifyRequest,
     SafeDeployModuleRequest,
     GitCommitRequest,
@@ -123,6 +124,7 @@ from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
 from ..services.frontend_visual_service import FrontendVisualService
 from ..services.deploy_impact_service import classify_deploy_impact
+from ..services.skill_service import SkillService
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
@@ -198,6 +200,18 @@ def _external_tool_descriptor(item: ToolDescriptor) -> ToolDescriptor:
 _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="connector.health",
         title="Check connector health", description="Check connector service health", read_only=True),
+    ToolDescriptor(
+        name="skills.list",
+        title="List Odoo skills",
+        description="List exact Odoo domain skills available for on-demand loading.",
+        read_only=True,
+    ),
+    ToolDescriptor(
+        name="skills.read",
+        title="Load an Odoo skill",
+        description="Load the exact Markdown for one matching Odoo domain skill on demand.",
+        read_only=True,
+    ),
     ToolDescriptor(
         name="artifacts.read",
         title="Read saved artifact",
@@ -661,6 +675,8 @@ _TOOL_DESCRIPTORS = [
 
 _TOOL_INPUT_MODELS = {
     "connector.health": EmptyRequest,
+    "skills.list": EmptyRequest,
+    "skills.read": SkillReadRequest,
     "artifacts.read": ArtifactReadRequest,
     "client.check": ClientCheckRequest,
     "workflow.agent_instructions": EmptyRequest,
@@ -2152,6 +2168,12 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "connector.health":
         EmptyRequest.model_validate(args)
         return {"status": "ok", "service": "odoo-mcp-agent-connector"}
+    if name == "skills.list":
+        EmptyRequest.model_validate(args)
+        return SkillService().list()
+    if name == "skills.read":
+        req = SkillReadRequest.model_validate(args)
+        return SkillService().read(req.name)
     if name == "artifacts.read":
         req = ArtifactReadRequest.model_validate(args)
         return JsonStore().read_artifact(req.artifact_id, req.offset, req.max_chars)
