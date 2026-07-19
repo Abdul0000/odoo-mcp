@@ -15,8 +15,32 @@ from odoo_agent_server.services.git_service import GitService
 from odoo_agent_server.services.odoosh_service import OdooShService
 from odoo_agent_server.services.repo_service import RepoService
 from odoo_agent_server.services.store_service import JsonStore
+from odoo_agent_server.services.workflow_guard_service import safe_deploy_shell_block
 from odoo_agent_server.routers.workflow import _pre_push_verify_files
 from odoo_agent_server.routers import tools, workflow
+
+
+def test_manual_module_deploy_stops_after_confirmed_safe_deploy(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    store = JsonStore()
+    job = store.create_job(JobRecord(
+        job_type="safe_deploy_module",
+        status=JobStatus.running,
+        request={"module_name": "aurvio_website", "project_path": str(tmp_path / "repo")},
+    ))
+    store.finish_job(job, JobStatus.passed, {
+        "status": "passed",
+        "module_name": "aurvio_website",
+        "deploy_confirmed": True,
+    })
+
+    blocked = safe_deploy_shell_block("odoo.module_deploy", module_name="aurvio_website")
+
+    assert blocked is not None
+    assert blocked.status == "ok"
+    assert blocked.result["status"] == "already_deploy_confirmed"
+    assert blocked.result["tool_exit_allowed"] is True
+    assert blocked.result["next_call"] is None
 
 
 def _init_repo(path):

@@ -163,6 +163,47 @@ def find_blocking_safe_deploy(
     return None
 
 
+def find_latest_confirmed_safe_deploy(
+    *,
+    project_path: str | None = None,
+    module_name: str | None = None,
+    limit: int = 100,
+):
+    """Return the latest matching safe deploy only when it already confirmed success."""
+    for job in JsonStore().list_jobs(limit=limit):
+        if job.job_type != "safe_deploy_module":
+            continue
+        request = job.request or {}
+        if project_path and request.get("project_path") and not _same_project(project_path, str(request["project_path"])):
+            continue
+        if module_name and request.get("module_name") and str(request["module_name"]) != module_name:
+            continue
+        result = job.result if isinstance(job.result, dict) else {}
+        confirmed = bool(result.get("deploy_confirmed") or result.get("already_deployed_confirmed"))
+        return job if job.status == JobStatus.passed and confirmed else None
+    return None
+
+
+def _confirmed_safe_deploy_payload(action: str, job: Any) -> dict[str, Any]:
+    result = job.result if isinstance(job.result, dict) else {}
+    return {
+        "status": "already_deploy_confirmed",
+        "message": (
+            f"Skipped redundant {action}: workflow.safe_deploy_module already confirmed this module. "
+            "Stop calling deploy tools and return the final summary immediately."
+        ),
+        "job_id": job.id,
+        "job_status": getattr(job.status, "value", str(job.status)),
+        "module_name": (job.request or {}).get("module_name"),
+        "deploy_confirmed": bool(result.get("deploy_confirmed")),
+        "already_deployed_confirmed": bool(result.get("already_deployed_confirmed")),
+        "completion_required": False,
+        "success_allowed": True,
+        "tool_exit_allowed": True,
+        "next_call": None,
+    }
+
+
 def safe_deploy_block_payload(action: str, job: Any) -> dict[str, Any]:
     request = job.request or {}
     job_status = getattr(job.status, "value", str(job.status))
@@ -303,6 +344,10 @@ def safe_deploy_shell_block(action: str, *, module_name: str | None = None, proj
             error=payload["message"],
             result=payload,
         )
+    confirmed_job = find_latest_confirmed_safe_deploy(project_path=project_path, module_name=module_name)
+    if confirmed_job:
+        payload = _confirmed_safe_deploy_payload(action, confirmed_job)
+        return OdooResult(status="ok", result=payload)
     return None
 
 
