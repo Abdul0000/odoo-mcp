@@ -55,24 +55,17 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
     assert response.status_code == 200
     instructions = response.json()["instructions"]
     rules = "\n".join(instructions["rules"])
-    small_flow = "\n".join(instructions["small_patch_fast_path"]["steps"])
-    do_not = "\n".join(instructions["small_patch_fast_path"]["do_not"])
+    provider_flow = instructions["provider_flow"]
     skills = instructions["skills"]
 
-    assert "do not stop after writing files" in rules
-    assert "printing JSON MCP tool calls" in rules
-    assert "ir.model.fields" in rules
-    assert "ir.ui.view" in rules
-    assert "Never generate Pydantic models/imports inside Odoo addon code" in rules
-    assert "If the deploy cycle breaks mid-flow" in rules
-    assert "repo.write_many_smart" in small_flow
-    assert "workflow.safe_deploy_module" in small_flow
-    assert "workflow.resume_job" in small_flow
-    assert "override_step=push/install/upgrade" in small_flow
-    assert "Do not end with 'next steps'" in do_not
-    assert "Do not print sample MCP JSON blocks" in do_not
-    assert "Do not use Studio/ORM database schema mutations" in do_not
-    assert "Do not put Pydantic code in Odoo addons" in do_not
+    assert len(instructions["rules"]) <= 8
+    assert "workflow.odoo_code_change" in rules
+    assert "hidden repo, Git" in rules
+    assert "Pydantic code inside Odoo addons" in rules
+    assert provider_flow["code_change"] == "workflow.odoo_code_change"
+    assert provider_flow["visual_change"] == "workflow.frontend_visual_implement"
+    assert provider_flow["continuation"] == ["jobs.get", "workflow.resume_job"]
+    assert "deploy_confirmed=true" in provider_flow["terminal_success"]
     assert skills["mode"] == "on_demand"
     assert skills["list_tool"] == "skills.list"
     assert skills["read_tool"] == "skills.read"
@@ -88,3 +81,17 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
         "odoo-pos-development",
         "odoo-website-development",
     }.issubset(skills["available"])
+
+    forbidden_sections = {
+        "small_patch_fast_path",
+        "mandatory_dual_read",
+        "core_reading_rules",
+        "strict_frontend_owl_js_xml_preflight",
+        "adaptive_scope_levels",
+        "pre_push_verify",
+        "large_file_writing",
+        "flow",
+        "error_guide",
+        "new_tools_v14plus",
+    }
+    assert not (forbidden_sections & instructions.keys())

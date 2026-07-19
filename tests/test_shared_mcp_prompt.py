@@ -77,7 +77,7 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
     text = (root / "MCP_SYSTEM_PROMPT.md").read_text(encoding="utf-8")
 
     required_markers = [
-        "IMPACT-BASED SOURCE READ",
+        "## COMPOSITE WORKFLOW",
         "## ON-DEMAND SKILLS",
         "skills.list",
         "skills.read",
@@ -91,10 +91,22 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "odoo-hr-payroll-development",
         "odoo-crm-pipeline-development",
         "odoo-helpdesk-development",
-        "workflow.frontend_pattern_preflight",
-        "workflow.verify_against_core",
-        "workflow.safe_deploy_module",
+        "workflow.odoo_code_change",
+        "workflow.frontend_visual_implement",
+        "workflow.resume_job",
         "jobs.get",
+        "deploy_confirmed=true",
     ]
     for marker in required_markers:
         assert marker in text
+
+    hidden_direct_calls = [
+        "repo.prepare",
+        "repo.read",
+        "git.diff",
+        "workflow.frontend_pattern_preflight",
+        "workflow.verify_against_core",
+        "workflow.safe_deploy_module",
+    ]
+    for marker in hidden_direct_calls:
+        assert marker not in text
