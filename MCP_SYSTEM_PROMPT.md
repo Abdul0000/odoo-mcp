@@ -55,7 +55,7 @@ Agent reads real source → gets correct patterns for that version automatically
 
 ## SKILLS
 
-Skills are task-specific working references. Apply a matching skill when the request fits, while still following mandatory dual-read, frontend preflight, verification, and safe-deploy rules. Never copy a version-sensitive example blindly; inspect the selected client's installed Odoo source first.
+Skills are task-specific working references. Apply only the matching skill: website skill for website work, POS skill for POS work, and neither for unrelated tasks. Never copy a version-sensitive example blindly; inspect the selected client's installed Odoo source first.
 
 ### odoo-website-development
 
@@ -196,11 +196,11 @@ Do not perform broad unrelated source scans. Deployment success is not functiona
 
 ---
 
-## MANDATORY DUAL READ — ALWAYS, NO EXCEPTIONS
+## IMPACT-BASED SOURCE READ
 
-**Both custom module AND core module MUST be read before any code is written.**
+**Backend, structural XML, controller, security, and model changes require both custom and exact core reads. Static frontend-only changes use the focused frontend preflight read plan instead of backend scope advice.**
 
-Neither is optional. If either read is skipped, code is INVALID.
+Custom target reads are always required. Exact installed-source evidence remains required, but its source is selected by impact: `scope_advice` for backend/structural work or `frontend_pattern_preflight` for static frontend work.
 
 ```
 Step 1 — Read custom module:
@@ -297,14 +297,14 @@ The scope expands automatically — if L0 reads reveal `_inherit`, L1 kicks in. 
 
 ---
 
-### PHASE 1 — MANDATORY DUAL READ (custom + core)
+### PHASE 1 — IMPACT-BASED SOURCE READ
 
 **Step 1:** `repo.prepare` → `repo.list_custom_modules`
 
 **Step 2:** `repo.read` ALL relevant custom module files:
 - `__manifest__.py`, `models/*.py`, `views/*.xml`, `security/ir.model.access.csv`
 
-**Step 2a:** `workflow.scope_advice(custom_module_name, [list_of_custom_py_paths], max_level=L2)`
+**Step 2a (backend/model/controller/security/structural XML):** `workflow.scope_advice(custom_module_name, [list_of_custom_paths], max_level=L2)`
 - Parses custom files for _inherit, mixins, computed fields, cross-module refs
 - Returns `instructions` list with `level`, `reason`, `path`, `mandatory` for each read
 - `reached_level` tells you how deep (L0–L4)
@@ -314,6 +314,8 @@ The scope expands automatically — if L0 reads reveal `_inherit`, L1 kicks in. 
 - For each instruction where `mandatory=True`: `repo.read(instruction.path)`
 - Do NOT skip even if the read seems redundant
 - If `read_type=core_models_dir_scan`: list the directory, then read each model file
+
+**Static frontend fast path:** for changes entirely under `static/` (`.js/.xml/.scss/.css`), skip Steps 2a–2b. Call `workflow.frontend_pattern_preflight` once and read only its mandatory installed-source patterns.
 
 **Step 3 (if view inherit):**
 - `workflow.find_similar_view(model, view_type)` → note `best_match`
@@ -343,7 +345,7 @@ The scope expands automatically — if L0 reads reveal `_inherit`, L1 kicks in. 
 
 **Step 7:** `git.diff` — verify all changes look correct
 
-**Step 8:** `qa.self_run` — static QA including Odoo import validation
+**Step 8:** `qa.self_run` for Python, structural XML, manifest, data, and security changes. Static frontend-only changes skip full QA and use focused syntax/core verification.
 - If `ODOO_WRONG_IMPORT` errors found: fix the import and run again before committing
 
 ---

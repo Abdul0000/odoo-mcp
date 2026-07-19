@@ -105,7 +105,7 @@ class Settings(BaseSettings):
     odoosh_odoo_path: str = Field(default="/home/odoo/src/odoo", alias="ODOOSH_ODOO_PATH")
     odoosh_user_addons_path: str = Field(default="/home/odoo/src/user", alias="ODOOSH_USER_ADDONS_PATH")
     odoosh_wait_timeout_seconds: int = Field(default=600, alias="ODOOSH_WAIT_TIMEOUT_SECONDS")
-    odoosh_wait_interval_seconds: int = Field(default=10, alias="ODOOSH_WAIT_INTERVAL_SECONDS")
+    odoosh_wait_interval_seconds: int = Field(default=3, alias="ODOOSH_WAIT_INTERVAL_SECONDS")
 
     # Phase 1 — lazy on-demand core source sync (find_core_file / verify_against_core).
     core_sync_enabled: bool = Field(default=True, alias="CORE_SYNC_ENABLED")

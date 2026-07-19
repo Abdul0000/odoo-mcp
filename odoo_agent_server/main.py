@@ -139,8 +139,13 @@ def agent_instructions() -> dict:
                 "CACHE RULE: use workflow.repo_index for module/assets/template discovery instead of full repo scans. Reuse cache unless files changed or force_refresh is required.",
             ],
             "skills": {
+                "routing": {
+                    "mode": "conditional",
+                    "rule": "Activate only the matching task skill; do not apply website or POS guidance to unrelated requests.",
+                },
                 "odoo_website_development": {
                     "name": "odoo-website-development",
+                    "activation": "website, website_sale, theme, snippet, portal/frontend page, or website controller task",
                     "versions": [16, 17, 18, 19],
                     "use_for": [
                         "website themes and pages",
@@ -155,6 +160,7 @@ def agent_instructions() -> dict:
                 },
                 "odoo_pos_development": {
                     "name": "odoo-pos-development",
+                    "activation": "point_of_sale, POS UI/session/order/payment/receipt/hardware/restaurant task",
                     "versions": [16, 17, 18, 19],
                     "use_for": [
                         "POS sessions, configuration, orders, and payments",
@@ -181,7 +187,7 @@ def agent_instructions() -> dict:
                     "5. Patch with repo.apply_patch_atomic or repo.write_many_smart. Use repo.write_many_atomic only for large/risky refactors.",
                     "6. Run git.diff and qa.self_run(run_pytest=false) unless tests/shared logic are touched.",
                     "7. workflow.verify_against_core only for changed files.",
-                    "8. Call workflow.safe_deploy_module with the changed paths. It must pull/fetch the configured branch before work begins, poll Odoo.sh every 10 seconds for up to 10 minutes, verify deployed file hashes, upgrade the module, and run registry smoke tests.",
+                    "8. Call workflow.safe_deploy_module with the changed paths. It pulls/fetches the configured branch, polls Odoo.sh every 3 seconds, verifies deployed changed-file hashes, and upgrades only when impact classification requires it.",
                     "9. If safe_deploy returns status=running, module_upgrade_running, or any next_call, call the returned next_call/jobs.get or workflow.resume_job. If Odoo.sh deploy polling times out, recent Odoo.sh logs show build/test failure, changed /home/odoo/src/user file hashes do not match, the Odoo module deploy is still running, or registry_field_verify fails, do not claim success. Do not repeat commit/push.",
                     "10. If the client loses job_id mid-flow, call workflow.resume_job without job_id to use the latest saved safe-deploy job, or pass override_step=push/install/upgrade for an explicit user-requested continuation point.",
                     "11. Finish only after safe deploy/resume reports passed, or report the exact blocker and next_call returned by the workflow.",
@@ -198,7 +204,7 @@ def agent_instructions() -> dict:
             "mandatory_dual_read": {
                 "rule": "BOTH custom module AND core module must ALWAYS be read — neither is optional",
                 "step_1_custom": "repo.read ALL relevant files in the custom module first",
-                "step_2_scope": "For backend/model/controller/security/structural changes: workflow.scope_advice(custom_module_name, custom_file_paths) → get adaptive read plan. For lightweight UI/text/style XML/CSS/SCSS edits: still perform mandatory dual read; read exact custom target plus workflow.scope_advice mandatory core source, then write and safe_deploy.",
+                "step_2_scope": "For backend/model/controller/security/structural XML changes use workflow.scope_advice. For static/src JS/XML/CSS/SCSS edits use the cached workflow.frontend_pattern_preflight read plan and skip backend scope_advice.",
                 "step_3_core": "Execute EVERY mandatory ScopeReadInstruction: repo.read each path returned",
                 "step_4_code": "ONLY THEN write code — using ONLY verified field/method names from core reads",
                 "step_5_verify": "Before git.push → ALWAYS workflow.verify_against_core(written_files)",
@@ -287,7 +293,7 @@ def agent_instructions() -> dict:
             "flow": [
                 "1. repo.prepare → repo.list_custom_modules",
                 "2. repo.read ALL relevant custom module files (models, views, manifest)",
-                "3. For backend/structural changes only: workflow.scope_advice(custom_module, [custom_file_paths]) → get mandatory read plan. For lightweight UI/text/style XML/CSS/SCSS edits, do not skip dual read: read target custom file, call workflow.scope_advice, read mandatory core source, then repo.write.",
+                "3. For backend/structural changes call workflow.scope_advice. For static frontend-only edits, read the custom target and mandatory cached frontend preflight patterns; do not call backend scope_advice.",
                 "4. Execute ALL mandatory ScopeReadInstructions: repo.read each path",
                 "   L1: IF _inherit → repo.read core model(s)",
                 "   L2: IF mixin → repo.read mail.thread / portal.mixin / etc.",
@@ -303,7 +309,7 @@ def agent_instructions() -> dict:
                 "   → If push_blocked=False: proceed to git.commit",
                 "10. Prefer workflow.safe_deploy_module for commit → push → Odoo.sh verification → upgrade",
                 "11. Manual git.push is only safe when followed by Odoo.sh SHA/failure/hash verification",
-                "12. odoo.ensure_dependencies → odoo.module_deploy → poll jobs.get every 10s; direct module_deploy blocks itself if recent pushed code is not verified",
+                "12. When an impact-required module upgrade runs, poll its job every 3s; direct module_deploy blocks itself if safe deploy already confirmed the module.",
                 "    If Access Denied → SSH fallback auto-triggered inside module_deploy",
                 "13. If failed → odoosh.grep_errors → read traceback → fix → back to step 6 (max 3x)",
                 "15. odoo.module_status = installed ✅",
@@ -322,14 +328,14 @@ def agent_instructions() -> dict:
                 "find_core_file returns 0 matches": "Module may not be installed on this Odoo.sh server — try workflow.list_module_files first to browse, or check /home/odoo/src/odoo/addons directly",
                 "not sure what files exist in a module": "Call workflow.list_module_files(module_name, subdir) to browse before find_core_file",
                 "verify_against_core push_blocked=True": "Fix ALL CRITICAL findings shown in findings[] then call verify_against_core again with fix_cycle incremented",
-                "scope_advice mandatory_count>0": "Execute ALL mandatory ScopeReadInstructions before any Odoo addon write. Lightweight UI/text/style XML/CSS/SCSS edits still need scope_advice and mandatory installed-source reads before writing; keep scope capped at L2.",
+                "scope_advice mandatory_count>0": "Execute all mandatory ScopeReadInstructions for backend/structural work. Static frontend-only edits use mandatory frontend_pattern_preflight instructions instead.",
                 "frontend_pattern_preflight push_blocked_until_done=true": "Read all mandatory frontend pattern instructions before writing JS/OWL/XML/assets — no guessing.",
             },
             "new_tools_v14plus": {
                 "workflow.find_core_file": "Find exact core source file before _inherit. Returns best_match absolute path.",
                 "workflow.find_similar_view": "Find exact core view XML before xpath inherit. Returns best_match absolute path.",
                 "workflow.list_module_files": "Browse all files in a module dir when keyword unknown. Use subdir to narrow (models/views/static/src).",
-                "workflow.scope_advice": "NEW V14+: Adaptive mandatory read plan for all Odoo addon code changes, including lightweight UI/text/style edits; keep capped at L2.",
+                "workflow.scope_advice": "Adaptive mandatory read plan for backend/model/controller/security/structural XML changes. Static frontend-only edits use frontend_pattern_preflight instead.",
                 "workflow.verify_against_core": "NEW V14+: Pre-push cross-check — call before every git.push. Blocks push on CRITICAL findings.",
                 "workflow.verify_deployed_module": "Compare active checkout files to real /home/odoo/src/user and live module status before claiming a change is already deployed.",
                 "odoosh.read_user_file": "Read exact deployed custom-source file from /home/odoo/src/user.",

@@ -7,7 +7,7 @@ from typing import Any, Iterable
 
 from fastapi import HTTPException, status
 
-from ..schemas import CommandResult, ScopeAdviceResult
+from ..schemas import CommandResult, FrontendPatternPreflightResult, ScopeAdviceResult
 from .client_resolver_service import ClientResolverService
 from .path_service import resolve_allowed_path
 from .store_service import JsonStore
@@ -101,6 +101,29 @@ class PreWriteGateService:
         }
         self._save(state, client_name)
 
+    def record_frontend_preflight(self, result: FrontendPatternPreflightResult, payload: Any) -> None:
+        client_name = getattr(payload, "client_name", None) or None
+        module_name = str(getattr(payload, "target_module_name", None) or "").strip()
+        custom_paths = list(getattr(payload, "custom_file_paths", []) or [])
+        project_path = self._infer_project_from_custom_paths(module_name, custom_paths) if module_name else None
+        if not module_name or not project_path:
+            return
+        state = self._load(client_name)
+        gate = self._gate(state)
+        mandatory = [
+            self._normalise_required_path(item.path)
+            for item in result.instructions
+            if getattr(item, "mandatory", False) and self._normalise_required_path(item.path)
+        ]
+        gate.setdefault("frontend_preflight", {})[self._scope_key(project_path, module_name)] = {
+            "at": self._now(),
+            "project_path": project_path,
+            "module_name": module_name,
+            "target_area": result.target_area,
+            "mandatory_paths": mandatory,
+        }
+        self._save(state, client_name)
+
     # ------------------------------------------------------------------
     # Enforcement
     # ------------------------------------------------------------------
@@ -157,6 +180,26 @@ class PreWriteGateService:
                 continue
 
             scope_record = self._latest_scope_for(gate, str(project), module_name)
+            frontend_record = (gate.get("frontend_preflight") or {}).get(module_key)
+            static_frontend_only = bool(module_targets) and all(
+                self._is_static_frontend_path(path, module_dir) for path in module_targets
+            )
+            if static_frontend_only and frontend_record:
+                missing_frontend = [
+                    path for path in frontend_record.get("mandatory_paths", [])
+                    if not self._path_satisfied(path, read_paths, inspected_paths)
+                ]
+                if missing_frontend:
+                    first = missing_frontend[0]
+                    blocked.append({
+                        "module_name": module_name,
+                        "reason": "mandatory_frontend_source_not_read",
+                        "message": "Read the mandatory installed frontend patterns returned by workflow.frontend_pattern_preflight.",
+                        "gate_mode": "frontend_fast_path",
+                        "missing_paths": missing_frontend[:20],
+                        "next_call": self._next_call_for_required_path(first, client_name),
+                    })
+                continue
             if not scope_record:
                 blocked.append({
                     "module_name": module_name,
@@ -223,6 +266,15 @@ class PreWriteGateService:
                     "blocked": blocked,
                 },
             )
+
+    @staticmethod
+    def _is_static_frontend_path(path: Path, module_dir: Path) -> bool:
+        try:
+            rel = path.resolve().relative_to(module_dir.resolve())
+        except Exception:
+            return False
+        parts = {part.lower() for part in rel.parts}
+        return "static" in parts and path.suffix.lower() in {".js", ".jsx", ".ts", ".tsx", ".xml", ".scss", ".css"}
 
     @staticmethod
     def _reject_nested_addon_manifests(project: Path, relative_paths: Iterable[str]) -> None:

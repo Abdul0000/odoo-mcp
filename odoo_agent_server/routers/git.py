@@ -110,7 +110,7 @@ def _module_names_from_paths(project_path: str, paths: list[str]) -> list[str]:
     return _detect_modules_from_paths(project_path, paths)
 
 
-AUTO_UPGRADE_DEPLOY_POLL_INTERVAL_SECONDS = 10.0
+AUTO_UPGRADE_DEPLOY_POLL_INTERVAL_SECONDS = 3.0
 AUTO_UPGRADE_DEPLOY_TIMEOUT_SECONDS = 300
 
 

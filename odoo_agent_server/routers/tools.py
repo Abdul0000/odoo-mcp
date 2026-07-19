@@ -1546,6 +1546,14 @@ def _looks_like_frontend_code_change(payload: OdooCodeChangeRequest, rel_paths: 
     return any(marker in text for marker in strong_markers)
 
 
+def _static_frontend_fast_path(rel_paths: list[str]) -> bool:
+    paths = [str(path).lower().replace("\\", "/") for path in rel_paths if str(path).strip()]
+    return bool(paths) and all(
+        "/static/" in path and path.endswith((".js", ".jsx", ".ts", ".tsx", ".xml", ".scss", ".css"))
+        for path in paths
+    )
+
+
 def _git_status_changed_module_files(project_path: str, module_path: str) -> list[str]:
     """Return dirty/tracked/untracked files under module_path from git status.
 
@@ -1581,24 +1589,34 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     client_name = resolved_client_name or payload.client_name
     repo = RepoService()
     gate = PreWriteGateService()
+    state_store = JsonStore()
     steps: list[dict[str, Any]] = []
 
     # 1) Prepare checkout once.  In real multi-client use the client config supplies
     # repo URL/branch; for already-materialized local checkouts/tests, avoid failing
     # just because TARGET_GIT_REPO is not configured.
-    try:
-        prepare = repo.prepare_repo(project_path=project_path, client_name=client_name)
-        project_path = prepare.project_path
-        project = Path(project_path)
-        steps.append({"step": "repo.prepare", "status": "ok", "project_path": project_path, "branch": prepare.branch, "sha": prepare.sha})
-    except HTTPException as exc:
-        detail = str(exc.detail)
-        project = repo.project(project_path)
-        if exc.status_code == 400 and "repo_url is required" in detail and (project / ".git").exists():
-            steps.append({"step": "repo.prepare", "status": "skipped_existing_checkout", "project_path": str(project), "reason": detail})
-            project_path = str(project)
-        else:
-            raise
+    cached_prepare = (state_store.load_session_state(client_name).get("workflow_prepare_cache") or {})
+    cached_path = str(cached_prepare.get("project_path") or "")
+    cached_at = float(cached_prepare.get("at") or 0)
+    project = repo.project(project_path)
+    if cached_path and Path(cached_path).resolve() == project.resolve() and (project / ".git").exists() and time.time() - cached_at < 300:
+        project_path = str(project)
+        steps.append({"step": "repo.prepare", "status": "cached", "project_path": project_path, "max_age_seconds": 300})
+    else:
+        try:
+            prepare = repo.prepare_repo(project_path=project_path, client_name=client_name)
+            project_path = prepare.project_path
+            project = Path(project_path)
+            steps.append({"step": "repo.prepare", "status": "ok", "project_path": project_path, "branch": prepare.branch, "sha": prepare.sha})
+            state_store.save_session_state({"workflow_prepare_cache": {"project_path": project_path, "at": time.time(), "branch": prepare.branch, "sha": prepare.sha}}, client_name=client_name)
+        except HTTPException as exc:
+            detail = str(exc.detail)
+            project = repo.project(project_path)
+            if exc.status_code == 400 and "repo_url is required" in detail and (project / ".git").exists():
+                steps.append({"step": "repo.prepare", "status": "skipped_existing_checkout", "project_path": str(project), "reason": detail})
+                project_path = str(project)
+            else:
+                raise
 
     # 2) Discover/validate module once, with a safe fuzzy resolver for human hints.
     _ensure_root_module_scaffold(repo, project, payload)
@@ -1693,22 +1711,28 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         if not scope_file_paths:
             scope_file_paths = list(custom_file_paths_abs)
 
-    scope_payload = ScopeAdviceRequest(
-        custom_module_name=effective_module_name,
-        custom_file_paths=scope_file_paths,
-        task_description=payload.task_description,
-        client_name=client_name,
-    )
-    if cached_evidence and cached_evidence.get("scope"):
-        from ..schemas import ScopeAdviceResult
-        scope = ScopeAdviceResult.model_validate(cached_evidence["scope"])
-        steps.append({"step": "workflow.scope_advice", "status": "cached", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level)})
-    else:
-        scope = scope_advice(scope_payload)
-        steps.append({"step": "workflow.scope_advice", "status": "ok", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level)})
-
     frontend_preflight = None
     frontend_paths = list(dict.fromkeys(custom_rel_paths + [_safe_module_relative(effective_module_name, w.relative_path) for w in payload.writes]))
+    write_rel_paths = [_safe_module_relative(effective_module_name, w.relative_path) for w in (payload.writes or generated_writes)]
+    frontend_fast_path = _static_frontend_fast_path(write_rel_paths)
+    scope = None
+    if frontend_fast_path:
+        steps.append({"step": "workflow.scope_advice", "status": "skipped", "reason": "static frontend fast path"})
+    else:
+        scope_payload = ScopeAdviceRequest(
+            custom_module_name=effective_module_name,
+            custom_file_paths=scope_file_paths,
+            task_description=payload.task_description,
+            client_name=client_name,
+        )
+        if cached_evidence and cached_evidence.get("scope"):
+            from ..schemas import ScopeAdviceResult
+            scope = ScopeAdviceResult.model_validate(cached_evidence["scope"])
+            steps.append({"step": "workflow.scope_advice", "status": "cached", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level)})
+        else:
+            scope = scope_advice(scope_payload)
+            steps.append({"step": "workflow.scope_advice", "status": "ok", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level)})
+
     if _looks_like_frontend_code_change(payload, frontend_paths):
         if cached_evidence and cached_evidence.get("frontend_preflight"):
             from ..schemas import FrontendPatternPreflightResult
@@ -1732,11 +1756,21 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     else:
         frontend_preflight = None
 
+    if frontend_preflight is not None:
+        gate.record_frontend_preflight(frontend_preflight, FrontendPatternPreflightRequest(
+            client_name=client_name,
+            task_description=payload.task_description,
+            target_area=frontend_preflight.target_area,
+            target_module_name=effective_module_name,
+            custom_file_paths=custom_file_paths_abs,
+            planned_file_paths=frontend_paths,
+        ))
+
     # 4a) Manifest dependency fallback: scope_advice should detect them, but make sure
     # common dependency manifests are read with /home/odoo/src/odoo/addons priority.
-    existing_scope_paths = {item.path for item in scope.instructions}
+    existing_scope_paths = {item.path for item in scope.instructions} if scope is not None else set()
     extra_core_reads: list[str] = []
-    for dep in _parse_manifest_depends(manifest_abs):
+    for dep in ([] if frontend_fast_path else _parse_manifest_depends(manifest_abs)):
         if dep == effective_module_name:
             continue
         try:
@@ -1746,7 +1780,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         except Exception:
             continue
 
-    mandatory_paths = [item.path for item in scope.instructions if item.mandatory and not str(item.path).startswith("NOT_FOUND:")]
+    mandatory_paths = [item.path for item in scope.instructions if item.mandatory and not str(item.path).startswith("NOT_FOUND:")] if scope is not None else []
     mandatory_paths.extend(path for path in extra_core_reads if path not in mandatory_paths)
     if frontend_preflight is not None:
         for item in frontend_preflight.instructions:
@@ -1762,7 +1796,10 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             resolved = path
         if resolved.is_dir():
             # Read a small number of files from mandatory dirs so the gate sees the dir satisfied.
-            files = [p for p in resolved.rglob("*.py") if p.is_file()][:10]
+            files = [
+                p for p in resolved.rglob("*")
+                if p.is_file() and p.suffix.lower() in {".py", ".js", ".xml", ".scss", ".css"}
+            ][:10]
             if not files:
                 core_reads.append({"path": str(resolved), "status": "dir_no_readable_files"})
                 continue
@@ -1786,7 +1823,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     steps.append({"step": "repo.read_core", "status": "ok", "count": len([r for r in core_reads if r.get("status") == "read"])})
     cache = dict(evidence_cache) if isinstance(evidence_cache, dict) else {}
     cache[evidence_signature] = {
-        "scope": scope.model_dump(mode="json"),
+        "scope": scope.model_dump(mode="json") if scope is not None else None,
         "frontend_preflight": frontend_preflight.model_dump(mode="json") if frontend_preflight is not None else None,
         "core_paths": [r.get("path") for r in core_reads if r.get("status") == "read"],
         "task_profile": _task_profile(payload, frontend_paths),
@@ -1870,7 +1907,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "supported_autopatch_cases": ["style_rule", "text_replace"],
             "task_profile": _task_profile(payload, frontend_paths),
             "recommended_live_verifier": _task_profile(payload, frontend_paths).get("live_verifier"),
-            "scope_advice": scope.model_dump(mode="json"),
+            "scope_advice": scope.model_dump(mode="json") if scope is not None else None,
             "frontend_preflight": frontend_preflight.model_dump(mode="json") if frontend_preflight is not None else None,
             "core_reads": core_reads[:30],
             "success_allowed": False,
@@ -1917,7 +1954,25 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
 
     # 6) Diff, QA, verify against core before deploy.
     diff = GitService().diff(project_path, staged=False, timeout_seconds=60)
-    qa = self_run(SelfRunRequest(project_path=project_path, client_name=client_name, module_name=effective_module_name, run_pytest=False, include_git_status=True))
+    dirty_module_paths = _git_status_changed_module_files(project_path, module.path)
+    deploy_paths = list(dict.fromkeys(
+        [str(Path(path).resolve().relative_to(project.resolve()).as_posix()) for path in written_files_abs]
+        + dirty_module_paths
+    ))
+    try:
+        deploy_impact = classify_deploy_impact(
+            project_path=project_path,
+            module_name=effective_module_name,
+            changed_paths=deploy_paths,
+            git_diff=diff.stdout,
+            deploy_mode=payload.deploy_mode,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if deploy_impact.impact == "asset_only":
+        qa = OdooResult(status="ok", result={"skipped": True, "reason": "asset-only fast path uses focused syntax/core verification"})
+    else:
+        qa = self_run(SelfRunRequest(project_path=project_path, client_name=client_name, module_name=effective_module_name, run_pytest=False, include_git_status=True))
     verify = verify_against_core(SyntaxVerifyRequest(written_files=written_files_abs, project_path=project_path, client_name=client_name, fix_cycle=0))
     steps.append({"step": "git.diff", "status": "ok" if diff.exit_code == 0 else "failed", "exit_code": diff.exit_code})
     steps.append({"step": "qa.self_run", "status": qa.status})
@@ -1954,21 +2009,6 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         }
 
     commit_message = payload.commit_message or f"Update {effective_module_name}: {payload.task_description[:180]}"
-    dirty_module_paths = _git_status_changed_module_files(project_path, module.path)
-    deploy_paths = list(dict.fromkeys(
-        [str(Path(path).resolve().relative_to(project.resolve()).as_posix()) for path in written_files_abs]
-        + dirty_module_paths
-    ))
-    try:
-        deploy_impact = classify_deploy_impact(
-            project_path=project_path,
-            module_name=effective_module_name,
-            changed_paths=deploy_paths,
-            git_diff=diff.stdout,
-            deploy_mode=payload.deploy_mode,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
     deploy_payload = SafeDeployModuleRequest(
         client_name=client_name,
         project_path=project_path,

@@ -1969,9 +1969,16 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     if not _wait_for_odoosh_deployment():
         return
 
-    if payload.wait_for_odoosh and expected_user_hashes:
-        code_verify = odoosh.verify_user_file_hashes(expected_user_hashes)
-        _step("odoosh_user_file_verify", "passed" if code_verify.exit_code == 0 else "failed", code_verify)
+    manifest_changed = any(Path(path).name in {"__manifest__.py", "__openerp__.py"} for path in deploy_paths)
+    if payload.wait_for_odoosh and (expected_user_hashes or manifest_changed):
+        combined_verify = getattr(odoosh, "verify_deployed_changes", None)
+        if callable(combined_verify):
+            code_verify = combined_verify(expected_user_hashes, module_name=payload.module_name, verify_manifest=manifest_changed)
+        else:
+            code_verify = odoosh.verify_user_file_hashes(expected_user_hashes)
+            if code_verify.exit_code == 0 and manifest_changed:
+                code_verify = odoosh.verify_module_manifest(payload.module_name)
+        _step("odoosh_deployed_change_verify", "passed" if code_verify.exit_code == 0 else "failed", code_verify)
         if code_verify.exit_code != 0:
             job = store.get_job(job_id)
             result = {
@@ -1985,12 +1992,8 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             store.finish_job(job, JobStatus.failed, result)
             _save_state("deploy_code_mismatch")
             return
-
-    manifest_result = odoosh.verify_module_manifest(payload.module_name)
-    if manifest_result.exit_code != 0:
-        _fail("odoosh_verify_module_manifest", manifest_result)
-        return
-    _step("odoosh_verify_module_manifest", "passed", manifest_result)
+    else:
+        _step("odoosh_deployed_change_verify", "skipped", {"message": "No changed deploy files or manifest required verification."})
 
     def _fetch_upgrade_error_pack(attempt: int, deploy_result) -> CommandResult:
         try:
@@ -2510,7 +2513,9 @@ def frontend_pattern_preflight(payload: FrontendPatternPreflightRequest) -> Fron
     exact source areas/files the agent must read so the implementation matches
     the installed Odoo framework pattern instead of guessing.
     """
-    return FrontendPatternService().preflight(payload)
+    result = FrontendPatternService().preflight(payload)
+    PreWriteGateService().record_frontend_preflight(result, payload)
+    return result
 
 
 # ===========================================================================

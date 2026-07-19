@@ -551,9 +551,9 @@ def test_safe_deploy_verifies_changed_user_files_before_upgrade(tmp_path, monkey
 
     finished = store.get_job(job.id)
     assert finished.status == JobStatus.passed
-    assert calls == {"check": 1, "verify_user": 1, "manifest": 1, "deploy": 1}
+    assert calls == {"check": 1, "verify_user": 1, "manifest": 0, "deploy": 1}
     assert set(captured) == {"x_module/models/a.py"}
-    assert any(step.name == "odoosh_user_file_verify" and step.status == "passed" for step in finished.steps)
+    assert any(step.name == "odoosh_deployed_change_verify" and step.status == "passed" for step in finished.steps)
     assert finished.request["expected_user_file_hashes"] == captured
 
 
@@ -644,7 +644,7 @@ def test_safe_deploy_blocks_upgrade_when_deployed_user_file_differs(tmp_path, mo
     assert finished.status == JobStatus.failed
     assert finished.result["status"] == "deploy_code_mismatch"
     assert calls == {"manifest": 0, "deploy": 0}
-    assert any(step.name == "odoosh_user_file_verify" and step.status == "failed" for step in finished.steps)
+    assert any(step.name == "odoosh_deployed_change_verify" and step.status == "failed" for step in finished.steps)
 
 
 def test_verify_deployed_module_compares_against_odoosh_user_source(tmp_path, monkeypatch):

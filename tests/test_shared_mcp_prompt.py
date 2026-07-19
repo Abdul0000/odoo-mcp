@@ -77,7 +77,7 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
     text = (root / "MCP_SYSTEM_PROMPT.md").read_text(encoding="utf-8")
 
     required_markers = [
-        "MANDATORY DUAL READ",
+        "IMPACT-BASED SOURCE READ",
         "## SKILLS",
         "odoo-website-development",
         "odoo-pos-development",
