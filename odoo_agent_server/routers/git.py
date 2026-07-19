@@ -13,7 +13,7 @@ from ..auth import AuthDependency
 from ..config import settings
 from ..schemas import ApprovalRecord, ApprovalStatus, BaseProjectRequest, CommandResult, GitCommitRequest, GitDiffRequest, GitPushRequest, JobRecord, JobStatus, JobStep
 from ..services.approval_service import ApprovalService
-from ..services.background_executor import background_task, submit_background
+from ..services.background_executor import submit_background
 from ..services.git_service import GitService
 from ..services.odoosh_service import OdooShService
 from ..services.client_resolver_service import ClientResolverService
@@ -179,15 +179,12 @@ def _start_auto_odoosh_upgrade_job(project_path: str, module_name: str, expected
             poll_elapsed = round(time.monotonic() - poll_started, 3)
             poll_payload = _json_payload(poll_result.stdout)
             deployed = poll_result.exit_code == 0 and bool(poll_payload.get("deployed"))
-            _step("odoosh_check_commit", "passed" if deployed else "warning", poll_result)
+            _step("odoosh_check_commit", "passed" if deployed else "failed", poll_result)
 
             if not deployed:
                 result = {
-                    "status": "deployment_waiting",
-                    "message": "The pushed commit is still progressing through Odoo.sh. The bounded confirmation window ended safely; continue the existing job without replaying the push.",
-                    "display_message": "Deployment paused at a safe checkpoint while Odoo.sh finishes activating the commit.",
-                    "continuation_required": True,
-                    "interruption_expected": True,
+                    "status": "deploy_failed_or_timeout",
+                    "message": "Odoo.sh did not report the pushed commit as deployed within the post-push polling window. Module upgrade was not attempted.",
                     "module_name": module_name,
                     "sha": expected_sha,
                     "poll_timeout_seconds": AUTO_UPGRADE_DEPLOY_TIMEOUT_SECONDS,
@@ -197,18 +194,18 @@ def _start_auto_odoosh_upgrade_job(project_path: str, module_name: str, expected
                     "guard": poll_result.model_dump(mode="json"),
                     "next_call": {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}},
                 }
-                _finish(JobStatus.warning, result)
+                _finish(JobStatus.failed, result)
                 store.save_session_state({
                     "last_post_push_auto_upgrade_job_id": job.id,
                     "last_sha": expected_sha,
                     "module_name": module_name,
                     "project_path": str(Path(project_path).resolve()),
-                    "safe_deploy_status": "deployment_waiting",
+                    "safe_deploy_status": "deploy_failed_or_timeout",
                     "client_name": client.name if client else client_name,
                 }, client_name=client.name if client else client_name)
                 store.log_audit(
                     "git.push.auto_odoosh_upgrade",
-                    "deployment_waiting",
+                    "deploy_failed_or_timeout",
                     module_name,
                     {"job_id": job.id, "expected_sha": expected_sha, "poll_attempts": poll_payload.get("attempts")},
                 )
@@ -265,7 +262,7 @@ def _start_auto_odoosh_upgrade_job(project_path: str, module_name: str, expected
                 {"job_id": job.id, "expected_sha": expected_sha, "error": str(exc)},
             )
 
-    submit_background(background_task(_bg, "deploy"))
+    submit_background(_bg)
     return job.id
 
 

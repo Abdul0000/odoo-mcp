@@ -13,7 +13,6 @@ from ..schemas import CommandResult, JobStatus, OdooResult
 from .store_service import JsonStore
 
 _RESUMABLE_SAFE_DEPLOY_RESULTS = {
-    "deployment_waiting",
     "deploy_failed_or_timeout",
     "deploy_running",
     "module_upgrade_running",
@@ -169,7 +168,7 @@ def safe_deploy_block_payload(action: str, job: Any) -> dict[str, Any]:
     job_status = getattr(job.status, "value", str(job.status))
     active = job.status in {JobStatus.queued, JobStatus.running}
     next_call = (
-        {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}}
+        {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
         if active
         else {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}}
     )

@@ -10,7 +10,7 @@ from odoo_agent_server.main import app
 from odoo_agent_server.routers import workflow
 from odoo_agent_server.services.lock_service import RepoLockService
 from odoo_agent_server.services.odoosh_service import OdooShService
-from odoo_agent_server.schemas import BrowserCheckResult, CommandResult, OdooResult, PosFlowCheckResult, PosFlowStepResult, RestoreLastGoodCommitRequest, SafeDeployModuleRequest
+from odoo_agent_server.schemas import BrowserCheckResult, PosFlowCheckResult, PosFlowStepResult, SafeDeployModuleRequest
 from odoo_agent_server.services.validator_service import OdooModuleValidator
 from odoo_agent_server.schemas import Severity
 
@@ -20,7 +20,6 @@ def _auth() -> dict[str, str]:
 
 
 def _init_git_repo(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
     subprocess.run(["git", "init"], cwd=path, check=True, stdout=subprocess.PIPE)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
@@ -116,81 +115,6 @@ ModuleNotFoundError: No module named 'missing_lib'
 """
     blocks = service._extract_error_blocks(sample)
     assert blocks and "ModuleNotFoundError" in blocks[0]
-
-
-def test_error_pack_structures_invalid_field_and_rejects_xml_eval_hint(monkeypatch):
-    service = OdooShService()
-    sample = (
-        "odoo.tools.convert.ParseError: while parsing /home/odoo/src/user/x/data/data.xml:313\n"
-        "ValueError: Invalid field 'total_copies' on model 'school.library.book'\n"
-    )
-    monkeypatch.setattr(
-        service,
-        "grep_errors",
-        lambda tail_lines: CommandResult(
-            command=["grep"], cwd="odoosh:ssh", exit_code=0, stdout=sample
-        ),
-    )
-
-    result = service.error_pack(50)
-
-    assert '"field": "total_copies"' in result.stdout
-    assert '"model": "school.library.book"' in result.stdout
-    assert "do not change the XML value syntax or add eval" in result.stdout
-
-
-def test_restore_latest_commit_uses_git_inverse_bumps_manifest_and_hands_off_deploy(monkeypatch, tmp_path):
-    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
-    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
-    repo = tmp_path / "repo"
-    _init_git_repo(repo)
-    module = repo / "custom_website_home"
-    module.mkdir()
-    manifest = module / "__manifest__.py"
-    homepage = module / "homepage.xml"
-    manifest.write_text("{'name': 'Home', 'version': '18.0.1.0.0', 'installable': True}\n", encoding="utf-8")
-    homepage.write_text("<odoo><template id='home'>Old home</template></odoo>\n", encoding="utf-8")
-    subprocess.run(["git", "add", "."], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-m", "old home"], cwd=repo, check=True, stdout=subprocess.PIPE)
-    homepage.write_text("<odoo><template id='home'>Unwanted redesign</template></odoo>\n", encoding="utf-8")
-    subprocess.run(["git", "add", "."], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-m", "homepage redesign"], cwd=repo, check=True, stdout=subprocess.PIPE)
-    bad_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
-
-    monkeypatch.setattr(workflow.GitService, "validate_target", lambda self, *args, **kwargs: CommandResult(command=["git", "validate"], cwd=str(repo), exit_code=0))
-    monkeypatch.setattr(workflow.GitService, "push", lambda self, *args, **kwargs: CommandResult(command=["git", "push"], cwd=str(repo), exit_code=0, stdout="PUSH_OK"))
-
-    class QaPassed:
-        status = "passed"
-
-        def model_dump(self, mode=None):
-            return {"status": "passed"}
-
-    monkeypatch.setattr(workflow, "self_run", lambda payload: QaPassed())
-    monkeypatch.setattr(
-        workflow,
-        "start_odoo_module_deploy_job",
-        lambda *args, **kwargs: OdooResult(status="failed", error="running", result={"job_id": "deploy-job", "status": "running"}),
-    )
-
-    result = workflow.restore_last_good_commit(RestoreLastGoodCommitRequest(
-        project_path=str(repo),
-        module_name="custom_website_home",
-        revert_latest=True,
-        bump_manifest_version=True,
-        deploy_module=True,
-    ))
-
-    assert result.status == "running"
-    assert result.job_id == "deploy-job"
-    assert result.summary["bad_sha"] == bad_sha
-    assert result.summary["parent_file_reconstruction"] is False
-    assert "Old home" in homepage.read_text(encoding="utf-8")
-    assert "Unwanted redesign" not in homepage.read_text(encoding="utf-8")
-    assert "18.0.1.0.1" in manifest.read_text(encoding="utf-8")
-    changed = subprocess.run(["git", "show", "--name-only", "--format="], cwd=repo, check=True, capture_output=True, text=True).stdout
-    assert "custom_website_home/homepage.xml" in changed
-    assert "custom_website_home/__manifest__.py" in changed
 
 
 def test_validator_nested_one2many_no_false_positive_and_action_order(tmp_path):

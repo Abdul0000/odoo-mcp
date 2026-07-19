@@ -141,7 +141,7 @@ class OdooService:
             "                missing.append({'name': name, 'state': row.get('state') if row else 'not_found'})\n"
             "            else:\n"
             "                installed.append({'name': name, 'state': row.get('state')})\n"
-            "        data = {'status': 'ok', 'result': {'module': module_name, 'state': mod.state, 'dependencies': dep_names, 'installed': installed, 'missing': missing}}\n"
+            "        data = {'status': 'ok', 'result': {'module': module_name, 'dependencies': dep_names, 'installed': installed, 'missing': missing}}\n"
             "except Exception as exc:\n"
             "    data = {'status': 'failed', 'error': str(exc), 'traceback': traceback.format_exc()[-4000:]}\n"
             "print(marker + json.dumps(data, ensure_ascii=False))\n"
@@ -185,8 +185,8 @@ class OdooService:
     def module_update(self, module_name: str) -> OdooResult:
         return self._command_result("module_update", self._ssh().module_update(module_name, timeout_seconds=600))
 
-    def module_deploy(self, module_name: str, timeout_seconds: int = 600) -> OdooResult:
-        result = self._command_result("module_deploy", self._ssh().module_deploy_ssh(module_name, timeout_seconds=timeout_seconds))
+    def module_deploy(self, module_name: str) -> OdooResult:
+        result = self._command_result("module_deploy", self._ssh().module_deploy_ssh(module_name, timeout_seconds=600))
         if result.result is None:
             result.result = {}
         if isinstance(result.result, dict):
@@ -196,28 +196,16 @@ class OdooService:
             result.result.setdefault("cause", f"Module {module_name} not found in ir.module.module or live shell deploy path was unavailable; used Odoo.sh SSH deploy.")
         return result
 
-    def registry_smoke_test(
-        self,
-        module_name: str,
-        model_names: list[str] | None = None,
-        menu_names: list[str] | None = None,
-        strict: bool = True,
-        module_status_result: OdooResult | None = None,
-    ) -> OdooResult:
+    def registry_smoke_test(self, module_name: str, model_names: list[str] | None = None, menu_names: list[str] | None = None, strict: bool = True) -> OdooResult:
         checks: dict[str, Any] = {"module": module_name, "models": [], "menus": [], "module_status": None}
         failures: list[str] = []
-        # Safe deploy already queried module_status immediately before this
-        # check. Reuse that evidence to avoid booting another Odoo shell.
-        status_result = module_status_result or self.module_status(module_name)
+        status_result = self.module_status(module_name)
         checks["module_status"] = status_result.model_dump(mode="json")
         if status_result.status != "ok":
             failures.append(status_result.error or "module status failed")
 
         models = list(model_names or [])
-        # Broad model discovery is useful for an explicit strict smoke test,
-        # but safe deploy uses strict=False and verifies exact changed fields
-        # separately. Avoid many extra SSH/Odoo shell startups in that path.
-        if not models and strict:
+        if not models:
             prefix = module_name.replace("_", ".")
             inferred = self.search_read("ir.model", [["model", "=ilike", prefix + ".%"]], ["model", "name"], 200)
             if inferred.status == "ok" and isinstance(inferred.result, list):

@@ -62,10 +62,6 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
     assert "ir.ui.view" in rules
     assert "Never generate Pydantic models/imports inside Odoo addon code" in rules
     assert "If the deploy cycle breaks mid-flow" in rules
-    assert "Never browse Odoo documentation" in rules
-    assert "fhidalgodev" not in rules
-    assert "never remove valid manifest dependencies" in rules
-    assert "entire installable addon as one complete writes array" in rules
     assert "repo.write_many_smart" in small_flow
     assert "workflow.safe_deploy_module" in small_flow
     assert "workflow.resume_job" in small_flow

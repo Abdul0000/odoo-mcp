@@ -66,66 +66,6 @@ def test_client_check_lists_all_configured_clients_even_placeholders(monkeypatch
     assert "CHANGE_ME" not in json.dumps(result["clients"])
 
 
-def test_real_odoo_enterprise_branch_and_instance_are_not_placeholders():
-    assert ClientGateService._usable("odoo-ent-18") is True
-    assert ClientGateService._usable("odoo_18") is True
-    assert ClientGateService._usable("abdul0000-odoo-18-test-odoo-ent-18-35121710.dev.odoo.com") is True
-    assert ClientGateService._usable("abdul0000-odoo-18-test-odoo-ent-18-35121710") is True
-    assert ClientGateService._usable("YOUR_BRANCH") is False
-    assert ClientGateService._usable("CHANGE_ME_GITHUB_TOKEN") is False
-
-
-def test_client_selection_reply_validates_once_without_second_confirmation(monkeypatch, tmp_path):
-    state = tmp_path / "state"
-    checkout = tmp_path / "alpha"
-    _make_checkout(checkout)
-    monkeypatch.setattr(settings, "state_dir", str(state))
-    _set_clients(monkeypatch, [
-        _client("Alpha", "https://github.com/acme/a.git", "dev", str(checkout)),
-        _client("Beta", "https://github.com/acme/b.git", "dev", str(tmp_path / "b")),
-    ])
-    _patch_successful_validation(monkeypatch)
-
-    # Backward-compatible path: an MCP client with a cached schema may not know
-    # user_confirmed. Its explicit selected client_name still validates directly.
-    confirmed = ClientGateService().check(client_name="Alpha", validate=True)
-    assert confirmed["validated"] is True
-    assert JsonStore().load_session_state("Alpha")["client_validation"]["user_confirmed"] is True
-
-    repeated = ClientGateService().check(client_name="Alpha", validate=True)
-    assert repeated["validated"] is True
-    assert repeated["summary"] == "Client already validated."
-
-
-def test_accidental_force_refresh_reuses_healthy_validation_without_network_checks(monkeypatch, tmp_path):
-    state = tmp_path / "state"
-    checkout = tmp_path / "alpha"
-    _make_checkout(checkout)
-    monkeypatch.setattr(settings, "state_dir", str(state))
-    _set_clients(monkeypatch, [
-        _client("Alpha", "https://github.com/acme/a.git", "dev", str(checkout)),
-        _client("Beta", "https://github.com/acme/b.git", "dev", str(tmp_path / "b")),
-    ])
-    _patch_successful_validation(monkeypatch)
-    first = ClientGateService().check(client_name="Alpha", validate=True)
-    assert first["validated"] is True
-
-    def unexpected_network_check(*args, **kwargs):
-        raise AssertionError("healthy cached validation must not run network checks")
-
-    monkeypatch.setattr(ClientGateService, "_check_repo_branch", unexpected_network_check)
-    monkeypatch.setattr(ClientGateService, "_check_checkout", unexpected_network_check)
-    monkeypatch.setattr(ClientGateService, "_check_odoo_shell", unexpected_network_check)
-    monkeypatch.setattr(ClientGateService, "_check_odoosh", unexpected_network_check)
-
-    repeated = ClientGateService().check(client_name="Alpha", validate=True, force_refresh=True)
-    assert repeated["validated"] is True
-    assert repeated["cache_hit"] is True
-    assert repeated["force_refresh_requested"] is True
-    assert repeated["force_refresh_ignored"] is True
-    assert repeated["summary"] == "Client already validated."
-
-
 def test_client_check_validation_saves_active_client_and_allows_guarded_repo_tool(monkeypatch, tmp_path):
     state = tmp_path / "state"
     checkout = tmp_path / "alpha"
@@ -146,10 +86,10 @@ def test_client_check_validation_saves_active_client_and_allows_guarded_repo_too
     assert "requires_validation" in str(not_validated.value.detail)
 
     _patch_successful_validation(monkeypatch)
-    checked = ClientGateService().check(client_name="Alpha", validate=True, user_confirmed=True)
+    checked = ClientGateService().check(client_name="Alpha", validate=True)
     assert checked["ok"] is True
     assert checked["validated"] is True
-    assert checked["next_call"]["tool"] == "workflow.odoo_code_change"
+    assert checked["next_call"]["tool"] == "workflow.agent_instructions"
 
     content = repo_read(RepoReadRequest(client_name="Alpha", project_path=str(checkout), relative_path="README.md"))
     assert content.content == "ok\n"
@@ -197,7 +137,7 @@ def test_client_check_shell_failure_still_allows_coding_when_ssh_ok(monkeypatch,
     monkeypatch.setattr(ClientGateService, "_check_odoo_shell", lambda self, client: {"status": "failed", "error_type": "odoo_login_error", "log": ["shell failed"]})
     monkeypatch.setattr(ClientGateService, "_check_odoosh", lambda self, client: {"status": "ok", "addons_path_status": "ok", "log": ["ssh ok"]})
 
-    checked = ClientGateService().check(client_name="Alpha", validate=True, user_confirmed=True)
+    checked = ClientGateService().check(client_name="Alpha", validate=True)
 
     assert checked["ok"] is True
     assert checked["coding_ready"] is True
@@ -208,29 +148,6 @@ def test_client_check_shell_failure_still_allows_coding_when_ssh_ok(monkeypatch,
 
     content = repo_read(RepoReadRequest(client_name="Alpha", project_path=str(checkout), relative_path="README.md"))
     assert content.content == "ok\n"
-
-
-def test_client_validation_cache_invalidates_when_secret_or_target_changes(monkeypatch, tmp_path):
-    state = tmp_path / "state"
-    checkout = tmp_path / "alpha"
-    _make_checkout(checkout)
-    monkeypatch.setattr(settings, "state_dir", str(state))
-    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
-    original = _client("Alpha", "https://github.com/acme/a.git", "dev", str(checkout))
-    _set_clients(monkeypatch, [original])
-    _patch_successful_validation(monkeypatch)
-
-    checked = ClientGateService().check(client_name="Alpha", validate=True, user_confirmed=True)
-    assert checked["validated"] is True
-    assert JsonStore().load_session_state("Alpha")["client_validation"]["config_fingerprint"]
-
-    changed = dict(original)
-    changed["token"] = "rotated-token"
-    _set_clients(monkeypatch, [changed])
-
-    with pytest.raises(HTTPException) as stale:
-        ClientGateService().require_validated_client("Alpha", "repo.read")
-    assert "configuration changed" in stale.value.detail["message"]
 
 
 def test_client_check_shell_ok_without_ssh_does_not_enable_safe_deploy(monkeypatch, tmp_path):
@@ -248,7 +165,7 @@ def test_client_check_shell_ok_without_ssh_does_not_enable_safe_deploy(monkeypat
     monkeypatch.setattr(ClientGateService, "_check_odoo_shell", lambda self, client: {"status": "ok", "log": ["https jsonrpc ok"]})
     monkeypatch.setattr(ClientGateService, "_check_odoosh", lambda self, client: {"status": "failed", "addons_path_status": "skipped", "log": ["ssh timeout"]})
 
-    checked = ClientGateService().check(client_name="Alpha", validate=True, user_confirmed=True)
+    checked = ClientGateService().check(client_name="Alpha", validate=True)
 
     assert checked["ok"] is True
     assert checked["coding_ready"] is True
@@ -258,9 +175,6 @@ def test_client_check_shell_ok_without_ssh_does_not_enable_safe_deploy(monkeypat
     assert checked["deploy_ready"] is False
     assert "Odoo.sh SSH is required" in checked["deploy_blocker"]
 
-    # Source publication is allowed from a validated checkout even when the
-    # runtime SSH probe is down. Only the deploy/upgrade continuation waits.
-    ClientGateService().require_validated_client("Alpha", "workflow.safe_deploy_module")
     with pytest.raises(HTTPException) as blocked:
-        ClientGateService().require_validated_client("Alpha", "workflow.resume_job")
+        ClientGateService().require_validated_client("Alpha", "workflow.safe_deploy_module")
     assert blocked.value.detail["required_capability"] == "deploy_ready"

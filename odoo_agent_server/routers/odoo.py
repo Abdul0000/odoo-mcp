@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 
 from fastapi import APIRouter
@@ -15,11 +14,9 @@ from ..services.store_service import JsonStore
 from ..services.workflow_guard_service import safe_deploy_shell_block
 from ..services.client_gate_service import ClientGateService
 from ..services.client_resolver_service import ClientResolverService
-from ..services.background_executor import background_task, submit_background
+from ..services.background_executor import submit_background
 
 router = APIRouter(prefix="/odoo", tags=["odoo"], dependencies=[AuthDependency])
-
-_TIMEOUT_RESULT_RE = re.compile(r"\b(?:timed?\s*out|timeout|deadline exceeded)\b", re.I)
 
 
 def _odoo_service_for_client(client=None):
@@ -29,85 +26,6 @@ def _odoo_service_for_client(client=None):
         except TypeError:
             return OdooService()
     return OdooService()
-
-
-def _module_state_value(result: OdooResult) -> str | None:
-    rows = result.result if result.status == "ok" and isinstance(result.result, list) else []
-    if not rows or not isinstance(rows[0], dict):
-        return None
-    return str(rows[0].get("state") or "").strip().lower() or None
-
-
-def _module_deploy_with_timeout_recovery(service: OdooService, payload: OdooModuleRequest) -> OdooResult:
-    """Retry one idempotent smart deploy only after checking live module state."""
-    try:
-        first = service.module_deploy(payload.module_name, timeout_seconds=payload.operation_timeout_seconds)
-    except TypeError:
-        first = service.module_deploy(payload.module_name)
-    first_text = json.dumps(first.model_dump(mode="json"), ensure_ascii=False, default=str)
-    if first.status == "ok" or not _TIMEOUT_RESULT_RE.search(first_text):
-        return first
-
-    status_after_timeout = service.module_status(payload.module_name)
-    state = _module_state_value(status_after_timeout)
-    if state == "installed":
-        return OdooResult(
-            status="ok",
-            result={
-                "module_name": payload.module_name,
-                "state": state,
-                "timeout_recovered": True,
-                "attempts": 1,
-                "message": "The install command response timed out, but live Odoo status confirms the module is installed.",
-                "first_attempt": first.model_dump(mode="json"),
-                "status_probe": status_after_timeout.model_dump(mode="json"),
-            },
-        )
-
-    try:
-        retry = service.module_deploy(payload.module_name, timeout_seconds=payload.operation_timeout_seconds)
-    except TypeError:
-        retry = service.module_deploy(payload.module_name)
-    if retry.status == "ok":
-        data = retry.result if isinstance(retry.result, dict) else {"result": retry.result}
-        retry.result = {
-            **data,
-            "timeout_recovered": True,
-            "attempts": 2,
-            "first_attempt": first.model_dump(mode="json"),
-            "status_probe": status_after_timeout.model_dump(mode="json"),
-        }
-        return retry
-
-    final_status = service.module_status(payload.module_name)
-    final_state = _module_state_value(final_status)
-    if final_state == "installed":
-        return OdooResult(
-            status="ok",
-            result={
-                "module_name": payload.module_name,
-                "state": final_state,
-                "timeout_recovered": True,
-                "attempts": 2,
-                "message": "The retry response was inconclusive, but live Odoo status confirms installation.",
-                "first_attempt": first.model_dump(mode="json"),
-                "retry_attempt": retry.model_dump(mode="json"),
-                "final_status_probe": final_status.model_dump(mode="json"),
-            },
-        )
-    return OdooResult(
-        status="failed",
-        error=retry.error or first.error or "Module install/upgrade timed out after one verified retry.",
-        result={
-            "module_name": payload.module_name,
-            "timeout_recovery_attempted": True,
-            "attempts": 2,
-            "first_attempt": first.model_dump(mode="json"),
-            "status_probe": status_after_timeout.model_dump(mode="json"),
-            "retry_attempt": retry.model_dump(mode="json"),
-            "final_status_probe": final_status.model_dump(mode="json"),
-        },
-    )
 
 
 def _prepare_validated_client(payload: OdooModuleRequest, action: str):
@@ -146,50 +64,6 @@ def _poll_manual_push_deployed(odoosh: OdooShService, pushed_sha: str, timeout_s
 
 def _direct_module_deploy_guard(payload: OdooModuleRequest, store: JsonStore) -> OdooResult | None:
     """Block direct install/upgrade after manual git.push until Odoo.sh is verified."""
-    # A local-first MCP client such as OpenCode pushes from the user's PC, so
-    # this server has no local Git-push session record. The explicit pushed SHA
-    # is the cross-machine trust boundary: never upgrade until Odoo.sh proves
-    # that exact commit is active in ~/src/user.
-    if payload.expected_sha:
-        client = _prepare_validated_client(payload, "odoo.module_deploy_expected_sha_guard")
-        odoosh = OdooShService(client) if client else OdooShService()
-        check = _poll_manual_push_deployed(
-            odoosh,
-            payload.expected_sha,
-            payload.deploy_guard_timeout_seconds,
-            payload.deploy_guard_poll_interval_seconds,
-        )
-        if check.exit_code != 0:
-            return OdooResult(
-                status="failed",
-                error="Module deploy paused: Odoo.sh has not activated the pushed expected_sha, so install/upgrade would target stale source.",
-                result={
-                    "status": "deployment_waiting",
-                    "display_message": "The local push is complete; waiting for Odoo.sh to activate the exact commit before module install/upgrade.",
-                    "continuation_required": True,
-                    "interruption_expected": True,
-                    "sha": payload.expected_sha,
-                    "guard": check.model_dump(mode="json"),
-                    "next_call": {
-                        "tool": "odoo.module_deploy",
-                        "arguments": {
-                            "client_name": payload.client_name,
-                            "module_name": payload.module_name,
-                            "expected_sha": payload.expected_sha,
-                            "wait_for_result": False,
-                        },
-                    },
-                },
-            )
-        store.save_session_state({
-            "opencode_expected_sha": {
-                "sha": payload.expected_sha,
-                "module_name": payload.module_name,
-                "deployed": True,
-            }
-        }, client_name=payload.client_name)
-        return None
-
     state = store.load_session_state(client_name=payload.client_name)
     push = state.get("last_git_push")
     if not isinstance(push, dict) or push.get("verified_for_module_deploy"):
@@ -219,10 +93,7 @@ def _direct_module_deploy_guard(payload: OdooModuleRequest, store: JsonStore) ->
             status="failed",
             error="Direct module deploy blocked: Odoo.sh has not deployed the recent git.push SHA, so module upgrade would target stale code.",
             result={
-                "status": "deployment_waiting",
-                "display_message": "Module upgrade is paused safely until Odoo.sh activates the pushed commit.",
-                "continuation_required": True,
-                "interruption_expected": True,
+                "status": "deploy_failed_or_timeout",
                 "sha": pushed_sha,
                 "guard": check.model_dump(mode="json"),
                 "next_call": {"tool": "workflow.resume_job", "arguments": {"module_name": payload.module_name}},
@@ -453,7 +324,7 @@ def odoo_module_install(payload: OdooModuleRequest) -> OdooResult:
         approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_install succeeded", "odoo.module_install failed")
         store.log_audit("odoo.module_install", result.status, payload.module_name)
 
-    submit_background(background_task(_bg, "deploy"))
+    submit_background(_bg)
     return _background_job_response(store, job, payload, "Install started.")
 
 
@@ -480,7 +351,7 @@ def odoo_module_update(payload: OdooModuleRequest) -> OdooResult:
         approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_update succeeded", "odoo.module_update failed")
         store.log_audit("odoo.module_update", result.status, payload.module_name)
 
-    submit_background(background_task(_bg, "deploy"))
+    submit_background(_bg)
     return _background_job_response(store, job, payload, "Upgrade started.")
 
 
@@ -498,11 +369,7 @@ def start_odoo_module_deploy_job(payload: OdooModuleRequest, approval: ApprovalS
     def _bg():
         try:
             guarded = _direct_module_deploy_guard(payload, store) if enforce_deploy_guard else None
-            if guarded:
-                result = guarded
-            else:
-                service = _odoo_service_for_client(client)
-                result = _module_deploy_with_timeout_recovery(service, payload)
+            result = guarded or _odoo_service_for_client(client).module_deploy(payload.module_name)
         except Exception as exc:
             result = OdooResult(status="failed", error=f"Unexpected error: {exc}")
         j = store.get_job(job.id)
@@ -511,7 +378,7 @@ def start_odoo_module_deploy_job(payload: OdooModuleRequest, approval: ApprovalS
             approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_deploy succeeded", "odoo.module_deploy failed")
         store.log_audit("odoo.module_deploy", result.status, payload.module_name)
 
-    submit_background(background_task(_bg, "deploy"))
+    submit_background(_bg)
     return _background_job_response(store, job, payload, "Deploy started.")
 
 

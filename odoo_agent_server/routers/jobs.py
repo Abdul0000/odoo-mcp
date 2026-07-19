@@ -11,8 +11,7 @@ router = APIRouter(prefix="/jobs", tags=["jobs"], dependencies=[AuthDependency])
 
 @router.get("", response_model=list[JobRecord])
 def list_jobs(limit: int = 100) -> list[JobRecord]:
-    store = JsonStore()
-    return [store.get_job(job.id) for job in store.list_jobs(limit=limit)]
+    return JsonStore().list_jobs(limit=limit)
 
 
 @router.get("/audit/events", response_model=list[AuditEvent])
@@ -24,8 +23,8 @@ def list_audit(limit: int = 200) -> list[AuditEvent]:
 def get_job(
     job_id: str,
     wait_for_result: bool = True,
-    wait_timeout_seconds: int = 20,
-    poll_interval_seconds: float = 2.0,
+    wait_timeout_seconds: int = 600,
+    poll_interval_seconds: float = 10.0,
 ) -> JobRecord:
     """Return one job with explicit deploy-success safety gates.
 

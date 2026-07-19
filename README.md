@@ -450,9 +450,9 @@ For code-changing work, prefer `workflow.safe_deploy_module` instead of manually
 3. configure repo-local Git author identity from `GIT_AUTHOR_NAME` / `GIT_AUTHOR_EMAIL`;
 4. validate `TARGET_GIT_REPO` and `TARGET_GIT_BRANCH` before push;
 5. commit and push the selected paths;
-6. poll Odoo.sh adaptively for the pushed SHA, stopping immediately when a build failure is detected;
+6. check Odoo.sh once for the pushed SHA and return `retry_later` with `workflow.resume_job` if it is not deployed yet;
 7. verify the deployed module manifest exists and has `installable: True`;
-8. call `odoo.module_deploy` with a bounded five-minute operation timeout and short progress polling;
+8. call the background `odoo.module_deploy` path with a short wait window so install/upgrade continues without blocking;
 9. return `deploy_running` with `jobs.get` when the module deploy is still running;
 10. run module status and registry smoke checks when deploy completes.
 
@@ -470,95 +470,17 @@ GIT_AUTHOR_NAME=Odoo MCP Agent
 GIT_AUTHOR_EMAIL=odoo-mcp@example.local
 ODOOSH_ODOO_PATH=/home/odoo/src/odoo
 ODOOSH_USER_ADDONS_PATH=/home/odoo/src/user
-ODOOSH_WAIT_TIMEOUT_SECONDS=240
-ODOOSH_WAIT_INTERVAL_SECONDS=2
+ODOOSH_WAIT_TIMEOUT_SECONDS=600
+ODOOSH_WAIT_INTERVAL_SECONDS=10
 ```
 
-## Unified provider MCP coding workflow
+## Repo-first MCP coding workflow
 
-Provider MCP clients use one composite code-change tool. Repository inspection,
-adaptive core scope, frontend preflight, QA, compatibility verification, safe
-deployment, module upgrade, and registry checks run internally:
+For every coding task, the MCP agent should start with the repository tools, not with Odoo database reads:
 
 ```text
-client_check (once) → workflow_odoo_code_change → jobs_get with 20-second progress windows until terminal
+repo_prepare → repo_list_custom_modules → repo_read → repo_apply_patch_atomic or repo_write_many_smart → git_diff → qa_self_run → workflow_verify_against_core(changed files only) → workflow_safe_deploy_module → workflow_resume_job/jobs_get only when returned as next_call
 ```
-
-`workflow_odoo_code_change` returns an `odoo_code_change` job immediately; repo
-refresh, inspection, edits, QA, and safe deploy run outside the MCP HTTP request.
-Poll the returned parent `job_id` throughout. Its phase advances through
-`resolve_project`, `repo.prepare`, custom/core inspection, safe changes, QA, and
-safe deploy. The parent mirrors the nested deploy terminal result, so clients do
-not need to switch job IDs. An identical retry returns the existing active job
-instead of starting a second writer/deployer.
-
-Correction calls with the same operation identity and Git HEAD reuse cached
-custom/core inspection evidence and skip checkout refresh, scope calculation,
-and source rereads. The lower-level tools below remain available on the REST
-administration surface but are intentionally hidden from provider MCP clients.
-
-Deployment polling starts at two seconds and backs off to five and then ten
-seconds. Source deployment is bounded at four minutes, module upgrade at five
-minutes, and the default is one upgrade attempt. If additional attempts are
-explicitly enabled, each one runs only after the correction creates a real
-commit, avoiding repeated waits against unchanged code.
-
-The module deployment path also reuses the dependency probe's module-state
-result and the post-upgrade module-status result. Non-strict smoke verification
-does not perform broad model discovery, so the normal path avoids redundant
-Odoo shell startups while retaining dependency, upgrade, field, module-status,
-and registry verification.
-
-Bounded Odoo.sh confirmation windows are represented as
-`status=deployment_waiting` with a warning job state, not as deployment
-failures. Responses explicitly say the deployment paused at a safe checkpoint
-and that `workflow.resume_job` continues completed work without replaying the
-commit or push. Only real build, source, upgrade, or registry errors use failure
-language.
-
-The provider composite also preserves dirty checkouts. If an unresolved change
-already exists on the selected branch, it skips checkout/pull refresh and
-continues in place; it never restores, resets, switches branches, or creates a
-clean replacement checkout. Terse approvals such as `apply` and `implement`
-reuse the pending operation identity. Provider agents are instructed to avoid
-web search and terminal/Git workarounds and to send exact writes back through
-`workflow.odoo_code_change`.
-
-Odoo.sh failure attribution is commit-scoped. The guard filters individual log
-blocks by their timestamps instead of treating a recently modified log file as
-entirely new. Historical tracebacks and missing filestore attachment blobs are
-reported as non-blocking noise; only post-push build/test, import, XML parsing,
-registry-load, or other source-relevant failures prevent deployment
-confirmation.
-
-### Fast UI Fix mode
-
-Small CSS/SCSS visual corrections use a bounded path inside
-`workflow.odoo_code_change`: at most three focused custom files and eight
-compatibility files are inspected, selector-to-file locations persist per
-client/module, and frontend compatibility evidence is reused while its source
-file hashes remain unchanged. When one selector matches uniquely and explicit
-style properties are supplied, the connector creates a minimal deterministic
-patch in the first pass. Ambiguous selectors still return focused internal
-context rather than risking a broad edit. Existing static assets deploy as
-`asset_only`, so the workflow skips an unnecessary module upgrade while keeping
-QA, Git, Odoo.sh SHA/hash confirmation, and failure attribution intact.
-
-### Adaptive task lanes
-
-The same acceleration applies beyond UI work. With `complexity=auto`, the
-composite assigns one of three lanes:
-
-- `fast`: up to 3 target files, 6 search matches, 4 custom reads, and 8 core reads;
-- `normal`: up to 6 target files, 10 search matches, 8 custom reads, and 16 core reads;
-- `long`: the existing full 30-custom/60-core inspection for broad work.
-
-One- or two-file targeted changes normally use `fast`; ordinary vague fixes use
-`normal`; refactors, migrations, new modules, architecture changes, and large
-multi-file requests use `long`. If mandatory compatibility scope exceeds the
-selected budget, the server promotes the task to `long` automatically instead
-of skipping required evidence. Target-to-file cache reuse applies to fast and
-normal Python, XML, JS, SCSS/CSS, and CSV work.
 
 New MCP/REST tools:
 
@@ -576,9 +498,6 @@ Recommended environment:
 WORKSPACE_ROOT=/workspace/repos
 ODOO_AGENT_API_TOKEN=<strong-random-secret>
 ODOO_AGENT_BACKGROUND_MAX_WORKERS=2
-ODOO_AGENT_BACKGROUND_ORCHESTRATOR_WORKERS=2
-ODOO_AGENT_BACKGROUND_DEPLOY_WORKERS=2
-ODOO_AGENT_CLIENT_VALIDATION_TTL_SECONDS=900
 TARGET_GIT_REPO=git@github.com:Abdul0000/test_18.git
 TARGET_GIT_BRANCH=feature_branch
 TARGET_PROJECT_PATH=/workspace/repos/odoo_project
@@ -587,10 +506,6 @@ GIT_SSH_KEY_PATH=/tmp/keys/github_key
 
 `ODOO_AGENT_OPERATION_GUARD_ENABLED=false` preserves the current MCP flow. Enable it only after validating the stricter duplicate/phase guard with your clients.
 
-`ODOO_AGENT_BACKGROUND_MAX_WORKERS` remains accepted for compatibility. New deployments use isolated orchestration and deploy pools so long SSH/module-upgrade work cannot starve workflow coordination. Client validation is cached for 15 minutes by default and invalidates immediately when the hashed repo/credential/deployment configuration changes.
-
-The composite `workflow.odoo_code_change` returns its parent job immediately. Its background fast path prepares all file contents first, writes related files through one smart transaction, and runs independent QA/core validation concurrently. Sensitive accounting, payment, security, payroll, stock-valuation, and migration tasks cannot force the fast lane; they are promoted to the long evidence budget.
-
-Failures now include a structured `failure_policy` with a stable fingerprint, class, retry/correction decision, bounded backoff, and circuit-break state. Only transient failures are retried unchanged; deterministic code, compatibility, registry, and functional failures require new evidence and a minimal correction.
+Legacy `ODOO_AGENT_BACKGROUND_MAX_WORKERS=1` values are accepted and safely clamped to two workers internally.
 
 For SSH GitHub repos, either set `GIT_SSH_COMMAND` yourself or set `GIT_SSH_KEY_PATH`; `repo.prepare` will build a safe `GIT_SSH_COMMAND` using that key.

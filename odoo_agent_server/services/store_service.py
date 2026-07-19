@@ -31,17 +31,6 @@ class JsonStore:
 
     _lock = Lock()  # in-process thread safety
     _read_cache: dict[str, tuple[float, int, list[dict[str, Any]]]] = {}
-    _CODE_CHANGE_PHASE_TIMEOUT_SECONDS = 180
-    _CODE_CHANGE_LOCAL_PHASE_TIMEOUT_SECONDS = 60
-    _CODE_CHANGE_LOCAL_PHASES = {
-        "inspect_custom_code",
-        "inspect_core_scope",
-        "inspect_frontend_patterns",
-        "read_core_evidence",
-        "module_completeness",
-        "qa_and_compatibility",
-    }
-    _MAX_JOBS = 500
 
     @contextmanager
     def _file_lock(self, path: Path):
@@ -156,12 +145,7 @@ class JsonStore:
         return record
 
     def create_job(self, job: JobRecord) -> JobRecord:
-        def update(rows):
-            rows.append(job.model_dump(mode="json"))
-            if len(rows) > self._MAX_JOBS:
-                del rows[:-self._MAX_JOBS]
-
-        self._update_list(self.jobs_file, update)
+        self._update_list(self.jobs_file, lambda rows: rows.append(job.model_dump(mode="json")))
         self.log_audit("job.create", job.status.value, job.job_type, {"job_id": job.id})
         return job
 
@@ -170,86 +154,12 @@ class JsonStore:
         return [JobRecord.model_validate(row) for row in rows[-limit:]][::-1]
 
     def get_job(self, job_id: str) -> JobRecord:
-        rows = self._read_list(self.jobs_file)
-        for row in rows:
+        for row in self._read_list(self.jobs_file):
             if row.get("id") == job_id:
-                job = JobRecord.model_validate(row)
-                return self._refresh_code_change_deploy(job, rows)
+                return JobRecord.model_validate(row)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
-    def _refresh_code_change_deploy(self, job: JobRecord, rows: list[dict[str, Any]]) -> JobRecord:
-        """Mirror a nested safe-deploy terminal result onto its code-change job.
-
-        The code-change worker must release the orchestration executor as soon as
-        it starts safe deploy.  Polling the parent job performs this cheap state
-        join, avoiding a blocked worker (and a one-worker executor deadlock).
-        """
-        if job.job_type != "odoo_code_change" or job.status not in {JobStatus.queued, JobStatus.running}:
-            return job
-        result = job.result if isinstance(job.result, dict) else {}
-        nested_job_id = result.get("nested_job_id")
-        if not nested_job_id:
-            if job.steps and job.steps[-1].status == "running":
-                activity_at = result.get("heartbeat_at") or job.steps[-1].started_at
-                try:
-                    started = datetime.fromisoformat(str(activity_at).replace("Z", "+00:00"))
-                    age_seconds = (datetime.now(timezone.utc) - started).total_seconds()
-                except (TypeError, ValueError):
-                    age_seconds = 0.0
-                phase = job.steps[-1].name
-                phase_timeout = (
-                    self._CODE_CHANGE_LOCAL_PHASE_TIMEOUT_SECONDS
-                    if phase in self._CODE_CHANGE_LOCAL_PHASES
-                    else self._CODE_CHANGE_PHASE_TIMEOUT_SECONDS
-                )
-                if age_seconds > phase_timeout:
-                    now = datetime.now(timezone.utc).isoformat()
-                    job.steps[-1].status = "failed"
-                    job.steps[-1].finished_at = now
-                    job.steps[-1].error = f"Phase exceeded {phase_timeout}s hard limit"
-                    return self.finish_job(job, JobStatus.failed, {
-                        **result,
-                        "status": "failed",
-                        "phase": phase,
-                        "error": f"Code-change phase '{phase}' exceeded {phase_timeout}s and was marked stale.",
-                        "stale_after_seconds": phase_timeout,
-                        "retryable": True,
-                        "worker_alive": False,
-                        "completion_required": False,
-                        "success_allowed": False,
-                        "tool_exit_allowed": True,
-                        "next_call": {"tool": "workflow.odoo_code_change", "arguments": job.request},
-                    })
-            return job
-        nested_row = next((item for item in rows if item.get("id") == nested_job_id), None)
-        if nested_row is None:
-            return job
-        nested = JobRecord.model_validate(nested_row)
-        if nested.status in {JobStatus.queued, JobStatus.running}:
-            return job
-
-        now = datetime.now(timezone.utc).isoformat()
-        if job.steps and job.steps[-1].status == "running":
-            job.steps[-1].status = nested.status.value
-            job.steps[-1].finished_at = now
-            job.steps[-1].result = {"nested_job_id": nested.id, "status": nested.status.value}
-        nested_result = nested.result if isinstance(nested.result, dict) else {"result": nested.result}
-        code_change_result = dict(result)
-        job.result = {
-            **code_change_result,
-            **nested_result,
-            "code_change_result": code_change_result,
-            "safe_deploy_job": nested.model_dump(mode="json"),
-            "job_id": job.id,
-            "nested_job_id": nested.id,
-            "completion_required": False,
-            "success_allowed": bool(nested.deploy_confirmed or nested.already_deployed_confirmed),
-            "tool_exit_allowed": True,
-            "next_call": None,
-        }
-        return self.finish_job(job, nested.status, job.result)
-
-    def wait_job(self, job_id: str, timeout_seconds: int = 20, poll_interval_seconds: float = 2.0) -> JobRecord:
+    def wait_job(self, job_id: str, timeout_seconds: int = 600, poll_interval_seconds: float = 10.0) -> JobRecord:
         """Wait for a job to finish without requiring repeated client/tool calls.
 
         Safe deploy must not be treated as complete until its owning job reaches

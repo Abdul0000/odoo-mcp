@@ -10,7 +10,6 @@ from __future__ import annotations
 import ast
 import glob
 import re
-from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -75,7 +74,6 @@ _ALIAS_MODULES = {
 }
 
 _EXTERNAL_IMPORTS = {"@odoo/owl", "luxon"}
-_ALLOW_REMOTE_CORE_SYNC: ContextVar[bool] = ContextVar("allow_remote_core_sync", default=True)
 
 
 def _read_file(path: str, max_bytes: int = 524288) -> str:
@@ -98,7 +96,7 @@ def _iter_module_dirs(module_name: str, client_name: str | None = None) -> list[
     dirs: list[Path] = []
     for root in _SRC_ROOTS:
         found = _module_dir(root, module_name)
-        if not found and _ALLOW_REMOTE_CORE_SYNC.get():
+        if not found:
             core_sync_service.ensure_module_synced(str(root), module_name, client_name=client_name)
             found = _module_dir(root, module_name)
         if found:
@@ -123,8 +121,6 @@ def _core_source_available(client_name: str | None = None) -> bool:
     """
     if any(root.exists() and any(root.iterdir()) for root in _SRC_ROOTS if root.exists()):
         return True
-    if not _ALLOW_REMOTE_CORE_SYNC.get():
-        return False
     if not settings.core_sync_enabled:
         return False
     if settings.odoosh_ssh_host:
@@ -268,13 +264,6 @@ class SyntaxVerifierService:
     """Pre-push cross-checker for Odoo Python/XML/manifest/JS asset files."""
 
     def verify(self, request: SyntaxVerifyRequest) -> SyntaxVerifyResult:
-        token = _ALLOW_REMOTE_CORE_SYNC.set(bool(request.allow_remote_core_sync))
-        try:
-            return self._verify(request)
-        finally:
-            _ALLOW_REMOTE_CORE_SYNC.reset(token)
-
-    def _verify(self, request: SyntaxVerifyRequest) -> SyntaxVerifyResult:
         findings: list[VerifyFinding] = []
         files_checked: list[str] = []
         xml_contents: dict[str, str] = {}
@@ -296,7 +285,6 @@ class SyntaxVerifierService:
             ))
 
         written_files = self._impact_aware_files(request)
-        directly_written = {str(Path(path).resolve()) for path in request.written_files}
 
         # First pass: read files and collect XML/JS context for template matching.
         file_contents: dict[str, str] = {}
@@ -325,12 +313,7 @@ class SyntaxVerifierService:
         for file_path, content in file_contents.items():
             path = Path(file_path)
             if path.name == "__manifest__.py":
-                findings.extend(self._verify_manifest(
-                    file_path,
-                    content,
-                    request.client_name,
-                    verify_dependencies=str(path.resolve()) in directly_written,
-                ))
+                findings.extend(self._verify_manifest(file_path, content, request.client_name))
             elif path.suffix == ".py":
                 findings.extend(self._verify_python_model(file_path, content, request.client_name))
             elif path.suffix == ".xml":
@@ -394,17 +377,10 @@ class SyntaxVerifierService:
     # Manifest verification
     # ------------------------------------------------------------------
 
-    def _verify_manifest(
-        self,
-        file_path: str,
-        content: str,
-        client_name: str | None = None,
-        *,
-        verify_dependencies: bool = True,
-    ) -> list[VerifyFinding]:
+    def _verify_manifest(self, file_path: str, content: str, client_name: str | None = None) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
         m = _MANIFEST_DEPS_RE.search(content)
-        if m and verify_dependencies:
+        if m:
             deps_block = m.group(1)
             dep_names = [n.group(1) for n in _MODULE_NAME_RE.finditer(deps_block)]
             for dep in dep_names:

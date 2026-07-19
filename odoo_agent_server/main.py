@@ -40,7 +40,6 @@ from .routers.mcp import (
     claude_router as claude_mcp_router,
     chatgpt_router as chatgpt_mcp_router,
     grok_router as grok_mcp_router,
-    opencode_router as opencode_mcp_router,
     provider_tool_names_safe,
 )
 from .routers.odoo import router as odoo_router
@@ -76,10 +75,9 @@ def health() -> dict[str, str]:
 
 @app.get("/agent-instructions")
 def agent_instructions() -> dict:
-    """Legacy HTTP diagnostics for the connector-owned system prompt.
-
-    Provider MCP clients receive their instructions during initialization; no
-    separate instruction-generation tool is advertised.
+    """Full agent system prompt stored in connector.
+    MCP client system instructions can contain only:
+    'Before any task, call workflow.agent_instructions first and follow exactly.'
     """
     from .config import settings, get_client_names
     from .services.client_resolver_service import ClientResolverService
@@ -88,13 +86,12 @@ def agent_instructions() -> dict:
     if len(client_names) > 1 and not ClientGateService().any_validated_client():
         return {
             "version": "client-check-gate",
-            "connector_revision": settings.build_revision,
             "prompt_source": "CLIENT_CHECK_SYSTEM_PROMPT.md",
             "system_prompt": load_client_check_system_prompt(),
             "requires_client_selection": True,
             "requires_validation": True,
             "available_client_names": client_names,
-            "next_action": "Call client.check, ask the user to select client_name, then call client.check(client_name=..., validate=true). After it passes, continue with workflow.odoo_code_change.",
+            "next_action": "Call client.check, ask the user to select client_name, then call client.check(client_name=..., validate=true). After it passes, call workflow.agent_instructions again to load MCP_SYSTEM_PROMPT.md.",
         }
     try:
         active_client = ClientResolverService().resolve_client(require_complete=False)
@@ -106,22 +103,20 @@ def agent_instructions() -> dict:
 
     return {
         "version": "v14+",
-        "connector_revision": settings.build_revision,
         "prompt_source": "MCP_SYSTEM_PROMPT.md",
         "system_prompt": load_mcp_system_prompt(),
         "instructions": {
-            "role": "You are an Odoo developer agent (supports Odoo 16/17/18/19). Use the connector-owned MCP workflow to code and deploy autonomously. Repository and compatibility evidence come only from MCP checkout/cache tools; never browse the public web for implementation evidence. No hallucination and no push without changed-file verification.",
+            "role": "You are an Odoo developer agent (supports Odoo 16/17/18/19). Use MCP tools to code and deploy autonomously. You are a Self-Learning Agent — you ALWAYS read real Odoo core source AND custom module source before writing any code. No static skill. No hallucination. No push without verify.",
             "rules": [
                 "Always start with repo.prepare",
                 "Write COMPLETE files only — never partial or placeholder",
                 "Never change module version",
                 "Never edit src/odoo or src/enterprise core files — READ them only",
                 "Dummy data requests → add data.xml",
-                "Never browse Odoo documentation, GitHub, design sites, blogs, or search engines during a repository coding task unless the user explicitly asks for external research. The MCP checkout and connector-owned local/cache checks are authoritative.",
+                "Coding patterns: github.com/fhidalgodev/odoo-development-skill",
                 "Module reference priority for installed-source reads: /home/odoo/src/odoo/addons first, then /home/odoo/src/enterprise fallback, then /home/odoo/src/user only as fallback for other related custom dependencies. For editing, read the current custom module from the active checkout; for already-live/deployed/done proof, verify real /home/odoo/src/user with workflow.verify_deployed_module or odoosh.read_user_file.",
-                "Before install/upgrade: verify changed files locally. If core/cache source is unavailable, record a warning; never remove valid manifest dependencies or rewrite code solely because remote core evidence could not be located.",
+                "Before install/upgrade: repo.read each file and verify imports against core modules",
                 "Long operations return job_id and next_call — poll jobs.get with short bounded waits until passed/failed/warning. Never treat status=running, deploy_running, module_upgrade_running, or job_status=running as complete.",
-                "status=deployment_waiting is an expected bounded pause, not a failure. Say the deployment is continuing from a safe checkpoint and call the returned workflow.resume_job. Never say 'failed deployment' unless an explicit terminal build, source, upgrade, or registry error is returned.",
                 "Job/workflow responses include status_label and steps_summary fields (e.g. '✅ git.push') — show these directly to the user instead of writing your own status text",
                 "Tools that return a list (repo.list, repo.list_custom_modules, jobs.list, approvals.list, audit.list) come wrapped as {items: [...], count: N} — read result.items, not result directly",
                 "On error: diagnose first, fix, retry max 3x — never blind retry",
@@ -134,10 +129,10 @@ def agent_instructions() -> dict:
                 "If workflow.safe_deploy_module or odoo.module_deploy returns a transport/transient/server/timeout/serialization error after code was changed, do not summarize local code as done and do not ask the user to run upgrade manually. Recover immediately with session.load_state, jobs.list/jobs.get, or workflow.resume_job, then continue until a terminal upgrade success or terminal failure is confirmed.",
                 "Never answer a code-changing request by printing JSON MCP tool calls or saying the client/user should execute them. You are connected to the MCP tools; call them yourself.",
                 "Never create module schema changes by direct ORM/Studio writes to ir.model.fields or ir.ui.view unless the user explicitly asks for a no-code Studio/database customization. For normal Odoo development, write Python/XML files in the custom module and deploy the module.",
-                "NEW ADDON PATH: create local code only at <project_path>/<module_name> with create_module=true on the composite workflow. Submit the entire installable addon as one complete writes array (manifest, init/imports, Python, security, views/data, and assets); scaffold-only batches are rejected before mutation. Never nest an addon inside another addon. /home/odoo/src/user is remote Odoo.sh read/verification space, not the local write target.",
+                "NEW ADDON PATH: create local code only at <project_path>/<module_name> with create_module=true on the composite workflow. Never nest an addon inside another addon. /home/odoo/src/user is remote Odoo.sh read/verification space, not the local write target.",
                 "Never generate Pydantic models/imports inside Odoo addon code. Pydantic is only for this MCP server's API schemas; Odoo modules must use the normal Odoo ORM: models.Model, fields, api, and XML views.",
                 "SMART ROUTER: pass explicit operation/target_surface when known. Fuzzy routing is advisory only. If clarification_required=true or confidence=low, perform only the returned read-only discovery and clarify before any write/deploy. For pure data queries, use direct odoo.search_read and skip repo tools.",
-                "STRICT FRONTEND: workflow.odoo_code_change owns frontend preflight internally. Do not browse public documentation or separately orchestrate frontend pattern tools when using the composite workflow.",
+                "STRICT FRONTEND: before writing any Odoo JS/OWL/POS/website/payment/QWeb/XML/SCSS asset code, call workflow.frontend_pattern_preflight and read the mandatory pattern files it returns. Results are cached; do not guess framework syntax.",
                 "POS CONFIG RULE: never use legacy load_fields('pos.config', ...) / models.load_fields for pos.config. Read installed point_of_sale source and use the version's real loader/backend pattern.",
                 "FAST WRITE RULE: for multi-file edits use repo.write_many_smart first. It keeps lock+backup+rollback for small changes and automatically uses repo.write_many_atomic only when size/risk requires it. Never skip git.diff or impact-aware changed-files verification.",
                 "CACHE RULE: use workflow.repo_index for module/assets/template discovery instead of full repo scans. Reuse cache unless files changed or force_refresh is required.",
@@ -155,8 +150,8 @@ def agent_instructions() -> dict:
                     "5. Patch with repo.apply_patch_atomic or repo.write_many_smart. Use repo.write_many_atomic only for large/risky refactors.",
                     "6. Run git.diff and qa.self_run(run_pytest=false) unless tests/shared logic are touched.",
                     "7. workflow.verify_against_core only for changed files.",
-                    "8. Call workflow.safe_deploy_module with the changed paths. It must pull/fetch the configured branch before work begins, use adaptive Odoo.sh polling for up to 4 minutes with immediate build-failure detection, verify deployed file hashes, upgrade the module, and run registry smoke tests.",
-                    "9. If safe_deploy returns status=running, deployment_waiting, module_upgrade_running, or any next_call, call the returned next_call/jobs.get or workflow.resume_job. Describe deployment_waiting as an expected safe checkpoint, not a failure. If recent Odoo.sh logs show build/test failure, changed /home/odoo/src/user file hashes do not match, the Odoo module deploy fails, or registry_field_verify fails, report that real blocker. Do not repeat commit/push.",
+                    "8. Call workflow.safe_deploy_module with the changed paths. It must pull/fetch the configured branch before work begins, poll Odoo.sh every 10 seconds for up to 10 minutes, verify deployed file hashes, upgrade the module, and run registry smoke tests.",
+                    "9. If safe_deploy returns status=running, module_upgrade_running, or any next_call, call the returned next_call/jobs.get or workflow.resume_job. If Odoo.sh deploy polling times out, recent Odoo.sh logs show build/test failure, changed /home/odoo/src/user file hashes do not match, the Odoo module deploy is still running, or registry_field_verify fails, do not claim success. Do not repeat commit/push.",
                     "10. If the client loses job_id mid-flow, call workflow.resume_job without job_id to use the latest saved safe-deploy job, or pass override_step=push/install/upgrade for an explicit user-requested continuation point.",
                     "11. Finish only after safe deploy/resume reports passed, or report the exact blocker and next_call returned by the workflow.",
                 ],
@@ -170,14 +165,14 @@ def agent_instructions() -> dict:
                 ],
             },
             "mandatory_dual_read": {
-                "rule": "Read custom checkout code first. Use only local/cached core evidence selected by the composite workflow; unavailable remote core source is warning-only and must not trigger dependency removal.",
+                "rule": "BOTH custom module AND core module must ALWAYS be read — neither is optional",
                 "step_1_custom": "repo.read ALL relevant files in the custom module first",
                 "step_2_scope": "For backend/model/controller/security/structural changes: workflow.scope_advice(custom_module_name, custom_file_paths) → get adaptive read plan. For lightweight UI/text/style XML/CSS/SCSS edits: still perform mandatory dual read; read exact custom target plus workflow.scope_advice mandatory core source, then write and safe_deploy.",
-                "step_3_core": "The composite workflow executes locally available mandatory evidence. Never replace missing cache evidence with public web browsing.",
+                "step_3_core": "Execute EVERY mandatory ScopeReadInstruction: repo.read each path returned",
                 "step_4_code": "ONLY THEN write code — using ONLY verified field/method names from core reads",
                 "step_5_verify": "Before git.push → ALWAYS workflow.verify_against_core(written_files)",
                 "step_6_push": "If push_blocked=False → git.push. If True → fix CRITICAL findings, re-verify (max 3 cycles)",
-                "enforcement": "If cached core evidence is unavailable, keep valid declared dependencies unchanged, run local changed-file verification, and surface a warning rather than blocking or guessing.",
+                "enforcement": "Agent MUST NOT skip any mandatory instruction. If core file not found → WARN user, do not guess",
             },
             "core_reading_rules": {
                 "purpose": "Read real Odoo source to eliminate hallucination — no static skill, no guessing",
@@ -277,7 +272,7 @@ def agent_instructions() -> dict:
                 "   → If push_blocked=False: proceed to git.commit",
                 "10. Prefer workflow.safe_deploy_module for commit → push → Odoo.sh verification → upgrade",
                 "11. Manual git.push is only safe when followed by Odoo.sh SHA/failure/hash verification",
-                "12. odoo.ensure_dependencies → odoo.module_deploy → poll jobs.get in short 20-second progress windows; direct module_deploy blocks itself if recent pushed code is not verified",
+                "12. odoo.ensure_dependencies → odoo.module_deploy → poll jobs.get every 10s; direct module_deploy blocks itself if recent pushed code is not verified",
                 "    If Access Denied → SSH fallback auto-triggered inside module_deploy",
                 "13. If failed → odoosh.grep_errors → read traceback → fix → back to step 6 (max 3x)",
                 "15. odoo.module_status = installed ✅",
@@ -350,7 +345,6 @@ def agent_instructions() -> dict:
 def root() -> dict[str, object]:
     return {
         "service": "Odoo MCP Agent Connector",
-        "build_revision": settings.build_revision,
         "ui": "not_required",
         "docs": "/docs",
         "openapi": "/openapi.json",
@@ -365,7 +359,6 @@ def root() -> dict[str, object]:
             "claude": "/claude/mcp",
             "qwen": "/qwen/mcp",
             "grok": "/grok/mcp",
-            "opencode": "/opencode/mcp",
         },
         "workflow": ["/workflow/capability-check", "/workflow/full-verify", "/workflow/safe-deploy-module"],
     }
@@ -398,5 +391,4 @@ app.include_router(qwen_mcp_router)
 app.include_router(claude_mcp_router)
 app.include_router(chatgpt_mcp_router)
 app.include_router(grok_mcp_router)
-app.include_router(opencode_mcp_router)
 app.include_router(workflow_router)

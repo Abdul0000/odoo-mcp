@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 from pathlib import Path
 
@@ -233,41 +232,6 @@ class GitService:
         if not sha or not all(c in "0123456789abcdefABCDEF" for c in sha[:40]):
             return CommandResult(command=["git", "revert", sha], cwd=str(project), exit_code=2, stderr="Unsafe or empty SHA for revert.")
         return self._run(["git", "revert", "--no-edit", sha], project, timeout_seconds)
-
-    def resolve_commit(self, project_path: str, ref: str = "HEAD", timeout_seconds: int = 20) -> CommandResult:
-        """Resolve a commit ref to a full SHA without reading/reconstructing files."""
-        project = self._project(project_path)
-        if ref != "HEAD" and (not re.fullmatch(r"[0-9a-fA-F]{7,64}", ref or "")):
-            return CommandResult(command=["git", "rev-parse", ref], cwd=str(project), exit_code=2, stderr="Unsafe commit reference.")
-        return self._run(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], project, timeout_seconds)
-
-    def revert_commit_no_commit(self, project_path: str, sha: str, timeout_seconds: int = 120) -> CommandResult:
-        """Apply an inverse commit to the index/worktree so related metadata can join one commit."""
-        project = self._project(project_path)
-        if not re.fullmatch(r"[0-9a-fA-F]{7,64}", sha or ""):
-            return CommandResult(command=["git", "revert", "--no-commit", sha], cwd=str(project), exit_code=2, stderr="Unsafe or empty SHA for revert.")
-        return self._run(["git", "revert", "--no-commit", sha], project, timeout_seconds)
-
-    def abort_revert(self, project_path: str, timeout_seconds: int = 30) -> CommandResult:
-        return self._run(["git", "revert", "--abort"], self._project(project_path), timeout_seconds)
-
-    def commit_staged(self, project_path: str, message: str, timeout_seconds: int = 60) -> CommandResult:
-        """Commit the existing index without pulling/rebasing during an active revert transaction."""
-        project = self._project(project_path)
-        identity_result = self.configure_identity(str(project))
-        if identity_result.exit_code != 0:
-            return identity_result
-        staged = self._run(["git", "diff", "--cached", "--quiet"], project, timeout_seconds)
-        if staged.exit_code == 0:
-            return CommandResult(command=["git", "commit", "-m", message], cwd=str(project), exit_code=1, stderr="No staged revert changes to commit.")
-        return self._run(["git", "commit", "-m", message], project, timeout_seconds)
-
-    def stage_all(self, project_path: str, timeout_seconds: int = 30) -> CommandResult:
-        return self._run(["git", "add", "-A"], self._project(project_path), timeout_seconds)
-
-    def diff_check(self, project_path: str, staged: bool = False, timeout_seconds: int = 30) -> CommandResult:
-        command = ["git", "diff", "--cached", "--check"] if staged else ["git", "diff", "--check"]
-        return self._run(command, self._project(project_path), timeout_seconds)
 
     def push(self, project_path: str, remote: str = "origin", branch: str | None = None, set_upstream: bool = True, timeout_seconds: int = 120) -> CommandResult:
         project = self._project(project_path)

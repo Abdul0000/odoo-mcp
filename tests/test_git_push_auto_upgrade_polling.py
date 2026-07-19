@@ -134,12 +134,12 @@ def test_post_push_auto_upgrade_polls_until_pushed_commit_is_deployed_then_upgra
     assert job.request["deploy_timeout_seconds"] == 300
     assert job.result["status"] == "passed"
     assert job.result["poll_attempts"] == 3
-    assert job.result["poll_elapsed_seconds"] == 4.0
+    assert job.result["poll_elapsed_seconds"] == 20.0
     assert len([step for step in job.steps if step.name == "odoosh_check_commit_poll"]) == 3
     assert [step.status for step in job.steps if step.name == "odoosh_check_commit_poll"] == ["running", "running", "passed"]
     assert _DeploysOnThirdPoll.check_calls == ["abc1234", "abc1234", "abc1234"]
     assert _DeploysOnThirdPoll.deploy_calls == [("x_module", 120)]
-    assert fake_clock.sleeps == [2.0, 2.0]
+    assert fake_clock.sleeps == [10.0, 10.0]
 
 
 def test_post_push_auto_upgrade_times_out_without_running_module_upgrade(project, monkeypatch):
@@ -147,45 +147,14 @@ def test_post_push_auto_upgrade_times_out_without_running_module_upgrade(project
 
     assert result.exit_code == 2
     assert job.job_type == "post_push_auto_upgrade"
-    assert job.status == JobStatus.warning
-    assert job.result["status"] == "deployment_waiting"
-    assert job.result["interruption_expected"] is True
+    assert job.status == JobStatus.failed
+    assert job.result["status"] == "deploy_failed_or_timeout"
     assert job.result["sha"] == "abc1234"
     assert job.result["poll_timeout_seconds"] == 300
     assert job.result["poll_interval_seconds"] == 10.0
     assert job.result["poll_elapsed_seconds"] == 300.0
-    assert job.result["poll_attempts"] == 39
+    assert job.result["poll_attempts"] == 31
     assert job.result["next_call"] == {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}}
     assert _NeverDeploys.deploy_calls == []
-    assert len(_NeverDeploys.check_calls) == 39
+    assert len(_NeverDeploys.check_calls) == 31
     assert sum(fake_clock.sleeps) == 300.0
-
-
-def test_commit_poll_stops_immediately_when_build_failure_is_detected(monkeypatch):
-    fake_clock = _FakeClock()
-    monkeypatch.setattr(odoosh_service.time, "monotonic", fake_clock.monotonic)
-    monkeypatch.setattr(odoosh_service.time, "sleep", fake_clock.sleep)
-    service = _NeverDeploys()
-    failure_checks = []
-
-    def failure_check():
-        failure_checks.append(True)
-        return CommandResult(
-            command=["odoosh", "recent-build-failure"],
-            cwd="odoosh:ssh",
-            exit_code=1,
-            stdout='{"failed": true, "summary": "build failed"}',
-        )
-
-    result = service.poll_deployed_commit(
-        "abc1234",
-        timeout_seconds=240,
-        interval_seconds=10,
-        failure_check=failure_check,
-    )
-
-    assert result.exit_code == 1
-    assert '"build_failed": true' in result.stdout
-    assert _NeverDeploys.check_calls == ["abc1234"]
-    assert failure_checks == [True]
-    assert fake_clock.sleeps == []

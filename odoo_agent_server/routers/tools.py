@@ -3,15 +3,11 @@ from __future__ import annotations
 import asyncio
 import ast
 import difflib
-import fnmatch
-import glob
 import json
 import re
-import threading
 import time
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import ValidationError
@@ -35,7 +31,7 @@ from ..schemas import (
     MenuCrawlerRequest,
     CodingTaskPlanRequest,
     OdooCodeChangeRequest,
-    OdooCodeFileChange,
+    FrontendVisualImplementRequest,
     EmptyRequest,
     FullVerifyRequest,
     SafeDeployModuleRequest,
@@ -75,10 +71,8 @@ from ..schemas import (
     RepoWriteItem,
     RepoWriteRequest,
     SelfRunRequest,
-    SelfRunReport,
     JobStatus,
     JobStep,
-    JobRecord,
     deployment_confirmed_from_record,
     ToolCallRequest,
     ToolCallResult,
@@ -94,8 +88,6 @@ from ..schemas import (
     ListModuleFilesRequest,
     # V14+: Pillar 2 — Adaptive Scope Advisor
     ScopeAdviceRequest,
-    ScopeAdviceResult,
-    ScopeLevel,
     # V14+: Pillar 3 — Pre-Push Syntax Verifier
     SyntaxVerifyRequest,
     PosChangeVerifyRequest,
@@ -129,14 +121,12 @@ from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_
 from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index, verify_deployed_module, _poll_odoosh_deployed, _pre_push_verify_files, _expected_user_file_hashes, _infer_registry_fields_from_python, _normalise_expected_registry_fields, _verify_registry_fields, _assert_head_commit_contains_paths
 from ..schemas import ApprovalRecord, ApprovalStatus
 from ..services.store_service import JsonStore
+from ..services.frontend_visual_service import FrontendVisualService
 from ..services.deploy_impact_service import classify_deploy_impact
-from ..services.failure_policy_service import FailurePolicyService
-from ..services.background_executor import background_task, submit_background
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
 _STRICT_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
-_CODE_CHANGE_ENTRY_LOCK = threading.Lock()
 
 
 def strict_safe_tool_name(name: str) -> str:
@@ -178,6 +168,7 @@ def _agent_priority(name: str) -> tuple[int, str]:
         "odoo.health": 3,
         "odoo.module_status": 3,
         "workflow.smart_tool_router": 4,
+        "workflow.agent_instructions": 5,
         "workflow.capability_check": 6,
     }
     if name in order:
@@ -219,16 +210,23 @@ _TOOL_DESCRIPTORS = [
         description=(
             "Mandatory first gate for multi-client ODOO_CLIENTS setups. "
             "Call without client_name to list clients and require user selection when multiple clients exist. "
-            "The user's exact client-name reply is final confirmation: immediately call with that client_name, "
-            "validate=true, and user_confirmed=true when the field is available; never ask a second confirmation. "
-            "Older/cached client schemas may omit user_confirmed, so validation also accepts the selected client_name alone. "
-            "Never set force_refresh=true for a normal query, schema retry, or repeated request; healthy cached validation is reused. "
+            "After the user selects a client, call with client_name and validate=true. "
             "Validation checks repo/token/branch, checkout, Odoo.sh SSH, Odoo shell health, and addons path. "
             "Write/git/deploy tools are blocked until this passes when multiple clients are configured."
         ),
         read_only=True,
     ),
 
+    ToolDescriptor(
+        name="workflow.agent_instructions",
+        title="Load agent instructions",
+        description=(
+            "CALL THIS FIRST in every session before any other tool. "
+            "Returns full agent rules, flow, error guide, and repo config from the connector. "
+            "Follow these instructions exactly for every task."
+        ),
+        read_only=True,
+    ),
     ToolDescriptor(name="workflow.capability_check",
         title="Check connector capabilities", description="Check local connector capabilities and missing runtime configuration", read_only=True),
     ToolDescriptor(name="workflow.coding_task_plan",
@@ -238,20 +236,24 @@ _TOOL_DESCRIPTORS = [
         title="Provider-safe Odoo code change",
         description=(
             "Single high-level provider-safe coding workflow. Use this instead of manually calling repo.read/write, "
-            "scope_advice, verify, git.push, or module_deploy. It returns a background job_id immediately; poll jobs.get "
-            "for live phase transitions and the terminal result. It enforces the v15 flow internally: "
+            "scope_advice, verify, git.push, or module_deploy. It enforces the v15 flow internally: "
             "read custom module, scope_advice, read /home/odoo/src/odoo/addons related source first with enterprise fallback, "
             "apply provided edits, git.diff, qa.self_run, verify_against_core, then workflow.safe_deploy_module and jobs.get polling. "
             "For a missing addon, set create_module=true with an exact lowercase technical name; it is created only at the checkout root. "
-            "For a new addon, generate its entire installable file set in one writes array (up to 100 complete files). "
-            "An empty, scaffold-only, or manifest-referencing-incomplete new-addon batch is rejected before any file is written. "
-            "For an existing addon, empty writes returns focused inspection context and asks for a second call with exact writes. "
-            "Never use web search, terminal/Git commands, restore/reset/checkout, or a second clean checkout to work "
-            "around dirty files. Re-call this workflow in the same checkout; it preserves and safely includes existing "
-            "uncommitted module work. Short approvals such as apply/implement continue the pending operation. Adaptive "
-            "task lanes keep small and normal work within strict read/search budgets and cache target locations. Tiny deterministic CSS/SCSS/XML text/manifest edits skip remote core discovery but retain diff, QA, syntax, push, and deploy guards. Broad, "
-            "ambiguous, migration, architecture, or multi-file work automatically "
-            "promotes to long mode. CSS/SCSS additionally supports deterministic unique-selector autopatching."
+            "If writes is empty it returns focused inspection context and asks for a second call with exact writes."
+        ),
+        requires_approval=True,
+    ),
+    ToolDescriptor(
+        name="workflow.frontend_visual_implement",
+        title="Implement frontend visual asset",
+        description=(
+            "Generic visual implementation workflow for Odoo POS/OWL/dashboard/website/backend UI. "
+            "Use when a design needs SCSS, SVG assets, decorative backgrounds, logos/icons, premium cards, "
+            "or decorative shapes. It generates deterministic visual assets/writes, reads custom/native context, "
+            "runs verify_against_core, then uses the same safe deploy pipeline. For exact geometric/logo/background shapes, "
+            "prefer allowed_methods=['svg_asset'] instead of guessing with CSS borders. Set create_module=true only for a new "
+            "standalone root-level addon; otherwise module_name must already exist."
         ),
         requires_approval=True,
     ),
@@ -273,7 +275,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.full_verify",
         title="Run full verification", description="Run the full self-verification workflow for an Odoo module", read_only=True),
     ToolDescriptor(name="workflow.safe_deploy_module",
-        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh adaptively for up to 4 minutes for the pushed SHA, stop immediately on detected Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, upgrade an Odoo module, For MCP clients this starts/resumes a background safe-deploy job and returns job_id/next_call immediately; status=running is not success and must be followed via jobs.get. Only treat the deployment as complete when response.deploy_confirmed == true. A finished job without this field set to true means the deploy did not fully complete — do not report success to the user. If git diff shows no changes for this module, safe_deploy_module automatically runs Odoo.sh source verification and returns verified_already_deployed/already_deployed_confirmed; read this field before telling the user anything is 'already added' or 'already live'. Do not make that claim from memory of a previous turn.", requires_approval=True),
+        title="Deploy module (full pipeline)", description="Safely commit, push, poll Odoo.sh every 10s up to 10 minutes for the pushed SHA, reject recent Odoo.sh build/test failures, verify changed file hashes under /home/odoo/src/user, verify manifest, upgrade an Odoo module, For MCP clients this starts/resumes a background safe-deploy job and returns job_id/next_call immediately; status=running is not success and must be followed via jobs.get. Only treat the deployment as complete when response.deploy_confirmed == true. A finished job without this field set to true means the deploy did not fully complete — do not report success to the user. If git diff shows no changes for this module, safe_deploy_module automatically runs Odoo.sh source verification and returns verified_already_deployed/already_deployed_confirmed; read this field before telling the user anything is 'already added' or 'already live'. Do not make that claim from memory of a previous turn.", requires_approval=True),
     ToolDescriptor(
         name="workflow.verify_deployed_module",
         title="Verify deployed source",
@@ -289,7 +291,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="workflow.registry_smoke_test",
         title="Test Odoo registry", description="Verify live Odoo registry models/menus after install or upgrade", read_only=True),
     ToolDescriptor(name="workflow.restore_last_good_commit",
-        title="Revert a bad code release", description="Fast deterministic Git revert for an exact bad SHA or current HEAD, with optional manifest version/bump, local QA, one combined commit, push, and SHA-guarded module deployment. Use for revert/rollback/restore-last-version requests; never reconstruct parent files through workflow.odoo_code_change writes or artifacts.", requires_approval=True),
+        title="Restore last working commit", description="Emergency restore by reverting a bad commit and optionally pushing the revert", requires_approval=True),
     ToolDescriptor(name="workflow.browser_menu_crawl",
         title="Crawl Odoo menus in browser", description="Open multiple Odoo paths through CDP and capture console/network/Odoo UI errors", read_only=True),
     ToolDescriptor(
@@ -443,7 +445,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="odoosh.grep_errors",
         title="Search Odoo.sh error logs", description="Search Odoo.sh logs for errors", read_only=True),
     ToolDescriptor(name="odoosh.error_pack",
-        title="Collect Odoo.sh error details", description="Return Odoo.sh tracebacks plus structured root-cause hints/files/XML/model names. Invalid-field failures explicitly require Python registry/import inspection and reject XML eval/value-format fixes.", read_only=True),
+        title="Collect Odoo.sh error details", description="Return Odoo.sh tracebacks plus root-cause hints/files/XML/model names", read_only=True),
     ToolDescriptor(
         name="odoosh.module_deploy_ssh",
         title="Deploy module via SSH",
@@ -481,12 +483,9 @@ _TOOL_DESCRIPTORS = [
         name="odoo.query",
         title="Smart Odoo functional query",
         description=(
-            "First tool for every read-only Odoo business-data question, including custom models and analytical/ranking requests. "
-            "It generates a query plan, dynamically discovers the relevant model/module and fields from live ir.model.fields metadata, "
-            "then executes a bounded search_read. Supported derived cross-model reports such as workforce presence gaps run in one "
-            "Odoo shell session. It never guesses res.partner for an unknown request. "
-            "Delete/unlink/write/create/update/archive requests are hard-blocked without executing Odoo methods. "
-            "Returns the generated model/domain/fields/order plan plus live records. "
+            "Best tool for simple functional Odoo questions from any MCP client: list users, employees, "
+            "draft invoices, unpaid invoices, customers, vendors, products, sale orders, purchase orders, or modules. "
+            "Takes a natural-language query and returns parsed model/domain/fields plus live Odoo records. "
             "Runs read-only Odoo shell through the selected client's Odoo.sh SSH context."
         ),
         read_only=True,
@@ -497,11 +496,10 @@ _TOOL_DESCRIPTORS = [
         name="odoo.module_deploy",
         title="Install or upgrade module",
         description=(
-            "SMART INSTALL/UPGRADE — use directly for an existing module install or upgrade; never route an install-only request through workflow.odoo_code_change. "
+            "SMART INSTALL/UPGRADE — always use this for ALL first-time installs and upgrades. "
             "If a recent manual git.push was recorded, this tool first verifies the pushed SHA, recent "
             "Odoo.sh failure logs, and changed /home/odoo/src/user file hashes before touching the DB. "
             "Runs install/upgrade through Odoo.sh SSH and verifies source/deploy state in the same background job. "
-            "For OpenCode/local-checkout changes, pass expected_sha from the pushed local HEAD; the connector will not touch the module registry until that exact SHA is active on Odoo.sh. "
             "For MCP providers this never blocks for final success: it returns job_id + next_call. status=running is not success; call jobs.get until terminal passed/failed before telling the user deployed/upgraded."
         ),
         requires_approval=True,
@@ -529,18 +527,16 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="jobs.list",
         title="List background jobs", description="List recent connector jobs", read_only=True),
     ToolDescriptor(name="jobs.get",
-        title="Check background job status", description="Read one connector job by id. Remote MCP profiles force this call to be non-blocking to prevent client HTTP timeouts; poll again while status is queued/running. Only treat the deployment as complete when the terminal result confirms the requested module operation.", read_only=True),
+        title="Check background job status", description="Read one connector job by id; waits server-side by default until done or timeout to avoid fragile client polling. Only treat the deployment as complete when response.deploy_confirmed == true. A finished job without this field set to true means the deploy did not fully complete — do not report success to the user.", read_only=True),
     ToolDescriptor(name="audit.list",
         title="View audit log", description="List recent audit events", read_only=True),
-    # Continue a bounded, interrupted, or recoverable pipeline from its checkpoint.
+    # Fix 3: Resume failed pipeline from last successful step
     ToolDescriptor(
         name="workflow.resume_job",
-        title="Continue paused deployment",
+        title="Resume interrupted job",
         description=(
-            "Continue an intentionally paused, bounded-wait, interrupted, or recoverable "
-            "safe_deploy_module pipeline from its last successful checkpoint. A continuation is "
-            "not a deployment failure unless the returned result explicitly reports a terminal "
-            "error. Pass job_id when available; if omitted, the connector continues the "
+            "Fix 3 — Resume a failed safe_deploy_module or start_session pipeline from its last "
+            "successful step. Pass job_id when available; if omitted, the connector resumes the "
             "last saved safe-deploy job from session state or the latest matching job. Instead of "
             "starting over from step 1, the agent continues from where it left off. Optionally "
             "override the start step with override_step (qa | commit | push | wait_odoosh | "
@@ -667,9 +663,11 @@ _TOOL_INPUT_MODELS = {
     "connector.health": EmptyRequest,
     "artifacts.read": ArtifactReadRequest,
     "client.check": ClientCheckRequest,
+    "workflow.agent_instructions": EmptyRequest,
     "workflow.capability_check": EmptyRequest,
     "workflow.coding_task_plan": CodingTaskPlanRequest,
     "workflow.odoo_code_change": OdooCodeChangeRequest,
+    "workflow.frontend_visual_implement": FrontendVisualImplementRequest,
     "workflow.smart_tool_router": SmartToolRouteRequest,
     "workflow.repo_index": RepoIndexRequest,
     "workflow.full_verify": FullVerifyRequest,
@@ -851,12 +849,10 @@ def _search_read_via_shell(
     context: dict | None = None,
     client_name: str | None = None,
     query_text: str | None = None,
-    timeout_seconds: int = 45,
+    timeout_seconds: int = 120,
 ) -> dict:
     client = _resolve_query_client(client_name, query_text)
-    shell_result = _odoo_service_for_client(client).search_read(
-        model, domain, fields, limit, offset, order, context, timeout_seconds
-    )
+    shell_result = _odoo_service_for_client(client).search_read(model, domain, fields, limit, offset, order, context)
     shell_dumped = shell_result.model_dump(mode="json") if hasattr(shell_result, "model_dump") else shell_result
     if isinstance(shell_dumped, dict) and shell_dumped.get("status") == "ok":
         return {
@@ -869,469 +865,34 @@ def _search_read_via_shell(
             "message": "Odoo query completed. SSH is preferred; HTTPS JSON-RPC read-only fallback is used automatically when SSH is unavailable.",
         }
 
-    # OdooService already attempted SSH and its bounded HTTPS fallback. Replaying
-    # the same SSH command here doubled worst-case latency without a new path.
+    # Preserve the original explicit Odoo.sh fallback path for compatibility and
+    # tests. In normal runtime OdooService already attempted SSH + HTTPS JSON-RPC,
+    # but direct tests/legacy monkeypatches may still expect this second path.
+    ssh_result = OdooShService(client).search_read(model, domain, fields, limit, offset, order, context, timeout_seconds)
+    ssh_dumped = ssh_result.model_dump(mode="json") if hasattr(ssh_result, "model_dump") else ssh_result
+    if isinstance(ssh_dumped, dict) and ssh_dumped.get("status") == "ok":
+        return {
+            "status": "ok",
+            "source": "odoosh_ssh_fallback",
+            "client_name": client.name if client else None,
+            "odoo": ssh_dumped,
+            "shell_attempt": shell_dumped,
+            "ssh_fallback_used": True,
+            "message": "Primary Odoo query failed; Odoo.sh SSH fallback was used.",
+        }
     return {
-        "status": shell_dumped.get("status") if isinstance(shell_dumped, dict) else "failed",
+        "status": ssh_dumped.get("status") if isinstance(ssh_dumped, dict) else "failed",
         "source": "odoo_ssh_or_https_jsonrpc_failed",
         "client_name": client.name if client else None,
-        "odoo": shell_dumped,
+        "odoo": ssh_dumped,
         "shell_attempt": shell_dumped,
-        "ssh_fallback_used": False,
-        "message": "Odoo query failed after one SSH attempt and the bounded HTTPS JSON-RPC fallback; duplicate SSH replay was skipped.",
-    }
-
-
-_QUERY_MUTATION_RE = re.compile(
-    r"\b(delete|remove|unlink|erase|purge|destroy|archive|deactivate|drop|truncate|wipe)\b",
-    re.I,
-)
-_QUERY_WRITE_RE = re.compile(
-    r"^\s*(?:(?:please|kindly)\s+)*(?:(?:can|could|would)\s+you\s+)?"
-    r"(?:(?:please|kindly)\s+)*(write|update|modify|create|change|set)\b",
-    re.I,
-)
-_QUERY_RANKING_RE = re.compile(r"\b(highest|largest|maximum|max|top|lowest|smallest|minimum|min|best|worst)\b", re.I)
-_WORKFORCE_PRESENCE_GAP_RE = re.compile(
-    r"\b(absent|absence|missing\s+attendance|no\s+attendance|did\s+not\s+attend)\b.*\b(employee|employees|staff|worker|workers)\b|"
-    r"\b(employee|employees|staff|worker|workers)\b.*\b(absent|absence|missing\s+attendance|no\s+attendance|did\s+not\s+attend)\b",
-    re.I,
-)
-_QUERY_STOP_WORDS = {
-    "a", "an", "and", "are", "all", "for", "from", "get", "give", "in", "is", "last", "list",
-    "me", "of", "on", "please", "record", "records", "show", "the", "to", "with", "who", "which",
-    "highest", "largest", "maximum", "max", "top", "lowest", "smallest", "minimum", "min", "best", "worst",
-}
-_QUERY_SYNONYM_GROUPS = {
-    "employee": {"employee", "employees", "staff", "worker", "workers"},
-    "salary": {"salary", "salaries", "wage", "wages", "pay", "compensation"},
-    "customer": {"customer", "customers", "client", "clients", "partner", "partners"},
-    "invoice": {"invoice", "invoices", "billing", "billings"},
-    "product": {"product", "products", "item", "items"},
-    "amount": {"amount", "total", "value", "revenue", "cost", "price"},
-    "quantity": {"quantity", "qty", "stock", "units"},
-    "order": {"order", "orders", "quotation", "quotations"},
-    "unpaid": {"unpaid", "not_paid", "not"},
-}
-_NUMERIC_FIELD_TYPES = {"integer", "float", "monetary"}
-_DATE_FIELD_TYPES = {"date", "datetime"}
-_QUERY_MONTHS = {
-    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
-    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
-    "august": 8, "aug": 8, "september": 9, "sep": 9, "sept": 9,
-    "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
-}
-
-
-def _raw_query_tokens(text: str) -> set[str]:
-    tokens = {token for token in re.findall(r"[a-z][a-z0-9_]+", text.lower()) if token not in _QUERY_STOP_WORDS}
-    inflections = set(tokens)
-    for token in tokens:
-        if len(token) > 4 and token.endswith("ies"):
-            inflections.add(token[:-3] + "y")
-        elif len(token) > 4 and token.endswith("s") and not token.endswith(("ss", "us")):
-            inflections.add(token[:-1])
-    return inflections
-
-
-def _query_tokens(text: str) -> set[str]:
-    raw = _raw_query_tokens(text)
-    expanded = set(raw)
-    for aliases in _QUERY_SYNONYM_GROUPS.values():
-        if raw & aliases:
-            expanded.update(aliases)
-    return expanded
-
-
-def _is_mutating_query(text: str) -> bool:
-    return bool(_QUERY_MUTATION_RE.search(text) or _QUERY_WRITE_RE.search(text.strip()))
-
-
-def _requested_calendar_date(text: str) -> str | None:
-    iso_match = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", text)
-    if iso_match:
-        raw = f"{iso_match.group(1)}-{int(iso_match.group(2)):02d}-{int(iso_match.group(3)):02d}"
-        try:
-            return datetime.strptime(raw, "%Y-%m-%d").date().isoformat()
-        except ValueError:
-            return None
-    month_names = "|".join(sorted(_QUERY_MONTHS, key=len, reverse=True))
-    day_first = re.search(rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_names})\s+(20\d{{2}})\b", text, re.I)
-    month_first = re.search(rf"\b({month_names})\s+(\d{{1,2}})(?:st|nd|rd|th)?(?:,)?\s+(20\d{{2}})\b", text, re.I)
-    if day_first:
-        day, month, year = int(day_first.group(1)), _QUERY_MONTHS[day_first.group(2).lower()], int(day_first.group(3))
-    elif month_first:
-        month, day, year = _QUERY_MONTHS[month_first.group(1).lower()], int(month_first.group(2)), int(month_first.group(3))
-    else:
-        return None
-    try:
-        return datetime(year, month, day).date().isoformat()
-    except ValueError:
-        return None
-
-
-def _workforce_presence_gap_query(req: OdooFunctionalQueryRequest, report_date: str) -> dict[str, Any]:
-    client = _resolve_query_client(req.client_name, req.query)
-    result = OdooShService(client).workforce_presence_report(report_date, limit=req.limit, timeout_seconds=45)
-    dumped = result.model_dump(mode="json")
-    return {
-        "status": dumped.get("status"),
-        "intent": "workforce_presence_gap",
-        "planner": "single_shell_composite_recipe",
-        "read_only_enforced": True,
-        "client_name": client.name if client else None,
-        "parsed": {
-            "report_date": report_date,
-            "operation": "scheduled_employees - attendance_overlap - approved_leave",
-            "models": ["hr.employee", "hr.attendance", "hr.leave", "resource.calendar"],
-            "single_odoo_shell": True,
-            "limit": req.limit,
-        },
-        "odoo": dumped,
-        "message": (
-            "Workforce presence gap calculated in one Odoo shell session."
-            if dumped.get("status") == "ok"
-            else dumped.get("error") or "Workforce presence analysis failed."
-        ),
-    }
-
-
-def _odoo_result_rows(data: dict[str, Any]) -> list[dict[str, Any]]:
-    payload = data.get("odoo") if isinstance(data, dict) else None
-    if hasattr(payload, "model_dump"):
-        payload = payload.model_dump(mode="json")
-    result = payload.get("result") if isinstance(payload, dict) else None
-    return [row for row in result if isinstance(row, dict)] if isinstance(result, list) else []
-
-
-def _metadata_or_domain(tokens: set[str], raw_tokens: set[str] | None = None) -> list[Any]:
-    conditions: list[Any] = []
-    for token in sorted(tokens, key=lambda item: (-len(item), item))[:8]:
-        if token in (raw_tokens if raw_tokens is not None else tokens):
-            conditions.append(("model", "ilike", token))
-        conditions.extend([("name", "ilike", token), ("field_description", "ilike", token)])
-    if not conditions:
-        return []
-    return ["|"] * (len(conditions) - 1) + conditions
-
-
-def _relative_date_domain(text: str, field_name: str | None) -> list[Any]:
-    if not field_name:
-        return []
-    today = datetime.now(timezone.utc).date()
-    if "yesterday" in text:
-        day = today - timedelta(days=1)
-        return [(field_name, ">=", day.isoformat()), (field_name, "<", today.isoformat())]
-    if "today" in text:
-        return [(field_name, ">=", today.isoformat())]
-    word_numbers = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7}
-    match = re.search(r"\blast\s+(\d+|one|two|three|four|five|six|seven)\s+days?\b", text)
-    if match:
-        days = int(match.group(1)) if match.group(1).isdigit() else word_numbers[match.group(1)]
-        return [(field_name, ">=", (today - timedelta(days=max(0, days - 1))).isoformat())]
-    if re.search(r"\blast\s+(week|7\s+days)\b", text):
-        return [(field_name, ">=", (today - timedelta(days=7)).isoformat())]
-    if re.search(r"\blast\s+(month|30\s+days)\b", text):
-        return [(field_name, ">=", (today - timedelta(days=30)).isoformat())]
-    return []
-
-
-def _field_match_score(
-    row: dict[str, Any],
-    tokens: set[str],
-    *,
-    ranking: bool,
-    include_model: bool = True,
-) -> int:
-    name = str(row.get("name") or "").lower()
-    description = str(row.get("field_description") or "").lower()
-    model = str(row.get("model") or "").lower()
-    relation = str(row.get("relation") or "").lower()
-    field_tokens = set(re.findall(r"[a-z][a-z0-9_]+", name.replace("_", " ") + " " + description))
-    model_tokens = set(re.findall(r"[a-z][a-z0-9_]+", model.replace(".", " ").replace("_", " ")))
-    score = 0
-    for token in tokens:
-        if include_model and token in model_tokens:
-            score = max(score, 10)
-        elif token == name or token in field_tokens:
-            score = max(score, 8)
-        elif token in description:
-            score = max(score, 5)
-        elif token in model or token in relation:
-            score = max(score, 3)
-    if ranking and str(row.get("ttype") or "") in _NUMERIC_FIELD_TYPES and score:
-        score += 5
-    return score
-
-
-def _module_hints_for_model(model: str, field_rows: list[dict[str, Any]] | None = None) -> list[str]:
-    counts: dict[str, int] = {}
-    for row in field_rows or []:
-        raw = str(row.get("modules") or "")
-        for module in re.split(r"[,\s]+", raw):
-            module = module.strip()
-            if module:
-                counts[module] = counts.get(module, 0) + 1
-    if counts:
-        return [name for name, _count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:5]]
-    return []
-
-
-def _selection_options(raw: Any) -> list[tuple[str, str]]:
-    """Normalize live ir.model.fields selection metadata without executing code."""
-    value = raw
-    if isinstance(value, str):
-        try:
-            value = ast.literal_eval(value)
-        except (SyntaxError, ValueError):
-            return []
-    if not isinstance(value, (list, tuple)):
-        return []
-    options: list[tuple[str, str]] = []
-    for item in value:
-        if isinstance(item, (list, tuple)) and len(item) >= 2:
-            key, label = str(item[0]), str(item[1])
-            if key and label:
-                options.append((key, label))
-    return options
-
-
-def _selection_domains(text: str, tokens: set[str], field_rows: list[dict[str, Any]]) -> list[Any]:
-    """Build filters from the selected model's live selection labels."""
-    domains: list[Any] = []
-    normalized_text = re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
-    for row in field_rows:
-        if str(row.get("ttype") or "") != "selection":
-            continue
-        scored: list[tuple[int, str]] = []
-        for key, label in _selection_options(row.get("selection")):
-            label_text = re.sub(r"[^a-z0-9]+", " ", label.lower()).strip()
-            label_tokens = _query_tokens(label_text)
-            overlap = len(tokens & label_tokens)
-            phrase_match = bool(label_text and re.search(rf"\b{re.escape(label_text)}s?\b", normalized_text))
-            score = 20 if phrase_match else overlap
-            if score:
-                scored.append((score, key))
-        if not scored:
-            continue
-        best_score = max(score for score, _key in scored)
-        keys = list(dict.fromkeys(key for score, key in scored if score == best_score))
-        field_name = str(row.get("name") or "")
-        if field_name and keys:
-            domains.append((field_name, "=" if len(keys) == 1 else "in", keys[0] if len(keys) == 1 else keys))
-    return domains
-
-
-def _best_date_field(text: str, tokens: set[str], field_rows: list[dict[str, Any]]) -> str | None:
-    candidates = [row for row in field_rows if str(row.get("ttype") or "") in _DATE_FIELD_TYPES]
-    if not candidates:
-        return None
-    ranked = sorted(
-        candidates,
-        key=lambda row: (-_field_match_score(row, tokens, ranking=False, include_model=False), str(row.get("name") or "")),
-    )
-    scored = _field_match_score(ranked[0], tokens, ranking=False, include_model=False)
-    if scored:
-        return str(ranked[0].get("name") or "") or None
-    create_field = next((row for row in candidates if row.get("name") == "create_date"), None)
-    return str((create_field or ranked[0]).get("name") or "") or None
-
-
-def _numeric_comparison(text: str) -> tuple[str, float] | None:
-    match = re.search(
-        r"\b(over|above|greater\s+than|more\s+than|under|below|less\s+than)\s+([0-9]+(?:\.[0-9]+)?)\b",
-        text,
-    )
-    if not match:
-        return None
-    operator = ">" if match.group(1) in {"over", "above", "greater than", "more than"} else "<"
-    return operator, float(match.group(2))
-
-
-def _dynamic_query_plan(req: OdooFunctionalQueryRequest) -> dict[str, Any]:
-    text = (req.query or "").strip().lower()
-    raw_tokens = _raw_query_tokens(text)
-    tokens = _query_tokens(text)
-    ranking = bool(_QUERY_RANKING_RE.search(text))
-    metadata = _search_read_via_shell(
-        model="ir.model.fields",
-        domain=_metadata_or_domain(tokens, raw_tokens),
-        fields=["model", "name", "field_description", "ttype", "relation", "readonly", "modules", "selection"],
-        limit=300,
-        order="model asc, name asc",
-        client_name=req.client_name,
-        query_text=req.query,
-    )
-    rows = _odoo_result_rows(metadata)
-    if metadata.get("status") != "ok" or not rows:
-        return {
-            "status": "needs_clarification",
-            "intent": "dynamic_query",
-            "read_only_enforced": True,
-            "message": "No reliable Odoo model/field match was found. Ask for one business object or field clue; do not guess a model.",
-            "query": req.query,
-            "metadata_source": metadata.get("source"),
-            "success_allowed": False,
-        }
-
-    grouped: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        model = str(row.get("model") or "").strip()
-        if not model or model.startswith(("ir.model", "base.", "bus.")):
-            continue
-        item = grouped.setdefault(model, {"score": 0, "field_scores": [], "fields": [], "numeric_score": 0})
-        score = _field_match_score(row, tokens, ranking=ranking, include_model=False)
-        item["field_scores"].append(score)
-        item["fields"].append(row)
-        if str(row.get("ttype") or "") in _NUMERIC_FIELD_TYPES:
-            item["numeric_score"] = max(int(item["numeric_score"]), score)
-    for model, item in grouped.items():
-        strongest = sorted((int(score) for score in item["field_scores"]), reverse=True)[:6]
-        model_tokens = set(re.findall(r"[a-z][a-z0-9_]+", model.replace(".", " ").replace("_", " ")))
-        item["score"] = sum(strongest) + (8 * len(raw_tokens & model_tokens))
-    if ranking:
-        ranked_groups = [(model, info) for model, info in grouped.items() if int(info["numeric_score"]) > 0]
-    else:
-        ranked_groups = list(grouped.items())
-    ranked_groups.sort(key=lambda item: (-int(item[1]["score"]), item[0]))
-    close_ambiguous = bool(
-        len(ranked_groups) > 1
-        and int(ranked_groups[0][1]["score"]) - int(ranked_groups[1][1]["score"]) <= 1
-    )
-    if not ranked_groups or int(ranked_groups[0][1]["score"]) < 5 or close_ambiguous:
-        return {
-            "status": "needs_clarification",
-            "intent": "dynamic_query",
-            "read_only_enforced": True,
-            "message": "The request is ambiguous across Odoo models. Provide the business object or desired field; no fallback model was queried.",
-            "candidates": [{"model": model, "score": info["score"]} for model, info in ranked_groups[:5]],
-            "success_allowed": False,
-        }
-
-    model, best = ranked_groups[0]
-    all_fields_data = _search_read_via_shell(
-        model="ir.model.fields",
-        domain=[("model", "=", model)],
-        fields=["model", "name", "field_description", "ttype", "relation", "readonly", "modules", "selection"],
-        limit=400,
-        order="name asc",
-        client_name=req.client_name,
-        query_text=req.query,
-    )
-    all_fields = _odoo_result_rows(all_fields_data) or list(best["fields"])
-    by_name = {str(row.get("name") or ""): row for row in all_fields if row.get("name")}
-    matched = sorted(
-        all_fields,
-        key=lambda row: (-_field_match_score(row, tokens, ranking=ranking, include_model=False), str(row.get("name") or "")),
-    )
-    measure = next(
-        (str(row["name"]) for row in matched if str(row.get("ttype") or "") in _NUMERIC_FIELD_TYPES and _field_match_score(row, tokens, ranking=ranking, include_model=False)),
-        None,
-    )
-    result_fields: list[str] = ["id"]
-    for preferred in ("display_name", "name"):
-        if preferred in by_name:
-            result_fields.append(preferred)
-            break
-    for row in matched:
-        name = str(row.get("name") or "")
-        score = _field_match_score(row, tokens, ranking=ranking, include_model=False)
-        if name and score and name not in result_fields and str(row.get("ttype") or "") not in {"one2many", "many2many", "binary", "html"}:
-            result_fields.append(name)
-        if len(result_fields) >= 8:
-            break
-    for preferred in ("state", "active", "company_id", "currency_id", "date", "date_start", "date_end"):
-        if preferred in by_name and preferred not in result_fields and len(result_fields) < 10:
-            result_fields.append(preferred)
-    if len(result_fields) < 5:
-        relation_field = next(
-            (
-                str(row.get("name") or "")
-                for row in all_fields
-                if str(row.get("ttype") or "") == "many2one"
-                and str(row.get("name") or "") not in {"company_id", "create_uid", "write_uid"}
-            ),
-            None,
-        )
-        if relation_field and relation_field not in result_fields:
-            result_fields.append(relation_field)
-
-    descending = not bool(re.search(r"\b(lowest|smallest|minimum|min)\b", text))
-    domain: list[Any] = []
-    if "active" in by_name:
-        if "inactive" in text or "archived" in text:
-            domain.append(("active", "=", False))
-        elif "active" in text:
-            domain.append(("active", "=", True))
-    domain.extend(_selection_domains(text, tokens, all_fields))
-    for row in matched:
-        name = str(row.get("name") or "")
-        score = _field_match_score(row, tokens, ranking=False, include_model=False)
-        field_type = str(row.get("ttype") or "")
-        if not name or score < 8:
-            continue
-        if field_type == "boolean" and not any(item[0] == name for item in domain if isinstance(item, tuple)):
-            domain.append((name, "=", not bool(re.search(rf"\b(not|without|no)\s+{re.escape(name.replace('_', ' '))}\b", text))))
-        elif field_type in _NUMERIC_FIELD_TYPES and name.endswith("_rank"):
-            domain.append((name, ">", 0))
-    comparison = _numeric_comparison(text)
-    if comparison and measure:
-        domain.append((measure, comparison[0], comparison[1]))
-    date_field = _best_date_field(text, tokens, all_fields)
-    domain.extend(_relative_date_domain(text, date_field))
-    if date_field and date_field not in result_fields and len(result_fields) < 10:
-        result_fields.append(date_field)
-    order = (
-        f"{measure} {'desc' if descending else 'asc'}, id desc"
-        if ranking and measure
-        else f"{date_field} desc, id desc"
-        if date_field and (bool(_relative_date_domain(text, date_field)) or re.search(r"\b(latest|recent|newest|oldest)\b", text))
-        else "id desc"
-    )
-    relevant_module_fields = [
-        row
-        for row in all_fields
-        if _field_match_score(row, tokens, ranking=False, include_model=False) > 0
-    ]
-    target_modules = _module_hints_for_model(model, relevant_module_fields or all_fields)
-    plan = {
-        "model": model,
-        "target_module": target_modules[0] if target_modules else None,
-        "target_modules": target_modules,
-        "domain": domain,
-        "fields": result_fields,
-        "limit": req.limit,
-        "order": order,
-        "measure_field": measure,
-        "confidence": "high" if int(best["score"]) >= 15 else "medium",
-        "candidate_models": [{"model": name, "score": info["score"]} for name, info in ranked_groups[:5]],
-    }
-    data = _search_read_via_shell(
-        model=model,
-        domain=domain,
-        fields=result_fields,
-        limit=req.limit,
-        order=order,
-        client_name=req.client_name,
-        query_text=req.query,
-    )
-    return {
-        "status": data.get("status"),
-        "intent": "dynamic_query",
-        "planner": "live_odoo_metadata",
-        "read_only_enforced": True,
-        "source": data.get("source"),
-        "client_name": data.get("client_name"),
-        "parsed": plan,
-        "odoo": data.get("odoo"),
-        "shell_attempt": data.get("shell_attempt"),
-        "ssh_fallback_used": data.get("ssh_fallback_used"),
-        "message": data.get("message"),
+        "ssh_fallback_used": True,
+        "message": "Odoo query failed through primary path and Odoo.sh fallback.",
     }
 
 
 def _odoo_functional_query(req: OdooFunctionalQueryRequest) -> object:
-    """Plan every functional question from live Odoo metadata, then search_read.
+    """Map common functional Odoo questions to safe read-only search_read.
 
     It tries Odoo shell first. When shell authentication fails but the selected
     client has Odoo.sh SSH settings, it automatically falls back to a read-only
@@ -1339,28 +900,134 @@ def _odoo_functional_query(req: OdooFunctionalQueryRequest) -> object:
     without an Odoo email/password, as long as SSH access is working.
     """
     text = (req.query or "").strip().lower()
+    limit = req.limit
 
-    if _is_mutating_query(text):
-        return {
-            "status": "blocked",
-            "error_type": "read_only_query_guard",
-            "read_only_enforced": True,
-            "success_allowed": False,
-            "message": "Delete/unlink/write/create/update/archive/drop/truncate/wipe requests are forbidden in the Odoo query engine. No model method was executed.",
-            "query": req.query,
-        }
-    if _WORKFORCE_PRESENCE_GAP_RE.search(text):
-        report_date = _requested_calendar_date(text)
-        if not report_date:
-            return {
-                "status": "needs_clarification",
-                "intent": "workforce_presence_gap",
-                "read_only_enforced": True,
-                "success_allowed": False,
-                "message": "Provide one exact calendar date for the attendance-gap report, for example 2026-07-16.",
-            }
-        return _workforce_presence_gap_query(req, report_date)
-    return _dynamic_query_plan(req)
+    model = "res.partner"
+    domain: list = []
+    fields = ["name", "email", "phone", "active"]
+    order = "id desc"
+    intent = "partners"
+
+    if any(word in text for word in ["user", "users", "login"]):
+        model = "res.users"
+        domain = []
+        if "inactive" in text or "archived" in text:
+            domain = [("active", "=", False)]
+        elif "all" not in text:
+            domain = [("active", "=", True)]
+        fields = ["name", "login", "active", "partner_id", "company_ids"]
+        order = "id asc"
+        intent = "users"
+    elif "employee" in text or "employees" in text or "staff" in text:
+        model = "hr.employee"
+        domain = []
+        if "inactive" in text or "archived" in text:
+            domain = [("active", "=", False)]
+        elif "all" not in text:
+            domain = [("active", "=", True)]
+        fields = ["name", "work_email", "work_phone", "department_id", "job_id", "active"]
+        order = "id asc"
+        intent = "employees"
+    elif "invoice" in text or "invoices" in text:
+        model = "account.move"
+        move_type = "in_invoice" if any(w in text for w in ["vendor", "bill", "bills", "supplier"]) else "out_invoice"
+        domain = [("move_type", "=", move_type)]
+        if "draft" in text:
+            domain.append(("state", "=", "draft"))
+        elif "posted" in text or "confirmed" in text:
+            domain.append(("state", "=", "posted"))
+        if "unpaid" in text or "not paid" in text or "open" in text:
+            domain.append(("payment_state", "in", ["not_paid", "partial"]))
+        elif "paid" in text and "unpaid" not in text and "not paid" not in text:
+            domain.append(("payment_state", "=", "paid"))
+        if "cancel" in text:
+            domain.append(("state", "=", "cancel"))
+        fields = ["name", "partner_id", "invoice_date", "invoice_date_due", "amount_total", "amount_residual", "currency_id", "state", "payment_state"]
+        order = "invoice_date desc, id desc"
+        intent = "vendor_bills" if move_type == "in_invoice" else "customer_invoices"
+    elif any(w in text for w in ["customer", "customers", "client", "clients"]):
+        model = "res.partner"
+        domain = [("customer_rank", ">", 0)]
+        fields = ["name", "email", "phone", "customer_rank", "active"]
+        order = "customer_rank desc, name asc"
+        intent = "customers"
+    elif any(w in text for w in ["vendor", "vendors", "supplier", "suppliers"]):
+        model = "res.partner"
+        domain = [("supplier_rank", ">", 0)]
+        fields = ["name", "email", "phone", "supplier_rank", "active"]
+        order = "supplier_rank desc, name asc"
+        intent = "vendors"
+    elif "product" in text or "products" in text:
+        model = "product.product"
+        domain = []
+        if "can be sold" in text or "sale" in text or "sell" in text:
+            domain.append(("sale_ok", "=", True))
+        if "can be purchased" in text or "purchase" in text or "buy" in text:
+            domain.append(("purchase_ok", "=", True))
+        fields = ["display_name", "default_code", "list_price", "standard_price", "qty_available", "uom_id", "active"]
+        order = "id desc"
+        intent = "products"
+    elif "sale order" in text or "sales order" in text or "quotation" in text or "quotations" in text:
+        model = "sale.order"
+        domain = []
+        if "draft" in text or "quotation" in text:
+            domain.append(("state", "in", ["draft", "sent"]))
+        elif "done" in text:
+            domain.append(("state", "=", "done"))
+        elif "cancel" in text:
+            domain.append(("state", "=", "cancel"))
+        elif "confirmed" in text or "sale" in text:
+            domain.append(("state", "=", "sale"))
+        fields = ["name", "partner_id", "date_order", "amount_total", "currency_id", "state", "invoice_status"]
+        order = "date_order desc, id desc"
+        intent = "sale_orders"
+    elif "purchase order" in text or "rfq" in text or "purchase" in text:
+        model = "purchase.order"
+        domain = []
+        if "draft" in text or "rfq" in text:
+            domain.append(("state", "in", ["draft", "sent"]))
+        elif "done" in text:
+            domain.append(("state", "=", "done"))
+        elif "cancel" in text:
+            domain.append(("state", "=", "cancel"))
+        elif "confirmed" in text or "purchase" in text:
+            domain.append(("state", "=", "purchase"))
+        fields = ["name", "partner_id", "date_order", "amount_total", "currency_id", "state", "invoice_status"]
+        order = "date_order desc, id desc"
+        intent = "purchase_orders"
+    elif "module" in text or "modules" in text or "apps" in text:
+        model = "ir.module.module"
+        domain = []
+        if "installed" in text:
+            domain.append(("state", "=", "installed"))
+        elif "uninstalled" in text:
+            domain.append(("state", "=", "uninstalled"))
+        fields = ["name", "shortdesc", "state", "latest_version", "installed_version"]
+        order = "name asc"
+        intent = "modules"
+
+    data = _search_read_via_shell(
+        model=model,
+        domain=domain,
+        fields=fields,
+        limit=limit,
+        offset=0,
+        order=order,
+        context=None,
+        client_name=req.client_name,
+        query_text=req.query,
+    )
+    return {
+        "status": data.get("status"),
+        "intent": intent,
+        "source": data.get("source"),
+        "client_name": data.get("client_name"),
+        "parsed": {"model": model, "domain": domain, "fields": fields, "limit": limit, "order": order},
+        "odoo": data.get("odoo"),
+        "shell_attempt": data.get("shell_attempt"),
+        "ssh_fallback_used": data.get("ssh_fallback_used"),
+        "message": data.get("message"),
+    }
 
 
 def _resolve_code_change_project(payload: OdooCodeChangeRequest) -> tuple[str | None, str]:
@@ -1395,14 +1062,7 @@ def _safe_module_relative(module_name: str, relative_path: str) -> str:
 
 
 def _ensure_root_module_scaffold(repo: RepoService, project: Path, payload: OdooCodeChangeRequest) -> None:
-    """Materialize one complete new-addon batch at the checkout root.
-
-    A previous implementation wrote an empty initializer and placeholder
-    manifest before the provider had supplied the rest of the module. If a
-    continuation or inspection was interrupted, that left a misleading partial
-    addon in the checkout. New addons are now accepted only as one complete,
-    atomic batch.
-    """
+    """Create only the minimal root-level skeleton needed for first module reads."""
     if not payload.create_module:
         return
     module_name = payload.module_name.strip()
@@ -1418,292 +1078,28 @@ def _ensure_root_module_scaffold(repo: RepoService, project: Path, payload: Odoo
     if (module_dir / "__manifest__.py").exists():
         return
 
-    planned, missing, errors = _validate_complete_new_module_writes(project, payload)
-    if missing or errors:
-        detail = "; ".join([*errors, f"missing complete files: {', '.join(missing)}" if missing else ""])
-        raise HTTPException(status_code=409, detail=detail.strip("; "))
-    result = repo.write_many_atomic(str(project), planned, timeout_seconds=120)
+    supplied = {_safe_module_relative(module_name, item.relative_path): item.content for item in payload.writes if item.content is not None}
+    skeleton = [
+        RepoWriteItem(
+            relative_path=f"{module_name}/__init__.py",
+            content=supplied.get(f"{module_name}/__init__.py", ""),
+        ),
+        RepoWriteItem(
+            relative_path=f"{module_name}/__manifest__.py",
+            content=supplied.get(
+                f"{module_name}/__manifest__.py",
+                repr({"name": module_name.replace("_", " ").title(), "depends": ["base"], "installable": True}) + "\n",
+            ),
+        ),
+    ]
+    result = repo.write_many_fast_safe(str(project), skeleton)
     if result.exit_code != 0:
-        raise HTTPException(status_code=400, detail=result.stderr or "Could not atomically create complete root-level module")
-
-
-def _validate_complete_new_module_writes(
-    project: Path,
-    payload: OdooCodeChangeRequest,
-) -> tuple[list[RepoWriteItem], list[str], list[str]]:
-    """Validate a complete new-addon file graph without mutating the checkout."""
-    module_name = payload.module_name.strip()
-    supplied: dict[str, str] = {}
-    errors: list[str] = []
-    for change in payload.writes:
-        rel = _safe_module_relative(module_name, change.relative_path)
-        if change.content is None:
-            errors.append(f"new file {rel} requires complete content, not search/replace")
-            continue
-        supplied[rel] = change.content
-
-    required = {f"{module_name}/__init__.py", f"{module_name}/__manifest__.py"}
-    manifest_rel = f"{module_name}/__manifest__.py"
-    manifest: dict[str, Any] = {}
-    manifest_content = supplied.get(manifest_rel)
-    if manifest_content is None and (project / manifest_rel).is_file():
-        manifest_content = (project / manifest_rel).read_text(encoding="utf-8")
-    if manifest_content is not None:
-        try:
-            parsed = ast.literal_eval(manifest_content)
-            if not isinstance(parsed, dict):
-                raise ValueError("manifest must evaluate to a dictionary")
-            manifest = parsed
-        except (SyntaxError, ValueError) as exc:
-            errors.append(f"invalid complete manifest: {exc}")
-
-    # Every local data/demo/asset path declared by the proposed manifest must
-    # either already exist or be included in the same write batch.
-    for key in ("data", "demo"):
-        values = manifest.get(key) or []
-        if isinstance(values, str):
-            values = [values]
-        for value in values if isinstance(values, (list, tuple)) else []:
-            if isinstance(value, str) and not value.startswith(("http://", "https://", "//")):
-                rel = value.lstrip("/")
-                required.add(rel if rel.startswith(f"{module_name}/") else f"{module_name}/{rel}")
-
-    assets = manifest.get("assets") or {}
-    if isinstance(assets, dict):
-        for entries in assets.values():
-            entries = entries if isinstance(entries, (list, tuple)) else [entries]
-            for entry in entries:
-                candidates = [entry] if isinstance(entry, str) else (
-                    [part for part in entry if isinstance(part, str)] if isinstance(entry, (list, tuple)) else []
-                )
-                for candidate in candidates:
-                    rel = candidate.lstrip("/")
-                    if rel.startswith(f"{module_name}/"):
-                        required.add(rel)
-
-    # Validate direct package imports such as ``from . import models`` and
-    # ``from . import library`` against the same proposed file set.
-    initializer_contents: dict[str, str] = {}
-    existing_module = project / module_name
-    if existing_module.is_dir():
-        for init_path in existing_module.rglob("__init__.py"):
-            initializer_contents[init_path.relative_to(project).as_posix()] = init_path.read_text(encoding="utf-8")
-    initializer_contents.update({rel: text for rel, text in supplied.items() if rel.endswith("/__init__.py")})
-    for init_rel, content in initializer_contents.items():
-        try:
-            tree = ast.parse(content or "")
-        except SyntaxError as exc:
-            errors.append(f"invalid initializer {init_rel}: {exc}")
-            continue
-        base = init_rel.rsplit("/", 1)[0]
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom) or node.level != 1 or node.module:
-                continue
-            for alias in node.names:
-                if alias.name == "*":
-                    continue
-                py_path = f"{base}/{alias.name}.py"
-                package_path = f"{base}/{alias.name}/__init__.py"
-                if not any((project / path).is_file() or path in supplied for path in (py_path, package_path)):
-                    required.add(py_path)
-
-    missing: list[str] = []
-    supplied_paths = set(supplied)
-    for rel in sorted(required):
-        if "*" in rel:
-            if not any(fnmatch.fnmatch(path, rel) for path in supplied_paths) and not glob.glob(str(project / rel), recursive=True):
-                missing.append(rel)
-        elif rel not in supplied_paths and not (project / rel).is_file():
-            missing.append(rel)
-
-    planned = [RepoWriteItem(relative_path=rel, content=content) for rel, content in supplied.items()]
-    return planned, missing, errors
-
-
-def _is_legacy_placeholder_module(module_dir: Path) -> bool:
-    """Recognize the old connector's empty two-file scaffold."""
-    manifest_path = module_dir / "__manifest__.py"
-    init_path = module_dir / "__init__.py"
-    if not manifest_path.is_file() or not init_path.is_file():
-        return False
-    try:
-        manifest = ast.literal_eval(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
-        return False
-    if not isinstance(manifest, dict) or init_path.read_text(encoding="utf-8").strip():
-        return False
-    return set(manifest).issubset({"name", "depends", "installable"}) and manifest.get("depends") == ["base"]
+        raise HTTPException(status_code=400, detail=result.stderr or "Could not create root-level module scaffold")
 
 
 def _read_text_safe(path: Path, limit: int = 300_000) -> str:
     data = path.read_text(encoding="utf-8")
     return data[:limit]
-
-
-_INVALID_FIELD_ERROR_RE = re.compile(
-    r"Invalid\s+field\s+['\"](?P<field>[A-Za-z_][A-Za-z0-9_]*)['\"]\s+on\s+model\s+['\"](?P<model>[A-Za-z_][A-Za-z0-9_.]*)['\"]",
-    re.I,
-)
-
-
-def _invalid_field_request(payload: OdooCodeChangeRequest) -> tuple[str, str] | None:
-    text = "\n".join(
-        str(value or "")
-        for value in (
-            payload.task_description,
-            payload.intent,
-            _target_hint(payload),
-            "\n".join(payload.investigation_evidence or []),
-        )
-    )
-    match = _INVALID_FIELD_ERROR_RE.search(text)
-    return (match.group("model"), match.group("field")) if match else None
-
-
-def _literal_model_names(node: ast.AST) -> list[str]:
-    try:
-        value = ast.literal_eval(node)
-    except (ValueError, TypeError):
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, (list, tuple)):
-        return [str(item) for item in value if isinstance(item, str)]
-    return []
-
-
-def _model_class_facts(path: Path, model_name: str, field_name: str) -> list[dict[str, Any]]:
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    except (OSError, UnicodeDecodeError, SyntaxError):
-        return []
-    facts: list[dict[str, Any]] = []
-    for node in tree.body:
-        if not isinstance(node, ast.ClassDef):
-            continue
-        names: list[str] = []
-        inherits: list[str] = []
-        fields: list[str] = []
-        for child in node.body:
-            if isinstance(child, (ast.Assign, ast.AnnAssign)):
-                targets = child.targets if isinstance(child, ast.Assign) else [child.target]
-                value = child.value
-                for target in targets:
-                    if not isinstance(target, ast.Name):
-                        continue
-                    if target.id == "_name" and value is not None:
-                        names.extend(_literal_model_names(value))
-                    elif target.id == "_inherit" and value is not None:
-                        inherits.extend(_literal_model_names(value))
-                    elif target.id == field_name:
-                        fields.append(target.id)
-        if model_name in names or model_name in inherits:
-            facts.append({
-                "class_name": node.name,
-                "line": node.lineno,
-                "declares_name": model_name in names,
-                "inherits_model": model_name in inherits,
-                "defines_field": field_name in fields,
-            })
-    return facts
-
-
-def _invalid_field_registry_diagnostic(
-    project: Path,
-    module_path: str,
-    payload: OdooCodeChangeRequest,
-) -> dict[str, Any] | None:
-    requested = _invalid_field_request(payload)
-    if requested is None:
-        return None
-    model_name, field_name = requested
-    module_dir = (project / module_path).resolve()
-    models_dir = module_dir / "models"
-    definitions: list[dict[str, Any]] = []
-    target_files: list[str] = []
-    for path in sorted(models_dir.rglob("*.py")) if models_dir.is_dir() else []:
-        for fact in _model_class_facts(path, model_name, field_name):
-            rel = path.relative_to(project).as_posix()
-            definitions.append({"relative_path": rel, **fact})
-            if rel not in target_files:
-                target_files.append(rel)
-
-    init_path = models_dir / "__init__.py"
-    imported_modules: list[str] = []
-    if init_path.is_file():
-        init_rel = init_path.relative_to(project).as_posix()
-        target_files.insert(0, init_rel)
-        try:
-            init_tree = ast.parse(init_path.read_text(encoding="utf-8"), filename=str(init_path))
-            for node in init_tree.body:
-                if isinstance(node, ast.ImportFrom) and node.level == 1:
-                    imported_modules.extend(alias.name for alias in node.names)
-        except (OSError, UnicodeDecodeError, SyntaxError):
-            pass
-
-    for path in sorted(module_dir.rglob("*.xml")):
-        try:
-            content = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            continue
-        if field_name in content and model_name in content:
-            rel = path.relative_to(project).as_posix()
-            if rel not in target_files:
-                target_files.append(rel)
-
-    primary = [item for item in definitions if item["declares_name"]]
-    field_defs = [item for item in definitions if item["defines_field"]]
-    missing_imports = [
-        item["relative_path"]
-        for item in definitions
-        if Path(item["relative_path"]).stem not in imported_modules
-    ]
-    if len(primary) > 1:
-        classification = "duplicate_model_definitions"
-        root_cause = (
-            f"Model {model_name!r} is declared with _name in {len(primary)} Python classes. "
-            f"Field {field_name!r} is not consistently defined across those primary declarations; "
-            "registry composition/import order can expose a model without that field. Consolidate one primary "
-            "model and convert intentional extensions to _inherit before changing XML data values."
-        )
-    elif field_defs and missing_imports:
-        classification = "model_file_not_imported"
-        root_cause = f"Field {field_name!r} is defined in a Python model file that models/__init__.py does not import."
-    elif not field_defs:
-        classification = "field_not_defined_in_module"
-        root_cause = f"No loaded Python class for {model_name!r} defines field {field_name!r}; correct the XML field name or add the field."
-    else:
-        classification = "deployed_registry_or_source_mismatch"
-        root_cause = (
-            f"A single imported model definition contains {field_name!r}; verify the deployed SHA/source and restart/upgrade registry. "
-            "Changing the XML value syntax cannot create a missing registry field."
-        )
-    return {
-        "status": "diagnosed",
-        "error_type": "invalid_registry_field",
-        "model": model_name,
-        "field": field_name,
-        "classification": classification,
-        "root_cause": root_cause,
-        "definitions": definitions,
-        "models_init_import_order": imported_modules,
-        "missing_import_files": sorted(set(missing_imports)),
-        "target_files": target_files,
-        "xml_value_format_change_is_fix": False,
-    }
-
-
-def _invalid_field_xml_only_write_block(
-    diagnostic: dict[str, Any] | None,
-    writes: list[OdooCodeFileChange],
-) -> bool:
-    """Reject cosmetic XML edits when the registry failure is in Python model composition."""
-    return bool(
-        diagnostic
-        and diagnostic.get("classification") == "duplicate_model_definitions"
-        and writes
-        and all(str(change.relative_path).lower().endswith(".xml") for change in writes)
-    )
 
 
 def _parse_manifest_depends(manifest_path: Path) -> list[str]:
@@ -1839,23 +1235,11 @@ def _style_value(style: dict[str, Any], *names: str) -> str | None:
 
 def _css_style_declarations(style: dict[str, Any]) -> list[str]:
     declarations: list[str] = []
-    color = _style_value(style, "color", "text_color")
-    background = _style_value(style, "background")
-    background_color = _style_value(style, "background_color", "backgroundColor")
-    border_color = _style_value(style, "border_color", "borderColor")
-    fill = _style_value(style, "fill")
+    color = _style_value(style, "color")
     font_style = _style_value(style, "font_style", "fontStyle")
     font_weight = _style_value(style, "font_weight", "fontWeight")
-    safe_values = {
-        "color": color,
-        "background": background,
-        "background-color": background_color,
-        "border-color": border_color,
-        "fill": fill,
-    }
-    for prop, value in safe_values.items():
-        if value and not any(char in value for char in ";{}"):
-            declarations.append(f"{prop}: {value} !important;")
+    if color:
+        declarations.append(f"color: {color} !important;")
     if font_style:
         declarations.append(f"font-style: {font_style} !important;")
     if font_weight:
@@ -1903,267 +1287,6 @@ def _focused_search(repo: RepoService, project_path: str, module_path: str, patt
     return search_results, rel_paths
 
 
-def _is_fast_ui_task(payload: OdooCodeChangeRequest) -> bool:
-    task_type = _normalized_task_type(payload)
-    if task_type in {"style", "scss_css", "css"}:
-        return True
-    text = " ".join((payload.task_description or "", payload.intent or "", _target_hint(payload))).lower()
-    return any(term in text for term in (
-        "color", "colour", "dark mode", "dark theme", "heatmap", "border", "spacing", "font", "background",
-        "loader", "spinner", "loading indicator", "loading state", "tooltip", "icon", "badge",
-    )) and not any(term in text for term in ("python", "model field", "controller", "database", "security"))
-
-
-_TASK_LANE_BUDGETS = {
-    "fast": {"target_files": 3, "search_matches": 6, "custom_files": 4, "core_files": 8},
-    "normal": {"target_files": 6, "search_matches": 10, "custom_files": 8, "core_files": 16},
-    "long": {"target_files": 50, "search_matches": 25, "custom_files": 30, "core_files": 60},
-}
-
-
-def _compatibility_lane_budget(task_lane: str, mandatory_count: int) -> tuple[dict[str, int], bool]:
-    """Fit mandatory reads without changing an evidence-based task lane."""
-    budget = dict(_TASK_LANE_BUDGETS[task_lane])
-    expanded = task_lane != "long" and mandatory_count > budget["core_files"]
-    if expanded:
-        budget["core_files"] = mandatory_count
-    return budget, expanded
-
-
-def _task_lane_decision(payload: OdooCodeChangeRequest) -> dict[str, Any]:
-    """Classify every Odoo task from evidence instead of trusting provider labels."""
-    task_type = _normalized_task_type(payload)
-    text = " ".join((payload.task_description or "", payload.intent or "", _target_hint(payload))).lower()
-    requested = str(payload.complexity or "auto").strip().lower()
-    high_risk_types = {"security_csv", "payment", "payment_frontend", "migration", "migrations", "accounting", "payroll"}
-    high_risk_markers = (
-        "access rights", "record rule", "security group", "accounting", "journal entry",
-        "tax filing", "payment provider", "payment transaction", "stock valuation",
-        "inventory valuation", "payroll", "data migration", "production branch",
-    )
-    # An explicit fast hint must not weaken inspection for sensitive business
-    # flows. These tasks use the long evidence budget even when only one file is
-    # expected to change.
-    if task_type in high_risk_types or any(marker in text for marker in high_risk_markers):
-        return {"lane": "long", "requested_lane": requested, "score": None, "reason": "Safety-sensitive business or data scope requires long inspection."}
-    long_markers = (
-        "refactor", "redesign", "migration", "migrate", "all modules", "entire module", "whole module",
-        "multi-module", "architecture", "end to end", "full workflow", "race condition", "data migration",
-        "replace system", "new module", "large change", "new layout", "responsive overhaul",
-        "replace theme", "all styling", "entire ui", "whole dashboard",
-        "multiple components",
-    )
-    if (
-        payload.create_module
-        or task_type in {"migration", "migrations", "refactor", "architecture"}
-        or len(payload.writes) > 5
-        or len(payload.target_files) > 8
-        or any(marker in text for marker in long_markers)
-    ):
-        return {"lane": "long", "requested_lane": requested, "score": None, "reason": "Broad, architectural, migration, or mandatory multi-file scope detected."}
-
-    if payload.force_complexity and requested in _TASK_LANE_BUDGETS:
-        return {"lane": requested, "requested_lane": requested, "score": None, "reason": "Caller explicitly forced the inspection lane."}
-
-    score = 0
-    evidence: list[str] = []
-    write_count = len(payload.writes)
-    target_count = len(payload.target_files)
-    target_hint = _target_hint(payload).strip()
-    if 0 < write_count <= 2:
-        score += 5
-        evidence.append(f"{write_count} exact write(s)")
-    elif 3 <= write_count <= 5:
-        score += 1
-        evidence.append(f"{write_count} bounded writes")
-    if 0 < target_count <= 3:
-        score += 3
-        evidence.append(f"{target_count} target file(s)")
-    if target_hint:
-        score += 3
-        evidence.append("exact target hint")
-    if task_type not in {"", "auto"}:
-        score += 1
-        evidence.append(f"task type {task_type}")
-
-    deterministic_types = {"style", "scss_css", "css", "text_replace", "manifest"}
-    scope_markers = ("one ", "single ", "only ", "specific ", "exact ")
-    bounded_markers = (
-        "label", "typo", "color", "colour", "border", "background", "spacing", "font", "shadow",
-        "radius", "opacity", "button", "selector", "xpath", "method", "field",
-        "route", "dependency", "manifest", "loader", "spinner", "loading indicator",
-        "loading state", "tooltip", "icon", "badge",
-    )
-    frontend_micro_markers = (
-        "loader", "spinner", "loading indicator", "loading state", "tooltip", "icon", "badge",
-    )
-    if task_type in deterministic_types:
-        score += 3
-        evidence.append("deterministic task type")
-    if any(marker in text for marker in scope_markers):
-        score += 2
-        evidence.append("explicitly narrow scope")
-    if any(marker in text for marker in bounded_markers):
-        score += 2
-        evidence.append("bounded change wording")
-    if any(marker in text for marker in frontend_micro_markers):
-        score += 2
-        evidence.append("bounded frontend micro-feature")
-    if len(text) <= 180 and not re.search(r"\b(and|plus|across|throughout)\b", text):
-        score += 1
-        evidence.append("concise single-feature request")
-
-    if score >= 4:
-        lane = "fast"
-        reason = "Bounded low-risk task: " + ", ".join(evidence) + "."
-    else:
-        lane = "normal"
-        reason = (
-            "Scope is low-risk but not precise enough for the fast lane. "
-            "Unforced provider lane hints cannot override the server's evidence-based classification."
-        )
-    return {"lane": lane, "requested_lane": requested, "score": score, "reason": reason}
-
-
-def _task_lane(payload: OdooCodeChangeRequest) -> str:
-    return str(_task_lane_decision(payload)["lane"])
-
-
-_MICRO_CHANGE_SUFFIXES = (".scss", ".css", ".xml", ".md", ".txt", "__manifest__.py")
-_MICRO_CHANGE_RISK_RE = re.compile(
-    r"\b(?:security|access\s+rule|record\s+rule|payroll|accounting|migration|schema|architecture|redesign|refactor|delete|unlink|controller|javascript|owl|python)\b",
-    re.I,
-)
-
-
-def _is_low_risk_micro_change(
-    payload: OdooCodeChangeRequest,
-    writes: list[OdooCodeFileChange],
-    task_lane: str,
-) -> bool:
-    """Use local custom-file + QA checks for tiny deterministic edits; skip core discovery."""
-    if task_lane != "fast" or not writes or len(writes) > 2:
-        return False
-    text = " ".join(str(value or "") for value in (payload.task_description, payload.intent, _target_hint(payload)))
-    if _MICRO_CHANGE_RISK_RE.search(text):
-        return False
-    paths = [str(change.relative_path).lower().replace("\\", "/") for change in writes]
-    if not all(path.endswith(_MICRO_CHANGE_SUFFIXES) for path in paths):
-        return False
-    # Full-file replacement of XML can hide broad structural edits. Exact
-    # search/replace or generated bounded patches stay on the micro lane.
-    for change in writes:
-        if str(change.relative_path).lower().endswith(".xml") and change.content is not None:
-            return False
-    return True
-
-
-def _missing_manifest_asset_paths(project: Path, module_dir: Path, manifest_path: Path) -> list[str]:
-    """Resolve manifest asset references locally without core sync or SSH."""
-    try:
-        manifest = ast.literal_eval(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
-        return []
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("assets"), dict):
-        return []
-
-    missing: list[str] = []
-    for entries in manifest["assets"].values():
-        values = entries if isinstance(entries, (list, tuple)) else [entries]
-        for entry in values:
-            candidates = [entry] if isinstance(entry, str) else (
-                [value for value in entry if isinstance(value, str) and "/" in value]
-                if isinstance(entry, (list, tuple)) else []
-            )
-            for asset in candidates:
-                if asset.startswith(("http://", "https://", "//")):
-                    continue
-                raw_candidates = [project / asset, module_dir / asset]
-                exists = any(path.exists() for path in raw_candidates)
-                if not exists and "*" in asset:
-                    exists = any(glob.glob(str(path), recursive=True) for path in raw_candidates)
-                if not exists and asset not in missing:
-                    missing.append(asset)
-    return missing
-
-
-def _is_missing_asset_diagnostic_request(payload: OdooCodeChangeRequest, missing_assets: list[str]) -> bool:
-    if not missing_assets:
-        return False
-    text = " ".join((payload.task_description or "", payload.intent or "", _target_hint(payload))).lower()
-    failure_marker = any(marker in text for marker in ("missing", "cannot read", "can't read", "not found", "failed to load", "could not get content"))
-    asset_marker = any(marker in text for marker in ("asset", "manifest", "static/src", ".js", ".scss", ".css"))
-    return failure_marker and asset_marker
-
-
-def _ui_locator_key(project: Path, module_name: str, payload: OdooCodeChangeRequest) -> str:
-    import hashlib
-    target = " ".join((_target_hint(payload) or payload.task_description).lower().split())
-    tokens = sorted({token for token in re.split(r"[^a-z0-9_.#-]+", target) if len(token) >= 3})[:12]
-    raw = f"{project.resolve()}|{module_name}|{' '.join(tokens)}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
-
-
-def _cached_ui_paths(cache: Any, key: str, project: Path, module_path: str) -> list[str]:
-    if not isinstance(cache, dict) or not isinstance(cache.get(key), dict):
-        return []
-    module_root = (project / module_path).resolve()
-    paths: list[str] = []
-    for raw in cache[key].get("paths") or []:
-        candidate = (project / str(raw)).resolve()
-        try:
-            candidate.relative_to(module_root)
-        except ValueError:
-            continue
-        if candidate.is_file() and candidate.suffix.lower() in {".scss", ".css", ".xml", ".js", ".py", ".csv"}:
-            paths.append(candidate.relative_to(project).as_posix())
-    return list(dict.fromkeys(paths))[:3]
-
-
-def _update_ui_locator_cache(store: JsonStore, client_name: str | None, cache: Any, key: str, paths: list[str], project: Path) -> None:
-    import hashlib
-    updated = dict(cache) if isinstance(cache, dict) else {}
-    entries = list(dict.fromkeys(paths))[:3]
-    updated[key] = {
-        "paths": entries,
-        "fingerprints": {
-            rel: hashlib.sha256((project / rel).read_bytes()).hexdigest()[:16]
-            for rel in entries if (project / rel).is_file()
-        },
-        "saved_at": time.time(),
-    }
-    if len(updated) > 100:
-        updated = dict(list(updated.items())[-100:])
-    store.save_session_state({"ui_target_cache": updated}, client_name=client_name)
-
-
-def _ui_evidence_key(project: Path, module_name: str, payload: OdooCodeChangeRequest, paths: list[str]) -> str:
-    import hashlib
-    profile = _task_profile(payload, paths)
-    raw = f"{project.resolve()}|{module_name}|{profile.get('scope')}|{profile.get('live_verifier')}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
-
-
-def _path_content_fingerprint(raw_path: str) -> str | None:
-    import hashlib
-    path = Path(raw_path)
-    try:
-        if not path.is_file():
-            return None
-        return hashlib.sha256(path.read_bytes()).hexdigest()[:20]
-    except OSError:
-        return None
-
-
-def _shared_ui_evidence_valid(evidence: Any) -> bool:
-    if not isinstance(evidence, dict) or not evidence.get("frontend_preflight"):
-        return False
-    fingerprints = evidence.get("core_fingerprints") or {}
-    if not isinstance(fingerprints, dict):
-        return False
-    return all(_path_content_fingerprint(path) == expected for path, expected in fingerprints.items())
-
-
 def _normalized_task_type(payload: OdooCodeChangeRequest) -> str:
     task_type = str(payload.task_type or "auto").strip().lower().replace("-", "_").replace(" ", "_")
     return task_type or "auto"
@@ -2180,10 +1303,7 @@ def _style_request(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     cr = payload.change_request or {}
     if isinstance(cr.get("style"), dict):
         merged.update(cr["style"])
-    for key in (
-        "color", "text_color", "font_style", "fontStyle", "font_weight", "fontWeight",
-        "background", "background_color", "backgroundColor", "border_color", "borderColor", "fill",
-    ):
+    for key in ("color", "font_style", "fontStyle", "font_weight", "fontWeight", "background", "background_color"):
         if key in cr and cr[key] not in {None, ""}:
             merged[key] = cr[key]
     merged.update(payload.style or {})
@@ -2270,9 +1390,7 @@ def _build_safe_generic_autopatch(project: Path, module_path: str, payload: Odoo
     cr_type = str((payload.change_request or {}).get("type") or "").strip().lower().replace("-", "_").replace(" ", "_")
 
     if style and target and (task_type in {"auto", "style", "scss_css", "css", "qweb_template", "xml_view"} or strategy in {"auto", "safe_autopatch", "style_rule", "inline_style"} or cr_type in {"style", "change_style", "update_style"}):
-        writes = _build_selector_style_autopatch(project, module_path, custom_rel_paths, target, style)
-        if not writes:
-            writes = _build_simple_style_autopatch(project, module_path, target, style)
+        writes = _build_simple_style_autopatch(project, module_path, target, style)
         if writes:
             return writes, "style_rule", None
         return [], "style_rule", "target_text_or_class_not_found"
@@ -2285,61 +1403,6 @@ def _build_safe_generic_autopatch(project: Path, module_path: str, payload: Odoo
         return [], "text_replace", "search_text_not_found"
 
     return [], None, "unsupported_autopatch_for_task_type"
-
-
-def _build_selector_style_autopatch(
-    project: Path,
-    module_path: str,
-    target_files: list[str],
-    target_hint: str,
-    style: dict[str, Any],
-) -> list[OdooCodeFileChange]:
-    """Update one uniquely matched CSS/SCSS selector without rewriting a file."""
-    declarations = _css_style_declarations(style)
-    if not target_hint or not declarations:
-        return []
-    module_dir = project / module_path
-    candidates = [
-        path for path in _iter_autopatch_candidate_files(module_dir, target_files, project)
-        if path.suffix.lower() in {".scss", ".css"}
-    ]
-    exact_selector = target_hint.strip() if target_hint.strip().startswith((".", "#", "[")) else None
-    clue_tokens = [token for token in re.split(r"[^a-z0-9_-]+", target_hint.lower()) if len(token) >= 3]
-    matches: list[tuple[Path, re.Match[str]]] = []
-    for path in candidates:
-        try:
-            content = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        rule_re = re.compile(r"(?P<selector>[^{}]+)\{(?P<body>[^{}]*)\}", re.S)
-        for match in rule_re.finditer(content):
-            selector = " ".join(match.group("selector").split())
-            selector_lower = selector.lower()
-            if exact_selector:
-                selector_parts = [part.strip() for part in selector.split(",")]
-                selected = exact_selector in selector_parts or exact_selector == selector
-            else:
-                selected = bool(clue_tokens) and all(token in selector_lower for token in clue_tokens)
-            if selected:
-                matches.append((path, match))
-    if len(matches) != 1:
-        return []
-
-    path, match = matches[0]
-    old_rule = match.group(0)
-    body = match.group("body")
-    for declaration in declarations:
-        prop, value = declaration.split(":", 1)
-        prop_re = re.compile(rf"(?m)^(?P<indent>\s*){re.escape(prop)}\s*:\s*[^;]+;")
-        if prop_re.search(body):
-            body = prop_re.sub(lambda m: f"{m.group('indent')}{prop}: {value.strip()}", body, count=1)
-        else:
-            indent_match = re.search(r"\n(?P<indent>\s*)\S", body)
-            indent = indent_match.group("indent") if indent_match else "    "
-            body = body.rstrip() + f"\n{indent}{prop}: {value.strip()}\n"
-    new_rule = old_rule[: old_rule.index("{") + 1] + body + "}"
-    rel = path.relative_to(project).as_posix()
-    return [OdooCodeFileChange(relative_path=rel, search=old_rule, replace=new_rule, count=1)]
 
 
 def _build_simple_style_autopatch(project: Path, module_path: str, target_text: str, style: dict[str, Any]) -> list[OdooCodeFileChange]:
@@ -2439,74 +1502,16 @@ def _task_profile(payload: OdooCodeChangeRequest, rel_paths: list[str] | None = 
         profile["frontend"] = True
     return profile
 
-def _current_head_sha(project: Path) -> str | None:
-    try:
-        result = GitService().head_sha(str(project))
-    except Exception:
-        return None
-    return result.stdout.strip() if result.exit_code == 0 and result.stdout.strip() else None
-
-
-def _code_change_operation_identity(project: Path, payload: OdooCodeChangeRequest) -> dict[str, Any]:
-    return {
-        "project_path": str(project.resolve()),
-        "requested_module": payload.module_name.strip().lower(),
-        "task_description": " ".join(payload.task_description.lower().split()),
-        "task_type": _normalized_task_type(payload),
-        "intent": (payload.intent or "").strip().lower(),
-        "target_hint": _target_hint(payload).strip().lower(),
-    }
-
-
-_SHORT_CODE_CHANGE_CONTINUATIONS = {
-    "apply", "implement", "do it", "yes", "continue", "proceed", "push", "deploy", "fix it",
-}
-
-
-def _reuse_pending_code_change(payload: OdooCodeChangeRequest, pending: Any, project: Path) -> OdooCodeChangeRequest:
-    """Bind terse approval replies to the last unresolved composite operation."""
-    if not isinstance(pending, dict):
-        return payload
-    short = " ".join((payload.task_description or "").strip().lower().split())
-    if short not in _SHORT_CODE_CHANGE_CONTINUATIONS:
-        return payload
-    pending_project = str(pending.get("project_path") or "")
-    pending_module = str(pending.get("module_name") or "").strip().lower()
-    requested_module = re.sub(r"[^a-z0-9]+", "_", payload.module_name.strip().lower()).strip("_")
-    try:
-        same_project = Path(pending_project).resolve() == project.resolve()
-    except Exception:
-        same_project = False
-    if not same_project or not pending_module or pending_module != requested_module:
-        return payload
-    return payload.model_copy(update={
-        "task_description": str(pending.get("task_description") or payload.task_description),
-        "task_type": str(pending.get("task_type") or payload.task_type),
-        "complexity": str(pending.get("complexity") or payload.complexity),
-        "force_complexity": bool(pending.get("force_complexity", payload.force_complexity)),
-        "intent": pending.get("intent") or payload.intent,
-        "target_hint": pending.get("target_hint") or payload.target_hint,
-        "target_files": list(dict.fromkeys(list(pending.get("target_files") or []) + list(payload.target_files))),
-    })
-
-
-def _evidence_signature(project: Path, module_name: str, payload: OdooCodeChangeRequest, head_sha: str | None) -> str:
-    """Stable inspection key for uncommitted correction cycles.
-
-    File mtimes deliberately do not participate: the first attempted fix makes
-    files dirty and must not invalidate the source evidence collected for that
-    same operation. A changed HEAD still invalidates the cache after commit.
-    """
+def _evidence_signature(project: Path, module_name: str, payload: OdooCodeChangeRequest, rel_paths: list[str]) -> str:
     import hashlib
-    raw = json.dumps(
-        {
-            **_code_change_operation_identity(project, payload),
-            "module": module_name,
-            "head_sha": head_sha,
-        },
-        sort_keys=True,
-        default=str,
-    )
+    rows=[]
+    for rel in sorted(set(rel_paths)):
+        path=project/rel
+        try:
+            st=path.stat(); rows.append((rel, st.st_mtime_ns, st.st_size))
+        except OSError:
+            rows.append((rel, None, None))
+    raw=json.dumps({"module":module_name,"task_type":_normalized_task_type(payload),"paths":rows},sort_keys=True,default=str)
     return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
@@ -2565,171 +1570,37 @@ def _git_status_changed_module_files(project_path: str, module_path: str) -> lis
                 changed.append(rel)
     return list(dict.fromkeys(changed))
 
-
-def _record_code_change_phase(job_id: str, phase: str) -> None:
-    """Persist one concise progress transition for provider polling."""
-    store = JsonStore()
-    job = store.get_job(job_id)
-    if job.status not in {JobStatus.queued, JobStatus.running}:
-        raise RuntimeError(f"Code-change job {job_id} is already terminal ({job.status.value})")
-    now = datetime.now(timezone.utc).isoformat()
-    if job.steps and job.steps[-1].status == "running":
-        job.steps[-1].status = "passed"
-        job.steps[-1].finished_at = now
-    if not job.steps or job.steps[-1].name != phase:
-        job.steps.append(JobStep(name=phase, status="running"))
-    job.status = JobStatus.running
-    job.result = {
-        "status": "running",
-        "phase": phase,
-        "heartbeat_at": now,
-        "worker_alive": True,
-        "connector_revision": settings.build_revision,
-        "message": f"Odoo code-change workflow is running: {phase}.",
-        "completion_required": True,
-        "success_allowed": False,
-        "tool_exit_allowed": False,
-        "job_id": job.id,
-        "next_call": {
-            "tool": "jobs.get",
-            "arguments": {
-                "job_id": job.id,
-                "wait_for_result": True,
-                "wait_timeout_seconds": 20,
-                "poll_interval_seconds": 2.0,
-            },
-        },
-    }
-    store.update_job(job)
-
-
-def _touch_code_change_heartbeat(job_id: str) -> bool:
-    """Refresh liveness without invoking stale reconciliation on the active worker."""
-    store = JsonStore()
-    job = next((item for item in store.list_jobs(limit=500) if item.id == job_id), None)
-    if job is None or job.status not in {JobStatus.queued, JobStatus.running}:
-        return False
-    result = dict(job.result) if isinstance(job.result, dict) else {}
-    result.update({
-        "heartbeat_at": datetime.now(timezone.utc).isoformat(),
-        "worker_alive": True,
-        "completion_required": True,
-        "success_allowed": False,
-        "tool_exit_allowed": False,
-    })
-    job.result = result
-    store.update_job(job)
-    return True
-
-
-async def _workflow_odoo_code_change(
-    payload: OdooCodeChangeRequest,
-    progress: Callable[[str], None] | None = None,
-) -> dict[str, Any]:
+async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     """Provider-safe composite Odoo code-change workflow.
 
     This is intentionally server-owned to remove MCP provider overhead/confusion:
     provider calls this one tool, the connector performs the v15 custom+core read,
     applies explicit edits, verifies, starts safe deploy, and returns a job_id for jobs.get.
     """
-    report = progress or (lambda _phase: None)
-    report("resolve_project")
     resolved_client_name, project_path = _resolve_code_change_project(payload)
     client_name = resolved_client_name or payload.client_name
     repo = RepoService()
     gate = PreWriteGateService()
-    store = JsonStore()
     steps: list[dict[str, Any]] = []
 
-    # 1) Prepare checkout once per operation. Correction calls reuse the same
-    # local HEAD instead of fetching/checking out/pulling again.
+    # 1) Prepare checkout once.  In real multi-client use the client config supplies
     # repo URL/branch; for already-materialized local checkouts/tests, avoid failing
     # just because TARGET_GIT_REPO is not configured.
-    report("repo.prepare")
-    bootstrap_state = store.load_session_state(client_name=client_name)
-    candidate = Path(project_path).expanduser()
-    payload = _reuse_pending_code_change(payload, bootstrap_state.get("pending_code_change"), candidate)
-    active_change = bootstrap_state.get("active_code_change") if isinstance(bootstrap_state, dict) else None
-    candidate_head = _current_head_sha(candidate) if (candidate / ".git").exists() else None
-    requested_identity = _code_change_operation_identity(candidate, payload)
-    reuse_checkout = bool(
-        isinstance(active_change, dict)
-        and active_change.get("identity") == requested_identity
-        and active_change.get("head_sha")
-        and active_change.get("head_sha") == candidate_head
-    )
-    if reuse_checkout:
+    try:
+        prepare = repo.prepare_repo(project_path=project_path, client_name=client_name)
+        project_path = prepare.project_path
+        project = Path(project_path)
+        steps.append({"step": "repo.prepare", "status": "ok", "project_path": project_path, "branch": prepare.branch, "sha": prepare.sha})
+    except HTTPException as exc:
+        detail = str(exc.detail)
         project = repo.project(project_path)
-        project_path = str(project)
-        steps.append({
-            "step": "repo.prepare",
-            "status": "cached",
-            "project_path": project_path,
-            "sha": candidate_head,
-            "reason": "same uncommitted code-change operation",
-        })
-    else:
-        try:
-            prepare = repo.prepare_repo(project_path=project_path, client_name=client_name, preserve_dirty=True)
-            project_path = prepare.project_path
-            project = Path(project_path)
-            steps.append({"step": "repo.prepare", "status": "ok", "project_path": project_path, "branch": prepare.branch, "sha": prepare.sha})
-        except HTTPException as exc:
-            detail = str(exc.detail)
-            project = repo.project(project_path)
-            if exc.status_code == 400 and "repo_url is required" in detail and (project / ".git").exists():
-                steps.append({"step": "repo.prepare", "status": "skipped_existing_checkout", "project_path": str(project), "reason": detail})
-                project_path = str(project)
-            else:
-                raise
+        if exc.status_code == 400 and "repo_url is required" in detail and (project / ".git").exists():
+            steps.append({"step": "repo.prepare", "status": "skipped_existing_checkout", "project_path": str(project), "reason": detail})
+            project_path = str(project)
+        else:
+            raise
 
     # 2) Discover/validate module once, with a safe fuzzy resolver for human hints.
-    # A brand-new addon must arrive as one complete batch. Reject an empty or
-    # incomplete provider plan before creating even a placeholder manifest.
-    requested_module_dir = project / payload.module_name.strip()
-    if payload.create_module:
-        _planned, missing_new_module_files, new_module_errors = _validate_complete_new_module_writes(project, payload)
-        supplied_new_paths = {
-            _safe_module_relative(payload.module_name.strip(), change.relative_path)
-            for change in payload.writes if change.content is not None
-        }
-        if _is_legacy_placeholder_module(requested_module_dir):
-            required_replacements = {
-                f"{payload.module_name.strip()}/__manifest__.py",
-                f"{payload.module_name.strip()}/__init__.py",
-            }
-            if not required_replacements.issubset(supplied_new_paths):
-                new_module_errors.append(
-                    "legacy placeholder module detected; explicitly replace its manifest and root initializer, "
-                    "then submit the complete addon in one writes array"
-                )
-        if missing_new_module_files or new_module_errors:
-            return {
-                "status": "needs_writes",
-                "message": (
-                    "INTERNAL_CONTINUATION_REQUIRED: generate the complete installable addon in one call. "
-                    "No placeholder or partial module files were written."
-                ),
-                "client_name": client_name,
-                "project_path": project_path,
-                "module_name": payload.module_name,
-                "missing_complete_files": missing_new_module_files,
-                "write_errors": new_module_errors,
-                "writes_applied": False,
-                "success_allowed": False,
-                "completion_required": True,
-                "next_call": {
-                    "tool": "workflow.odoo_code_change",
-                    "arguments": {
-                        "client_name": client_name,
-                        "project_path": project_path,
-                        "module_name": payload.module_name,
-                        "create_module": True,
-                        "task_description": payload.task_description,
-                        "writes": "Generate every complete addon file in one writes array, including manifest/init/imported Python/data/views/security/assets. Do not send a scaffold-only batch.",
-                    },
-                },
-            }
     _ensure_root_module_scaffold(repo, project, payload)
     modules = repo.list_custom_modules(project_path, max_depth=5, include_uninstallable=False)
     module, module_resolution = _resolve_fuzzy_module(payload, modules)
@@ -2742,14 +1613,6 @@ async def _workflow_odoo_code_change(
             "success_allowed": False,
         }
     effective_module_name = module.module_name
-    report("inspect_custom_code")
-    fast_ui_mode = _is_fast_ui_task(payload)
-    lane_decision = _task_lane_decision(payload)
-    task_lane = str(lane_decision["lane"])
-    lane_budget = dict(_TASK_LANE_BUDGETS[task_lane])
-    steps.append({"step": "workflow.task_lane_select", "status": "ok", **lane_decision})
-    ui_locator_cache = bootstrap_state.get("ui_target_cache") if isinstance(bootstrap_state, dict) else {}
-    ui_locator_key = _ui_locator_key(project, effective_module_name, payload) if task_lane != "long" else None
     issue_fingerprint = code_change_issue_fingerprint(
         project_path=project_path,
         module_name=effective_module_name,
@@ -2761,32 +1624,11 @@ async def _workflow_odoo_code_change(
     module_dir = project / module.path
     manifest_rel = module.manifest_path
     manifest_abs = project / manifest_rel
-    invalid_field_diagnostic = _invalid_field_registry_diagnostic(project, module.path, payload)
-    if invalid_field_diagnostic:
-        steps.append({
-            "step": "workflow.invalid_field_registry_diagnostic",
-            "status": "ok",
-            "classification": invalid_field_diagnostic["classification"],
-            "model": invalid_field_diagnostic["model"],
-            "field": invalid_field_diagnostic["field"],
-        })
     steps.append({"step": "repo.list_custom_modules", "status": "ok", "module": effective_module_name, "module_path": module.path, "module_resolution": module_resolution})
-    head_sha = _current_head_sha(project)
-    store.save_session_state({
-        "active_code_change": {
-            "identity": _code_change_operation_identity(project, payload),
-            "effective_module": effective_module_name,
-            "head_sha": head_sha,
-        }
-    }, client_name=client_name)
 
     # 3) Read custom manifest + target/custom files.  This also records gate evidence.
     custom_rel_paths: list[str] = [manifest_rel]
-    for rel in (invalid_field_diagnostic or {}).get("target_files", []):
-        if rel not in custom_rel_paths:
-            custom_rel_paths.append(rel)
-    target_file_budget = lane_budget["target_files"] if not payload.writes else len(payload.target_files)
-    for raw in payload.target_files[:target_file_budget]:
+    for raw in payload.target_files:
         rel = _safe_module_relative(effective_module_name, raw)
         if rel not in custom_rel_paths:
             custom_rel_paths.append(rel)
@@ -2798,17 +1640,9 @@ async def _workflow_odoo_code_change(
     # Inspect/autopatch mode uses exact-first focused search to avoid huge noisy reads.
     search_results: list[dict[str, Any]] = []
     if not payload.writes:
-        focused_paths = _cached_ui_paths(ui_locator_cache, ui_locator_key, project, module.path) if ui_locator_key else []
-        if focused_paths:
-            search_results = [{"status": "cached_target", "paths": focused_paths, "count": len(focused_paths)}]
-        else:
-            patterns = _infer_code_change_search_patterns(payload)
-            search_budget = min(payload.max_search_matches, lane_budget["search_matches"])
-            search_results, focused_paths = _focused_search(repo, project_path, module.path, patterns, search_budget)
-            focused_paths = focused_paths[:lane_budget["target_files"]]
-            if ui_locator_key and focused_paths:
-                _update_ui_locator_cache(store, client_name, ui_locator_cache, ui_locator_key, focused_paths, project)
-        for rel in focused_paths[:lane_budget["target_files"]]:
+        patterns = _infer_code_change_search_patterns(payload)
+        search_results, focused_paths = _focused_search(repo, project_path, module.path, patterns, payload.max_search_matches)
+        for rel in focused_paths[:10]:
             if rel and rel not in custom_rel_paths:
                 custom_rel_paths.append(rel)
 
@@ -2822,55 +1656,25 @@ async def _workflow_odoo_code_change(
             if rel not in custom_rel_paths:
                 custom_rel_paths.append(rel)
 
-    evidence_signature = _evidence_signature(project, effective_module_name, payload, head_sha)
-    session_state = store.load_session_state(client_name=client_name)
-    evidence_cache = (session_state.get("code_change_evidence") or {}) if isinstance(session_state, dict) else {}
-    cached_evidence = evidence_cache.get(evidence_signature) if isinstance(evidence_cache, dict) else None
-    requested_custom_paths = set(list(dict.fromkeys(custom_rel_paths))[:30])
-    cached_custom_paths = set(cached_evidence.get("custom_paths") or []) if isinstance(cached_evidence, dict) else set()
-    reuse_custom_evidence = bool(cached_evidence and requested_custom_paths.issubset(cached_custom_paths))
-    if not reuse_custom_evidence:
-        cached_evidence = None
-
     custom_file_paths_abs: list[str] = []
     custom_reads: list[dict[str, Any]] = []
-    if reuse_custom_evidence:
-        cached_reads_by_path = {
-            str(item.get("relative_path")): item
-            for item in (cached_evidence.get("custom_reads") or [])
-            if isinstance(item, dict) and item.get("relative_path")
-        }
-        custom_read_budget = lane_budget["custom_files"]
-        for rel in list(dict.fromkeys(custom_rel_paths))[:custom_read_budget]:
-            target = project / rel
-            cached_read = dict(cached_reads_by_path.get(rel) or {"relative_path": rel, "status": "missing"})
-            if cached_read.get("status") in {"read", "cached"} and target.is_file():
-                custom_file_paths_abs.append(str(target.resolve()))
-                gate.record_repo_inspection(
-                    project_path=project_path,
-                    relative_path=rel,
-                    client_name=client_name,
-                    action="workflow.odoo_code_change.cached_custom_evidence",
-                    is_content_read=True,
-                )
-                cached_read["status"] = "cached"
-            custom_reads.append(cached_read)
-        steps.append({"step": "repo.read_custom", "status": "cached", "count": len(custom_file_paths_abs)})
-    else:
-        custom_read_budget = lane_budget["custom_files"]
-        for rel in list(dict.fromkeys(custom_rel_paths))[:custom_read_budget]:
-            target = project / rel
-            if not target.exists() or not target.is_file():
-                custom_reads.append({"relative_path": rel, "status": "missing"})
-                continue
-            try:
-                content = _read_text_safe(target)
-                gate.record_repo_inspection(project_path=project_path, relative_path=rel, client_name=client_name, action="workflow.odoo_code_change.read_custom", is_content_read=True)
-                custom_file_paths_abs.append(str(target.resolve()))
-                custom_reads.append({"relative_path": rel, "status": "read", "size": target.stat().st_size, "preview": _file_preview(content, 3000)})
-            except UnicodeDecodeError:
-                custom_reads.append({"relative_path": rel, "status": "binary_skipped"})
-        steps.append({"step": "repo.read_custom", "status": "ok", "count": len([r for r in custom_reads if r.get("status") == "read"])})
+    for rel in list(dict.fromkeys(custom_rel_paths))[:30]:
+        target = project / rel
+        if not target.exists() or not target.is_file():
+            custom_reads.append({"relative_path": rel, "status": "missing"})
+            continue
+        try:
+            content = _read_text_safe(target)
+            gate.record_repo_inspection(project_path=project_path, relative_path=rel, client_name=client_name, action="workflow.odoo_code_change.read_custom", is_content_read=True)
+            custom_file_paths_abs.append(str(target.resolve()))
+            custom_reads.append({"relative_path": rel, "status": "read", "size": target.stat().st_size, "preview": _file_preview(content, 3000)})
+        except UnicodeDecodeError:
+            custom_reads.append({"relative_path": rel, "status": "binary_skipped"})
+    steps.append({"step": "repo.read_custom", "status": "ok", "count": len([r for r in custom_reads if r.get("status") == "read"])})
+    evidence_signature = _evidence_signature(project, effective_module_name, payload, custom_rel_paths)
+    session_state = JsonStore().load_session_state(client_name=client_name)
+    evidence_cache = (session_state.get("code_change_evidence") or {}) if isinstance(session_state, dict) else {}
+    cached_evidence = evidence_cache.get(evidence_signature) if isinstance(evidence_cache, dict) else None
 
     # Ensure scope has at least manifest when nothing else exists.
     if not custom_file_paths_abs and manifest_abs.exists():
@@ -2885,56 +1689,19 @@ async def _workflow_odoo_code_change(
     if payload.writes or generated_writes:
         write_abs = {str((project / _safe_module_relative(effective_module_name, w.relative_path)).resolve()) for w in (payload.writes or generated_writes)}
         manifest_resolved = str(manifest_abs.resolve()) if manifest_abs.exists() else ""
-        include_manifest_scope = not fast_ui_mode or manifest_resolved in write_abs
-        scope_file_paths = [
-            path for path in custom_file_paths_abs
-            if path in write_abs or (include_manifest_scope and path == manifest_resolved)
-        ]
+        scope_file_paths = [path for path in custom_file_paths_abs if path == manifest_resolved or path in write_abs]
         if not scope_file_paths:
-            scope_file_paths = [path for path in custom_file_paths_abs if path != manifest_resolved] or list(custom_file_paths_abs)
+            scope_file_paths = list(custom_file_paths_abs)
 
-    report("inspect_core_scope")
     scope_payload = ScopeAdviceRequest(
         custom_module_name=effective_module_name,
         custom_file_paths=scope_file_paths,
         task_description=payload.task_description,
         client_name=client_name,
-        allow_remote_core_sync=False,
     )
-    missing_manifest_assets = _missing_manifest_asset_paths(project, module_dir, manifest_abs)
-    missing_asset_fast_path = _is_missing_asset_diagnostic_request(payload, missing_manifest_assets)
-    micro_change = (
-        _is_low_risk_micro_change(payload, list(payload.writes or generated_writes), task_lane)
-        or missing_asset_fast_path
-    )
-    if micro_change:
-        scope = ScopeAdviceResult(
-            custom_module=effective_module_name,
-            reached_level=ScopeLevel.L0,
-            instructions=[],
-            mandatory_count=0,
-            total_count=0,
-            warning=(
-                "Missing manifest assets were diagnosed locally; remote frontend/core discovery skipped."
-                if missing_asset_fast_path
-                else "Low-risk micro change: core discovery skipped; changed-file QA and syntax verification remain mandatory."
-            ),
-        )
-        gate.record_scope_advice(scope, scope_payload)
-        steps.append({
-            "step": "workflow.scope_advice",
-            "status": "micro_skipped",
-            "mandatory_count": 0,
-            "reached_level": "L0",
-            "reason": (
-                "Manifest asset references were checked against local module files; no core/SSH evidence is needed."
-                if missing_asset_fast_path
-                else "Bounded low-risk edit; avoid remote core discovery overhead."
-            ),
-        })
-    elif cached_evidence and cached_evidence.get("scope"):
+    if cached_evidence and cached_evidence.get("scope"):
+        from ..schemas import ScopeAdviceResult
         scope = ScopeAdviceResult.model_validate(cached_evidence["scope"])
-        gate.record_scope_advice(scope, scope_payload)
         steps.append({"step": "workflow.scope_advice", "status": "cached", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level)})
     else:
         scope = scope_advice(scope_payload)
@@ -2942,32 +1709,11 @@ async def _workflow_odoo_code_change(
 
     frontend_preflight = None
     frontend_paths = list(dict.fromkeys(custom_rel_paths + [_safe_module_relative(effective_module_name, w.relative_path) for w in payload.writes]))
-    shared_ui_cache = session_state.get("fast_ui_evidence") if isinstance(session_state, dict) else {}
-    shared_ui_key = _ui_evidence_key(project, effective_module_name, payload, frontend_paths) if fast_ui_mode else None
-    shared_ui_evidence = (
-        shared_ui_cache.get(shared_ui_key)
-        if shared_ui_key and isinstance(shared_ui_cache, dict)
-        else None
-    )
-    if not _shared_ui_evidence_valid(shared_ui_evidence):
-        shared_ui_evidence = None
-    if micro_change:
-        frontend_preflight = None
-        steps.append({
-            "step": "workflow.frontend_pattern_preflight",
-            "status": "micro_skipped",
-            "reason": "Tiny deterministic edit; local changed-file verification remains enabled.",
-        })
-    elif _looks_like_frontend_code_change(payload, frontend_paths):
-        report("inspect_frontend_patterns")
+    if _looks_like_frontend_code_change(payload, frontend_paths):
         if cached_evidence and cached_evidence.get("frontend_preflight"):
             from ..schemas import FrontendPatternPreflightResult
             frontend_preflight = FrontendPatternPreflightResult.model_validate(cached_evidence["frontend_preflight"])
             steps.append({"step": "workflow.frontend_pattern_preflight", "status": "cached", "target_area": frontend_preflight.target_area, "mandatory_count": frontend_preflight.mandatory_read_count})
-        elif shared_ui_evidence:
-            from ..schemas import FrontendPatternPreflightResult
-            frontend_preflight = FrontendPatternPreflightResult.model_validate(shared_ui_evidence["frontend_preflight"])
-            steps.append({"step": "workflow.frontend_pattern_preflight", "status": "cached_module", "target_area": frontend_preflight.target_area, "mandatory_count": frontend_preflight.mandatory_read_count})
         else:
             frontend_preflight = frontend_pattern_preflight(FrontendPatternPreflightRequest(
             client_name=client_name,
@@ -2975,8 +1721,7 @@ async def _workflow_odoo_code_change(
             target_area="auto",
             target_module_name=effective_module_name,
             custom_file_paths=custom_file_paths_abs,
-            planned_file_paths=frontend_paths,
-            allow_remote_core_sync=False,
+                planned_file_paths=frontend_paths,
             ))
             steps.append({
                 "step": "workflow.frontend_pattern_preflight",
@@ -2989,132 +1734,66 @@ async def _workflow_odoo_code_change(
 
     # 4a) Manifest dependency fallback: scope_advice should detect them, but make sure
     # common dependency manifests are read with /home/odoo/src/odoo/addons priority.
-    if cached_evidence and cached_evidence.get("mandatory_paths"):
-        mandatory_paths = list(cached_evidence.get("mandatory_paths") or [])
-    elif shared_ui_evidence and shared_ui_evidence.get("mandatory_paths"):
-        mandatory_paths = list(shared_ui_evidence.get("mandatory_paths") or [])
-    else:
-        existing_scope_paths = {item.path for item in scope.instructions}
-        extra_core_reads: list[str] = []
-        manifest_dependencies = [] if fast_ui_mode or micro_change else _parse_manifest_depends(manifest_abs)
-        for dep in manifest_dependencies:
-            if dep == effective_module_name:
-                continue
-            try:
-                found = find_core_file(FindCoreFileRequest(module_name=dep, file_type="manifest", keyword=dep, client_name=client_name))
-                if found.best_match and found.best_match not in existing_scope_paths:
-                    extra_core_reads.append(found.best_match)
-            except Exception:
-                continue
+    existing_scope_paths = {item.path for item in scope.instructions}
+    extra_core_reads: list[str] = []
+    for dep in _parse_manifest_depends(manifest_abs):
+        if dep == effective_module_name:
+            continue
+        try:
+            found = find_core_file(FindCoreFileRequest(module_name=dep, file_type="manifest", keyword=dep, client_name=client_name))
+            if found.best_match and found.best_match not in existing_scope_paths:
+                extra_core_reads.append(found.best_match)
+        except Exception:
+            continue
 
-        mandatory_paths = [item.path for item in scope.instructions if item.mandatory and not str(item.path).startswith("NOT_FOUND:")]
-        mandatory_paths.extend(path for path in extra_core_reads if path not in mandatory_paths)
-        if frontend_preflight is not None:
-            for item in frontend_preflight.instructions:
-                if item.mandatory and not str(item.path).startswith("NOT_FOUND:") and item.path not in mandatory_paths:
-                    mandatory_paths.append(item.path)
-    report("read_core_evidence")
-    previous_core_budget = lane_budget["core_files"]
-    lane_budget, compatibility_budget_expanded = _compatibility_lane_budget(task_lane, len(mandatory_paths))
-    if compatibility_budget_expanded:
-        # Compatibility evidence returned by scope advice is mandatory, but its
-        # raw file count is not task complexity.  A focused frontend change can
-        # reference several framework files and must not silently become a long
-        # task.  Expand only this read budget and preserve the selected lane.
-        steps.append({
-            "step": "workflow.compatibility_budget",
-            "status": "expanded",
-            "task_lane": task_lane,
-            "from": previous_core_budget,
-            "to": len(mandatory_paths),
-            "reason": "Read mandatory compatibility evidence without promoting task complexity.",
-        })
-    mandatory_paths = mandatory_paths[:lane_budget["core_files"]]
+    mandatory_paths = [item.path for item in scope.instructions if item.mandatory and not str(item.path).startswith("NOT_FOUND:")]
+    mandatory_paths.extend(path for path in extra_core_reads if path not in mandatory_paths)
+    if frontend_preflight is not None:
+        for item in frontend_preflight.instructions:
+            if item.mandatory and not str(item.path).startswith("NOT_FOUND:") and item.path not in mandatory_paths:
+                mandatory_paths.append(item.path)
 
     core_reads: list[dict[str, Any]] = []
-    cached_core_paths = list(cached_evidence.get("core_paths") or []) if cached_evidence else []
-    if not cached_core_paths and shared_ui_evidence:
-        cached_core_paths = list(shared_ui_evidence.get("core_paths") or [])
-    if cached_core_paths:
-        for raw_path in cached_core_paths:
-            resolved = Path(str(raw_path)).expanduser().resolve()
-            gate.record_repo_inspection(
-                project_path=str(resolved.parent),
-                relative_path=resolved.name,
-                client_name=client_name,
-                action="workflow.odoo_code_change.cached_core_evidence",
-                is_content_read=True,
-            )
-            core_reads.append({"path": str(resolved), "status": "cached"})
-        steps.append({"step": "repo.read_core", "status": "cached", "count": len(core_reads)})
-    else:
-        for raw_path in mandatory_paths[:lane_budget["core_files"]]:
-            path = Path(str(raw_path)).expanduser()
-            try:
-                resolved = path.resolve()
-            except Exception:
-                resolved = path
-            if resolved.is_dir():
-                # Read a small number of files from mandatory dirs so the gate sees the dir satisfied.
-                directory_file_budget = 1 if task_lane == "fast" else 3 if task_lane == "normal" else 10
-                files = [p for p in resolved.rglob("*.py") if p.is_file()][:directory_file_budget]
-                if not files:
-                    core_reads.append({"path": str(resolved), "status": "dir_no_readable_files"})
-                    continue
-                for file_path in files:
-                    try:
-                        _ = _read_text_safe(file_path, 100_000)
-                        gate.record_repo_inspection(project_path=str(file_path.parent), relative_path=file_path.name, client_name=client_name, action="workflow.odoo_code_change.read_core", is_content_read=True)
-                        core_reads.append({"path": str(file_path), "status": "read"})
-                    except Exception as exc:  # noqa: BLE001
-                        core_reads.append({"path": str(file_path), "status": "failed", "error": str(exc)})
+    for raw_path in mandatory_paths[:60]:
+        path = Path(str(raw_path)).expanduser()
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        if resolved.is_dir():
+            # Read a small number of files from mandatory dirs so the gate sees the dir satisfied.
+            files = [p for p in resolved.rglob("*.py") if p.is_file()][:10]
+            if not files:
+                core_reads.append({"path": str(resolved), "status": "dir_no_readable_files"})
                 continue
-            if not resolved.exists() or not resolved.is_file():
-                core_reads.append({"path": str(resolved), "status": "missing"})
-                continue
-            try:
-                _ = _read_text_safe(resolved, 200_000)
-                gate.record_repo_inspection(project_path=str(resolved.parent), relative_path=resolved.name, client_name=client_name, action="workflow.odoo_code_change.read_core", is_content_read=True)
-                core_reads.append({"path": str(resolved), "status": "read"})
-            except Exception as exc:  # noqa: BLE001
-                core_reads.append({"path": str(resolved), "status": "failed", "error": str(exc)})
-        steps.append({"step": "repo.read_core", "status": "ok", "count": len([r for r in core_reads if r.get("status") == "read"])})
+            for file_path in files:
+                try:
+                    _ = _read_text_safe(file_path, 100_000)
+                    gate.record_repo_inspection(project_path=str(file_path.parent), relative_path=file_path.name, client_name=client_name, action="workflow.odoo_code_change.read_core", is_content_read=True)
+                    core_reads.append({"path": str(file_path), "status": "read"})
+                except Exception as exc:  # noqa: BLE001
+                    core_reads.append({"path": str(file_path), "status": "failed", "error": str(exc)})
+            continue
+        if not resolved.exists() or not resolved.is_file():
+            core_reads.append({"path": str(resolved), "status": "missing"})
+            continue
+        try:
+            _ = _read_text_safe(resolved, 200_000)
+            gate.record_repo_inspection(project_path=str(resolved.parent), relative_path=resolved.name, client_name=client_name, action="workflow.odoo_code_change.read_core", is_content_read=True)
+            core_reads.append({"path": str(resolved), "status": "read"})
+        except Exception as exc:  # noqa: BLE001
+            core_reads.append({"path": str(resolved), "status": "failed", "error": str(exc)})
+    steps.append({"step": "repo.read_core", "status": "ok", "count": len([r for r in core_reads if r.get("status") == "read"])})
     cache = dict(evidence_cache) if isinstance(evidence_cache, dict) else {}
-    cached_custom_reads = list(cached_evidence.get("custom_reads") or []) if cached_evidence else []
-    merged_custom_reads = {
-        str(item.get("relative_path")): item
-        for item in [*cached_custom_reads, *custom_reads]
-        if isinstance(item, dict) and item.get("relative_path")
-    }
     cache[evidence_signature] = {
         "scope": scope.model_dump(mode="json"),
         "frontend_preflight": frontend_preflight.model_dump(mode="json") if frontend_preflight is not None else None,
-        "custom_paths": sorted(cached_custom_paths | requested_custom_paths),
-        "custom_reads": list(merged_custom_reads.values()),
-        "mandatory_paths": mandatory_paths,
-        "core_paths": [r.get("path") for r in core_reads if r.get("status") in {"read", "cached"}],
+        "core_paths": [r.get("path") for r in core_reads if r.get("status") == "read"],
         "task_profile": _task_profile(payload, frontend_paths),
     }
     if len(cache) > 20:
         cache = dict(list(cache.items())[-20:])
-    store.save_session_state({"code_change_evidence": cache}, client_name=client_name)
-    if fast_ui_mode and frontend_preflight is not None and shared_ui_key:
-        shared_updated = dict(shared_ui_cache) if isinstance(shared_ui_cache, dict) else {}
-        shared_core_paths = [str(r.get("path")) for r in core_reads if r.get("status") in {"read", "cached"} and r.get("path")]
-        shared_updated[shared_ui_key] = {
-            "frontend_preflight": frontend_preflight.model_dump(mode="json"),
-            "mandatory_paths": mandatory_paths,
-            "core_paths": shared_core_paths,
-            "core_fingerprints": {
-                path: fingerprint
-                for path in shared_core_paths
-                if (fingerprint := _path_content_fingerprint(path)) is not None
-            },
-            "saved_at": time.time(),
-        }
-        if len(shared_updated) > 30:
-            shared_updated = dict(list(shared_updated.items())[-30:])
-        store.save_session_state({"fast_ui_evidence": shared_updated}, client_name=client_name)
+    JsonStore().save_session_state({"code_change_evidence": cache}, client_name=client_name)
 
     failure_guard = repeated_failure_guard_status(
         client_name=client_name,
@@ -3136,8 +1815,8 @@ async def _workflow_odoo_code_change(
             "steps": steps,
             "failure_guard": failure_guard,
             "investigation_read_plan": {
-                "custom_files": [r.get("relative_path") for r in custom_reads if r.get("status") in {"read", "cached"}],
-                "native_files": [r.get("path") for r in core_reads if r.get("status") in {"read", "cached"}],
+                "custom_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
+                "native_files": [r.get("path") for r in core_reads if r.get("status") == "read"],
                 "selection_rule": (
                     "Select additional exact files only from inheritance, imports, dependencies, "
                     "field definitions, method calls, templates, and runtime evidence. "
@@ -3156,38 +1835,6 @@ async def _workflow_odoo_code_change(
         }
 
     writes_to_apply = list(payload.writes or generated_writes)
-    if _invalid_field_xml_only_write_block(invalid_field_diagnostic, writes_to_apply):
-        return {
-            "status": "root_cause_fix_required",
-            "message": (
-                "XML-only writes were rejected: changing an XML value or adding eval cannot create a field "
-                "missing from the Odoo model registry. Fix the duplicate Python model declarations first."
-            ),
-            "client_name": client_name,
-            "project_path": project_path,
-            "module_name": effective_module_name,
-            "invalid_field_diagnostic": invalid_field_diagnostic,
-            "missing_manifest_assets": missing_manifest_assets,
-            "rejected_writes": [change.relative_path for change in writes_to_apply],
-            "writes_applied": False,
-            "writes_blocked": True,
-            "success_allowed": False,
-            "completion_required": True,
-            "next_call": {
-                "tool": "workflow.odoo_code_change",
-                "arguments": {
-                    "client_name": client_name,
-                    "project_path": project_path,
-                    "module_name": effective_module_name,
-                    "task_description": payload.task_description,
-                    "target_files": invalid_field_diagnostic.get("target_files", []),
-                    "writes": (
-                        "Generate a Python root-cause fix from invalid_field_diagnostic: keep one primary _name "
-                        "definition and use _inherit for intentional extensions; do not change XML literal syntax."
-                    ),
-                },
-            },
-        }
     if not writes_to_apply:
         # Persist unresolved implementation context so short follow-ups such as
         # "yes", "implement", "push", or "revert" can continue the latest task.
@@ -3199,28 +1846,15 @@ async def _workflow_odoo_code_change(
                 "module_name": effective_module_name,
                 "task_description": payload.task_description,
                 "task_type": _normalized_task_type(payload),
-                "complexity": payload.complexity,
-                "force_complexity": payload.force_complexity,
                 "intent": payload.intent,
                 "target_hint": _target_hint(payload),
-                "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") in {"read", "cached"}],
+                "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
                 "status": "awaiting_internal_writes",
             }
         }, client_name=client_name)
         return {
             "status": "needs_writes",
             "message": "INTERNAL_CONTINUATION_REQUIRED: inspection is complete; generate exact writes and call workflow.odoo_code_change again. Do not present code or manual file-edit instructions to the user.",
-            "checkout_policy": {
-                "same_checkout_required": True,
-                "preserve_uncommitted_work": True,
-                "forbidden_actions": ["web_search", "terminal_git", "git_restore", "git_reset", "branch_switch", "clean_checkout"],
-                "message": "Continue through workflow.odoo_code_change only. Never restore, discard, switch, or replace the active checkout to handle existing uncommitted work.",
-            },
-            "fast_ui_mode": fast_ui_mode,
-            "task_lane": task_lane,
-            "task_lane_decision": lane_decision,
-            "inspection_budget": lane_budget,
-            "target_cache_hit": bool(search_results and search_results[0].get("status") == "cached_target"),
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
@@ -3239,7 +1873,6 @@ async def _workflow_odoo_code_change(
             "scope_advice": scope.model_dump(mode="json"),
             "frontend_preflight": frontend_preflight.model_dump(mode="json") if frontend_preflight is not None else None,
             "core_reads": core_reads[:30],
-            "invalid_field_diagnostic": invalid_field_diagnostic,
             "success_allowed": False,
             "completion_required": True,
             "next_call": {
@@ -3249,20 +1882,15 @@ async def _workflow_odoo_code_change(
                     "project_path": project_path,
                     "module_name": effective_module_name,
                     "task_description": payload.task_description,
-                    "complexity": task_lane,
-                    "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") in {"read", "cached"}],
+                    "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
                     "writes": "Generate exact writes internally: [{relative_path, content}] or [{relative_path, search, replace, regex, count}]. Do not ask the user to edit files.",
                 },
             },
         }
 
-    # 5) Resolve all content before mutating the checkout. Multi-file changes go
-    # through one smart transaction (fast-safe for small work, worktree-atomic
-    # for larger/riskier work) instead of taking the repo lock once per file.
-    report("apply_safe_changes")
+    # 5) Apply writes through normal repo.write so the pre-write gate is still enforced.
     written_files_abs: list[str] = []
     write_results: list[dict[str, Any]] = []
-    prepared_items: list[RepoWriteItem] = []
     for change in writes_to_apply:
         rel = _safe_module_relative(effective_module_name, change.relative_path)
         if change.content is not None and (change.search is not None or change.replace is not None):
@@ -3281,180 +1909,21 @@ async def _workflow_odoo_code_change(
                 new_content = old.replace(change.search, change.replace, change.count or -1)
             if replaced <= 0:
                 raise HTTPException(status_code=409, detail=f"Search text not found in {rel}")
-        prepared_items.append(RepoWriteItem(relative_path=rel, content=new_content))
+        result = repo_write(RepoWriteRequest(project_path=project_path, client_name=client_name, relative_path=rel, content=new_content))
         written_abs = str((project / rel).resolve())
         written_files_abs.append(written_abs)
+        write_results.append({"relative_path": rel, "status": "written", "size": result.size, "extra": result.extra})
+    steps.append({"step": "repo.write", "status": "ok", "written_count": len(written_files_abs)})
 
-    write_started = time.perf_counter()
-    if len(prepared_items) == 1:
-        item = prepared_items[0]
-        result = repo_write(RepoWriteRequest(
-            project_path=project_path,
-            client_name=client_name,
-            relative_path=item.relative_path,
-            content=item.content,
-        ))
-        write_strategy = "single_atomic"
-        write_results.append({
-            "relative_path": item.relative_path,
-            "status": "written",
-            "size": result.size,
-            "extra": result.extra,
-        })
-    else:
-        batch_result = repo_write_many_smart(RepoWriteManySmartRequest(
-            project_path=project_path,
-            client_name=client_name,
-            files=prepared_items,
-            strategy="auto",
-            timeout_seconds=60,
-        ))
-        if batch_result.exit_code != 0:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "status": "batch_write_failed",
-                    "message": batch_result.stderr or "Smart multi-file write failed",
-                    "command": batch_result.command,
-                },
-            )
-        write_strategy = "atomic" if "SMART_STRATEGY=atomic" in batch_result.stdout else "fast_safe"
-        write_results.extend({
-            "relative_path": item.relative_path,
-            "status": "written",
-            "size": len(item.content.encode("utf-8")),
-            "extra": {"strategy": write_strategy},
-        } for item in prepared_items)
-    write_elapsed_ms = int((time.perf_counter() - write_started) * 1000)
-    steps.append({
-        "step": "repo.write_many_smart" if len(prepared_items) > 1 else "repo.write",
-        "status": "ok",
-        "written_count": len(written_files_abs),
-        "strategy": write_strategy,
-        "elapsed_ms": write_elapsed_ms,
-    })
-
-    if payload.create_module:
-        missing_after_write = _missing_manifest_asset_paths(project, module_dir, manifest_abs)
-        if missing_after_write:
-            report("module_completeness")
-            JsonStore().save_session_state({
-                "pending_code_change": {
-                    "client_name": client_name,
-                    "project_path": project_path,
-                    "module_name": effective_module_name,
-                    "task_description": payload.task_description,
-                    "task_type": _normalized_task_type(payload),
-                    "complexity": task_lane,
-                    "intent": payload.intent,
-                    "target_hint": _target_hint(payload),
-                    "target_files": missing_after_write,
-                    "status": "incomplete_new_module",
-                }
-            }, client_name=client_name)
-            return {
-                "status": "needs_writes",
-                "message": (
-                    "INTERNAL_CONTINUATION_REQUIRED: the new module manifest references files that are not yet present. "
-                    "Generate all missing files in one workflow.odoo_code_change continuation before QA, commit, or push."
-                ),
-                "client_name": client_name,
-                "project_path": project_path,
-                "module_name": effective_module_name,
-                "missing_manifest_assets": missing_after_write,
-                "writes_applied": True,
-                "qa_started": False,
-                "commit_started": False,
-                "success_allowed": False,
-                "completion_required": True,
-                "next_call": {
-                    "tool": "workflow.odoo_code_change",
-                    "arguments": {
-                        "client_name": client_name,
-                        "project_path": project_path,
-                        "module_name": effective_module_name,
-                        "create_module": True,
-                        "task_description": payload.task_description,
-                        "target_files": missing_after_write,
-                        "writes": "Generate complete contents for every missing_manifest_assets path; do not stop or answer the user yet.",
-                    },
-                },
-            }
-
-    # 6) Diff, then run independent read-only QA/core validators concurrently.
-    report("qa_and_compatibility")
+    # 6) Diff, QA, verify against core before deploy.
     diff = GitService().diff(project_path, staged=False, timeout_seconds=60)
-    validation_started = time.perf_counter()
-    manifest_only_change = bool(written_files_abs) and all(
-        Path(path).name == "__manifest__.py" for path in written_files_abs
-    )
-    verify_request = SyntaxVerifyRequest(
-        written_files=written_files_abs,
-        project_path=project_path,
-        client_name=client_name,
-        fix_cycle=0,
-        allow_remote_core_sync=False,
-        impact_aware=False,
-    )
-    if manifest_only_change:
-        # The syntax verifier parses and validates the exact manifest. A full
-        # module scan here duplicates safe-deploy validation and made a one-line
-        # release bump wait behind unrelated module QA.
-        verify = await asyncio.to_thread(verify_against_core, verify_request)
-        qa = SelfRunReport(
-            status="passed",
-            project_path=project_path,
-            module_path=str(module_dir),
-            module_name=effective_module_name,
-            findings=[],
-            commands=[],
-            summary={
-                "mode": "manifest_only",
-                "full_module_scan_skipped": True,
-                "exact_file_syntax_verification": True,
-            },
-        )
-        validation_execution = "manifest_fast_path"
-    else:
-        qa, verify = await asyncio.gather(
-            asyncio.to_thread(
-                self_run,
-                SelfRunRequest(
-                    project_path=project_path,
-                    client_name=client_name,
-                    module_name=effective_module_name,
-                    run_pytest=False,
-                    include_git_status=True,
-                ),
-            ),
-            asyncio.to_thread(verify_against_core, verify_request),
-        )
-        validation_execution = "parallel"
-    validation_elapsed_ms = int((time.perf_counter() - validation_started) * 1000)
+    qa = self_run(SelfRunRequest(project_path=project_path, client_name=client_name, module_name=effective_module_name, run_pytest=False, include_git_status=True))
+    verify = verify_against_core(SyntaxVerifyRequest(written_files=written_files_abs, project_path=project_path, client_name=client_name, fix_cycle=0))
     steps.append({"step": "git.diff", "status": "ok" if diff.exit_code == 0 else "failed", "exit_code": diff.exit_code})
-    steps.append({"step": "qa.self_run", "status": qa.status, "execution": validation_execution})
-    steps.append({
-        "step": "workflow.verify_against_core",
-        "status": verify.status,
-        "push_blocked": verify.push_blocked,
-        "critical_count": verify.critical_count,
-        "execution": validation_execution,
-        "validation_group_elapsed_ms": validation_elapsed_ms,
-    })
+    steps.append({"step": "qa.self_run", "status": qa.status})
+    steps.append({"step": "workflow.verify_against_core", "status": verify.status, "push_blocked": verify.push_blocked, "critical_count": verify.critical_count})
 
     if qa.status == "failed" or verify.push_blocked:
-        failure_text = json.dumps(
-            {
-                "qa": qa.model_dump(mode="json"),
-                "verify": verify.model_dump(mode="json"),
-            },
-            default=str,
-        )[-20000:]
-        failure_policy = FailurePolicyService().decide(
-            stage="pre_deploy_validation",
-            error=failure_text,
-            attempt=1,
-        ).as_dict()
         return {
             "status": "verify_failed",
             "message": "Code was written but deploy is blocked by QA/core verification. Fix findings and rerun workflow.odoo_code_change.",
@@ -3466,7 +1935,6 @@ async def _workflow_odoo_code_change(
             "git_diff": {"exit_code": diff.exit_code, "stdout": diff.stdout[-12000:], "stderr": diff.stderr[-4000:]},
             "qa": qa.model_dump(mode="json"),
             "verify_against_core": verify.model_dump(mode="json"),
-            "failure_policy": failure_policy,
             "success_allowed": False,
             "completion_required": True,
         }
@@ -3485,7 +1953,6 @@ async def _workflow_odoo_code_change(
             "completion_required": True,
         }
 
-    report("start_safe_deploy")
     commit_message = payload.commit_message or f"Update {effective_module_name}: {payload.task_description[:180]}"
     dirty_module_paths = _git_status_changed_module_files(project_path, module.path)
     deploy_paths = list(dict.fromkeys(
@@ -3541,8 +2008,7 @@ async def _workflow_odoo_code_change(
         }
     job_id = deploy_struct.get("job_id") if isinstance(deploy_struct, dict) else None
     record_code_change_deploy_attempt(client_name=client_name, fingerprint=issue_fingerprint, job_id=job_id)
-    store.save_session_state({"pending_code_change": None}, client_name=client_name)
-    frontend_touched = _looks_like_frontend_code_change(payload, deploy_paths)
+    frontend_touched = any(str(p).endswith((".xml", ".scss", ".css", ".js")) for p in written_files_abs)
     return {
         "status": "deploy_started" if deploy_struct.get("status") in {"running", "already_running", "already_in_progress", "resumable_existing_job"} else deploy_struct.get("status", "deploy_started"),
         "message": "Code change workflow completed through verify phase; safe deploy is server-owned. Poll jobs.get until terminal result before final answer.",
@@ -3553,10 +2019,6 @@ async def _workflow_odoo_code_change(
         "write_results": write_results,
         "generated_autopatch": bool(generated_writes and not payload.writes),
         "generated_autopatch_strategy": generated_autopatch_strategy,
-        "fast_ui_mode": fast_ui_mode,
-        "task_lane": task_lane,
-        "task_lane_decision": lane_decision,
-        "inspection_budget": lane_budget,
         "task_type": _normalized_task_type(payload),
         "intent": payload.intent,
         "target_hint": _target_hint(payload),
@@ -3576,180 +2038,74 @@ async def _workflow_odoo_code_change(
         "core_verified": not verify.push_blocked,
         "frontend_touched": frontend_touched,
         "allowed_summary": "Code was written and verified; deploy is running. Do not claim pushed/deployed/upgraded until jobs.get returns terminal passed with deploy_confirmed=true.",
-        "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}} if job_id else None,
+        "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}} if job_id else None,
     }
 
 
-def _code_change_start_response(job: JobRecord, *, duplicate: bool = False) -> dict[str, Any]:
-    phase = None
-    if job.steps:
-        phase = job.steps[-1].name
-    return {
-        "status": "already_in_progress" if duplicate else "running",
-        "message": (
-            "The same Odoo code-change workflow is already running in the background; no duplicate worker was started."
-            if duplicate
-            else "Odoo code-change workflow started in the background. Poll jobs.get for phase progress and the terminal result."
-        ),
-        "job_id": job.id,
-        "job_status": job.status.value,
-        "phase": phase or "queued",
-        "worker_alive": True,
-        "connector_revision": settings.build_revision,
-        "completion_required": True,
-        "success_allowed": False,
-        "tool_exit_allowed": False,
-        "poll_after_seconds": 2,
-        "next_call": {
-            "tool": "jobs.get",
-            "arguments": {
-                "job_id": job.id,
-                "wait_for_result": True,
-                "wait_timeout_seconds": 20,
-                "poll_interval_seconds": 2.0,
-            },
+async def _workflow_frontend_visual_implement(payload: FrontendVisualImplementRequest) -> dict[str, Any]:
+    """Generate deterministic frontend visual assets, then run the normal Odoo workflow.
+
+    This tool is generic for POS/OWL/dashboard/website/backend visuals.  It is
+    intentionally a thin planner/generator around workflow.odoo_code_change so
+    it inherits the same custom/core reads, QA, verify_against_core, safe deploy,
+    and jobs.get polling contract.
+    """
+    service = FrontendVisualService()
+    writes, visual_plan = service.build_writes(payload, payload.module_name)
+    if payload.create_module:
+        area = (payload.target_area or "backend").lower()
+        bundle = "web.assets_frontend" if area == "website" else "point_of_sale._assets_pos" if area == "pos" else "web.assets_backend"
+        depends = ["web", "point_of_sale"] if area == "pos" else ["web"]
+        asset_paths = [write.relative_path for write in writes if write.relative_path.endswith((".js", ".xml", ".scss", ".css"))]
+        manifest = {
+            "name": payload.module_name.replace("_", " ").title(),
+            "depends": depends,
+            "assets": {bundle: asset_paths},
+            "installable": True,
+            "application": True,
+        }
+        writes = [
+            OdooCodeFileChange(relative_path=f"{payload.module_name}/__init__.py", content=""),
+            OdooCodeFileChange(relative_path=f"{payload.module_name}/__manifest__.py", content=repr(manifest) + "\n"),
+            *writes,
+        ]
+    target_files = list(dict.fromkeys([*payload.target_files, *[w.relative_path for w in writes]]))
+    description = (
+        f"Frontend visual implementation ({visual_plan.get('implementation_type')}): {payload.design_goal}. "
+        "Generated visual assets must be treated as implementation files and verified/deployed through the normal Odoo workflow."
+    )
+    change_payload = OdooCodeChangeRequest(
+        client_name=payload.client_name,
+        project_path=payload.project_path,
+        module_name=payload.module_name,
+        create_module=payload.create_module,
+        task_description=description[:2000],
+        task_type="scss_css" if visual_plan.get("implementation_type") in {"svg_asset", "scss"} else "js_owl",
+        intent="frontend_visual_implement",
+        target_hint=payload.css_selector or payload.component_type,
+        change_request={
+            "type": "frontend_visual_implement",
+            "target_area": payload.target_area,
+            "component_type": payload.component_type,
+            "allowed_methods": payload.allowed_methods,
+            "reference_images": payload.reference_images,
+            "visual_plan": visual_plan,
         },
-    }
-
-
-def _finish_code_change_without_deploy(job_id: str, result: dict[str, Any]) -> None:
-    store = JsonStore()
-    job = store.get_job(job_id)
-    if job.status not in {JobStatus.queued, JobStatus.running}:
-        return
-    result_status = str(result.get("status") or "failed")
-    failed_statuses = {"failed", "verify_failed", "deploy_blocked", "error"}
-    final_status = JobStatus.failed if result_status in failed_statuses else JobStatus.warning
-    now = datetime.now(timezone.utc).isoformat()
-    if job.steps and job.steps[-1].status == "running":
-        job.steps[-1].status = final_status.value
-        job.steps[-1].finished_at = now
-        job.steps[-1].result = {"status": result_status}
-    final_result = {
-        **result,
-        "job_id": job.id,
-        "completion_required": False,
-        "success_allowed": False,
-        "tool_exit_allowed": True,
-    }
-    store.finish_job(job, final_status, final_result)
-
-
-def _start_code_change_job(payload: OdooCodeChangeRequest) -> dict[str, Any]:
-    """Return immediately and own the complete code-change workflow in a job."""
-    request = payload.model_dump(mode="json")
-    with _CODE_CHANGE_ENTRY_LOCK:
-        store = JsonStore()
-        refreshed_jobs = [store.get_job(candidate.id) for candidate in store.list_jobs(limit=200)]
-        existing = next(
-            (
-                job
-                for job in refreshed_jobs
-                if job.job_type == "odoo_code_change"
-                and job.status in {JobStatus.queued, JobStatus.running}
-                and job.request == request
-            ),
-            None,
+        patch_strategy="explicit_writes",
+        target_files=target_files,
+        writes=writes,
+        commit_message=payload.commit_message or f"Implement frontend visual {visual_plan.get('asset_name', 'asset')}",
+        auto_deploy=payload.auto_deploy,
+    )
+    result = await _workflow_odoo_code_change(change_payload)
+    if isinstance(result, dict):
+        result.setdefault("visual_plan", visual_plan)
+        result.setdefault("generated_visual_writes", [w.model_dump(mode="json") for w in writes])
+        result.setdefault(
+            "visual_implementation_note",
+            "The implementation method was selected at runtime from the component behavior. Dynamic dimensions use SCSS; SVG is reserved for fixed artwork.",
         )
-        if existing is not None:
-            return _code_change_start_response(existing, duplicate=True)
-        job = store.create_job(JobRecord(
-            job_type="odoo_code_change",
-            status=JobStatus.running,
-            request=request,
-            steps=[JobStep(name="queued", status="passed")],
-            result={
-                "status": "running",
-                "phase": "queued",
-                "heartbeat_at": datetime.now(timezone.utc).isoformat(),
-                "worker_alive": True,
-                "connector_revision": settings.build_revision,
-                "completion_required": True,
-                "success_allowed": False,
-                "tool_exit_allowed": False,
-            },
-        ))
-
-    def _background() -> None:
-        heartbeat_stop = threading.Event()
-
-        def _heartbeat() -> None:
-            while not heartbeat_stop.wait(10):
-                try:
-                    if not _touch_code_change_heartbeat(job.id):
-                        return
-                except Exception:  # noqa: BLE001 - liveness must not crash work
-                    continue
-
-        _touch_code_change_heartbeat(job.id)
-        heartbeat_thread = threading.Thread(
-            target=_heartbeat,
-            name=f"odoo-code-heartbeat-{job.id[:8]}",
-            daemon=True,
-        )
-        heartbeat_thread.start()
-        try:
-            result = asyncio.run(
-                _workflow_odoo_code_change(
-                    payload,
-                    progress=lambda phase: _record_code_change_phase(job.id, phase),
-                )
-            )
-            nested_job_id = result.get("job_id") if isinstance(result, dict) else None
-            if nested_job_id:
-                current_store = JsonStore()
-                current = current_store.get_job(job.id)
-                if current.status not in {JobStatus.queued, JobStatus.running}:
-                    return
-                current.result = {
-                    **result,
-                    "status": "running",
-                    "phase": "safe_deploy",
-                    "job_id": current.id,
-                    "nested_job_id": nested_job_id,
-                    "nested_next_call": result.get("next_call"),
-                    "completion_required": True,
-                    "success_allowed": False,
-                    "tool_exit_allowed": False,
-                    "next_call": {
-                        "tool": "jobs.get",
-                        "arguments": {
-                            "job_id": current.id,
-                            "wait_for_result": True,
-                            "wait_timeout_seconds": 20,
-                            "poll_interval_seconds": 2.0,
-                        },
-                    },
-                }
-                current_store.update_job(current)
-                return
-            _finish_code_change_without_deploy(job.id, result)
-        except Exception as exc:  # noqa: BLE001
-            failure = {
-                "status": "failed",
-                "message": "Odoo code-change workflow failed before safe deploy started.",
-                "error": str(getattr(exc, "detail", exc)),
-                "success_allowed": False,
-            }
-            try:
-                _finish_code_change_without_deploy(job.id, failure)
-            except Exception:  # noqa: BLE001
-                pass
-        finally:
-            heartbeat_stop.set()
-            heartbeat_thread.join(timeout=1)
-
-    try:
-        submit_background(background_task(_background, "orchestration"))
-    except Exception as exc:  # noqa: BLE001
-        _finish_code_change_without_deploy(job.id, {
-            "status": "failed",
-            "message": "Odoo code-change worker could not be submitted.",
-            "error": str(exc),
-            "success_allowed": False,
-        })
-        return JsonStore().get_job(job.id).model_dump(mode="json")
-    return _code_change_start_response(job)
+    return result
 
 
 async def _dispatch(name: str, args: dict) -> object:
@@ -3761,14 +2117,23 @@ async def _dispatch(name: str, args: dict) -> object:
         return JsonStore().read_artifact(req.artifact_id, req.offset, req.max_chars)
     if name == "client.check":
         req = ClientCheckRequest.model_validate(args)
-        return ClientGateService().check(req.client_name, req.run_validation, req.force_refresh, req.user_confirmed)
+        return ClientGateService().check(req.client_name, req.run_validation, req.force_refresh)
+    if name == "workflow.agent_instructions":
+        try:
+            from ..main import agent_instructions
+
+            return agent_instructions()
+        except Exception as exc:
+            return {"error": str(exc), "fallback": "Call workflow.coding_task_plan for workflow guidance"}
     if name == "workflow.capability_check":
         EmptyRequest.model_validate(args)
         return capability_check()
     if name == "workflow.coding_task_plan":
         return coding_task_plan(CodingTaskPlanRequest.model_validate(args))
     if name == "workflow.odoo_code_change":
-        return _start_code_change_job(OdooCodeChangeRequest.model_validate(args))
+        return await _workflow_odoo_code_change(OdooCodeChangeRequest.model_validate(args))
+    if name == "workflow.frontend_visual_implement":
+        return await _workflow_frontend_visual_implement(FrontendVisualImplementRequest.model_validate(args))
     if name == "workflow.smart_tool_router":
         return smart_tool_router(SmartToolRouteRequest.model_validate(args))
     if name == "workflow.repo_index":
@@ -4135,7 +2500,7 @@ def _persist_resume_result(store: JsonStore, job, resume_results: dict, original
             )
             final_result = {**resume_results, "module_name": original_request.get("module_name")}
             target_status = JobStatus.failed
-    elif status_text in {"deployment_waiting", "deploy_failed_or_timeout", "module_upgrade_running"}:
+    elif status_text in {"deploy_failed_or_timeout", "module_upgrade_running"}:
         final_result = {**resume_results, "module_name": original_request.get("module_name")}
         target_status = JobStatus.warning
     else:
@@ -4182,8 +2547,8 @@ def _start_and_wait_module_deploy_for_resume(original_request: dict, module_name
         return started
 
     nested_job_id = result_payload.get("job_id")
-    timeout_seconds = int(original_request.get("odoo_module_deploy_timeout_seconds", 300))
-    poll_interval = float(original_request.get("odoo_module_deploy_poll_interval_seconds", 2.0))
+    timeout_seconds = int(original_request.get("odoo_module_deploy_timeout_seconds", 600))
+    poll_interval = float(original_request.get("odoo_module_deploy_poll_interval_seconds", 10.0))
     waited = JsonStore().wait_job(str(nested_job_id), timeout_seconds, poll_interval)
     data = waited.model_dump(mode="json")
     if waited.status == JobStatus.passed:
@@ -4206,7 +2571,7 @@ def _start_and_wait_module_deploy_for_resume(original_request: dict, module_name
             "tool_exit_allowed": False,
             "poll_after_seconds": 10,
             "message": f"Odoo module deploy is still running after {timeout_seconds}s. Safe deploy is not complete and final success is blocked.",
-            "next_call": {"tool": "jobs.get", "arguments": {"job_id": waited.id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}},
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": waited.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
         },
     )
 
@@ -4266,7 +2631,7 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
             "success_allowed": False,
             "tool_exit_allowed": False,
             "poll_after_seconds": 10,
-            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}},
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
         }
 
     completed_set = {s.name for s in (job.steps or []) if s.status in _RESUME_COMPLETED_STATUSES}
@@ -4506,17 +2871,14 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                 check = _poll_odoosh_deployed(
                     odoosh,
                     pushed_sha,
-                    int(original_request.get("odoosh_deploy_timeout_seconds", 240)),
+                    int(original_request.get("odoosh_deploy_timeout_seconds", 600)),
                     float(original_request.get("odoosh_deploy_poll_interval_seconds", 10.0)),
                 )
                 deployed = check.exit_code == 0 and '"deployed": true' in (check.stdout or "").lower()
                 resume_results["steps_run"][step_name] = {"status": "ok" if deployed else "warning", "sha": pushed_sha, "deployed": deployed, "result": _step_payload(check)}
                 if not deployed:
-                    resume_results["status"] = "deployment_waiting"
-                    resume_results["message"] = "Deployment is progressing normally but the bounded confirmation window ended before Odoo.sh activated the commit. Continuing later will reuse the completed commit/push steps."
-                    resume_results["display_message"] = "Deployment paused at a safe checkpoint while Odoo.sh finishes activating the commit."
-                    resume_results["continuation_required"] = True
-                    resume_results["interruption_expected"] = True
+                    resume_results["status"] = "deploy_failed_or_timeout"
+                    resume_results["message"] = "Odoo.sh did not report the pushed commit as deployed within the polling window. Completed commit/push steps will not be replayed."
                     resume_results["next_call"] = {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}}
                     return _persist_resume_result(store, job, resume_results, original_request)
                 failure_guard = getattr(odoosh, "recent_build_failure", None)
@@ -4567,7 +2929,7 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                     resume_results["success_allowed"] = False
                     resume_results["tool_exit_allowed"] = False
                     resume_results["poll_after_seconds"] = 5
-                    resume_results["next_call"] = nested.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": nested.get("job_id"), "wait_for_result": True, "wait_timeout_seconds": 20, "poll_interval_seconds": 2.0}}
+                    resume_results["next_call"] = nested.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": nested.get("job_id"), "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
                     return _persist_resume_result(store, job, resume_results, original_request)
                 if result.status != "ok":
                     resume_results["status"] = "failed"
@@ -4602,6 +2964,6 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
             return _persist_resume_result(store, job, resume_results, original_request)
 
     resume_results["status"] = "ok"
-    resume_results["message"] = f"Deployment continued successfully from checkpoint '{start_from}' and is now complete."
+    resume_results["message"] = f"Pipeline resumed and completed from step '{start_from}'"
     store.log_audit("workflow.resume_job", "ok", f"Completed resume of job {job_id}")
     return _persist_resume_result(store, job, resume_results, original_request)
