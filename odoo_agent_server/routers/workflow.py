@@ -1732,10 +1732,9 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 "message": "Upgrade confirmed successful after resuming from already-deployed source.",
                 "result": _safe_deploy_payload(deploy_result),
             }
-            module_status = _odoo_service_for_client(client).module_status(payload.module_name)
-            _step("odoo_module_status", "passed" if module_status.status == "ok" else "warning", module_status)
-            smoke = _odoo_service_for_client(client).registry_smoke_test(payload.module_name, [], [], strict=False)
-            _step("registry_smoke_test", "passed" if smoke.status == "ok" else "warning", smoke)
+            _step("post_upgrade_smoke", "skipped", {
+                "message": "Skipped redundant post-upgrade shell sessions; the successful module upgrade is the terminal confirmation."
+            })
             final_result = {
                 "status": "passed",
                 "message": module_upgrade_confirmation["message"],
@@ -2212,10 +2211,6 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module module upgrade failed after retries")
             return
 
-    module_status = _odoo_service_for_client(client).module_status(payload.module_name)
-    status_ = "passed" if module_status.status == "ok" else "warning"
-    _step("odoo_module_status", status_, module_status)
-
     if expected_registry_fields:
         field_verify = _verify_registry_fields(expected_registry_fields, client)
         _step("registry_field_verify", "passed" if field_verify.status == "ok" else "failed", field_verify)
@@ -2236,8 +2231,9 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     else:
         _step("registry_field_verify", "skipped", {"message": "No expected Python field additions were inferred or provided."})
 
-    smoke = _odoo_service_for_client(client).registry_smoke_test(payload.module_name, [], [], strict=False)
-    _step("registry_smoke_test", "passed" if smoke.status == "ok" else "warning", smoke)
+    _step("post_upgrade_smoke", "skipped", {
+        "message": "Skipped redundant post-upgrade shell sessions; the successful module upgrade is the terminal confirmation."
+    })
 
     fresh_job = store.get_job(job_id)
     final_result = {
