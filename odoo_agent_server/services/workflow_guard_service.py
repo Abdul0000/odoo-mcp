@@ -168,7 +168,7 @@ def safe_deploy_block_payload(action: str, job: Any) -> dict[str, Any]:
     job_status = getattr(job.status, "value", str(job.status))
     active = job.status in {JobStatus.queued, JobStatus.running}
     next_call = (
-        {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+        {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}}
         if active
         else {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}}
     )
@@ -187,7 +187,7 @@ def safe_deploy_block_payload(action: str, job: Any) -> dict[str, Any]:
         "completion_required": active,
         "success_allowed": False,
         "tool_exit_allowed": not active,
-        "poll_after_seconds": 10 if active else None,
+        "poll_after_seconds": 1 if active else None,
         "next_call": next_call,
     }
 

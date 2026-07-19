@@ -455,7 +455,7 @@ class McpOperationGuardService:
             return {"tool": "workflow.safe_deploy_module", "arguments_hint": "Use current client/module; then poll jobs.get."}
         if phase == "poll":
             job_id = op.get("job_id")
-            return {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+            return {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}}
         if phase == "final":
             return {"tool": "final_answer", "arguments_hint": "Report only verified facts; do not claim visible UI unless browser verification passed."}
         if not op.get("scope_advice_done"):

@@ -2038,7 +2038,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "core_verified": not verify.push_blocked,
         "frontend_touched": frontend_touched,
         "allowed_summary": "Code was written and verified; deploy is running. Do not claim pushed/deployed/upgraded until jobs.get returns terminal passed with deploy_confirmed=true.",
-        "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}} if job_id else None,
+        "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}} if job_id else None,
     }
 
 
@@ -2569,9 +2569,9 @@ def _start_and_wait_module_deploy_for_resume(original_request: dict, module_name
             "completion_required": True,
             "success_allowed": False,
             "tool_exit_allowed": False,
-            "poll_after_seconds": 10,
+            "poll_after_seconds": 1,
             "message": f"Odoo module deploy is still running after {timeout_seconds}s. Safe deploy is not complete and final success is blocked.",
-            "next_call": {"tool": "jobs.get", "arguments": {"job_id": waited.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": waited.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}},
         },
     )
 
@@ -2630,8 +2630,8 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
             "completion_required": True,
             "success_allowed": False,
             "tool_exit_allowed": False,
-            "poll_after_seconds": 10,
-            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
+            "poll_after_seconds": 1,
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}},
         }
 
     completed_set = {s.name for s in (job.steps or []) if s.status in _RESUME_COMPLETED_STATUSES}
@@ -2929,7 +2929,7 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                     resume_results["success_allowed"] = False
                     resume_results["tool_exit_allowed"] = False
                     resume_results["poll_after_seconds"] = 5
-                    resume_results["next_call"] = nested.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": nested.get("job_id"), "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+                    resume_results["next_call"] = nested.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": nested.get("job_id"), "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}}
                     return _persist_resume_result(store, job, resume_results, original_request)
                 if result.status != "ok":
                     resume_results["status"] = "failed"

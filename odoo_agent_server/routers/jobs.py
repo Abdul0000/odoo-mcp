@@ -24,7 +24,7 @@ def get_job(
     job_id: str,
     wait_for_result: bool = True,
     wait_timeout_seconds: int = 600,
-    poll_interval_seconds: float = 10.0,
+    poll_interval_seconds: float = 1.0,
 ) -> JobRecord:
     """Return one job with explicit deploy-success safety gates.
 

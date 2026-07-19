@@ -95,7 +95,7 @@ class JobGetRequest(BaseModel):
         le=2400,
         description="Maximum server-side wait for this poll call. Use 0 only for CLI/internal integrations that can safely wait indefinitely.",
     )
-    poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
+    poll_interval_seconds: float = Field(default=1.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
 
 
 class ArtifactReadRequest(BaseModel):
@@ -997,7 +997,7 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
         le=2400,
         description="Maximum server-side wait before returning job_id/next_call. Use 0 only for CLI/internal integrations that can safely wait indefinitely.",
     )
-    poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=10.0, description="Delay between safe deploy job polls while waiting")
+    poll_interval_seconds: float = Field(default=1.0, ge=0.25, le=10.0, description="Delay between safe deploy job polls while waiting")
     odoosh_deploy_timeout_seconds: int = Field(default=600, ge=0, le=600, description="Maximum time to poll Odoo.sh after git push for the pushed SHA to become deployed")
     odoosh_deploy_poll_interval_seconds: float = Field(default=10.0, ge=0.25, le=60.0, description="Polling interval for Odoo.sh deployed SHA checks")
     odoo_module_deploy_timeout_seconds: int = Field(default=600, ge=0, le=900, description="Maximum time for the internal Odoo module install/upgrade job to finish before returning a non-success resumable state")

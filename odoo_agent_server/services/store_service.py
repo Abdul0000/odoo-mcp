@@ -159,7 +159,7 @@ class JsonStore:
                 return JobRecord.model_validate(row)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
-    def wait_job(self, job_id: str, timeout_seconds: int = 600, poll_interval_seconds: float = 10.0) -> JobRecord:
+    def wait_job(self, job_id: str, timeout_seconds: int = 600, poll_interval_seconds: float = 1.0) -> JobRecord:
         """Wait for a job to finish without requiring repeated client/tool calls.
 
         Safe deploy must not be treated as complete until its owning job reaches

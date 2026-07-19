@@ -809,7 +809,7 @@ def test_resume_job_active_job_returns_poll_instruction_without_replay(tmp_path,
     result = asyncio.run(tools._resume_job(ResumeJobRequest(job_id=job.id)))
 
     assert result["status"] == "active_job"
-    assert result["next_call"] == {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+    assert result["next_call"] == {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}}
     assert JsonStore().get_job(job.id).status == JobStatus.running
 
 
@@ -852,7 +852,7 @@ def test_safe_deploy_wait_for_result_positive_timeout_returns_running(tmp_path, 
     )))
 
     assert result.status == "running"
-    assert result.summary["next_call"] == {"tool": "jobs.get", "arguments": {"job_id": result.job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+    assert result.summary["next_call"] == {"tool": "jobs.get", "arguments": {"job_id": result.job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}}
 
 
 def test_safe_deploy_wait_loop_does_not_sleep_past_timeout(tmp_path, monkeypatch):

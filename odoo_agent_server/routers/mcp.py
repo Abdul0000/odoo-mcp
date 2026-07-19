@@ -212,7 +212,7 @@ def _arguments_for_profile(tool_name: str, arguments: dict[str, Any], profile: s
             adjusted["wait_for_result"] = True
         if adjusted.get("wait_for_result") is True:
             adjusted["wait_timeout_seconds"] = min(max(int(adjusted.get("wait_timeout_seconds", 600) or 600), 1), 600)
-            adjusted["poll_interval_seconds"] = min(max(float(adjusted.get("poll_interval_seconds", 10.0) or 10.0), 0.25), 10.0)
+            adjusted["poll_interval_seconds"] = min(max(float(adjusted.get("poll_interval_seconds", 1.0) or 1.0), 0.25), 10.0)
             return adjusted
         if profile not in {"provider", "claude", "chatgpt", "grok", "qwen"} or "wait_for_result" not in adjusted:
             return adjusted

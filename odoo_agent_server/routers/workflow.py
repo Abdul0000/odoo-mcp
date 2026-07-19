@@ -653,7 +653,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                 "project_path + module_name. No new deploy thread was started; "
                 "poll the existing job instead of replaying commit/push/upgrade or resume."
             )
-            next_call = {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+            next_call = {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}}
             blocking_reason = "active_job"
         elif job.status == JobStatus.warning:
             report_status = "resumable_existing_job"
@@ -681,7 +681,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             # Defensive fallback; find_blocking_safe_deploy should only return
             # active/resumable safe deploy jobs.
             message = block_payload.get("message") or "Existing safe deploy job found."
-            next_call = block_payload.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}}
+            next_call = block_payload.get("next_call") or {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}}
             blocking_reason = "existing_job"
 
         return WorkflowReport(
@@ -706,7 +706,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                 "completion_required": job.status in {JobStatus.queued, JobStatus.running},
                 "success_allowed": bool(job.deploy_confirmed or job.already_deployed_confirmed),
                 "tool_exit_allowed": job.status not in {JobStatus.queued, JobStatus.running},
-                "poll_after_seconds": 10 if job.status in {JobStatus.queued, JobStatus.running} else None,
+                "poll_after_seconds": 1 if job.status in {JobStatus.queued, JobStatus.running} else None,
                 "next_call": next_call,
             },
         )
@@ -805,10 +805,10 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                     "completion_required": True,
                     "success_allowed": False,
                     "tool_exit_allowed": False,
-                    "poll_after_seconds": 10,
+                    "poll_after_seconds": 1,
                     "job_id": job.id,
                     "module_name": payload.module_name,
-                    "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
+                    "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}},
                 },
             )
         final_status: Literal["passed", "failed", "warning", "running"] = "passed" if waited.status == JobStatus.passed else "failed" if waited.status == JobStatus.failed else "warning"
@@ -844,10 +844,10 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             "completion_required": True,
             "success_allowed": False,
             "tool_exit_allowed": False,
-            "poll_after_seconds": 10,
+            "poll_after_seconds": 1,
             "job_id": job.id,
             "module_name": payload.module_name,
-            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 10.0}},
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": job.id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}},
         },
     )
 

@@ -95,7 +95,7 @@ def test_jobs_get_uses_single_bounded_ten_minute_poll(monkeypatch):
     assert captured["name"] == "jobs.get"
     assert captured["arguments"]["wait_for_result"] is True
     assert captured["arguments"]["wait_timeout_seconds"] == 600
-    assert captured["arguments"]["poll_interval_seconds"] == 10.0
+    assert captured["arguments"]["poll_interval_seconds"] == 1.0
 
 
 def test_root_provider_tools_metadata_matches_mcp_surface():
