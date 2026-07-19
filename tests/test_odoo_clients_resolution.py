@@ -262,6 +262,25 @@ def test_start_session_saves_safe_client_metadata(monkeypatch, tmp_path):
     assert "oauth2:" not in text
 
 
+@pytest.mark.integration
+def test_start_session_reuses_existing_checkout_without_fetch(monkeypatch, tmp_path):
+    origin = _init_origin(tmp_path, "dev")
+    checkout = tmp_path / "existing-checkout"
+    subprocess.run(["git", "clone", "--branch", "dev", str(origin), str(checkout)], check=True, capture_output=True, text=True)
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    _set_clients(monkeypatch, [_client("Client", str(origin), "dev", str(checkout))])
+
+    def unexpected_prepare(*args, **kwargs):
+        raise AssertionError("existing checkout must not fetch/pull during fast session start")
+
+    monkeypatch.setattr(RepoService, "prepare_repo", unexpected_prepare)
+    report = start_session(StartSessionRequest())
+
+    assert report.status in {"passed", "warning"}
+    assert report.summary["project_path"] == str(checkout.resolve())
+
+
 def test_resolver_accepts_per_client_odoosh_settings(monkeypatch, tmp_path):
     for key in (
         "ODOOSH_DB_NAME",

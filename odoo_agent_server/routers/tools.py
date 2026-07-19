@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import ast
+from copy import deepcopy
 import difflib
 import json
 import re
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +18,6 @@ from ..auth import AuthDependency
 from ..config import settings, get_odoo_clients, normalise_client
 from ..schemas import (
     ApprovalCreateRequest,
-    ApprovalDecisionRequest,
     ArtifactReadRequest,
     AuditListRequest,
     BaseProjectRequest,
@@ -106,7 +107,6 @@ from ..services.odoosh_service import OdooShService
 from ..services.browser_cdp_service import CdpBrowserService
 from ..services.repo_service import RepoService
 from ..services.prewrite_gate_service import PreWriteGateService
-from ..services.path_service import resolve_allowed_path
 from ..services.syntax_verifier_service import SyntaxVerifierService
 from ..services.workflow_guard_service import (
     code_change_issue_fingerprint,
@@ -120,7 +120,7 @@ from .git import git_commit, git_push
 from .odoo import odoo_module_install, odoo_module_update, odoo_module_deploy, start_odoo_module_deploy_job
 from .odoosh import odoosh_module_install_ssh, odoosh_module_deploy_ssh, odoosh_module_update, odoosh_wait_for_commit, odoosh_verify_module_manifest
 from .workflow import capability_check, full_verify, safe_deploy_module, coding_task_plan, start_session, registry_smoke_test, restore_last_good_commit, browser_menu_crawl, find_core_file, find_similar_view, list_module_files, scope_advice, verify_against_core, verify_pos_change, frontend_pattern_preflight, smart_tool_router, repo_index, verify_deployed_module, _poll_odoosh_deployed, _pre_push_verify_files, _expected_user_file_hashes, _infer_registry_fields_from_python, _normalise_expected_registry_fields, _verify_registry_fields, _assert_head_commit_contains_paths
-from ..schemas import ApprovalRecord, ApprovalStatus
+from ..schemas import ApprovalRecord
 from ..services.store_service import JsonStore
 from ..services.frontend_visual_service import FrontendVisualService
 from ..services.deploy_impact_service import classify_deploy_impact
@@ -759,13 +759,19 @@ _TOOL_INPUT_MODELS = {
 }
 
 
-def tool_input_schema(name: str) -> dict:
-    internal_name = internal_tool_name(name)
+@lru_cache(maxsize=None)
+def _cached_tool_input_schema(internal_name: str) -> dict:
     model = _TOOL_INPUT_MODELS.get(internal_name, EmptyRequest)
     schema = model.model_json_schema()
     schema.setdefault("type", "object")
     schema.setdefault("additionalProperties", False)
     return schema
+
+
+def tool_input_schema(name: str) -> dict:
+    # Return an isolated copy because provider compatibility cleanup may reshape
+    # nested schema dictionaries. Pydantic generation itself is cached once.
+    return deepcopy(_cached_tool_input_schema(internal_tool_name(name)))
 
 
 @router.get("/list", response_model=list[ToolDescriptor])

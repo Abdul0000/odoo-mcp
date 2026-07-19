@@ -57,9 +57,7 @@ def _service_for_client(client):
 
 def _run(name: str, callback) -> CommandResult:
     try:
-        result = callback()
-        JsonStore().log_audit(name, "ok" if result.exit_code == 0 else "failed", "Odoo.sh command", {"exit_code": result.exit_code})
-        return result
+        return callback()
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 

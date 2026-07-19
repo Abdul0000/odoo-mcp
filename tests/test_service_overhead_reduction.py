@@ -2,7 +2,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from odoo_agent_server.config import settings
-from odoo_agent_server.schemas import CommandResult, JobRecord, JobStatus
+from odoo_agent_server.schemas import CommandResult, JobRecord, JobStatus, OdooModuleRequest
+from odoo_agent_server.routers.odoo import _background_job_response
 from odoo_agent_server.services import core_sync_service
 from odoo_agent_server.services.odoosh_service import OdooShService, _SshMasterPool
 from odoo_agent_server.services.store_service import JsonStore
@@ -68,3 +69,26 @@ def test_running_job_updates_do_not_rewrite_audit_log(tmp_path, monkeypatch):
 
     store.finish_job(job, JobStatus.passed, {"ok": True})
     assert "job.update" in {event.action for event in store.list_audit()}
+
+
+def test_odoo_background_wait_honors_request_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    store = JsonStore()
+    job = store.create_job(JobRecord(job_type="odoo.module_update", status=JobStatus.running))
+    captured = {}
+
+    def wait_job(job_id, timeout_seconds, poll_interval_seconds):
+        captured.update(job_id=job_id, timeout=timeout_seconds, interval=poll_interval_seconds)
+        return store.get_job(job_id)
+
+    monkeypatch.setattr(store, "wait_job", wait_job)
+    result = _background_job_response(
+        store,
+        job,
+        OdooModuleRequest(module_name="x_module", wait_timeout_seconds=7, poll_interval_seconds=0.5),
+        "Upgrade started.",
+    )
+
+    assert captured == {"job_id": job.id, "timeout": 7, "interval": 0.5}
+    assert result.result["status"] == "running"
+    assert result.result["next_call"]["tool"] == "jobs.get"

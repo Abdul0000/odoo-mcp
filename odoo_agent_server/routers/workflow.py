@@ -31,7 +31,6 @@ from ..schemas import (
     JobRecord,
     JobStatus,
     JobStep,
-    Severity,
     WorkflowReport,
     SafeDeployModuleRequest,
     SelfRunRequest,
@@ -63,6 +62,7 @@ from ..schemas import (
     SmartToolRouteStep,
     RepoIndexRequest,
     RepoIndexResult,
+    RepoPrepareResult,
 )
 from ..services.approval_service import ApprovalService
 from ..services.client_resolver_service import ClientResolverService
@@ -81,7 +81,6 @@ from ..services.syntax_verifier_service import SyntaxVerifierService  # V14+
 from ..services.frontend_pattern_service import FrontendPatternService  # V15
 from ..services.repo_index_service import RepoIndexService  # V16
 from ..services.workflow_guard_service import (
-    _ACTIVE_JOB_STATUSES,
     _RESUMABLE_SAFE_DEPLOY_RESULTS,
     find_blocking_safe_deploy,
     safe_deploy_block_payload,
@@ -340,8 +339,9 @@ def start_session(payload: StartSessionRequest) -> WorkflowReport:
     Pass client_name to auto-resolve repo, branch, path, token, and Odoo creds
     from ODOO_CLIENTS env var. Falls back to TARGET_GIT_* env vars if no client_name.
 
-    Also confirms runtime capability, prepares the repo, reads git status,
-    lists custom modules, and checks Odoo/Odoo.sh connectivity.
+    Also confirms runtime capability, prepares the repo, reads git status, and
+    lists custom modules. Live Odoo/Odoo.sh checks are opt-in because client.check
+    already validates the selected client and remote checks can take minutes.
     """
     # ── Multi-Client Resolution ──────────────────────────────────────────
     resolver = ClientResolverService()
@@ -373,19 +373,41 @@ def start_session(payload: StartSessionRequest) -> WorkflowReport:
         flags.append("warning")
 
     prepared = None
+    status_result = None
     try:
-        prepared = RepoService().prepare_repo(
-            payload.repo_url,
-            payload.branch,
-            payload.repo_name,
-            payload.workspace_root,
-            payload.remote,
-            payload.timeout_seconds,
-            client.path if client else settings.target_project_path,
-            client.name if client else payload.client_name,
-        )
+        existing_client_path = Path(client.path) if client and client.path else None
+        if existing_client_path and (existing_client_path / ".git").is_dir() and not payload.refresh_repo:
+            git = GitService()
+            target = git.validate_target(str(existing_client_path), payload.branch, payload.remote)
+            if target.exit_code != 0:
+                raise HTTPException(status_code=409, detail=target.stderr or target.stdout or "Configured checkout target validation failed")
+            sha = git.head_sha(str(existing_client_path))
+            status_result = git.status(str(existing_client_path))
+            if sha.exit_code != 0 or status_result.exit_code != 0:
+                raise HTTPException(status_code=409, detail=sha.stderr or status_result.stderr or "Configured checkout is not ready")
+            prepared = RepoPrepareResult(
+                project_path=str(existing_client_path.resolve()),
+                repo_url=client.repo,
+                branch=payload.branch or client.branch,
+                sha=sha.stdout.strip(),
+                status=status_result.stdout,
+                already_cloned=True,
+                steps=[target, sha, status_result],
+            )
+        else:
+            prepared = RepoService().prepare_repo(
+                payload.repo_url,
+                payload.branch,
+                payload.repo_name,
+                payload.workspace_root,
+                payload.remote,
+                payload.timeout_seconds,
+                client.path if client else settings.target_project_path,
+                client.name if client else payload.client_name,
+            )
         step("repo_prepare", "passed", prepared)
-        status_result = GitService().status(prepared.project_path)
+        if status_result is None:
+            status_result = GitService().status(prepared.project_path)
         step("git_status", "passed" if status_result.exit_code == 0 else "warning", status_result)
         modules = RepoService().list_custom_modules(prepared.project_path, payload.max_depth, include_uninstallable=False)
         step("repo_list_custom_modules", "passed", {"count": len(modules), "modules": [m.model_dump(mode="json") for m in modules]})
@@ -608,20 +630,10 @@ def _wait_workflow_job_until_terminal(store: JsonStore, job_id: str, poll_interv
     terminal outcome of that loop, not an intermediate "running" message that
     shifts confirmation back to the user.
     """
-    interval = max(min(float(poll_interval_seconds or 2.0), 10.0), 0.25)
-    # timeout_seconds=0 is an explicit hard-wait request: do not return an
-    # intermediate running snapshot; wait until pass/fail/warning is recorded.
-    deadline = None if timeout_seconds is None or int(timeout_seconds) <= 0 else time.monotonic() + int(timeout_seconds)
-    while True:
-        current = store.get_job(job_id)
-        if current.status not in {JobStatus.queued, JobStatus.running}:
-            return current
-        if deadline is not None and time.monotonic() >= deadline:
-            return current
-        if deadline is None:
-            time.sleep(interval)
-        else:
-            time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+    # timeout_seconds=0/None remains an explicit hard wait. JsonStore owns the
+    # single bounded polling implementation used by every router.
+    bounded_timeout = 0 if timeout_seconds is None or int(timeout_seconds) <= 0 else int(timeout_seconds)
+    return store.wait_job(job_id, bounded_timeout, poll_interval_seconds)
 
 
 @router.post("/safe-deploy-module", response_model=WorkflowReport)

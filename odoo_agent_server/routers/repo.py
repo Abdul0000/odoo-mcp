@@ -110,7 +110,6 @@ def repo_prepare(payload: RepoPrepareRequest) -> RepoPrepareResult:
 @router.post("/custom-modules", response_model=list[CustomModuleItem])
 def repo_custom_modules(payload: RepoCustomModulesRequest) -> list[CustomModuleItem]:
     _require_explicit_client_when_multiclient(payload, "repo.list_custom_modules")
-    JsonStore().log_audit("repo.list_custom_modules", "ok", payload.project_path, _preview(payload))
     return RepoService().list_custom_modules(payload.project_path, payload.max_depth, payload.include_uninstallable)
 
 
@@ -118,7 +117,6 @@ def repo_custom_modules(payload: RepoCustomModulesRequest) -> list[CustomModuleI
 def repo_list(payload: RepoListRequest) -> list[FileListItem]:
     _require_explicit_client_when_multiclient(payload, "repo.list")
     _ensure_known_relative_module_current(payload.project_path, payload.relative_path)
-    JsonStore().log_audit("repo.list", "ok", payload.relative_path, _preview(payload))
     result = RepoService().list_files(payload.project_path, payload.relative_path, payload.max_depth, payload.max_items)
     PreWriteGateService().record_repo_inspection(project_path=payload.project_path, relative_path=payload.relative_path, client_name=payload.client_name, action="repo.list", is_content_read=False)
     return result
@@ -128,7 +126,6 @@ def repo_list(payload: RepoListRequest) -> list[FileListItem]:
 def repo_read(payload: RepoReadRequest) -> FileContent:
     _require_explicit_client_when_multiclient(payload, "repo.read")
     _ensure_known_relative_module_current(payload.project_path, payload.relative_path)
-    JsonStore().log_audit("repo.read", "ok", payload.relative_path, _preview(payload))
     result = RepoService().read_file(payload.project_path, payload.relative_path, payload.max_bytes)
     PreWriteGateService().record_repo_inspection(project_path=payload.project_path, relative_path=payload.relative_path, client_name=payload.client_name, action="repo.read", is_content_read=True)
     return result
@@ -138,7 +135,6 @@ def repo_read(payload: RepoReadRequest) -> FileContent:
 def repo_read_range(payload: RepoReadRangeRequest) -> dict:
     _require_explicit_client_when_multiclient(payload, "repo.read_range")
     _ensure_known_relative_module_current(payload.project_path, payload.relative_path)
-    JsonStore().log_audit("repo.read_range", "ok", payload.relative_path, _preview(payload))
     result = RepoService().read_range(payload.project_path, payload.relative_path, payload.start_line, payload.max_lines)
     PreWriteGateService().record_repo_inspection(project_path=payload.project_path, relative_path=payload.relative_path, client_name=payload.client_name, action="repo.read_range", is_content_read=True)
     return result
@@ -148,7 +144,6 @@ def repo_read_range(payload: RepoReadRangeRequest) -> dict:
 def repo_search(payload: RepoSearchRequest) -> dict:
     _require_explicit_client_when_multiclient(payload, "repo.search")
     _ensure_known_relative_module_current(payload.project_path, payload.relative_path)
-    JsonStore().log_audit("repo.search", "ok", payload.pattern, _preview(payload))
     result = RepoService().search(payload.project_path, payload.pattern, payload.relative_path, payload.max_matches, payload.context_lines, payload.regex)
     PreWriteGateService().record_repo_inspection(project_path=payload.project_path, relative_path=payload.relative_path, client_name=payload.client_name, action="repo.search", is_content_read=False)
     return result
@@ -197,7 +192,8 @@ def repo_apply_patch(payload: RepoPatchRequest) -> CommandResult:
     result = RepoService().apply_patch(payload.project_path, payload.patch, payload.check_only, payload.timeout_seconds)
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.apply_patch succeeded", "repo.apply_patch failed")
-    JsonStore().log_audit("repo.apply_patch", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
+    if not payload.check_only or result.exit_code != 0:
+        JsonStore().log_audit("repo.apply_patch", "ok" if result.exit_code == 0 else "failed", "apply", _preview(payload))
     return result
 
 
@@ -215,7 +211,8 @@ def repo_write_many_fast_safe(payload: RepoWriteManyFastSafeRequest) -> CommandR
     result = RepoService().write_many_fast_safe(payload.project_path, payload.files, payload.check_only, payload.timeout_seconds)
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.write_many_fast_safe succeeded", "repo.write_many_fast_safe failed")
-    JsonStore().log_audit("repo.write_many_fast_safe", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
+    if not payload.check_only or result.exit_code != 0:
+        JsonStore().log_audit("repo.write_many_fast_safe", "ok" if result.exit_code == 0 else "failed", "apply", _preview(payload))
     return result
 
 
@@ -229,7 +226,8 @@ def repo_write_many_smart(payload: RepoWriteManySmartRequest) -> CommandResult:
     result = RepoService().write_many_smart(payload.project_path, payload.files, payload.check_only, payload.timeout_seconds, payload.strategy)
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.write_many_smart succeeded", "repo.write_many_smart failed")
-    JsonStore().log_audit("repo.write_many_smart", "ok" if result.exit_code == 0 else "failed", payload.strategy, _preview(payload))
+    if not payload.check_only or result.exit_code != 0:
+        JsonStore().log_audit("repo.write_many_smart", "ok" if result.exit_code == 0 else "failed", payload.strategy, _preview(payload))
     return result
 
 
@@ -243,7 +241,8 @@ def repo_write_many_atomic(payload: RepoWriteManyAtomicRequest) -> CommandResult
     result = RepoService().write_many_atomic(payload.project_path, payload.files, payload.check_only, payload.timeout_seconds)
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.write_many_atomic succeeded", "repo.write_many_atomic failed")
-    JsonStore().log_audit("repo.write_many_atomic", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
+    if not payload.check_only or result.exit_code != 0:
+        JsonStore().log_audit("repo.write_many_atomic", "ok" if result.exit_code == 0 else "failed", "apply", _preview(payload))
     return result
 
 
@@ -259,7 +258,8 @@ def repo_apply_patch_atomic(payload: RepoAtomicPatchRequest) -> CommandResult:
     result = RepoService().apply_patch_atomic(payload.project_path, payload.patch, payload.check_only, payload.timeout_seconds)
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.apply_patch_atomic succeeded", "repo.apply_patch_atomic failed")
-    JsonStore().log_audit("repo.apply_patch_atomic", "ok" if result.exit_code == 0 else "failed", "check_only" if payload.check_only else "apply", _preview(payload))
+    if not payload.check_only or result.exit_code != 0:
+        JsonStore().log_audit("repo.apply_patch_atomic", "ok" if result.exit_code == 0 else "failed", "apply", _preview(payload))
     return result
 
 

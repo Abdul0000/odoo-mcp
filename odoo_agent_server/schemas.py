@@ -554,7 +554,7 @@ class OdooShModuleUpdateRequest(ApprovalMixin):
     expected_sha: str | None = Field(default=None, description="Pushed Git SHA that must be deployed on Odoo.sh before update. If omitted, manual Odoo.sh tools require local HEAD to match remote branch HEAD before running.")
     wait_for_result: bool = Field(default=True, description="Wait server-side for background SSH job until done or wait timeout")
     wait_timeout_seconds: int = Field(
-        default=900,
+        default=20,
         ge=0,
         le=2400,
         description="Maximum server-side wait for final job result. Use 0 to wait indefinitely until terminal pass/fail/warning.",
@@ -581,7 +581,7 @@ class OdooModuleRequest(ApprovalMixin):
     expected_sha: str | None = Field(default=None, description="Optional pushed Git SHA that must be deployed on Odoo.sh before manual SSH install/update. If omitted, local HEAD must match remote branch HEAD.")
     wait_for_result: bool = Field(default=True, description="For background install/upgrade/deploy, wait server-side until the job finishes or times out")
     wait_timeout_seconds: int = Field(
-        default=900,
+        default=20,
         ge=0,
         le=2400,
         description="Maximum server-side wait for final job result. Use 0 to wait indefinitely until terminal pass/fail/warning.",
@@ -1054,8 +1054,9 @@ class StartSessionRequest(BaseModel):
     workspace_root: str | None = Field(default=None, description="Workspace root for clones. Defaults to WORKSPACE_ROOT.")
     remote: str = Field(default="origin")
     max_depth: int = Field(default=5, ge=1, le=10)
-    include_odoosh: bool = True
-    include_odoo: bool = True
+    include_odoosh: bool = Field(default=False, description="Opt in to the slower live Odoo.sh SSH health check")
+    include_odoo: bool = Field(default=False, description="Opt in to the slower live Odoo RPC health check")
+    refresh_repo: bool = Field(default=False, description="Fetch/pull an existing checkout; false validates it locally for a fast session start")
     timeout_seconds: int = Field(default=180, ge=30, le=900)
 
 

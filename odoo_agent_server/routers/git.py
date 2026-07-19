@@ -325,9 +325,7 @@ def _ensure_protected_branch_approval(branch: str | None, approval_id: str | Non
 @router.post("/status", response_model=CommandResult)
 def git_status(payload: BaseProjectRequest) -> CommandResult:
     _require_explicit_client_when_multiclient(payload, "git.status")
-    result = GitService().status(payload.project_path)
-    JsonStore().log_audit("git.status", "ok" if result.exit_code == 0 else "failed", payload.project_path)
-    return result
+    return GitService().status(payload.project_path)
 
 
 @router.post("/current-branch", response_model=CommandResult)
@@ -339,9 +337,7 @@ def git_current_branch(payload: BaseProjectRequest) -> CommandResult:
 @router.post("/diff", response_model=CommandResult)
 def git_diff(payload: GitDiffRequest) -> CommandResult:
     _require_explicit_client_when_multiclient(payload, "git.diff")
-    result = GitService().diff(payload.project_path, payload.staged, payload.timeout_seconds)
-    JsonStore().log_audit("git.diff", "ok" if result.exit_code == 0 else "failed", payload.project_path, {"staged": payload.staged})
-    return result
+    return GitService().diff(payload.project_path, payload.staged, payload.timeout_seconds)
 
 
 @router.post("/commit", response_model=CommandResult)

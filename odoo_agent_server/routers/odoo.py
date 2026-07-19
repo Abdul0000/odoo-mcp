@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import json
-import time
-
 from fastapi import APIRouter
 
 from ..auth import AuthDependency
@@ -37,29 +34,12 @@ def _prepare_validated_client(payload: OdooModuleRequest, action: str):
 
 
 def _poll_manual_push_deployed(odoosh: OdooShService, pushed_sha: str, timeout_seconds: int, interval_seconds: float) -> CommandResult:
-    deadline = time.monotonic() + max(timeout_seconds, 0)
-    attempts = 0
-    recent_checks: list[dict] = []
-    while True:
-        attempts += 1
-        result = odoosh.check_commit_deployed(pushed_sha)
-        deployed = result.exit_code == 0 and '"deployed": true' in (result.stdout or "").lower()
-        recent_checks.append({"attempt": attempts, "exit_code": result.exit_code, "stdout": result.stdout, "stderr": result.stderr})
-        if deployed:
-            return result.model_copy(update={
-                "command": ["odoosh.check_commit_poll", pushed_sha],
-                "stdout": json.dumps({"deployed": True, "expected_sha": pushed_sha, "attempts": attempts, "last_check": result.stdout}),
-            })
-        if time.monotonic() >= deadline:
-            return CommandResult(
-                command=["odoosh.check_commit_poll", pushed_sha],
-                cwd="odoosh:ssh",
-                exit_code=124,
-                stdout=json.dumps({"deployed": False, "expected_sha": pushed_sha, "attempts": attempts, "recent_checks": recent_checks[-10:]}),
-                stderr=f"Odoo.sh did not deploy pushed commit {pushed_sha} within {timeout_seconds}s.",
-                timed_out=True,
-            )
-        time.sleep(min(interval_seconds, max(deadline - time.monotonic(), 0.0)))
+    poller = getattr(odoosh, "poll_deployed_commit", None)
+    if callable(poller):
+        return poller(pushed_sha, timeout_seconds, interval_seconds)
+    # Test doubles and legacy service adapters may only implement
+    # check_commit_deployed; the shared implementation supports that contract.
+    return OdooShService.poll_deployed_commit(odoosh, pushed_sha, timeout_seconds, interval_seconds)
 
 
 def _direct_module_deploy_guard(payload: OdooModuleRequest, store: JsonStore) -> OdooResult | None:
@@ -142,22 +122,6 @@ def _direct_module_deploy_guard(payload: OdooModuleRequest, store: JsonStore) ->
     return None
 
 
-def _wait_until_terminal(store: JsonStore, job_id: str, poll_interval_seconds: float) -> JobRecord:
-    """Block until a background Odoo job reaches a terminal state.
-
-    `wait_for_result=true` is an explicit request for a final answer. Returning
-    a polite "started / check back" payload from that mode caused agents to
-    report unconfirmed upgrades as completed. Non-blocking behavior remains
-    available by calling the tool with `wait_for_result=false`.
-    """
-    interval = max(min(float(poll_interval_seconds or 2.0), 10.0), 0.25)
-    while True:
-        current = store.get_job(job_id)
-        if current.status not in {JobStatus.queued, JobStatus.running}:
-            return current
-        time.sleep(interval)
-
-
 def _background_job_response(store: JsonStore, job: JobRecord, payload: OdooModuleRequest, started_message: str) -> OdooResult:
     """Return a final result for wait_for_result=true; otherwise return job_id.
 
@@ -192,7 +156,7 @@ def _background_job_response(store: JsonStore, job: JobRecord, payload: OdooModu
             },
         )
 
-    waited = _wait_until_terminal(store, job.id, payload.poll_interval_seconds)
+    waited = store.wait_job(job.id, payload.wait_timeout_seconds, payload.poll_interval_seconds)
     data = waited.model_dump(mode="json")
     if waited.status == JobStatus.passed:
         return OdooResult(
@@ -222,9 +186,32 @@ def _background_job_response(store: JsonStore, job: JobRecord, payload: OdooModu
             error=final_error,
         )
 
-    # _wait_until_terminal cannot return an active job, but keep this defensive
-    # failure branch so future enum changes never produce success-sounding text.
-    final_error = f"Module deploy did not produce a terminal result; job_status={waited.status.value}"
+    if waited.status in {JobStatus.queued, JobStatus.running}:
+        return OdooResult(
+            status="failed",
+            error=f"{started_message} is still running after the bounded server-side wait.",
+            result={
+                "job_id": waited.id,
+                "job_status": waited.status.value,
+                "status": "running",
+                "finished": False,
+                "completion_required": True,
+                "success_allowed": False,
+                "tool_exit_allowed": False,
+                "job": data,
+                "next_call": {
+                    "tool": "jobs.get",
+                    "arguments": {
+                        "job_id": waited.id,
+                        "wait_for_result": True,
+                        "wait_timeout_seconds": 20,
+                        "poll_interval_seconds": 2.0,
+                    },
+                },
+            },
+        )
+
+    final_error = f"Module deploy did not produce a supported terminal result; job_status={waited.status.value}"
     return OdooResult(
         status="failed",
         result={"job_id": waited.id, "job_status": waited.status.value, "finished": True, "message": f"Upgrade failed after 1 attempt(s), last error: {final_error}", "job": data},
@@ -288,17 +275,13 @@ def _existing_post_push_job_response(store: JsonStore, payload: OdooModuleReques
 @router.post("/health", response_model=OdooResult)
 def odoo_health() -> OdooResult:
     client = ClientResolverService().resolve_client(require_complete=False)
-    result = _odoo_service_for_client(client).health()
-    JsonStore().log_audit("odoo.health", result.status, "Odoo shell health")
-    return result
+    return _odoo_service_for_client(client).health()
 
 
 @router.post("/module-status", response_model=OdooResult)
 def odoo_module_status(payload: OdooModuleRequest) -> OdooResult:
     client = _prepare_validated_client(payload, "odoo.module_status")
-    result = _odoo_service_for_client(client).module_status(payload.module_name)
-    JsonStore().log_audit("odoo.module_status", result.status, payload.module_name)
-    return result
+    return _odoo_service_for_client(client).module_status(payload.module_name)
 
 
 @router.post("/module-install", response_model=OdooResult)
@@ -412,6 +395,4 @@ def odoo_module_deploy(payload: OdooModuleRequest) -> OdooResult:
 @router.post("/search-read", response_model=OdooResult)
 def odoo_search_read(payload: OdooSearchReadRequest) -> OdooResult:
     client = ClientResolverService().resolve_client(client_name=payload.client_name, require_complete=True) if payload.client_name else ClientResolverService().resolve_client(require_complete=False)
-    result = _odoo_service_for_client(client).search_read(payload.model, payload.domain, payload.fields, payload.limit, payload.offset, payload.order, payload.context)
-    JsonStore().log_audit("odoo.search_read", result.status, payload.model, {"fields": payload.fields, "limit": payload.limit})
-    return result
+    return _odoo_service_for_client(client).search_read(payload.model, payload.domain, payload.fields, payload.limit, payload.offset, payload.order, payload.context)
