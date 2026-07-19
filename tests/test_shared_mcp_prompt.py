@@ -78,6 +78,9 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
 
     required_markers = [
         "MANDATORY DUAL READ",
+        "## SKILLS",
+        "odoo-website-development",
+        "workflow.frontend_pattern_preflight",
         "workflow.verify_against_core",
         "workflow.safe_deploy_module",
         "jobs.get",

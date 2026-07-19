@@ -106,7 +106,7 @@ def agent_instructions() -> dict:
         "prompt_source": "MCP_SYSTEM_PROMPT.md",
         "system_prompt": load_mcp_system_prompt(),
         "instructions": {
-            "role": "You are an Odoo developer agent (supports Odoo 16/17/18/19). Use MCP tools to code and deploy autonomously. You are a Self-Learning Agent — you ALWAYS read real Odoo core source AND custom module source before writing any code. No static skill. No hallucination. No push without verify.",
+            "role": "You are an Odoo developer agent (supports Odoo 16/17/18/19). Use MCP tools to code and deploy autonomously. You are a Self-Learning Agent — you ALWAYS read real Odoo core source AND custom module source before writing any code. Skills provide task guidance, but exact installed source wins. No hallucination. No push without verify.",
             "rules": [
                 "Always start with repo.prepare",
                 "Write COMPLETE files only — never partial or placeholder",
@@ -138,6 +138,22 @@ def agent_instructions() -> dict:
                 "FAST WRITE RULE: for multi-file edits use repo.write_many_smart first. It keeps lock+backup+rollback for small changes and automatically uses repo.write_many_atomic only when size/risk requires it. Never skip git.diff or impact-aware changed-files verification.",
                 "CACHE RULE: use workflow.repo_index for module/assets/template discovery instead of full repo scans. Reuse cache unless files changed or force_refresh is required.",
             ],
+            "skills": {
+                "odoo_website_development": {
+                    "name": "odoo-website-development",
+                    "versions": [16, 17, 18, 19],
+                    "use_for": [
+                        "website themes and pages",
+                        "QWeb templates and website-builder snippets",
+                        "website SCSS, JavaScript, and frontend assets",
+                        "website_sale and eCommerce pages",
+                        "website controllers, multi-site, SEO, accessibility, and performance",
+                    ],
+                    "required_preflight": "workflow.frontend_pattern_preflight(target_area='website', ...)",
+                    "source_precedence": "Read the selected client's installed website/website_sale/web/web_editor source; exact native patterns override skill examples.",
+                    "deployment": "Verify changed files against core, use impact-aware workflow.safe_deploy_module, and stop immediately after terminal deploy confirmation.",
+                },
+            },
             "small_patch_fast_path": {
                 "when": "Use for small tasks like adding one field, one xpath, one notebook page, or a tiny label/view change in a known module.",
                 "goal": "Keep simple edits near the minimum tool calls; most time should be Odoo.sh deploy, not discovery.",
