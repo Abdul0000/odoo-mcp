@@ -87,6 +87,7 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "odoo-manufacturing-development",
         "odoo-inventory-development",
         "odoo-sales-development",
+        "odoo-purchase-development",
         "odoo-hr-payroll-development",
         "odoo-crm-pipeline-development",
         "odoo-helpdesk-development",

@@ -12,6 +12,7 @@ EXPECTED = {
     "odoo-manufacturing-development": "02-SKILL-manufacturing.md",
     "odoo-inventory-development": "03-SKILL-inventory.md",
     "odoo-sales-development": "04-SKILL-sales.md",
+    "odoo-purchase-development": "05-SKILL-purchase.md",
     "odoo-hr-payroll-development": "06-SKILL-hr-payroll.md",
     "odoo-crm-pipeline-development": "07-SKILL-crm-pipeline.md",
     "odoo-helpdesk-development": "08-SKILL-helpdesk.md",

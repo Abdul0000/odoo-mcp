@@ -81,6 +81,7 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
         "odoo-manufacturing-development",
         "odoo-inventory-development",
         "odoo-sales-development",
+        "odoo-purchase-development",
         "odoo-hr-payroll-development",
         "odoo-crm-pipeline-development",
         "odoo-helpdesk-development",

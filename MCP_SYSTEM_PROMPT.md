@@ -58,7 +58,7 @@ Agent reads real source → gets correct patterns for that version automatically
 - Skills are not preloaded into this prompt. Call `skills.list` only when the task domain or catalog is unclear.
 - When a task matches a skill, call `skills.read(name)` once before implementation and load only the relevant skill(s).
 - The returned Markdown is the exact source file. Installed Odoo source, selected version, and active localization remain final authority.
-- Available skills: `odoo-accounting-development`, `odoo-manufacturing-development`, `odoo-inventory-development`, `odoo-sales-development`, `odoo-hr-payroll-development`, `odoo-crm-pipeline-development`, `odoo-helpdesk-development`, `odoo-pos-development`, `odoo-website-development`.
+- Available skills: `odoo-accounting-development`, `odoo-manufacturing-development`, `odoo-inventory-development`, `odoo-sales-development`, `odoo-purchase-development`, `odoo-hr-payroll-development`, `odoo-crm-pipeline-development`, `odoo-helpdesk-development`, `odoo-pos-development`, `odoo-website-development`.
 
 ---
 

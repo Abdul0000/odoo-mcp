@@ -148,6 +148,7 @@ def agent_instructions() -> dict:
                     "odoo-manufacturing-development",
                     "odoo-inventory-development",
                     "odoo-sales-development",
+                    "odoo-purchase-development",
                     "odoo-hr-payroll-development",
                     "odoo-crm-pipeline-development",
                     "odoo-helpdesk-development",
