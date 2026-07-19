@@ -78,7 +78,7 @@ def test_grok_operation_guard_blocks_duplicate_scope_and_backwards_reads(tmp_pat
     backwards = svc.before_tool_call("repo.read", base | {"relative_path": "sample_website_module/static/src/scss/page_widget.scss"})
     assert backwards is not None
     assert backwards["status"] == "phase_guard"
-    assert backwards["next_call"]["tool"] == "git.diff"
+    assert backwards["next_call"]["tool"] == "workflow.odoo_code_change"
 
     repeated_write = svc.before_tool_call("repo.write", write_args)
     assert repeated_write is not None

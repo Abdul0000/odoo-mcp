@@ -12,7 +12,7 @@ import json
 import time
 import re
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable
 
 from ..schemas import (
     FrontendPatternPreflightRequest,

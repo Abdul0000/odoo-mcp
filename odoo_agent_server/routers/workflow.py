@@ -1240,13 +1240,18 @@ def _wait_nested_module_job(
 
 
 def _start_and_wait_module_deploy(payload: SafeDeployModuleRequest) -> OdooResult:
-    started = start_odoo_module_deploy_job(OdooModuleRequest(
+    module_request = OdooModuleRequest(
         client_name=payload.client_name,
         module_name=payload.module_name,
         wait_for_result=True,
         wait_timeout_seconds=min(max(int(payload.odoo_module_deploy_timeout_seconds or 1), 1), 25),
         poll_interval_seconds=max(min(float(payload.odoo_module_deploy_poll_interval_seconds or 10.0), 10.0), 0.25),
-    ))
+    )
+    try:
+        started = start_odoo_module_deploy_job(module_request, run_inline=True)
+    except TypeError:
+        # Compatibility with existing test doubles and external overrides.
+        started = start_odoo_module_deploy_job(module_request)
     started_payload = started.model_dump(mode="json") if hasattr(started, "model_dump") else started
     result_payload = started_payload.get("result") if isinstance(started_payload, dict) and isinstance(started_payload.get("result"), dict) else {}
     if result_payload.get("finished") is True or not result_payload.get("job_id"):
@@ -1910,7 +1915,11 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             return True
 
         def _odoosh_poll_progress(attempt_payload: dict[str, object]) -> None:
-            _step(f"{step_prefix}odoosh_check_commit_poll", "passed" if attempt_payload.get("deployed") else "running", attempt_payload)
+            attempt = int(attempt_payload.get("attempt") or 0)
+            # Keep the job responsive without appending/re-writing one large
+            # JSON step on every SSH poll. Record first, every fifth, and final.
+            if attempt_payload.get("deployed") or attempt == 1 or attempt % 5 == 0:
+                _step(f"{step_prefix}odoosh_check_commit_poll", "passed" if attempt_payload.get("deployed") else "running", attempt_payload)
 
         check_result = _poll_odoosh_deployed(
             odoosh,

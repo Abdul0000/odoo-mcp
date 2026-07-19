@@ -47,7 +47,6 @@ def _make_checkout(path: Path) -> None:
 
 
 def _patch_successful_validation(monkeypatch) -> None:
-    monkeypatch.setattr(ClientGateService, "_check_repo_branch", lambda self, client: {"status": "ok", "branch_ok": True, "log": ["repo ok"]})
     monkeypatch.setattr(ClientGateService, "_check_checkout", lambda self, client: {"status": "ok", "log": ["checkout ok"]})
     monkeypatch.setattr(ClientGateService, "_check_odoo_shell", lambda self, client: {"status": "ok", "log": ["odoo ok"]})
     monkeypatch.setattr(ClientGateService, "_check_odoosh", lambda self, client: {"status": "ok", "addons_path_status": "ok", "log": ["ssh ok"]})
@@ -132,7 +131,6 @@ def test_client_check_shell_failure_still_allows_coding_when_ssh_ok(monkeypatch,
         _client("Alpha", "https://github.com/acme/a.git", "dev", str(checkout)),
         _client("Beta", "https://github.com/acme/b.git", "dev", str(tmp_path / "b")),
     ])
-    monkeypatch.setattr(ClientGateService, "_check_repo_branch", lambda self, client: {"status": "ok", "branch_ok": True, "log": ["repo ok"]})
     monkeypatch.setattr(ClientGateService, "_check_checkout", lambda self, client: {"status": "ok", "log": ["checkout ok"]})
     monkeypatch.setattr(ClientGateService, "_check_odoo_shell", lambda self, client: {"status": "failed", "error_type": "odoo_login_error", "log": ["shell failed"]})
     monkeypatch.setattr(ClientGateService, "_check_odoosh", lambda self, client: {"status": "ok", "addons_path_status": "ok", "log": ["ssh ok"]})
@@ -160,7 +158,6 @@ def test_client_check_shell_ok_without_ssh_does_not_enable_safe_deploy(monkeypat
         _client("Alpha", "https://github.com/acme/a.git", "dev", str(checkout)),
         _client("Beta", "https://github.com/acme/b.git", "dev", str(tmp_path / "b")),
     ])
-    monkeypatch.setattr(ClientGateService, "_check_repo_branch", lambda self, client: {"status": "ok", "branch_ok": True, "log": ["repo ok"]})
     monkeypatch.setattr(ClientGateService, "_check_checkout", lambda self, client: {"status": "ok", "log": ["checkout ok"]})
     monkeypatch.setattr(ClientGateService, "_check_odoo_shell", lambda self, client: {"status": "ok", "log": ["https jsonrpc ok"]})
     monkeypatch.setattr(ClientGateService, "_check_odoosh", lambda self, client: {"status": "failed", "addons_path_status": "skipped", "log": ["ssh timeout"]})

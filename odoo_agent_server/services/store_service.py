@@ -189,7 +189,11 @@ class JsonStore:
             rows.append(job.model_dump(mode="json"))
 
         self._update_list(self.jobs_file, update)
-        self.log_audit("job.update", job.status.value, job.job_type, {"job_id": job.id})
+        # Running jobs can update on every deployment poll. Auditing every
+        # heartbeat rewrites the complete audit JSON and adds no durable value;
+        # create and terminal transitions remain audited.
+        if job.status not in {JobStatus.queued, JobStatus.running}:
+            self.log_audit("job.update", job.status.value, job.job_type, {"job_id": job.id})
         return job
 
     def add_step(self, job: JobRecord, step: JobStep) -> JobRecord:

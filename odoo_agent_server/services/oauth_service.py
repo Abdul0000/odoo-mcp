@@ -7,12 +7,11 @@ import json
 import secrets
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from threading import Lock
 from typing import Any
 from urllib.parse import urlencode, urlparse
 
-from fastapi import HTTPException, status
+from fastapi import HTTPException
 
 from ..config import settings
 

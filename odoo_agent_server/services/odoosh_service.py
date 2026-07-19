@@ -32,8 +32,11 @@ class _SshMasterPool:
         self._masters: dict[str, tuple[subprocess.Popen, Path]] = {}
         self._tmpdir = Path(tempfile.mkdtemp(prefix="odoosh_ssh_pool_"))
 
-    def _key(self, host: str, port: int, user: str) -> str:
-        return f"{user}@{host}:{port}"
+    def _key(self, host: str, port: int, user: str, key_path: Path | None = None) -> str:
+        # Different clients may share host/user while using different keys.
+        # Never reuse a multiplexed authenticated session across those clients.
+        key_identity = str(key_path.resolve()) if key_path else "default-key"
+        return f"{user}@{host}:{port}:{key_identity}"
 
     def _socket_path(self, key: str) -> Path:
         safe = key.replace("/", "_").replace(":", "_").replace("@", "_")
@@ -48,7 +51,7 @@ class _SshMasterPool:
         timeout: int = 15,
     ) -> Path | None:
         """Ensure a ControlMaster is alive; return socket path or None on failure."""
-        key = self._key(host, port, user)
+        key = self._key(host, port, user, key_path)
         with self._lock:
             entry = self._masters.get(key)
             if entry is not None:
@@ -58,7 +61,9 @@ class _SshMasterPool:
             sock = self._socket_path(key)
             sock.parent.mkdir(parents=True, exist_ok=True)
             cmd = [
-                "ssh", "-N", "-f", "-M",
+                # Do not use -f here: it forks SSH and makes the Popen parent
+                # exit, so the pool incorrectly treats a live master as dead.
+                "ssh", "-N", "-M",
                 "-S", str(sock),
                 "-p", str(port),
                 "-o", "BatchMode=yes",
@@ -88,8 +93,8 @@ class _SshMasterPool:
             return ["-o", f"ControlPath={sock}", "-o", "ControlMaster=no"]
         return []
 
-    def close_master(self, host: str, port: int, user: str) -> None:
-        key = self._key(host, port, user)
+    def close_master(self, host: str, port: int, user: str, key_path: Path | None = None) -> None:
+        key = self._key(host, port, user, key_path)
         with self._lock:
             entry = self._masters.pop(key, None)
             if entry:
@@ -256,7 +261,8 @@ class OdooShService:
         return self.run_shell(script, timeout_seconds=30)
 
     # NON-BLOCKING single check — MCP agents poll this instead of blocking wait
-    def adaptive_poll_interval(self, attempt: int) -> float:
+    @staticmethod
+    def adaptive_poll_interval(attempt: int) -> float:
         """Adaptive polling: fast early, slower later to reduce SSH calls."""
         if attempt < 3:
             return 5.0   # first 3 checks: every 5s
@@ -322,6 +328,11 @@ class OdooShService:
 
         while True:
             attempt += 1
+            adaptive_interval = (
+                max(interval_seconds, OdooShService.adaptive_poll_interval(attempt - 1))
+                if timeout_seconds >= 60
+                else interval_seconds
+            )
             check_result = self.check_commit_deployed(expected)
             deployed = OdooShService._check_result_deployed(check_result)
             elapsed_seconds = round(time.monotonic() - started, 3)
@@ -332,7 +343,7 @@ class OdooShService:
                 "stderr": check_result.stderr,
                 "deployed": deployed,
                 "expected_sha": expected,
-                "poll_interval_seconds": interval_seconds,
+                "poll_interval_seconds": adaptive_interval,
                 "elapsed_seconds": elapsed_seconds,
             }
             attempts.append(attempt_payload)
@@ -349,7 +360,7 @@ class OdooShService:
                         "deployed": True,
                         "expected_sha": expected,
                         "attempts": attempt,
-                        "poll_interval_seconds": interval_seconds,
+                        "poll_interval_seconds": adaptive_interval,
                         "elapsed_seconds": elapsed_seconds,
                         "message": "Odoo.sh deployed the pushed commit. Proceeding to module upgrade.",
                         "last_check": check_result.stdout,
@@ -367,7 +378,7 @@ class OdooShService:
                         "deployed": False,
                         "expected_sha": expected,
                         "attempts": attempt,
-                        "poll_interval_seconds": interval_seconds,
+                        "poll_interval_seconds": adaptive_interval,
                         "elapsed_seconds": elapsed_seconds,
                         "timeout_seconds": timeout_seconds,
                         "recent_checks": attempts[-10:],
@@ -376,36 +387,18 @@ class OdooShService:
                     timed_out=True,
                 )
 
-            sleep_for = min(interval_seconds, max(deadline - now, 0.0))
+            sleep_for = min(adaptive_interval, max(deadline - now, 0.0))
             if sleep_for > 0:
                 time.sleep(sleep_for)
 
-    # Kept for safe_deploy_module internal use only (not exposed as MCP tool)
+    # Backward-compatible wrapper for legacy internal/direct routes. Keep one
+    # polling implementation so timing, timeout metadata, and SSH behavior do
+    # not diverge between wait_for_commit and safe deploy.
     def wait_for_commit(self, expected_sha: str, timeout_seconds: int | None = None, interval_seconds: int | None = None) -> CommandResult:
-        timeout_seconds = timeout_seconds or settings.odoosh_wait_timeout_seconds
-        interval_seconds = interval_seconds or settings.odoosh_wait_interval_seconds
-        deadline = time.time() + timeout_seconds
-        expected = expected_sha.strip()
-        attempts: list[str] = []
-        while time.time() < deadline:
-            result = self.deployed_sha()
-            current = result.stdout.strip()
-            attempts.append(current or f"exit={result.exit_code}:{result.stderr.strip()[:120]}")
-            if result.exit_code == 0 and current and (current.startswith(expected) or expected.startswith(current)):
-                return CommandResult(
-                    command=["odoosh.wait_for_commit", expected],
-                    cwd="odoosh:ssh",
-                    exit_code=0,
-                    stdout=f"ODOOSH_DEPLOYED_COMMIT_OK\nexpected={expected}\ncurrent={current}\n",
-                )
-            time.sleep(interval_seconds)
-        return CommandResult(
-            command=["odoosh.wait_for_commit", expected],
-            cwd="odoosh:ssh",
-            exit_code=124,
-            stdout="\n".join(attempts[-10:]),
-            stderr=f"Odoo.sh did not deploy expected commit within {timeout_seconds}s. Expected {expected}.",
-            timed_out=True,
+        return self.poll_deployed_commit(
+            expected_sha,
+            timeout_seconds or settings.odoosh_wait_timeout_seconds,
+            float(interval_seconds or settings.odoosh_wait_interval_seconds),
         )
 
 

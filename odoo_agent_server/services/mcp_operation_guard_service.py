@@ -447,20 +447,15 @@ class McpOperationGuardService:
 
     def _next_call(self, op: dict[str, Any]) -> dict[str, Any]:
         phase = str((op or {}).get("phase") or "discovery")
-        if phase == "verify":
-            if not op.get("diff_seen") and op.get("project_path"):
-                return {"tool": "git.diff", "arguments": {"project_path": op.get("project_path"), "client_name": op.get("client_name")}}
-            return {"tool": "workflow.verify_against_core", "arguments_hint": "Pass written_files from git.diff."}
-        if phase == "deploy":
-            return {"tool": "workflow.safe_deploy_module", "arguments_hint": "Use current client/module; then poll jobs.get."}
         if phase == "poll":
             job_id = op.get("job_id")
             return {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}}
         if phase == "final":
             return {"tool": "final_answer", "arguments_hint": "Report only verified facts; do not claim visible UI unless browser verification passed."}
-        if not op.get("scope_advice_done"):
-            return {"tool": "workflow.scope_advice", "arguments_hint": "After reading custom files, call scope_advice(max_level=L2), then read all mandatory source paths."}
-        return {"tool": "repo.write", "arguments_hint": "After mandatory custom + core reads are complete."}
+        return {
+            "tool": "workflow.odoo_code_change",
+            "arguments_hint": "Continue the current composite code-change workflow; source reads, verification, Git, and deploy are server-owned.",
+        }
 
     def _guard_payload(self, *, status: str, message: str, operation: dict[str, Any], next_call: dict[str, Any]) -> dict[str, Any]:
         return {

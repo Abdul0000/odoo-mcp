@@ -2596,13 +2596,17 @@ def _persist_resume_result(store: JsonStore, job, resume_results: dict, original
 
 
 def _start_and_wait_module_deploy_for_resume(original_request: dict, module_name: str) -> OdooResult:
-    started = start_odoo_module_deploy_job(OdooModuleRequest(
+    module_request = OdooModuleRequest(
         client_name=original_request.get("client_name"),
         module_name=module_name,
         wait_for_result=False,
         wait_timeout_seconds=0,
         poll_interval_seconds=1.0,
-    ))
+    )
+    try:
+        started = start_odoo_module_deploy_job(module_request, run_inline=True)
+    except TypeError:
+        started = start_odoo_module_deploy_job(module_request)
     started_payload = started.model_dump(mode="json") if hasattr(started, "model_dump") else started
     result_payload = started_payload.get("result") if isinstance(started_payload, dict) and isinstance(started_payload.get("result"), dict) else {}
     if result_payload.get("finished") or not result_payload.get("job_id"):

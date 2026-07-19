@@ -25,7 +25,6 @@ import ast
 import os
 import re
 from pathlib import Path
-from typing import Sequence
 
 from . import core_sync_service
 from .client_resolver_service import ClientResolverService
@@ -34,7 +33,6 @@ from ..schemas import (
     FindCoreFileResult,
     FindSimilarViewResult,
     SimilarViewMatch,
-    ScopeAdviceRequest,
     ScopeAdviceResult,
     ScopeLevel,
     ScopeReadInstruction,

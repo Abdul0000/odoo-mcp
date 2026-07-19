@@ -355,7 +355,12 @@ def odoo_module_update(payload: OdooModuleRequest) -> OdooResult:
     return _background_job_response(store, job, payload, "Upgrade started.")
 
 
-def start_odoo_module_deploy_job(payload: OdooModuleRequest, approval: ApprovalService | None = None, enforce_deploy_guard: bool = False) -> OdooResult:
+def start_odoo_module_deploy_job(
+    payload: OdooModuleRequest,
+    approval: ApprovalService | None = None,
+    enforce_deploy_guard: bool = False,
+    run_inline: bool = False,
+) -> OdooResult:
     client = _prepare_validated_client(payload, "odoo.module_deploy")
     """Start smart deploy in the existing background-job path.
 
@@ -378,7 +383,13 @@ def start_odoo_module_deploy_job(payload: OdooModuleRequest, approval: ApprovalS
             approval.finalize_status(payload.approval_id, result.status == "ok", "odoo.module_deploy succeeded", "odoo.module_deploy failed")
         store.log_audit("odoo.module_deploy", result.status, payload.module_name)
 
-    submit_background(_bg)
+    # Composite safe-deploy already runs in a background worker. Starting a
+    # nested job on the same bounded executor can starve when concurrent parent
+    # jobs occupy all workers, so internal callers execute this child inline.
+    if run_inline:
+        _bg()
+    else:
+        submit_background(_bg)
     return _background_job_response(store, job, payload, "Deploy started.")
 
 

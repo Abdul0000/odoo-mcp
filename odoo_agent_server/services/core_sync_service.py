@@ -37,7 +37,9 @@ from .client_resolver_service import ClientResolverService, ResolvedClient
 _registry_lock = Lock()
 _module_locks: dict[str, Lock] = {}
 _sha_cache: dict[str, tuple[str | None, float]] = {}
+_negative_cache: dict[str, float] = {}
 _SHA_CACHE_TTL = 30.0  # don't hit odoosh.deployed_sha more than once per 30s
+_NEGATIVE_CACHE_TTL = 120.0
 
 
 def _module_lock(remote_root: str, module_name: str) -> Lock:
@@ -65,8 +67,12 @@ def _deployed_sha(client: ResolvedClient | None = None) -> str | None:
     per module.
     """
     host = (client.odoosh_ssh_host if client else None) or settings.odoosh_ssh_host or ""
+    user = (client.odoosh_ssh_user if client else None) or settings.odoosh_ssh_user or "odoo"
+    port = (client.odoosh_ssh_port if client else None) or settings.odoosh_ssh_port or 22
+    key_hint = (client.odoosh_ssh_key_path if client else None) or settings.odoosh_ssh_key_path or ""
+    cache_identity = f"{user}@{host}:{port}:{key_hint}"
     now = time.time()
-    cached = _sha_cache.get(host)
+    cached = _sha_cache.get(cache_identity)
     if cached and (now - cached[1]) < _SHA_CACHE_TTL:
         return cached[0]
     sha: str | None = None
@@ -79,7 +85,7 @@ def _deployed_sha(client: ResolvedClient | None = None) -> str | None:
             sha = lines[-1] if lines else None
     except Exception:  # noqa: BLE001
         sha = None
-    _sha_cache[host] = (sha, now)
+    _sha_cache[cache_identity] = (sha, now)
     return sha
 
 
@@ -125,7 +131,7 @@ def _normalise_root(remote_root: str, client: ResolvedClient | None) -> str:
         return f"{root}/addons"
     return root
 
-def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: int = 45, *, client_name: str | None = None, client: ResolvedClient | None = None) -> bool:
+def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: int = 15, *, client_name: str | None = None, client: ResolvedClient | None = None) -> bool:
     """Best-effort: make sure {remote_root}/{module_name} exists and is fresh locally.
 
     remote_root must be one of the existing hardcoded roots
@@ -149,6 +155,21 @@ def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: in
     local_dir = Path(source_root) / module_name
     marker = local_dir / ".synced_sha"
     sha = _deployed_sha(selected_client)
+    key_path = str(target.key_path or "")
+    negative_key = f"{target.user}@{target.host}:{target.port}:{key_path}:{source_root}:{module_name}:{sha or 'unknown'}"
+    now = time.monotonic()
+    negative_until = _negative_cache.get(negative_key, 0.0)
+    if negative_until > now and not (local_dir.exists() and any(local_dir.iterdir())):
+        return False
+
+    def remember_failure() -> None:
+        if len(_negative_cache) > 512:
+            expired = [key for key, until in _negative_cache.items() if until <= time.monotonic()]
+            for key in expired:
+                _negative_cache.pop(key, None)
+            if len(_negative_cache) > 512:
+                _negative_cache.clear()
+        _negative_cache[negative_key] = time.monotonic() + _NEGATIVE_CACHE_TTL
 
     with _module_lock(remote_root, module_name):
         if local_dir.exists() and local_dir.is_dir():
@@ -174,6 +195,7 @@ def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: in
         try:
             local_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
+            remember_failure()
             return local_dir.exists()
 
         ssh_opts = [
@@ -194,12 +216,14 @@ def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: in
                 cmd, capture_output=True, text=True, timeout=timeout_seconds + 5,
             )
         except (subprocess.TimeoutExpired, OSError):
+            remember_failure()
             return local_dir.exists() and any(local_dir.iterdir()) if local_dir.exists() else False
 
         if completed.returncode != 0:
             # Sync failed (module may genuinely not exist on that root, or
             # transient network issue) — leave whatever was there before and
             # let the caller's normal not-found path handle it.
+            remember_failure()
             return local_dir.exists() and any(local_dir.iterdir()) if local_dir.exists() else False
 
         if sha:
@@ -207,4 +231,5 @@ def ensure_module_synced(remote_root: str, module_name: str, timeout_seconds: in
                 marker.write_text(sha, encoding="utf-8")
             except OSError:
                 pass
+        _negative_cache.pop(negative_key, None)
         return True

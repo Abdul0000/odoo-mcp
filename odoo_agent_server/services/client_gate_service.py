@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import re
-import subprocess
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,8 +9,9 @@ from fastapi import HTTPException, status
 
 from ..config import get_odoo_clients, normalise_client, safe_client_public, settings
 from .client_resolver_service import ClientResolverService, ResolvedClient
-from .odoo_service import OdooService
+from .odoo_jsonrpc_service import OdooJsonRpcService
 from .odoosh_service import OdooShService
+from .git_service import GitService
 from .repo_service import RepoService
 from .store_service import JsonStore
 
@@ -301,17 +300,10 @@ class ClientGateService:
             pass_check("config", "Required client coding settings are present and do not look like placeholders.")
 
         if base_ok:
-            repo_result = self._check_repo_branch(resolved)
-            checks["github"] = repo_result["status"]
-            checks["branch"] = repo_result["status"] if repo_result.get("branch_ok") else ("failed" if repo_result["status"] == "failed" else "skipped")
-            log.extend(repo_result["log"])
-            if repo_result["status"] != "ok":
-                base_ok = False
-                error_type = repo_result.get("error_type") or "github_error"
-
-        if base_ok:
             checkout_result = self._check_checkout(resolved)
             checks["checkout"] = checkout_result["status"]
+            checks["github"] = checkout_result["status"] if checkout_result.get("network_verified") else "deferred"
+            checks["branch"] = checkout_result["status"]
             log.extend(checkout_result["log"])
             if checkout_result["status"] != "ok":
                 base_ok = False
@@ -473,37 +465,39 @@ class ClientGateService:
             return False
         return PLACEHOLDER_RE.search(text) is None
 
-    def _check_repo_branch(self, client: ResolvedClient) -> dict[str, Any]:
-        command = ["git", "ls-remote", "--heads", client.authenticated_repo, client.branch]
-        try:
-            completed = subprocess.run(command, capture_output=True, text=True, timeout=25, check=False)
-        except subprocess.TimeoutExpired:
-            return {"status": "failed", "branch_ok": False, "error_type": "github_timeout", "log": ["GitHub/repo validation timed out while checking the branch."]}
-        stderr = self._redact(completed.stderr)
-        stdout = completed.stdout.strip()
-        if completed.returncode != 0:
-            hint = stderr or "git ls-remote failed. Check repo URL/token access."
-            return {"status": "failed", "branch_ok": False, "error_type": "github_token_error", "log": [hint]}
-        if not stdout:
-            return {"status": "failed", "branch_ok": False, "error_type": "branch_not_found", "log": [f"Branch not found or not accessible: {client.branch}."]}
-        return {"status": "ok", "branch_ok": True, "log": ["GitHub repo/token access succeeded and branch exists."]}
-
     def _check_checkout(self, client: ResolvedClient) -> dict[str, Any]:
         try:
+            existing = Path(client.path).expanduser().resolve()
+            if existing.is_dir() and (existing / ".git").exists():
+                local_check = GitService().validate_target(str(existing), client.branch, "origin")
+                if local_check.exit_code == 0:
+                    return {"status": "ok", "network_verified": False, "log": [f"Existing checkout validated locally without fetch/pull: {existing} on branch {client.branch}. Remote access will be proven during push."]}
+                return {"status": "failed", "error_type": "checkout_target_error", "log": [self._redact(local_check.stderr or local_check.stdout or "Existing checkout target validation failed.")]}
+
+            # Network clone/prepare is required only when the checkout does not
+            # already exist. Normal recurring client validation stays local.
             result = RepoService().prepare_repo(client_name=client.name, timeout_seconds=180)
-            return {"status": "ok", "log": [f"Local checkout ready: {result.project_path} on branch {result.branch}."]}
+            return {"status": "ok", "network_verified": True, "log": [f"Local checkout ready: {result.project_path} on branch {result.branch}."]}
         except Exception as exc:  # noqa: BLE001
             return {"status": "failed", "error_type": "checkout_error", "log": [f"Repo checkout/prepare failed: {self._redact(str(exc))}"]}
 
     def _check_odoo_shell(self, client: ResolvedClient) -> dict[str, Any]:
+        # Client validation must stay fast. OdooService.health() tries an Odoo.sh
+        # shell first (up to 120s) and then HTTPS (up to 60s), duplicating the
+        # dedicated SSH check below. Probe HTTPS directly with a short timeout;
+        # SSH readiness itself is validated once by _check_odoosh().
+        https_values = [client.odoo_url, client.odoo_db, client.odoo_login, client.odoo_password]
+        if not all(self._usable(value) for value in https_values):
+            return {"status": "skipped", "log": ["Fast Odoo HTTPS health check skipped: HTTPS credentials are not configured; Odoo.sh SSH provides query fallback."]}
         try:
-            result = OdooService(client).health()
+            result = OdooJsonRpcService(client).search_read(
+                "ir.module.module", [], ["name", "state"], limit=1, timeout_seconds=15
+            )
             if result.status == "ok":
-                source = "HTTPS JSON-RPC fallback" if result.base_url else "Odoo.sh shell"
-                return {"status": "ok", "log": [f"Odoo data query health check succeeded through {source} for database {result.database}."]}
-            return {"status": "failed", "error_type": "odoo_login_error", "log": [f"Odoo shell failed: {self._redact(result.error or 'unknown error')}"]}
+                return {"status": "ok", "log": [f"Odoo HTTPS data-query health check succeeded for database {result.database}."]}
+            return {"status": "failed", "error_type": "odoo_login_error", "log": [f"Odoo HTTPS health check failed: {self._redact(result.error or 'unknown error')}"]}
         except Exception as exc:  # noqa: BLE001
-            return {"status": "failed", "error_type": "odoo_shell_error", "log": [f"Odoo shell validation failed: {self._redact(str(exc))}"]}
+            return {"status": "failed", "error_type": "odoo_shell_error", "log": [f"Odoo HTTPS validation failed: {self._redact(str(exc))}"]}
 
     def _check_odoosh(self, client: ResolvedClient) -> dict[str, Any]:
         try:

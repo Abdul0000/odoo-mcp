@@ -11,7 +11,6 @@ from ..config import (
     make_authenticated_repo_url,
     normalise_client,
     safe_client_public,
-    settings,
 )
 
 
