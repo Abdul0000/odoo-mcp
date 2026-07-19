@@ -153,6 +153,20 @@ def agent_instructions() -> dict:
                     "source_precedence": "Read the selected client's installed website/website_sale/web/web_editor source; exact native patterns override skill examples.",
                     "deployment": "Verify changed files against core, use impact-aware workflow.safe_deploy_module, and stop immediately after terminal deploy confirmation.",
                 },
+                "odoo_pos_development": {
+                    "name": "odoo-pos-development",
+                    "versions": [16, 17, 18, 19],
+                    "use_for": [
+                        "POS sessions, configuration, orders, and payments",
+                        "POS OWL screens, components, buttons, receipts, and assets",
+                        "barcode, printer, IoT, and payment-terminal integrations",
+                        "restaurant, KDS, loyalty, discounts, offline behavior, and reports",
+                    ],
+                    "required_preflight": "workflow.frontend_pattern_preflight(target_area='pos', ...)",
+                    "source_precedence": "Read the selected client's installed point_of_sale and related add-on source; exact native loaders, OWL patterns, receipt data, and asset bundles override skill examples.",
+                    "hard_rule": "Never use legacy load_fields('pos.config', ...), models.load_fields, or legacy odoo.define/Registries patterns unless the selected installed version actually uses them.",
+                    "deployment": "Verify backend/frontend contracts and changed files against core, use workflow.safe_deploy_module, and stop immediately after terminal deploy confirmation.",
+                },
             },
             "small_patch_fast_path": {
                 "when": "Use for small tasks like adding one field, one xpath, one notebook page, or a tiny label/view change in a known module.",

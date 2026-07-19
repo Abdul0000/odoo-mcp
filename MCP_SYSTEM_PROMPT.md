@@ -120,6 +120,51 @@ website_theme_custom/
 
 **Deployment checklist:** manifest dependencies and asset paths valid; XML/QWeb parses; frontend preflight completed; console/assets clean where browser verification is explicitly required; responsive layout checked; SEO/accessibility preserved; changed files verified against core; safe deploy terminal confirmation received.
 
+### odoo-pos-development
+
+**Use for:** Odoo 16–19 POS sessions/configuration, order and order-line extensions, payment methods and terminals, OWL screens/components, control buttons, receipts, barcode/hardware integration, restaurant/KDS flows, loyalty/discounts, offline behavior, and POS reports.
+
+**Required workflow:**
+
+1. Read the existing custom POS module, manifest, backend models, and all affected `static/src` files.
+2. Call `workflow.frontend_pattern_preflight(target_area="pos", ...)` before changing POS JavaScript, OWL, XML/QWeb, SCSS, receipts, or assets.
+3. Read the exact installed `point_of_sale` source and any relevant `pos_restaurant`, `pos_loyalty`, `payment`, or `iot` source selected by preflight/scope advice.
+4. Preserve the selected version's real asset bundle, ES-module imports, registries, services, hooks, stores/models, patching pattern, data loader, receipt component/data shape, and offline synchronization behavior.
+5. Verify backend/frontend contracts together, verify changed files against core, use safe deploy, and stop immediately after terminal deployment confirmation.
+
+**Module reference:**
+
+```text
+pos_custom/
+  __manifest__.py
+  models/
+  views/
+  static/src/app/
+  static/src/js/
+  static/src/xml/
+  static/src/scss/
+```
+
+Declare `point_of_sale` and only the actually used POS add-ons in `depends`. Confirm the current POS asset bundle from installed source; do not assume legacy `point_of_sale.assets` or any other bundle name.
+
+**Frontend:** never copy legacy `odoo.define`, `require('point_of_sale...')`, `PosGlobalState`, `Registries`, `AbstractAwesomeScreen`, or `models.load_fields` examples into modern POS without confirming they exist in the selected version. For Odoo 17–19, follow the exact native ES-module/OWL registry, patch, store, service, hook, and component patterns found by preflight.
+
+**Data loading:** never use legacy `load_fields('pos.config', ...)` or `models.load_fields`. Read the selected version's backend POS loader and frontend store/model code, then extend the real loader fields/methods and serialization contract.
+
+**Orders and sessions:** confirm real field/method names on `pos.session`, `pos.order`, `pos.order.line`, `pos.payment`, and `pos.payment.method`. Preserve taxes, currency rounding, fiscal positions, order lifecycle, reconciliation, refunds, and offline order synchronization. Do not invent fields such as customer/payment aliases.
+
+**Payments and hardware:** keep secrets and authoritative payment decisions server-side; authenticate callbacks; make operations idempotent; handle cancellation, timeout, retry, reversal, and duplicate events. Use native barcode, printer, IoT, customer display, scale, and payment-terminal services confirmed in source rather than browser-global listeners or ad-hoc public routes.
+
+**Receipts:** inspect the active receipt component/template and exported receipt data. Extend stable native nodes and data keys, preserve printing constraints, translations, tax/currency formatting, and narrow thermal layouts. Do not assume backend record fields are directly available in the frontend receipt context.
+
+**Restaurant/KDS:** reuse native restaurant floors/tables, order preparation, kitchen display, and bus/synchronization models when installed. Do not create parallel table/KDS models until native capabilities and extension points have been inspected.
+
+**Loyalty and discounts:** inspect native loyalty/promotion modules first. Preserve program rules, reward accounting, refund behavior, tax calculation, rounding, access control, and offline reconciliation; avoid duplicate custom loyalty engines when native models apply.
+
+**POS reports:** prefer ORM/read-group or verified SQL views with deterministic IDs and correct joins. Confirm actual schema from installed models before writing SQL and include access rights for new report models.
+
+**Quality checklist:** exact POS source/preflight read; asset/import/template paths valid; backend loader and frontend data contract aligned; offline/reload path preserved; payment/refund/idempotency considered; receipt renders; session open/close unaffected; changed files verified against core; safe deploy terminal confirmation received.
+
 ---
 
 
