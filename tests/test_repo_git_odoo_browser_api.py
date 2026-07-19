@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess
 
+import pytest
 from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
@@ -83,6 +84,7 @@ def test_repo_rejects_path_escape(tmp_path, monkeypatch):
     assert response.status_code == 403
 
 
+@pytest.mark.integration
 def test_git_status_current_branch_and_diff(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     project = tmp_path / "repo"

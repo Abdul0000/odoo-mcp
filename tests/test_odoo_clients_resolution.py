@@ -141,6 +141,7 @@ def test_incomplete_single_client_requires_repo_branch_path(monkeypatch):
     assert "odoo_password" not in detail
 
 
+@pytest.mark.integration
 def test_repo_prepare_uses_selected_client_path(monkeypatch, tmp_path):
     origin = _init_origin(tmp_path, "dev")
     checkout = tmp_path / "client-checkout"
@@ -157,6 +158,7 @@ def test_repo_prepare_uses_selected_client_path(monkeypatch, tmp_path):
     assert (checkout / ".git").exists()
 
 
+@pytest.mark.integration
 def test_repo_prepare_clones_into_existing_empty_client_path(monkeypatch, tmp_path):
     origin = _init_origin(tmp_path, "dev")
     checkout = tmp_path / "empty-checkout"
@@ -170,6 +172,7 @@ def test_repo_prepare_clones_into_existing_empty_client_path(monkeypatch, tmp_pa
     assert (checkout / "README.md").exists()
 
 
+@pytest.mark.integration
 def test_repo_prepare_rejects_non_git_non_empty_client_path(monkeypatch, tmp_path):
     origin = _init_origin(tmp_path, "dev")
     checkout = tmp_path / "occupied"
@@ -185,6 +188,7 @@ def test_repo_prepare_rejects_non_git_non_empty_client_path(monkeypatch, tmp_pat
     assert "repo config" not in str(exc.value.detail).lower()
 
 
+@pytest.mark.integration
 def test_git_validate_target_uses_client_branch_and_repo(monkeypatch, tmp_path):
     origin = _init_origin(tmp_path, "dev")
     checkout = tmp_path / "client-checkout"
@@ -236,6 +240,7 @@ def test_coding_task_plan_uses_fast_path_for_small_field_change(monkeypatch, tmp
     assert "printing MCP JSON blocks" in plan_text
 
 
+@pytest.mark.integration
 def test_start_session_saves_safe_client_metadata(monkeypatch, tmp_path):
     origin = _init_origin(tmp_path, "dev")
     checkout = tmp_path / "session-checkout"

@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
@@ -36,6 +37,7 @@ def _tool_names(path="/mcp"):
     return {tool["name"] for tool in response.json()["result"]["tools"]}
 
 
+@pytest.mark.slow
 def test_all_provider_mcp_endpoints_use_same_safe_core_read_surface():
     for path in ("/mcp", "/chatgpt/mcp", "/grok/mcp", "/claude/mcp"):
         assert _tool_names(path) == _PROVIDER_TOOLS

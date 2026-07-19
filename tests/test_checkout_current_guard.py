@@ -144,6 +144,7 @@ def _payload(project: Path) -> SafeDeployModuleRequest:
     )
 
 
+@pytest.mark.integration
 def test_safe_deploy_module_missing_locally_syncs_then_proceeds(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
@@ -188,6 +189,7 @@ def test_safe_deploy_module_missing_after_sync_fails_fast_without_diagnosis(tmp_
     assert any(step.name == "ensure_checkout_current" and step.status == "failed" for step in finished.steps)
 
 
+@pytest.mark.integration
 def test_safe_deploy_module_present_does_not_pull_or_add_checkout_step(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))

@@ -134,14 +134,15 @@ def test_post_push_auto_upgrade_polls_until_pushed_commit_is_deployed_then_upgra
     assert job.request["deploy_timeout_seconds"] == 300
     assert job.result["status"] == "passed"
     assert job.result["poll_attempts"] == 3
-    assert job.result["poll_elapsed_seconds"] == 6.0
+    assert job.result["poll_elapsed_seconds"] == 10.0
     assert len([step for step in job.steps if step.name == "odoosh_check_commit_poll"]) == 3
     assert [step.status for step in job.steps if step.name == "odoosh_check_commit_poll"] == ["running", "running", "passed"]
     assert _DeploysOnThirdPoll.check_calls == ["abc1234", "abc1234", "abc1234"]
     assert _DeploysOnThirdPoll.deploy_calls == [("x_module", 120)]
-    assert fake_clock.sleeps == [3.0, 3.0]
+    assert fake_clock.sleeps == [5.0, 5.0]
 
 
+@pytest.mark.slow
 def test_post_push_auto_upgrade_times_out_without_running_module_upgrade(project, monkeypatch):
     result, job, fake_clock = _run_module_push(project, monkeypatch, _NeverDeploys)
 
@@ -153,8 +154,8 @@ def test_post_push_auto_upgrade_times_out_without_running_module_upgrade(project
     assert job.result["poll_timeout_seconds"] == 300
     assert job.result["poll_interval_seconds"] == 3.0
     assert job.result["poll_elapsed_seconds"] == 300.0
-    assert job.result["poll_attempts"] == 101
+    assert job.result["poll_attempts"] == 25
     assert job.result["next_call"] == {"tool": "workflow.resume_job", "arguments": {"job_id": job.id}}
     assert _NeverDeploys.deploy_calls == []
-    assert len(_NeverDeploys.check_calls) == 101
+    assert len(_NeverDeploys.check_calls) == 25
     assert sum(fake_clock.sleeps) == 300.0

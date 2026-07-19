@@ -6,6 +6,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from threading import Event, Thread
 
+import pytest
 from fastapi import HTTPException
 
 from odoo_agent_server.config import settings
@@ -18,6 +19,17 @@ from odoo_agent_server.services.store_service import JsonStore
 from odoo_agent_server.services.workflow_guard_service import safe_deploy_shell_block
 from odoo_agent_server.routers.workflow import _pre_push_verify_files
 from odoo_agent_server.routers import tools, workflow
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
 
 
 def test_manual_module_deploy_stops_after_confirmed_safe_deploy(monkeypatch, tmp_path):
@@ -150,6 +162,7 @@ def test_safe_deploy_waits_and_returns_finished_job(tmp_path, monkeypatch):
     assert any(step.name == "git_push" for step in result.steps)
 
 
+@pytest.mark.integration
 def test_git_commit_configures_identity(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "git_author_name", "MCP Bot")
@@ -304,6 +317,7 @@ def test_safe_deploy_fails_without_upgrade_when_sha_is_not_deployed(tmp_path, mo
     assert any(step.name == "odoosh_check_commit" and step.status == "failed" for step in finished.steps)
 
 
+@pytest.mark.slow
 def test_safe_deploy_polls_odoosh_until_deployed_before_upgrade(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
@@ -863,6 +877,9 @@ def test_safe_deploy_wait_for_result_positive_timeout_returns_running(tmp_path, 
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     monkeypatch.setattr(workflow, "submit_background", lambda callback: None)
+    clock = _FakeClock()
+    monkeypatch.setattr(workflow.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(workflow.time, "sleep", clock.sleep)
     project = tmp_path / "repo"
     (project / "x_module").mkdir(parents=True)
 
@@ -883,13 +900,16 @@ def test_safe_deploy_wait_loop_does_not_sleep_past_timeout(tmp_path, monkeypatch
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     store = JsonStore()
     job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running))
+    clock = _FakeClock()
+    monkeypatch.setattr(workflow.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(workflow.time, "sleep", clock.sleep)
 
-    started = time.monotonic()
+    started = clock.monotonic()
     result = workflow._wait_workflow_job_until_terminal(store, job.id, poll_interval_seconds=10, timeout_seconds=1)
-    elapsed = time.monotonic() - started
+    elapsed = clock.monotonic() - started
 
     assert result.status == JobStatus.running
-    assert elapsed < 2
+    assert elapsed == 1
 
 
 
@@ -1954,6 +1974,7 @@ def _retry_project(tmp_path, monkeypatch, success_on=None, max_fix_cycles=5):
     return store, job, payload, calls
 
 
+@pytest.mark.slow
 def test_safe_deploy_upgrade_fail_then_succeeds_on_retry(tmp_path, monkeypatch):
     store, job, payload, calls = _retry_project(tmp_path, monkeypatch, success_on=2)
 
@@ -1975,6 +1996,7 @@ def test_safe_deploy_upgrade_fail_then_succeeds_on_retry(tmp_path, monkeypatch):
     assert steps["upgrade_attempt_2"] == "passed"
 
 
+@pytest.mark.slow
 def test_safe_deploy_upgrade_fails_all_5_cycles_with_real_error(tmp_path, monkeypatch):
     store, job, payload, calls = _retry_project(tmp_path, monkeypatch, success_on=None, max_fix_cycles=5)
 
@@ -2101,6 +2123,7 @@ def _run_safe_deploy_endpoint_retry_case(tmp_path, monkeypatch, *, success_on, m
     return result, finished, calls
 
 
+@pytest.mark.slow
 def test_safe_deploy_wait_for_result_fail_once_then_success_returns_confirmed_final_result(tmp_path, monkeypatch):
     result, finished, calls = _run_safe_deploy_endpoint_retry_case(tmp_path, monkeypatch, success_on=2)
 
@@ -2115,6 +2138,7 @@ def test_safe_deploy_wait_for_result_fail_once_then_success_returns_confirmed_fi
     assert "in progress" not in str(result.summary).lower()
 
 
+@pytest.mark.slow
 def test_safe_deploy_wait_for_result_fail_all_retries_returns_real_last_error(tmp_path, monkeypatch):
     result, finished, calls = _run_safe_deploy_endpoint_retry_case(tmp_path, monkeypatch, success_on=None, max_fix_cycles=5)
 
@@ -2132,6 +2156,7 @@ def test_safe_deploy_wait_for_result_fail_all_retries_returns_real_last_error(tm
     assert "in progress" not in str(result.summary).lower()
 
 
+@pytest.mark.slow
 def test_safe_deploy_wait_for_result_response_never_uses_progress_wording(tmp_path, monkeypatch):
     success, _finished_success, _calls_success = _run_safe_deploy_endpoint_retry_case(tmp_path, monkeypatch, success_on=1)
     success_text = str(success.summary).lower()

@@ -72,6 +72,7 @@ def test_symlink_escape_is_rejected(tmp_path, monkeypatch):
     assert response.status_code == 403
 
 
+@pytest.mark.integration
 def test_apply_patch_check_only_does_not_mutate_and_escape_rejected(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     project = tmp_path / "repo"
@@ -108,6 +109,7 @@ def test_approval_is_single_use_when_global_approval_enabled(tmp_path, monkeypat
     monkeypatch.setattr(settings, "require_approval", False)
 
 
+@pytest.mark.integration
 def test_protected_branch_push_requires_real_approved_git_push_approval_even_when_global_approval_off(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
@@ -215,6 +217,7 @@ def test_full_verify_failure_creates_failed_job_and_audit(tmp_path, monkeypatch)
     assert any(event["action"] == "job.update" for event in audit.json())
 
 
+@pytest.mark.integration
 def test_protected_branch_push_marks_failed_approval_when_command_fails_even_when_global_approval_off(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
@@ -284,6 +287,7 @@ def test_tool_bridge_respects_write_approval_gate(tmp_path, monkeypatch):
 
 
 
+@pytest.mark.integration
 def test_write_many_atomic_applies_all_files_or_none(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     project = tmp_path / "repo"
@@ -325,6 +329,7 @@ def test_write_many_atomic_applies_all_files_or_none(tmp_path, monkeypatch):
     assert branches.stdout.strip() == ""
 
 
+@pytest.mark.integration
 def test_apply_patch_atomic_check_only_and_apply(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     project = tmp_path / "repo"

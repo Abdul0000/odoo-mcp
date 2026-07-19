@@ -3,12 +3,14 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
 from odoo_agent_server.routers import workflow
 from odoo_agent_server.services.lock_service import RepoLockService
+from odoo_agent_server.services import lock_service
 from odoo_agent_server.services.odoosh_service import OdooShService
 from odoo_agent_server.schemas import BrowserCheckResult, PosFlowCheckResult, PosFlowStepResult, SafeDeployModuleRequest
 from odoo_agent_server.services.validator_service import OdooModuleValidator
@@ -45,9 +47,9 @@ def test_safe_deploy_request_has_no_browser_ui_contract(tmp_path):
         module_name="x_module",
         commit_message="Deploy x module",
     )
-    assert "verify_ui_paths" not in payload.model_fields
-    assert "verify_ui_screenshot_prefix" not in payload.model_fields
-    assert "verify_ui_timeout_seconds" not in payload.model_fields
+    assert "verify_ui_paths" not in SafeDeployModuleRequest.model_fields
+    assert "verify_ui_screenshot_prefix" not in SafeDeployModuleRequest.model_fields
+    assert "verify_ui_timeout_seconds" not in SafeDeployModuleRequest.model_fields
 
 
 def test_pos_flow_result_preserves_console_all_fields():
@@ -88,12 +90,25 @@ def test_browser_menu_crawl_fails_on_odoo_ui_breakage(monkeypatch):
     assert payload["steps"][0]["status"] == "failed"
 
 
+@pytest.mark.integration
 def test_repo_lock_blocks_second_owner(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
     repo = tmp_path / "repo"
     repo.mkdir()
     _init_git_repo(repo)
+    class FakeClock:
+        now = 1000.0
+
+        @classmethod
+        def time(cls):
+            return cls.now
+
+        @classmethod
+        def sleep(cls, seconds):
+            cls.now += seconds
+
+    monkeypatch.setattr(lock_service, "time", FakeClock)
     lock = RepoLockService(stale_after_seconds=999)
     first = lock.acquire(str(repo), owner="a", timeout_seconds=1)
     assert first.exit_code == 0
