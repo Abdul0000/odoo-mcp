@@ -389,7 +389,7 @@ def _remote_compatible_schema(schema: dict[str, Any]) -> dict[str, Any]:
         for key, child in value.items():
             if key in {"$defs", "title", "default", "examples", "computed_fields"}:
                 continue
-            if key == "description":
+            if key == "description" and isinstance(child, str):
                 # Tool descriptions carry the workflow contract. Field docs only
                 # need a compact hint; long examples materially inflate every
                 # tools/list response and the provider's planning context.

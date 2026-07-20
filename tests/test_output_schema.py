@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from jsonschema import Draft202012Validator
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
@@ -58,6 +59,17 @@ def test_all_provider_profiles_expose_output_schema_for_every_tool():
     for profile in (None, "provider", "chatgpt", "claude", "grok", "qwen"):
         tools = [_tool_to_mcp(tool, profile) for tool in _tools_for_profile(profile)]
         assert tools and all("outputSchema" in tool for tool in tools)
+        for tool in tools:
+            Draft202012Validator.check_schema(tool["outputSchema"])
+
+
+def test_description_result_field_remains_a_valid_property_schema():
+    tool = next(
+        _tool_to_mcp(item, "chatgpt")
+        for item in _tools_for_profile("chatgpt")
+        if item.name == "skills.read"
+    )
+    assert tool["outputSchema"]["properties"]["description"] == {"type": "string"}
 
 
 def test_job_output_schema_uses_serialization_fields():
