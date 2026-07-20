@@ -381,7 +381,7 @@ class CoreFinderService:
                 ))
 
         for module, xmlid in sorted(related_xmlids):
-            match = self._find_xmlid_file(module, xmlid, roots)
+            match = self._find_xmlid_file(module, xmlid, roots, client_name=client_name)
             if match:
                 add_instruction(ScopeReadInstruction(
                     level=ScopeLevel.L1,
@@ -670,7 +670,13 @@ class CoreFinderService:
             return []
         return [str(dep) for dep in deps if isinstance(dep, str) and dep]
 
-    def _find_xmlid_file(self, module_name: str, xmlid: str, roots: Sequence[tuple[int, str]]) -> str | None:
+    def _find_xmlid_file(
+        self,
+        module_name: str,
+        xmlid: str,
+        roots: Sequence[tuple[int, str]],
+        client_name: str | None = None,
+    ) -> str | None:
         """Find the XML file that defines or references an xmlid in a related module."""
         xmlid_patterns = (
             f'id="{xmlid}"',
