@@ -105,6 +105,7 @@ from ..services.git_service import GitService
 from ..services.client_resolver_service import ClientResolverService
 from ..services.client_gate_service import ClientGateService
 from ..services.odoo_service import OdooService
+from ..services.odoo_code_search_service import OdooCodeSearchService
 from ..services.odoosh_service import OdooShService
 from ..services.browser_cdp_service import CdpBrowserService
 from ..services.repo_service import RepoService
@@ -257,7 +258,8 @@ _TOOL_DESCRIPTORS = [
             "read custom module, scope_advice, read /home/odoo/src/odoo/addons related source first with enterprise fallback, "
             "apply provided edits, git.diff, qa.self_run, verify_against_core, then workflow.safe_deploy_module and jobs.get polling. "
             "For a missing addon, set create_module=true with an exact lowercase technical name; it is created only at the checkout root. "
-            "Task descriptions automatically supply quoted identifiers/selectors/XML IDs/methods for match-centered inspection. "
+            "A cached Odoo-aware index maps functional labels through menus/actions/views/models/fields/QWeb/JS relationships, then reads exact match-centered ranges. "
+            "Task descriptions automatically supply quoted identifiers/selectors/XML IDs/methods for focused inspection. "
             "An exact quoted replacement that occurs once can complete in one call; ambiguous or complex work returns focused context for a second call with exact writes."
         ),
         requires_approval=True,
@@ -1858,7 +1860,43 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     focused_match_lines: dict[str, list[int]] = {}
     if not payload.writes:
         patterns = _infer_code_change_search_patterns(payload)
-        search_results, focused_paths, focused_match_lines = _focused_search(repo, project_path, module.path, patterns, payload.max_search_matches)
+        focused_paths: list[str] = []
+        try:
+            graph_search = OdooCodeSearchService().search(
+                project_path=project_path,
+                module_path=module.path,
+                task_description=payload.task_description,
+                target_hint=_target_hint(payload),
+                intent=payload.intent,
+                search_patterns=payload.search_patterns,
+                task_type=_normalized_task_type(payload),
+                max_results=min(payload.max_search_matches, 10),
+            )
+            search_results.append(graph_search)
+            for match in graph_search.get("matches") or []:
+                rel = str(match.get("path") or "")
+                if rel and rel not in focused_paths:
+                    focused_paths.append(rel)
+                for line in match.get("lines") or []:
+                    line_no = int(line or 0)
+                    if line_no > 0 and line_no not in focused_match_lines.setdefault(rel, []):
+                        focused_match_lines[rel].append(line_no)
+        except Exception as exc:  # noqa: BLE001
+            search_results.append({"engine": "odoo_code_graph", "status": "failed", "error": str(exc)})
+
+        # Preserve the old lexical search as a bounded fallback only when the
+        # Odoo graph cannot produce confident target files.
+        graph_ok = bool(focused_paths) and float((search_results[0] or {}).get("confidence") or 0) >= 0.45
+        if not graph_ok:
+            lexical_results, lexical_paths, lexical_lines = _focused_search(repo, project_path, module.path, patterns, payload.max_search_matches)
+            search_results.extend(lexical_results)
+            for rel in lexical_paths:
+                if rel not in focused_paths:
+                    focused_paths.append(rel)
+            for rel, lines in lexical_lines.items():
+                for line in lines:
+                    if line not in focused_match_lines.setdefault(rel, []):
+                        focused_match_lines[rel].append(line)
         for rel in focused_paths[:10]:
             if rel and rel not in custom_rel_paths:
                 custom_rel_paths.append(rel)
