@@ -486,7 +486,7 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                     "tools": {"listChanged": False},
                     "prompts": {"listChanged": False},
                 },
-                "serverInfo": {"name": "odoo-mcp-agent-connector", "version": "1.1.0"},
+                "serverInfo": {"name": "odoo-mcp-agent-connector", "version": "1.7.0"},
                 "instructions": load_client_check_system_prompt(),
                 "prompt_source": "CLIENT_CHECK_SYSTEM_PROMPT.md",
                 "next_prompt_source_after_client_validation": "MCP_SYSTEM_PROMPT.md",
