@@ -34,6 +34,7 @@ from ..schemas import (
     OdooCodeChangeRequest,
     FrontendVisualImplementRequest,
     EmptyRequest,
+    SkillListRequest,
     SkillReadRequest,
     FullVerifyRequest,
     SafeDeployModuleRequest,
@@ -207,7 +208,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(
         name="skills.list",
         title="List Odoo skills",
-        description="List exact Odoo domain skills available for on-demand loading.",
+        description="List exact Odoo domain skills. Optionally pass task_description to receive one recommendation without loading skill content.",
         read_only=True,
     ),
     ToolDescriptor(
@@ -683,7 +684,7 @@ _TOOL_DESCRIPTORS = [
 
 _TOOL_INPUT_MODELS = {
     "connector.health": EmptyRequest,
-    "skills.list": EmptyRequest,
+    "skills.list": SkillListRequest,
     "skills.read": SkillReadRequest,
     "artifacts.read": ArtifactReadRequest,
     "client.check": ClientCheckRequest,
@@ -2476,8 +2477,8 @@ async def _dispatch(name: str, args: dict) -> object:
         EmptyRequest.model_validate(args)
         return {"status": "ok", "service": "odoo-mcp-agent-connector"}
     if name == "skills.list":
-        EmptyRequest.model_validate(args)
-        return SkillService().list()
+        req = SkillListRequest.model_validate(args)
+        return SkillService().list(req.task_description)
     if name == "skills.read":
         req = SkillReadRequest.model_validate(args)
         return SkillService().read(req.name)

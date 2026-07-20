@@ -42,8 +42,8 @@ _ALIASES = {
     "orm": "odoo-sql-query-development",
     "database": "odoo-sql-query-development",
     "analytics": "odoo-sql-query-development",
-    "report": "odoo-sql-query-development",
-    "reports": "odoo-sql-query-development",
+    "report": "odoo-qweb-reports-development",
+    "reports": "odoo-qweb-reports-development",
     "reporting": "odoo-sql-query-development",
     "pos": "odoo-pos-development",
     "website": "odoo-website-development",
@@ -68,14 +68,31 @@ _ALIASES = {
     "tax-report": "odoo-accounting-reports",
 }
 
+_ROUTING_TERMS = {
+    "odoo-accounting-reports": ("accounting report", "financial report", "invoice report", "ar aging", "aged receivable", "profit loss", "balance sheet", "tax report", "partner statement"),
+    "odoo-qweb-reports-development": ("qweb", "pdf report", "print report", "report template", "paperformat", "wkhtmltopdf", "ir.actions.report"),
+    "odoo-sql-query-development": ("sql", "query", "search_read", "read_group", "domain", "group by", "aggregate", "record count", "analytics"),
+    "odoo-pos-development": ("point of sale", "pos ", "pos_", "receipt", "payment screen", "restaurant pos"),
+    "odoo-website-development": ("website", "web page", "landing page", "snippet", "ecommerce", "portal page", "seo"),
+    "odoo-manufacturing-development": ("manufacturing", "mrp", "bill of materials", "bom", "work order"),
+    "odoo-inventory-development": ("inventory", "warehouse", "stock move", "picking", "location", "reservation"),
+    "odoo-sales-development": ("sale order", "sales order", "quotation", "pricelist", "subscription"),
+    "odoo-purchase-development": ("purchase order", "vendor", "procurement", "replenishment", "request for quotation", "rfq"),
+    "odoo-hr-payroll-development": ("payroll", "payslip", "employee", "attendance", "leave", "timesheet", "contract"),
+    "odoo-crm-pipeline-development": ("crm", "lead", "opportunity", "pipeline", "sales team"),
+    "odoo-helpdesk-development": ("helpdesk", "ticket", "sla", "support team", "escalation"),
+    "odoo-accounting-development": ("invoice", "journal", "payment", "tax", "reconciliation", "fiscal position", "account.move"),
+    "odoo-all-modules-reference": ("which module", "module dependency", "depends", "module selection", "implementation roadmap"),
+}
+
 
 def _skills_root() -> Path:
     return Path(__file__).resolve().parents[2] / "skills"
 
 
 class SkillService:
-    def list(self) -> dict:
-        return {
+    def list(self, task_description: str | None = None) -> dict:
+        result = {
             "skills": [
                 {"name": name, "description": description}
                 for name, (_, description) in _SKILLS.items()
@@ -83,6 +100,23 @@ class SkillService:
             "count": len(_SKILLS),
             "loading": "on_demand",
         }
+        if str(task_description or "").strip():
+            result["recommendation"] = self.recommend(task_description or "")
+        return result
+
+    @staticmethod
+    def recommend(task_description: str) -> dict | None:
+        text = f" {str(task_description or '').lower()} "
+        ranked: list[tuple[int, int, str, list[str]]] = []
+        for priority, (name, terms) in enumerate(_ROUTING_TERMS.items()):
+            matched = [term for term in terms if term in text]
+            if matched:
+                score = sum(3 if " " in term or "." in term or "_" in term else 1 for term in matched)
+                ranked.append((score, -priority, name, matched))
+        if not ranked:
+            return None
+        score, _, name, matched = max(ranked)
+        return {"name": name, "matched_terms": matched[:5], "confidence": "high" if score >= 3 else "medium"}
 
     def read(self, name: str) -> dict:
         requested = str(name or "").strip().lower()

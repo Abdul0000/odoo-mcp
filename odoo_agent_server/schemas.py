@@ -61,6 +61,14 @@ class EmptyRequest(BaseModel):
     """Empty argument object for no-input tools."""
 
 
+class SkillListRequest(BaseModel):
+    task_description: str | None = Field(
+        default=None,
+        max_length=2000,
+        description="Optional task text; when provided, return one deterministic skill recommendation without loading its content.",
+    )
+
+
 class SkillReadRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=100, description="Exact skill name or supported short alias from skills.list.")
 

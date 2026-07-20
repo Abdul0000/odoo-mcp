@@ -83,6 +83,27 @@ def test_query_reporting_and_module_reference_aliases_load_on_demand():
     assert modules["source"] == "skills/10-ALL-MODULES-REFERENCE.md"
 
 
+def test_generic_report_alias_uses_qweb_while_reporting_stays_query_focused():
+    service = SkillService()
+
+    assert service.read("report")["name"] == "odoo-qweb-reports-development"
+    assert service.read("reports")["name"] == "odoo-qweb-reports-development"
+    assert service.read("reporting")["name"] == "odoo-sql-query-development"
+
+
+def test_skill_list_recommends_without_loading_skill_content():
+    service = SkillService()
+
+    accounting = service.list("Customize the balance sheet accounting report")
+    qweb = service.list("Create a QWeb PDF report template")
+    query = service.list("Use read_group to return record counts by state")
+
+    assert accounting["recommendation"]["name"] == "odoo-accounting-reports"
+    assert qweb["recommendation"]["name"] == "odoo-qweb-reports-development"
+    assert query["recommendation"]["name"] == "odoo-sql-query-development"
+    assert all("content" not in result for result in (accounting, qweb, query))
+
+
 def test_qweb_report_aliases_load_dedicated_report_skill():
     service = SkillService()
 

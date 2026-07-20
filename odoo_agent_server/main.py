@@ -103,6 +103,7 @@ def agent_instructions() -> dict:
                 "mode": "on_demand",
                 "list_tool": "skills.list",
                 "read_tool": "skills.read",
+                "selection": "For an unclear domain, call skills.list with task_description and load only its recommendation.",
                 "available": [
                     "odoo-accounting-development",
                     "odoo-manufacturing-development",
