@@ -18,7 +18,8 @@ EXPECTED = {
     "odoo-helpdesk-development": "08-SKILL-helpdesk.md",
     "odoo-sql-query-development": "09-SKILL-sql-queries.md",
     "odoo-all-modules-reference": "10-ALL-MODULES-REFERENCE.md",
-    "odoo-qweb-report-development": "11-SKILL-qweb-reports.md",
+    "odoo-qweb-reports-development": "11-SKILL-qweb-reports-development.md",
+    "odoo-accounting-reports": "12-SKILL-accounting-reports.md",
     "odoo-pos-development": "odoo-pos-development-skill.md",
     "odoo-website-development": "odoo-website-development.md",
 }
@@ -87,5 +88,14 @@ def test_qweb_report_aliases_load_dedicated_report_skill():
 
     for alias in ("qweb", "qweb-report", "pdf-report", "report-template"):
         result = service.read(alias)
-        assert result["name"] == "odoo-qweb-report-development"
-        assert result["source"] == "skills/11-SKILL-qweb-reports.md"
+        assert result["name"] == "odoo-qweb-reports-development"
+        assert result["source"] == "skills/11-SKILL-qweb-reports-development.md"
+
+
+def test_accounting_report_aliases_load_dedicated_accounting_report_skill():
+    service = SkillService()
+
+    for alias in ("accounting-report", "financial-report", "invoice-report", "ar-aging", "tax-report"):
+        result = service.read(alias)
+        assert result["name"] == "odoo-accounting-reports"
+        assert result["source"] == "skills/12-SKILL-accounting-reports.md"

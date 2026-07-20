@@ -211,7 +211,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(
         name="skills.read",
         title="Load an Odoo skill",
-        description="Load one exact Odoo skill on demand. Use 'reporting' for ORM/SQL analytics or 'qweb-report' for PDF/HTML report templates.",
+        description="Load one exact Odoo skill on demand. Use 'reporting' for ORM/SQL analytics, 'qweb-report' for general PDF/HTML templates, or 'accounting-report' for financial reports.",
         read_only=True,
     ),
     ToolDescriptor(
