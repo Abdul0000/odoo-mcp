@@ -16,6 +16,7 @@ _SKILLS = {
     "odoo-helpdesk-development": ("08-SKILL-helpdesk.md", "Helpdesk tickets, teams, SLAs, escalation, communication, portal, knowledge, automation, and analytics."),
     "odoo-sql-query-development": ("09-SKILL-sql-queries.md", "Odoo ORM and SQL queries, domains, joins, read_group, analytics, reporting, and query performance."),
     "odoo-all-modules-reference": ("10-ALL-MODULES-REFERENCE.md", "Odoo module selection, dependencies, key models, integration planning, and implementation roadmap."),
+    "odoo-qweb-report-development": ("11-SKILL-qweb-reports.md", "QWeb PDF/HTML reports, ir.actions.report, templates, paper formats, assets, localization, and report debugging."),
     "odoo-pos-development": ("odoo-pos-development-skill.md", "POS sessions, orders, payments, OWL UI, receipts, hardware, restaurant, loyalty, and reporting."),
     "odoo-website-development": ("odoo-website-development.md", "Website themes, QWeb, snippets, eCommerce, controllers, multi-site, SEO, and performance."),
 }
@@ -48,6 +49,13 @@ _ALIASES = {
     "modules": "odoo-all-modules-reference",
     "all-modules": "odoo-all-modules-reference",
     "module-reference": "odoo-all-modules-reference",
+    "qweb": "odoo-qweb-report-development",
+    "qweb-report": "odoo-qweb-report-development",
+    "qweb-reports": "odoo-qweb-report-development",
+    "qweb-reporting": "odoo-qweb-report-development",
+    "pdf-report": "odoo-qweb-report-development",
+    "pdf-reports": "odoo-qweb-report-development",
+    "report-template": "odoo-qweb-report-development",
 }
 
 

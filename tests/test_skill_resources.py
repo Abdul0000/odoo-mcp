@@ -18,6 +18,7 @@ EXPECTED = {
     "odoo-helpdesk-development": "08-SKILL-helpdesk.md",
     "odoo-sql-query-development": "09-SKILL-sql-queries.md",
     "odoo-all-modules-reference": "10-ALL-MODULES-REFERENCE.md",
+    "odoo-qweb-report-development": "11-SKILL-qweb-reports.md",
     "odoo-pos-development": "odoo-pos-development-skill.md",
     "odoo-website-development": "odoo-website-development.md",
 }
@@ -79,3 +80,12 @@ def test_query_reporting_and_module_reference_aliases_load_on_demand():
     assert reporting["source"] == "skills/09-SKILL-sql-queries.md"
     assert modules["name"] == "odoo-all-modules-reference"
     assert modules["source"] == "skills/10-ALL-MODULES-REFERENCE.md"
+
+
+def test_qweb_report_aliases_load_dedicated_report_skill():
+    service = SkillService()
+
+    for alias in ("qweb", "qweb-report", "pdf-report", "report-template"):
+        result = service.read(alias)
+        assert result["name"] == "odoo-qweb-report-development"
+        assert result["source"] == "skills/11-SKILL-qweb-reports.md"
