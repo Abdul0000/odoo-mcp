@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from odoo_agent_server.routers import tools
@@ -117,3 +118,65 @@ def test_odoosh_search_read_parses_shell_marker(monkeypatch):
     assert result.status == "ok"
     assert result.database == "client-a-db"
     assert result.result == [{"name": "INV/1"}]
+
+
+def test_odoosh_read_group_returns_live_invoice_state_counts(monkeypatch):
+    client = ResolvedClient(
+        name="ClientA",
+        repo="https://github.com/ClientA/ClientA.git",
+        branch="22-06-2026",
+        path="/workspace/repos/ClientA",
+        odoosh_db_name="client-a-db",
+        odoosh_ssh_host="host",
+        odoosh_ssh_user="34342188",
+        odoosh_ssh_private_key_b64="ZmFrZQ==",
+        odoosh_odoo_path="/home/odoo/src/odoo",
+        odoosh_user_addons_path="/home/odoo/src/user",
+    )
+
+    def fake_run_shell(self, remote_script, timeout_seconds=60):
+        assert "model.read_group" in remote_script
+        return CommandResult(
+            command=["ssh"],
+            cwd="odoosh:ssh",
+            exit_code=0,
+            stdout=(
+                'MCP_ODOOSH_QUERY_JSON:{"status":"ok","result":'
+                '[{"state":"draft","state_count":4},{"state":"posted","state_count":21},'
+                '{"state":"cancel","state_count":2}],"count":3}\n'
+            ),
+        )
+
+    monkeypatch.setattr(OdooShService, "run_shell", fake_run_shell)
+    result = OdooShService(client).read_group(
+        "account.move",
+        [["move_type", "=", "out_invoice"]],
+        ["state"],
+        ["state"],
+    )
+
+    assert result.status == "ok"
+    assert result.result[1] == {"state": "posted", "state_count": 21}
+
+
+def test_provider_read_group_dispatches_safe_customer_invoice_aggregation(monkeypatch):
+    class FakeOdoo:
+        def read_group(self, model, domain, fields, groupby, lazy, context, timeout_seconds):
+            assert model == "account.move"
+            assert domain == [["move_type", "=", "out_invoice"]]
+            assert fields == ["state"]
+            assert groupby == ["state"]
+            return OdooResult(status="ok", result=[{"state": "posted", "state_count": 21}])
+
+    monkeypatch.setattr(tools, "_resolve_query_client", lambda client_name, query_text=None: object())
+    monkeypatch.setattr(tools, "_odoo_service_for_client", lambda client: FakeOdoo())
+    result = asyncio.run(tools._dispatch("odoo.read_group", {
+        "client_name": "ClientA",
+        "model": "account.move",
+        "domain": [["move_type", "=", "out_invoice"]],
+        "fields": ["state"],
+        "groupby": ["state"],
+    }))
+
+    assert result["status"] == "ok"
+    assert result["result"] == [{"state": "posted", "state_count": 21}]

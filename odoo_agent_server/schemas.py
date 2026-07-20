@@ -629,6 +629,17 @@ class OdooSearchReadRequest(BaseModel):
     context: dict[str, Any] | None = Field(default=None, description="Optional Odoo context passed to search_read")
 
 
+class OdooReadGroupRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when multiple clients are configured.")
+    model: str = Field(..., description="Odoo model to aggregate, e.g. account.move")
+    domain: list[Any] = Field(default_factory=list, description="Read-only Odoo domain")
+    fields: list[str] = Field(default_factory=lambda: ["id:count"], description="Aggregate fields, e.g. id:count or amount_total:sum")
+    groupby: list[str] = Field(..., min_length=1, max_length=5, description="Grouping fields, e.g. state or invoice_date:month")
+    lazy: bool = Field(default=False, description="Return all requested grouping levels when false")
+    context: dict[str, Any] | None = Field(default=None, description="Optional Odoo context passed to read_group")
+    timeout_seconds: int = Field(default=120, ge=15, le=300)
+
+
 class OdooShQueryRequest(BaseModel):
     client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when multiple clients are configured.")
     model: str = Field(..., description="Odoo model to query with read-only ORM search_read, e.g. account.move")

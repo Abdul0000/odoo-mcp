@@ -143,3 +143,38 @@ class OdooJsonRpcService:
                 database=self._db(),
                 error=self._format_exception(exc),
             )
+
+    def read_group(
+        self,
+        model: str,
+        domain: list | None,
+        fields: list[str],
+        groupby: list[str],
+        lazy: bool = False,
+        context: dict[str, Any] | None = None,
+        timeout_seconds: int = 60,
+    ) -> OdooResult:
+        if not self.configured():
+            return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error="Odoo HTTPS JSON-RPC fallback is not configured for this client.")
+        if not re.fullmatch(r"[a-zA-Z0-9_.]+", model or ""):
+            return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error="Invalid model name for JSON-RPC query.")
+        aggregate_re = re.compile(r"^[a-zA-Z0-9_]+(?::(?:sum|avg|min|max|count|count_distinct|bool_and|bool_or|array_agg))?$")
+        groupby_re = re.compile(r"^[a-zA-Z0-9_]+(?::(?:day|week|month|quarter|year))?$")
+        if not fields or any(not isinstance(field, str) or not aggregate_re.fullmatch(field) for field in fields):
+            return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error="Invalid aggregate field for JSON-RPC read_group.")
+        if not groupby or any(not isinstance(field, str) or not groupby_re.fullmatch(field) for field in groupby):
+            return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error="Invalid groupby field for JSON-RPC read_group.")
+        kwargs: dict[str, Any] = {"lazy": bool(lazy)}
+        if context:
+            kwargs["context"] = context
+        try:
+            uid = self._login_uid(timeout_seconds)
+            records = self._call(
+                "object",
+                "execute_kw",
+                [self._db(), uid, self._password(), model, "read_group", [domain or [], fields, groupby], kwargs],
+                timeout_seconds,
+            )
+            return OdooResult(status="ok", base_url=self._base_url(), database=self._db(), result=records or [])
+        except Exception as exc:
+            return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error=self._format_exception(exc))

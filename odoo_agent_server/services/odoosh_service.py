@@ -943,6 +943,8 @@ class OdooShService:
         order: str | None = None,
         context: dict | None = None,
         timeout_seconds: int = 120,
+        groupby: list[str] | None = None,
+        lazy: bool = False,
     ) -> OdooResult:
         """Read Odoo records through Odoo.sh SSH using ``odoo-bin shell``.
 
@@ -955,11 +957,19 @@ class OdooShService:
             return OdooResult(status="failed", error="ODOOSH_DB_NAME/odoosh_db_name is not configured for SSH query.")
         if not re.fullmatch(r"[a-zA-Z0-9_.]+", model or ""):
             return OdooResult(status="failed", error="Invalid model name for SSH query.")
+        aggregate_re = re.compile(r"^[a-zA-Z0-9_]+(?::(?:sum|avg|min|max|count|count_distinct|bool_and|bool_or|array_agg))?$")
+        field_re = aggregate_re if groupby else re.compile(r"^[a-zA-Z0-9_]+$")
         safe_fields: list[str] = []
         for field in fields or []:
-            if not isinstance(field, str) or not re.fullmatch(r"[a-zA-Z0-9_]+", field):
+            if not isinstance(field, str) or not field_re.fullmatch(field):
                 return OdooResult(status="failed", error=f"Invalid field name for SSH query: {field!r}")
             safe_fields.append(field)
+        groupby_re = re.compile(r"^[a-zA-Z0-9_]+(?::(?:day|week|month|quarter|year))?$")
+        safe_groupby: list[str] = []
+        for field in groupby or []:
+            if not isinstance(field, str) or not groupby_re.fullmatch(field):
+                return OdooResult(status="failed", error=f"Invalid groupby field for SSH query: {field!r}")
+            safe_groupby.append(field)
         if order and not re.fullmatch(r"[a-zA-Z0-9_,.\s]+(?:\s+(?:asc|desc))?", order, flags=re.I):
             return OdooResult(status="failed", error="Invalid order string for SSH query.")
 
@@ -971,6 +981,8 @@ class OdooShService:
             "offset": max(0, int(offset or 0)),
             "order": order or None,
             "context": context or {},
+            "groupby": safe_groupby,
+            "lazy": bool(lazy),
         }
         payload_b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
         safe_db = shlex.quote(self._db_name() or "")
@@ -997,13 +1009,15 @@ class OdooShService:
             "        return value.decode('utf-8', 'replace')\n"
             "    return value\n"
             "try:\n"
-            "    records = env[payload['model']].with_context(**(payload.get('context') or {})).search_read(\n"
-            "        payload.get('domain') or [],\n"
-            "        payload.get('fields') or [],\n"
-            "        offset=int(payload.get('offset') or 0),\n"
-            "        limit=int(payload.get('limit') or 20),\n"
-            "        order=payload.get('order') or None,\n"
-            "    )\n"
+            "    model = env[payload['model']].with_context(**(payload.get('context') or {}))\n"
+            "    if payload.get('groupby'):\n"
+            "        records = model.read_group(payload.get('domain') or [], payload.get('fields') or [], payload['groupby'], lazy=bool(payload.get('lazy')))\n"
+            "    else:\n"
+            "        records = model.search_read(\n"
+            "            payload.get('domain') or [], payload.get('fields') or [],\n"
+            "            offset=int(payload.get('offset') or 0), limit=int(payload.get('limit') or 20),\n"
+            "            order=payload.get('order') or None,\n"
+            "        )\n"
             "    print(marker + json.dumps({'status': 'ok', 'result': norm(records), 'count': len(records)}, ensure_ascii=False))\n"
             "except Exception as exc:\n"
             "    print(marker + json.dumps({'status': 'failed', 'error': str(exc), 'traceback': traceback.format_exc()[-4000:]}, ensure_ascii=False))\n"
@@ -1042,6 +1056,21 @@ class OdooShService:
             status="ok",
             database=self._db_name(),
             result=parsed.get("result") or [],
+        )
+
+    def read_group(
+        self,
+        model: str,
+        domain: list | None,
+        fields: list[str],
+        groupby: list[str],
+        lazy: bool = False,
+        context: dict | None = None,
+        timeout_seconds: int = 120,
+    ) -> OdooResult:
+        return self.search_read(
+            model, domain or [], fields, context=context, timeout_seconds=timeout_seconds,
+            groupby=groupby, lazy=lazy,
         )
 
     def _dependency_guard(self, module_name: str) -> CommandResult | None:

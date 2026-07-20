@@ -43,6 +43,7 @@ from ..schemas import (
     JobGetRequest,
     LimitRequest,
     OdooModuleRequest,
+    OdooReadGroupRequest,
     OdooResult,
     OdooSearchReadRequest,
     OdooShQueryRequest,
@@ -164,7 +165,8 @@ def _agent_priority(name: str) -> tuple[int, str]:
     """
     order = {
         "connector.health": 0,
-        "odoo.query": 1,
+        "odoo.read_group": 1,
+        "odoo.query": 2,
         "odoosh.query": 2,
         "odoo.search_read": 3,
         "odoo.health": 3,
@@ -524,6 +526,8 @@ _TOOL_DESCRIPTORS = [
         title="Upgrade Odoo module", description="[LEGACY] Direct button_immediate_upgrade — use odoo.module_deploy instead", requires_approval=True, deprecated=True),
     ToolDescriptor(name="odoo.search_read",
         title="Query Odoo records", description="Run Odoo search_read safely. Uses Odoo.sh SSH first, then HTTPS JSON-RPC read-only fallback when SSH is refused/unavailable for a client.", read_only=True),
+    ToolDescriptor(name="odoo.read_group",
+        title="Aggregate Odoo records", description="Return live grouped counts, sums, averages, minima, or maxima with safe read_group. Example: account.move customer invoices grouped by state.", read_only=True),
     ToolDescriptor(name="browser.screenshot",
         title="Check browser page", description="Navigate an Odoo page through external CDP browser and capture console/network errors; screenshot_path is optional", read_only=True),
     ToolDescriptor(name="browser.pos_flow",
@@ -737,6 +741,7 @@ _TOOL_INPUT_MODELS = {
     "odoo.module_install": OdooModuleRequest,
     "odoo.module_update": OdooModuleRequest,
     "odoo.search_read": OdooSearchReadRequest,
+    "odoo.read_group": OdooReadGroupRequest,
     "browser.screenshot": BrowserCheckRequest,
     "browser.pos_flow": PosFlowCheckRequest,
     "approvals.list": LimitRequest,
@@ -910,6 +915,21 @@ def _search_read_via_shell(
         "shell_attempt": shell_dumped,
         "ssh_fallback_used": True,
         "message": "Odoo query failed through primary path and Odoo.sh fallback.",
+    }
+
+
+def _read_group_via_shell(req: OdooReadGroupRequest, query_text: str | None = None) -> dict:
+    client = _resolve_query_client(req.client_name, query_text)
+    result = _odoo_service_for_client(client).read_group(
+        req.model, req.domain, req.fields, req.groupby, req.lazy, req.context, req.timeout_seconds
+    )
+    dumped = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+    return {
+        "status": dumped.get("status") if isinstance(dumped, dict) else "failed",
+        "source": "odoo_ssh_or_https_jsonrpc",
+        "client_name": getattr(client, "name", None),
+        "odoo": dumped,
+        "message": "Live Odoo read_group completed through SSH or HTTPS fallback." if isinstance(dumped, dict) and dumped.get("status") == "ok" else "Live Odoo read_group failed.",
     }
 
 
@@ -2350,6 +2370,10 @@ async def _dispatch(name: str, args: dict) -> object:
             client_name=req.client_name,
         )
         return data.get("odoo") if data.get("status") == "ok" else OdooResult(status="failed", result=data, error=data.get("message") or "Odoo search_read failed")
+    if name == "odoo.read_group":
+        req = OdooReadGroupRequest.model_validate(args)
+        data = _read_group_via_shell(req)
+        return data.get("odoo") if data.get("status") == "ok" else OdooResult(status="failed", result=data, error=data.get("message"))
     if name == "browser.pos_flow":
         req = PosFlowCheckRequest.model_validate(args)
         return await CdpBrowserService().run_pos_flow(req)

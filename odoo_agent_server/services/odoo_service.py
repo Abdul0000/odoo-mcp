@@ -87,6 +87,38 @@ class OdooService:
             },
         )
 
+    def read_group(
+        self,
+        model: str,
+        domain: list | None,
+        fields: list[str],
+        groupby: list[str],
+        lazy: bool = False,
+        context: dict[str, Any] | None = None,
+        timeout_seconds: int = 120,
+    ) -> OdooResult:
+        try:
+            ssh_result = self._ssh().read_group(model, domain or [], fields, groupby, lazy, context, timeout_seconds)
+        except Exception as exc:  # noqa: BLE001
+            ssh_result = OdooResult(status="failed", database=self._database(), error=f"Odoo SSH read_group failed before execution: {exc}")
+        if ssh_result.status == "ok":
+            return ssh_result
+        https_result = OdooJsonRpcService(self._active_client()).read_group(
+            model, domain or [], fields, groupby, lazy, context, timeout_seconds=min(max(timeout_seconds, 15), 60)
+        )
+        if https_result.status == "ok":
+            return https_result
+        return OdooResult(
+            status="failed",
+            base_url=https_result.base_url,
+            database=self._database(),
+            error=(
+                "Odoo SSH read_group failed and HTTPS JSON-RPC fallback also failed. "
+                f"SSH error: {ssh_result.error or 'unknown'}; HTTPS error: {https_result.error or 'unknown'}"
+            ),
+            result={"ssh_attempt": ssh_result.model_dump(mode="json"), "https_jsonrpc_attempt": https_result.model_dump(mode="json")},
+        )
+
 
     def execute_kw(self, model: str, method: str, args: list | None = None, kwargs: dict | None = None, superuser: bool = False) -> OdooResult:
         """Compatibility wrapper for old callers/tests; executed through Odoo shell only."""

@@ -254,6 +254,11 @@ _PROVIDER_TOOL_NAMES = {
     "workflow.agent_instructions",
     "workflow.odoo_code_change",
     "workflow.frontend_visual_implement",
+    # Live read-only model access. OdooService uses Odoo.sh SSH first and falls
+    # back to HTTPS JSON-RPC; no raw SQL or write method is exposed.
+    "odoo.query",
+    "odoo.search_read",
+    "odoo.read_group",
     # Source discovery and verification are server-owned steps inside the
     # composite workflows. Keeping them off the provider surface avoids extra
     # planning loops and repeated input-schema payloads.

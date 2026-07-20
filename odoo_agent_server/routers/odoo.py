@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from ..auth import AuthDependency
-from ..schemas import CommandResult, JobRecord, JobStatus, OdooModuleRequest, OdooResult, OdooSearchReadRequest
+from ..schemas import CommandResult, JobRecord, JobStatus, OdooModuleRequest, OdooReadGroupRequest, OdooResult, OdooSearchReadRequest
 from ..services.approval_service import ApprovalService
 from ..services.odoo_service import OdooService
 from ..services.odoosh_service import OdooShService
@@ -396,3 +396,11 @@ def odoo_module_deploy(payload: OdooModuleRequest) -> OdooResult:
 def odoo_search_read(payload: OdooSearchReadRequest) -> OdooResult:
     client = ClientResolverService().resolve_client(client_name=payload.client_name, require_complete=True) if payload.client_name else ClientResolverService().resolve_client(require_complete=False)
     return _odoo_service_for_client(client).search_read(payload.model, payload.domain, payload.fields, payload.limit, payload.offset, payload.order, payload.context)
+
+
+@router.post("/read-group", response_model=OdooResult)
+def odoo_read_group(payload: OdooReadGroupRequest) -> OdooResult:
+    client = ClientResolverService().resolve_client(client_name=payload.client_name, require_complete=True) if payload.client_name else ClientResolverService().resolve_client(require_complete=False)
+    return _odoo_service_for_client(client).read_group(
+        payload.model, payload.domain, payload.fields, payload.groupby, payload.lazy, payload.context, payload.timeout_seconds
+    )
