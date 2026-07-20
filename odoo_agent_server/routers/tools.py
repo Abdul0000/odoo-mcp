@@ -44,6 +44,7 @@ from ..schemas import (
     LimitRequest,
     OdooModuleRequest,
     OdooReadGroupRequest,
+    OdooCodeFileChange,
     OdooResult,
     OdooSearchReadRequest,
     OdooShQueryRequest,
@@ -256,7 +257,8 @@ _TOOL_DESCRIPTORS = [
             "read custom module, scope_advice, read /home/odoo/src/odoo/addons related source first with enterprise fallback, "
             "apply provided edits, git.diff, qa.self_run, verify_against_core, then workflow.safe_deploy_module and jobs.get polling. "
             "For a missing addon, set create_module=true with an exact lowercase technical name; it is created only at the checkout root. "
-            "If writes is empty it returns focused inspection context and asks for a second call with exact writes."
+            "Task descriptions automatically supply quoted identifiers/selectors/XML IDs/methods for match-centered inspection. "
+            "An exact quoted replacement that occurs once can complete in one call; ambiguous or complex work returns focused context for a second call with exact writes."
         ),
         requires_approval=True,
     ),
@@ -1188,6 +1190,45 @@ def _change_request_values(value: Any, *, limit: int = 12) -> list[str]:
     return found
 
 
+_TASK_CLUE_STOPWORDS = {
+    "add", "change", "create", "delete", "development", "display", "existing",
+    "field", "file", "fix", "function", "method", "module", "odoo", "remove",
+    "report", "template", "update", "view", "website",
+}
+
+
+def _task_description_search_clues(description: str, *, limit: int = 10) -> list[str]:
+    """Extract concrete code clues from natural language without guessing domain terms.
+
+    Quoted labels, CSS selectors, XML IDs, routes, and callable identifiers are
+    safe exact-search inputs. Generic prose is deliberately ignored so repository
+    inspection stays focused and deterministic.
+    """
+    text = str(description or "")
+    candidates: list[str] = []
+    patterns = (
+        r"`([^`\r\n]{2,160})`",
+        r'"([^"\r\n]{2,160})"',
+        r"'([^'\r\n]{2,160})'",
+        r"(?<![\w-])([.#][A-Za-z_][\w-]{1,100})",
+        r"\b([A-Za-z_][\w]*\.[A-Za-z_][\w.]*)\b",
+        r"\b([A-Za-z_][\w]{2,})\s*\(",
+        r"\b(?:xml\s*id|xmlid|selector|method|function|class|field|template|view|route)\s*[:=]?\s*[`'\"]?([/.#A-Za-z_][\w./#-]{1,159})",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            value = match.group(1).strip().rstrip(".,:;")
+            if (
+                len(value) >= 2
+                and value.lower() not in _TASK_CLUE_STOPWORDS
+                and value not in candidates
+            ):
+                candidates.append(value)
+                if len(candidates) >= limit:
+                    return candidates
+    return candidates
+
+
 def _infer_code_change_search_patterns(payload: OdooCodeChangeRequest) -> list[str]:
     patterns: list[str] = []
     for raw in payload.search_patterns:
@@ -1198,9 +1239,8 @@ def _infer_code_change_search_patterns(payload: OdooCodeChangeRequest) -> list[s
     # works for labels, method names, fields, XML ids, routes, CSS selectors, etc.
     for raw in _change_request_values(payload.change_request):
         _append_unique(patterns, raw)
-    # Keep automatic search derivation generic. Domain-specific terms must come
-    # from explicit target hints, search patterns, file paths, or structured
-    # change_request values supplied by the caller.
+    for raw in _task_description_search_clues(payload.task_description):
+        _append_unique(patterns, raw)
     return patterns[:10]
 
 
@@ -1290,12 +1330,13 @@ def _css_style_declarations(style: dict[str, Any]) -> list[str]:
     return declarations
 
 
-def _focused_search(repo: RepoService, project_path: str, module_path: str, patterns: list[str], max_matches: int) -> tuple[list[dict[str, Any]], list[str]]:
+def _focused_search(repo: RepoService, project_path: str, module_path: str, patterns: list[str], max_matches: int) -> tuple[list[dict[str, Any]], list[str], dict[str, list[int]]]:
     """Exact-first, low-noise search for inspect/autopatch mode."""
     preferred_suffixes = (".xml", ".scss", ".css", ".js", ".py")
     search_results: list[dict[str, Any]] = []
     rel_paths: list[str] = []
     seen_paths: set[str] = set()
+    match_lines: dict[str, list[int]] = {}
     for pattern in patterns[:10]:
         try:
             result = repo.search(project_path, pattern, module_path, max(1, min(max_matches, 25)), 24, False)
@@ -1321,12 +1362,16 @@ def _focused_search(repo: RepoService, project_path: str, module_path: str, patt
                 if rel and rel.endswith(preferred_suffixes) and rel not in seen_paths:
                     seen_paths.add(rel)
                     rel_paths.append(rel)
+                if rel and rel.endswith(preferred_suffixes):
+                    line = int(match.get("line") or 0)
+                    if line > 0 and line not in match_lines.setdefault(rel, []):
+                        match_lines[rel].append(line)
             # Exact visible text found in XML/CSS is usually enough for inspection.
             if rel_paths and any(pattern.lower() in str(m.get("text", "")).lower() for m in matches):
                 break
         except Exception as exc:  # noqa: BLE001
             search_results.append({"pattern": pattern, "status": "failed", "error": str(exc)})
-    return search_results, rel_paths
+    return search_results, rel_paths, match_lines
 
 
 def _normalized_task_type(payload: OdooCodeChangeRequest) -> str:
@@ -1372,6 +1417,20 @@ def _text_replace_request(payload: OdooCodeChangeRequest) -> tuple[str | None, s
     return str(old), str(new)
 
 
+def _task_description_text_replace(description: str) -> tuple[str | None, str | None]:
+    """Parse only explicit, quoted natural-language replacement instructions."""
+    text = str(description or "").strip()
+    patterns = (
+        r"\b(?:replace|change|rename)\s+[`\"']([^`\"'\r\n]{1,300})[`\"']\s+(?:with|to)\s+[`\"']([^`\"'\r\n]{1,300})[`\"']",
+        r"[`\"']([^`\"'\r\n]{1,300})[`\"']\s*->\s*[`\"']([^`\"'\r\n]{1,300})[`\"']",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match and match.group(1) != match.group(2):
+            return match.group(1), match.group(2)
+    return None, None
+
+
 def _iter_autopatch_candidate_files(module_dir: Path, target_files: list[str], project: Path) -> list[Path]:
     suffix_order = {".xml": 0, ".scss": 1, ".css": 2, ".js": 3, ".py": 4, ".csv": 5}
     candidates: list[Path] = []
@@ -1396,22 +1455,39 @@ def _iter_autopatch_candidate_files(module_dir: Path, target_files: list[str], p
     return sorted(candidates, key=lambda p: (suffix_order.get(p.suffix, 99), len(p.as_posix()), p.as_posix()))
 
 
-def _build_text_replace_autopatch(project: Path, module_path: str, target_files: list[str], old: str, new: str) -> list[OdooCodeFileChange]:
+def _build_text_replace_autopatch(
+    project: Path,
+    module_path: str,
+    target_files: list[str],
+    old: str,
+    new: str,
+    *,
+    require_unique: bool = False,
+) -> list[OdooCodeFileChange]:
     if not old or new is None:
         return []
     module_dir = project / module_path
+    matches: list[tuple[Path, int]] = []
     for file_path in _iter_autopatch_candidate_files(module_dir, target_files, project):
         try:
             content = file_path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        if old not in content:
+        count = content.count(old)
+        if count <= 0:
             continue
-        rel = file_path.relative_to(project).as_posix()
-        # Use search/replace rather than full content rewrite so the diff remains
-        # minimal and deterministic across all text-like task types.
-        return [OdooCodeFileChange(relative_path=rel, search=old, replace=new, count=1)]
-    return []
+        matches.append((file_path, count))
+        if not require_unique:
+            break
+        if sum(item[1] for item in matches) > 1:
+            return []
+    if not matches or (require_unique and sum(item[1] for item in matches) != 1):
+        return []
+    file_path = matches[0][0]
+    rel = file_path.relative_to(project).as_posix()
+    # Use search/replace rather than full content rewrite so the diff remains
+    # minimal and deterministic across all text-like task types.
+    return [OdooCodeFileChange(relative_path=rel, search=old, replace=new, count=1)]
 
 
 def _build_safe_generic_autopatch(project: Path, module_path: str, payload: OdooCodeChangeRequest, custom_rel_paths: list[str]) -> tuple[list[OdooCodeFileChange], str | None, str | None]:
@@ -1423,13 +1499,28 @@ def _build_safe_generic_autopatch(project: Path, module_path: str, payload: Odoo
     universal workflow, but return focused inspection context and request explicit
     writes when no deterministic patch exists.
     """
-    if not payload.allow_autopatch and not payload.style and not payload.change_request:
-        return [], None, "autopatch_not_requested"
     task_type = _normalized_task_type(payload)
     strategy = _normalized_patch_strategy(payload)
     target = _target_hint(payload)
     style = _style_request(payload)
     cr_type = str((payload.change_request or {}).get("type") or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+    inferred_old, inferred_new = _task_description_text_replace(payload.task_description)
+    if inferred_old is not None and inferred_new is not None:
+        writes = _build_text_replace_autopatch(
+            project,
+            module_path,
+            [],
+            inferred_old,
+            inferred_new,
+            require_unique=True,
+        )
+        if writes:
+            return writes, "task_description_text_replace", None
+        return [], "task_description_text_replace", "replacement_not_unique_or_not_found"
+
+    if not payload.allow_autopatch and not payload.style and not payload.change_request:
+        return [], None, "autopatch_not_requested"
 
     if style and target and (task_type in {"auto", "style", "scss_css", "css", "qweb_template", "xml_view"} or strategy in {"auto", "safe_autopatch", "style_rule", "inline_style"} or cr_type in {"style", "change_style", "update_style"}):
         writes = _build_simple_style_autopatch(project, module_path, target, style)
@@ -1543,6 +1634,71 @@ def _task_profile(payload: OdooCodeChangeRequest, rel_paths: list[str] | None = 
     elif any(path.endswith((".js", ".scss", ".css")) or is_frontend_xml(path) for path in paths):
         profile["frontend"] = True
     return profile
+
+
+def _core_relevance_terms(payload: OdooCodeChangeRequest, rel_paths: list[str]) -> list[str]:
+    values = [*_infer_code_change_search_patterns(payload), *rel_paths]
+    terms: list[str] = []
+    for value in values:
+        for token in re.split(r"[^a-zA-Z0-9_]+", str(value).lower()):
+            if len(token) >= 3 and token not in _TASK_CLUE_STOPWORDS and token not in terms:
+                terms.append(token)
+    return terms[:30]
+
+
+def _core_path_relevance(path: Path, terms: list[str], suffixes: set[str], task_type: str, original_index: int = 0) -> tuple[int, int, str]:
+    text = path.as_posix().lower()
+    name = path.name.lower()
+    stem = path.stem.lower()
+    score = 0
+    for term in terms:
+        if term == stem or term == name:
+            score += 8
+        elif term in name:
+            score += 5
+        elif term in text:
+            score += 2
+    if path.suffix.lower() in suffixes:
+        score += 4
+    area_hints = {
+        "python_model": "/models/",
+        "controller": "/controllers/",
+        "xml_view": "/views/",
+        "qweb_template": "/views/",
+        "report": "/report/",
+        "js_report": "/static/",
+        "js_owl": "/static/",
+        "pos_owl": "/static/",
+        "scss_css": "/static/",
+    }
+    if area_hints.get(task_type) and area_hints[task_type] in text:
+        score += 5
+    return (-score, original_index, text)
+
+
+def _rank_core_required_paths(paths: list[str], payload: OdooCodeChangeRequest, rel_paths: list[str], limit: int) -> list[str]:
+    unique = list(dict.fromkeys(str(path) for path in paths if str(path).strip()))
+    terms = _core_relevance_terms(payload, rel_paths)
+    suffixes = {Path(path).suffix.lower() for path in rel_paths if Path(path).suffix}
+    ranked = sorted(
+        enumerate(unique),
+        key=lambda item: _core_path_relevance(Path(item[1]), terms, suffixes, _normalized_task_type(payload), item[0]),
+    )
+    return [path for _, path in ranked[: max(1, min(limit, 10))]]
+
+
+def _rank_core_directory_files(directory: Path, payload: OdooCodeChangeRequest, rel_paths: list[str]) -> list[Path]:
+    terms = _core_relevance_terms(payload, rel_paths)
+    suffixes = {Path(path).suffix.lower() for path in rel_paths if Path(path).suffix}
+    files = [
+        path for path in directory.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".py", ".js", ".xml", ".scss", ".css"}
+    ]
+    return sorted(
+        files,
+        key=lambda path: _core_path_relevance(path, terms, suffixes, _normalized_task_type(payload)),
+    )
+
 
 def _evidence_signature(project: Path, module_name: str, payload: OdooCodeChangeRequest, rel_paths: list[str]) -> str:
     import hashlib
@@ -1699,9 +1855,10 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
 
     # Inspect/autopatch mode uses exact-first focused search to avoid huge noisy reads.
     search_results: list[dict[str, Any]] = []
+    focused_match_lines: dict[str, list[int]] = {}
     if not payload.writes:
         patterns = _infer_code_change_search_patterns(payload)
-        search_results, focused_paths = _focused_search(repo, project_path, module.path, patterns, payload.max_search_matches)
+        search_results, focused_paths, focused_match_lines = _focused_search(repo, project_path, module.path, patterns, payload.max_search_matches)
         for rel in focused_paths[:10]:
             if rel and rel not in custom_rel_paths:
                 custom_rel_paths.append(rel)
@@ -1724,10 +1881,31 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             custom_reads.append({"relative_path": rel, "status": "missing"})
             continue
         try:
-            content = _read_text_safe(target)
             gate.record_repo_inspection(project_path=project_path, relative_path=rel, client_name=client_name, action="workflow.odoo_code_change.read_custom", is_content_read=True)
             custom_file_paths_abs.append(str(target.resolve()))
-            custom_reads.append({"relative_path": rel, "status": "read", "size": target.stat().st_size, "preview": _file_preview(content, 3000)})
+            match_lines = sorted(focused_match_lines.get(rel, []))
+            if match_lines:
+                range_reads: list[dict[str, Any]] = []
+                covered_until = 0
+                for center in match_lines:
+                    if center <= covered_until or len(range_reads) >= 3:
+                        continue
+                    ranged = repo.read_range(project_path, rel, start_line=max(1, center - 40), max_lines=81)
+                    covered_until = int(ranged["end_line"])
+                    range_reads.append(ranged)
+                custom_reads.append({
+                    "relative_path": rel,
+                    "status": "read",
+                    "read_mode": "match_range",
+                    "size": target.stat().st_size,
+                    "ranges": [{"start_line": item["start_line"], "end_line": item["end_line"]} for item in range_reads],
+                    "total_lines": range_reads[0]["total_lines"],
+                    "match_lines": match_lines[:20],
+                    "preview": "\n\n... focused match window ...\n\n".join(str(item["content"]) for item in range_reads),
+                })
+            else:
+                content = _read_text_safe(target)
+                custom_reads.append({"relative_path": rel, "status": "read", "read_mode": "file_preview", "size": target.stat().st_size, "preview": _file_preview(content, 3000)})
         except UnicodeDecodeError:
             custom_reads.append({"relative_path": rel, "status": "binary_skipped"})
     steps.append({"step": "repo.read_custom", "status": "ok", "count": len([r for r in custom_reads if r.get("status") == "read"])})
@@ -1758,6 +1936,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     write_rel_paths = [_safe_module_relative(effective_module_name, w.relative_path) for w in (payload.writes or generated_writes)]
     frontend_fast_path = _static_frontend_fast_path(write_rel_paths)
     scope = None
+    scope_payload: ScopeAdviceRequest | None = None
     if frontend_fast_path:
         steps.append({"step": "workflow.scope_advice", "status": "skipped", "reason": "static frontend fast path"})
     else:
@@ -1775,20 +1954,22 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             scope = scope_advice(scope_payload)
             steps.append({"step": "workflow.scope_advice", "status": "ok", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level)})
 
+    frontend_preflight_payload: FrontendPatternPreflightRequest | None = None
     if _looks_like_frontend_code_change(payload, frontend_paths):
-        if cached_evidence and cached_evidence.get("frontend_preflight"):
-            from ..schemas import FrontendPatternPreflightResult
-            frontend_preflight = FrontendPatternPreflightResult.model_validate(cached_evidence["frontend_preflight"])
-            steps.append({"step": "workflow.frontend_pattern_preflight", "status": "cached", "target_area": frontend_preflight.target_area, "mandatory_count": frontend_preflight.mandatory_read_count})
-        else:
-            frontend_preflight = frontend_pattern_preflight(FrontendPatternPreflightRequest(
+        frontend_preflight_payload = FrontendPatternPreflightRequest(
             client_name=client_name,
             task_description=payload.task_description,
             target_area="auto",
             target_module_name=effective_module_name,
             custom_file_paths=custom_file_paths_abs,
-                planned_file_paths=frontend_paths,
-            ))
+            planned_file_paths=frontend_paths,
+        )
+        if cached_evidence and cached_evidence.get("frontend_preflight"):
+            from ..schemas import FrontendPatternPreflightResult
+            frontend_preflight = FrontendPatternPreflightResult.model_validate(cached_evidence["frontend_preflight"])
+            steps.append({"step": "workflow.frontend_pattern_preflight", "status": "cached", "target_area": frontend_preflight.target_area, "mandatory_count": frontend_preflight.mandatory_read_count})
+        else:
+            frontend_preflight = frontend_pattern_preflight(frontend_preflight_payload)
             steps.append({
                 "step": "workflow.frontend_pattern_preflight",
                 "status": "ok",
@@ -1797,16 +1978,6 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             })
     else:
         frontend_preflight = None
-
-    if frontend_preflight is not None:
-        gate.record_frontend_preflight(frontend_preflight, FrontendPatternPreflightRequest(
-            client_name=client_name,
-            task_description=payload.task_description,
-            target_area=frontend_preflight.target_area,
-            target_module_name=effective_module_name,
-            custom_file_paths=custom_file_paths_abs,
-            planned_file_paths=frontend_paths,
-        ))
 
     # 4a) Manifest dependency fallback: scope_advice should detect them, but make sure
     # common dependency manifests are read with /home/odoo/src/odoo/addons priority.
@@ -1829,40 +2000,86 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             if item.mandatory and not str(item.path).startswith("NOT_FOUND:") and item.path not in mandatory_paths:
                 mandatory_paths.append(item.path)
 
+    # Keep native-source inspection surgical. Deterministic one-file edits need
+    # at most five relevant source files; complex/two-pass changes may inspect ten.
+    core_read_limit = 5 if generated_writes else 10
+    ranked_mandatory_paths = _rank_core_required_paths(mandatory_paths, payload, write_rel_paths or frontend_paths, core_read_limit)
+    selected_required = set(ranked_mandatory_paths)
+    if scope is not None and scope_payload is not None:
+        selected_scope_instructions = [
+            item for item in scope.instructions
+            if not item.mandatory or str(item.path).startswith("NOT_FOUND:") or item.path in selected_required
+        ]
+        scope = scope.model_copy(update={
+            "instructions": selected_scope_instructions,
+            "mandatory_count": sum(1 for item in selected_scope_instructions if item.mandatory),
+            "total_count": len(selected_scope_instructions),
+        })
+        # scope_advice recorded the unbounded plan; replace it with the selected
+        # relevance-ranked plan so the hard pre-write gate enforces the same reads.
+        gate.record_scope_advice(scope, scope_payload)
+    if frontend_preflight is not None and frontend_preflight_payload is not None:
+        selected_frontend_instructions = [
+            item for item in frontend_preflight.instructions
+            if not item.mandatory or str(item.path).startswith("NOT_FOUND:") or item.path in selected_required
+        ]
+        frontend_preflight = frontend_preflight.model_copy(update={
+            "instructions": selected_frontend_instructions,
+            "mandatory_read_count": sum(1 for item in selected_frontend_instructions if item.mandatory),
+        })
+        gate.record_frontend_preflight(frontend_preflight, frontend_preflight_payload)
+
     core_reads: list[dict[str, Any]] = []
-    for raw_path in mandatory_paths[:60]:
+    core_files: list[Path] = []
+    core_file_seen: set[str] = set()
+    directory_extras: list[Path] = []
+    for raw_path in ranked_mandatory_paths:
         path = Path(str(raw_path)).expanduser()
         try:
             resolved = path.resolve()
         except Exception:
             resolved = path
         if resolved.is_dir():
-            # Read a small number of files from mandatory dirs so the gate sees the dir satisfied.
-            files = [
-                p for p in resolved.rglob("*")
-                if p.is_file() and p.suffix.lower() in {".py", ".js", ".xml", ".scss", ".css"}
-            ][:10]
+            files = _rank_core_directory_files(resolved, payload, write_rel_paths or frontend_paths)
             if not files:
                 core_reads.append({"path": str(resolved), "status": "dir_no_readable_files"})
                 continue
-            for file_path in files:
-                try:
-                    _ = _read_text_safe(file_path, 100_000)
-                    gate.record_repo_inspection(project_path=str(file_path.parent), relative_path=file_path.name, client_name=client_name, action="workflow.odoo_code_change.read_core", is_content_read=True)
-                    core_reads.append({"path": str(file_path), "status": "read"})
-                except Exception as exc:  # noqa: BLE001
-                    core_reads.append({"path": str(file_path), "status": "failed", "error": str(exc)})
+            first = files[0]
+            if str(first) not in core_file_seen:
+                core_file_seen.add(str(first)); core_files.append(first)
+            directory_extras.extend(files[1:])
             continue
         if not resolved.exists() or not resolved.is_file():
             core_reads.append({"path": str(resolved), "status": "missing"})
             continue
+        if str(resolved) not in core_file_seen:
+            core_file_seen.add(str(resolved)); core_files.append(resolved)
+
+    terms = _core_relevance_terms(payload, write_rel_paths or frontend_paths)
+    suffixes = {Path(path).suffix.lower() for path in (write_rel_paths or frontend_paths) if Path(path).suffix}
+    directory_extras.sort(key=lambda path: _core_path_relevance(path, terms, suffixes, _normalized_task_type(payload)))
+    for file_path in directory_extras:
+        if len(core_files) >= core_read_limit:
+            break
+        if str(file_path) not in core_file_seen:
+            core_file_seen.add(str(file_path)); core_files.append(file_path)
+
+    for resolved in core_files[:core_read_limit]:
         try:
             _ = _read_text_safe(resolved, 200_000)
             gate.record_repo_inspection(project_path=str(resolved.parent), relative_path=resolved.name, client_name=client_name, action="workflow.odoo_code_change.read_core", is_content_read=True)
             core_reads.append({"path": str(resolved), "status": "read"})
         except Exception as exc:  # noqa: BLE001
             core_reads.append({"path": str(resolved), "status": "failed", "error": str(exc)})
-    steps.append({"step": "repo.read_core", "status": "ok", "count": len([r for r in core_reads if r.get("status") == "read"])})
+    steps.append({
+        "step": "repo.read_core",
+        "status": "ok",
+        "count": len([r for r in core_reads if r.get("status") == "read"]),
+        "limit": core_read_limit,
+        "required_candidates": len(list(dict.fromkeys(mandatory_paths))),
+        "selected_required": len(ranked_mandatory_paths),
+        "selection": "relevance_ranked",
+    })
     cache = dict(evidence_cache) if isinstance(evidence_cache, dict) else {}
     cache[evidence_signature] = {
         "scope": scope.model_dump(mode="json") if scope is not None else None,

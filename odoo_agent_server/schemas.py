@@ -223,7 +223,7 @@ class OdooCodeChangeRequest(BaseModel):
     project_path: str | None = Field(default=None, description="Existing checkout path. If omitted, resolved from client_name and prepared if needed.")
     module_name: str = Field(..., description="Custom module technical name or human hint. The workflow resolves fuzzy hints against actual custom modules before using paths.")
     create_module: bool = Field(default=False, description="Create a missing addon as a direct child of the repository checkout. Requires an exact lowercase technical module_name; nested addon creation is rejected.")
-    task_description: str = Field(..., min_length=3, max_length=2000, description="Natural-language task/change request")
+    task_description: str = Field(..., min_length=3, max_length=2000, description="Natural-language task/change request. Quoted labels, selectors, XML IDs, routes, and method names are extracted automatically for focused inspection.")
     search_patterns: list[str] = Field(default_factory=list, max_length=10, description="Optional search terms to locate target files when writes are not yet provided")
     # Generic task-routing fields.  These are optional shortcuts; explicit writes[] remain
     # the universal path for any Odoo task (Python, XML, QWeb, JS/OWL/POS, SCSS, CSV, data).
@@ -237,9 +237,9 @@ class OdooCodeChangeRequest(BaseModel):
     # normalized into target_hint/change_request internally and do not limit the workflow.
     target_text: str | None = Field(default=None, max_length=500, description="Backward-compatible exact visible text for focused inspection/autopatch. Prefer target_hint for new clients.")
     style: dict[str, Any] = Field(default_factory=dict, description="Backward-compatible style patch request. Supported keys: color, font_style/fontStyle, font_weight/fontWeight.")
-    allow_autopatch: bool = Field(default=False, description="When true, the connector may apply a safe generated patch when the task maps to a supported deterministic autopatch; otherwise it returns focused inspection context and asks for writes.")
+    allow_autopatch: bool = Field(default=False, description="Enable supported structured style/text autopatches. An explicit quoted replacement such as Replace 'Old' with 'New' is always eligible when it occurs exactly once; ambiguous or complex work remains two-pass.")
     target_files: list[str] = Field(default_factory=list, max_length=50, description="Candidate/target files inside the module to read and use for scope advice")
-    writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=20, description="Actual file edits to apply. If empty, the tool returns focused inspection context or can autopatch when allow_autopatch/style/target_text are provided.")
+    writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=20, description="Actual file edits to apply. If empty, an unambiguous deterministic small edit may complete in one call; complex work returns focused inspection context for an exact second-call write.")
     commit_message: str | None = Field(default=None, max_length=300, description="Commit message for safe deploy. Defaults to a concise message from task_description.")
     auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
     deploy_mode: Literal["auto", "always_upgrade", "source_only"] = Field(default="auto", description="Automatic impact classification by default. always_upgrade forces -u; source_only is allowed only for verified non-structural changes.")
