@@ -16,6 +16,8 @@ EXPECTED = {
     "odoo-hr-payroll-development": "06-SKILL-hr-payroll.md",
     "odoo-crm-pipeline-development": "07-SKILL-crm-pipeline.md",
     "odoo-helpdesk-development": "08-SKILL-helpdesk.md",
+    "odoo-sql-query-development": "09-SKILL-sql-queries.md",
+    "odoo-all-modules-reference": "10-ALL-MODULES-REFERENCE.md",
     "odoo-pos-development": "odoo-pos-development-skill.md",
     "odoo-website-development": "odoo-website-development.md",
 }
@@ -65,3 +67,15 @@ def test_provider_can_list_and_read_exact_skill_resource():
     assert result["name"] == "odoo-accounting-development"
     assert result["content"] == expected
     assert result["exact"] is True
+
+
+def test_query_reporting_and_module_reference_aliases_load_on_demand():
+    service = SkillService()
+
+    reporting = service.read("reporting")
+    modules = service.read("modules")
+
+    assert reporting["name"] == "odoo-sql-query-development"
+    assert reporting["source"] == "skills/09-SKILL-sql-queries.md"
+    assert modules["name"] == "odoo-all-modules-reference"
+    assert modules["source"] == "skills/10-ALL-MODULES-REFERENCE.md"

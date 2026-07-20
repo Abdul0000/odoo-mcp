@@ -14,6 +14,8 @@ _SKILLS = {
     "odoo-hr-payroll-development": ("06-SKILL-hr-payroll.md", "HR, contracts, payroll, payslips, attendance, leave, timesheets, and statutory deductions."),
     "odoo-crm-pipeline-development": ("07-SKILL-crm-pipeline.md", "CRM leads/opportunities, stages, teams, scoring, activities, forecasting, automation, and pipeline reporting."),
     "odoo-helpdesk-development": ("08-SKILL-helpdesk.md", "Helpdesk tickets, teams, SLAs, escalation, communication, portal, knowledge, automation, and analytics."),
+    "odoo-sql-query-development": ("09-SKILL-sql-queries.md", "Odoo ORM and SQL queries, domains, joins, read_group, analytics, reporting, and query performance."),
+    "odoo-all-modules-reference": ("10-ALL-MODULES-REFERENCE.md", "Odoo module selection, dependencies, key models, integration planning, and implementation roadmap."),
     "odoo-pos-development": ("odoo-pos-development-skill.md", "POS sessions, orders, payments, OWL UI, receipts, hardware, restaurant, loyalty, and reporting."),
     "odoo-website-development": ("odoo-website-development.md", "Website themes, QWeb, snippets, eCommerce, controllers, multi-site, SEO, and performance."),
 }
@@ -31,8 +33,21 @@ _ALIASES = {
     "payroll": "odoo-hr-payroll-development",
     "crm": "odoo-crm-pipeline-development",
     "helpdesk": "odoo-helpdesk-development",
+    "sql": "odoo-sql-query-development",
+    "sql-queries": "odoo-sql-query-development",
+    "query": "odoo-sql-query-development",
+    "queries": "odoo-sql-query-development",
+    "orm": "odoo-sql-query-development",
+    "database": "odoo-sql-query-development",
+    "analytics": "odoo-sql-query-development",
+    "report": "odoo-sql-query-development",
+    "reports": "odoo-sql-query-development",
+    "reporting": "odoo-sql-query-development",
     "pos": "odoo-pos-development",
     "website": "odoo-website-development",
+    "modules": "odoo-all-modules-reference",
+    "all-modules": "odoo-all-modules-reference",
+    "module-reference": "odoo-all-modules-reference",
 }
 
 
