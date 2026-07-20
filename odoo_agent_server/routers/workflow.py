@@ -2277,6 +2277,10 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         "upgrade_reasons": payload.upgrade_reasons,
         "deploy_confirmed": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")) and (not payload.upgrade_module or bool(module_upgrade_confirmation.get("passed"))),
         "success_allowed": True,
+        "completion_required": False,
+        "tool_exit_allowed": True,
+        "next_call": None,
+        "terminal_action": "stop_and_summarize",
     }
     store.finish_job(fresh_job, JobStatus.passed, final_result)
     approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module succeeded")

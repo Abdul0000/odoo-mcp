@@ -75,7 +75,7 @@ def agent_instructions() -> dict:
     path = (active_client.path if active_client else None) or settings.target_project_path or "/workspace/repos/<repo>"
 
     return {
-        "version": "v17-compact",
+        "version": "v18-compact",
         "prompt_source": "MCP_SYSTEM_PROMPT.md",
         "system_prompt": load_mcp_system_prompt(),
         "instructions": {
@@ -96,6 +96,7 @@ def agent_instructions() -> dict:
                 "continuation": ["jobs.get", "workflow.resume_job"],
                 "diagnostics": ["artifacts.read", "odoosh.error_pack"],
                 "terminal_success": ["deploy_confirmed=true", "already_deployed_confirmed=true"],
+                "terminal_action": "stop_and_summarize",
                 "inspect_then_write": "If the composite workflow requests writes, use its focused inspection result and call the same composite tool again with complete writes.",
             },
             "skills": {

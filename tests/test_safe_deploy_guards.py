@@ -944,6 +944,7 @@ def test_ui_verification_warning_still_confirms_deploy_and_stops_polling(tmp_pat
     assert finished.deploy_confirmed is True
     assert finished.success_allowed is False
     assert finished.next_call is None
+    assert finished.terminal_action == "stop_and_summarize"
 
 
 def test_resume_already_complete_warning_job_finalizes_without_loop(tmp_path, monkeypatch):

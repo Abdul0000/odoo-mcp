@@ -944,6 +944,14 @@ class JobRecord(BaseModel):
             },
         }
 
+    @computed_field  # type: ignore[misc]
+    @property
+    def terminal_action(self) -> str | None:
+        """Tell MCP clients to stop tool calls as soon as deploy is confirmed."""
+        if self.deploy_confirmed or self.already_deployed_confirmed:
+            return "stop_and_summarize"
+        return None
+
 
 class ToolDescriptor(BaseModel):
     name: str
@@ -1149,6 +1157,14 @@ class WorkflowReport(BaseModel):
         if len(labels) > 12:
             labels = ["…"] + labels[-12:]
         return " ".join(labels)
+
+    @computed_field  # type: ignore[misc]
+    @property
+    def terminal_action(self) -> str | None:
+        """Machine-readable terminal instruction for provider agents."""
+        if self.deploy_confirmed or self.already_deployed_confirmed:
+            return "stop_and_summarize"
+        return None
 
 
 def validate_safe_name(value: str, field_name: str) -> str:

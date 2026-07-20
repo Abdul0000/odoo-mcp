@@ -66,6 +66,7 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
     assert provider_flow["visual_change"] == "workflow.frontend_visual_implement"
     assert provider_flow["continuation"] == ["jobs.get", "workflow.resume_job"]
     assert "deploy_confirmed=true" in provider_flow["terminal_success"]
+    assert provider_flow["terminal_action"] == "stop_and_summarize"
     assert skills["mode"] == "on_demand"
     assert skills["list_tool"] == "skills.list"
     assert skills["read_tool"] == "skills.read"
