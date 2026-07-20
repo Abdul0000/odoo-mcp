@@ -1861,33 +1861,59 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     if not payload.writes:
         patterns = _infer_code_change_search_patterns(payload)
         focused_paths: list[str] = []
-        try:
-            graph_search = OdooCodeSearchService().search(
-                project_path=project_path,
-                module_path=module.path,
-                task_description=payload.task_description,
-                target_hint=_target_hint(payload),
-                intent=payload.intent,
-                search_patterns=payload.search_patterns,
-                task_type=_normalized_task_type(payload),
-                max_results=min(payload.max_search_matches, 10),
-            )
-            search_results.append(graph_search)
-            for match in graph_search.get("matches") or []:
-                rel = str(match.get("path") or "")
-                if rel and rel not in focused_paths:
-                    focused_paths.append(rel)
-                for line in match.get("lines") or []:
-                    line_no = int(line or 0)
-                    if line_no > 0 and line_no not in focused_match_lines.setdefault(rel, []):
-                        focused_match_lines[rel].append(line_no)
-        except Exception as exc:  # noqa: BLE001
-            search_results.append({"engine": "odoo_code_graph", "status": "failed", "error": str(exc)})
+        direct_targets = list(dict.fromkeys(
+            _safe_module_relative(effective_module_name, raw)
+            for raw in payload.target_files
+            if str(raw or "").strip()
+        ))
+        if direct_targets:
+            search_results.append({"engine": "direct_target", "status": "ok", "target_count": len(direct_targets)})
+            for target_rel in direct_targets[:20]:
+                if not (project / target_rel).is_file():
+                    search_results.append({"engine": "direct_target", "status": "missing", "path": target_rel})
+                    continue
+                if target_rel not in focused_paths:
+                    focused_paths.append(target_rel)
+                if not patterns:
+                    continue
+                target_results, _, target_lines = _focused_search(repo, project_path, target_rel, patterns, payload.max_search_matches)
+                search_results.extend(target_results)
+                for rel, lines in target_lines.items():
+                    for line in lines:
+                        if line not in focused_match_lines.setdefault(rel, []):
+                            focused_match_lines[rel].append(line)
+
+        if not focused_paths:
+            try:
+                graph_search = OdooCodeSearchService().search(
+                    project_path=project_path,
+                    module_path=module.path,
+                    task_description=payload.task_description,
+                    target_hint=_target_hint(payload),
+                    intent=payload.intent,
+                    search_patterns=payload.search_patterns,
+                    task_type=_normalized_task_type(payload),
+                    max_results=min(payload.max_search_matches, 10),
+                )
+                search_results.append(graph_search)
+                for match in graph_search.get("matches") or []:
+                    rel = str(match.get("path") or "")
+                    if rel and rel not in focused_paths:
+                        focused_paths.append(rel)
+                    for line in match.get("lines") or []:
+                        line_no = int(line or 0)
+                        if line_no > 0 and line_no not in focused_match_lines.setdefault(rel, []):
+                            focused_match_lines[rel].append(line_no)
+            except Exception as exc:  # noqa: BLE001
+                search_results.append({"engine": "odoo_code_graph", "status": "failed", "error": str(exc)})
 
         # Preserve the old lexical search as a bounded fallback only when the
         # Odoo graph cannot produce confident target files.
-        graph_ok = bool(focused_paths) and float((search_results[0] or {}).get("confidence") or 0) >= 0.45
-        if not graph_ok:
+        graph_result = next((item for item in search_results if item.get("engine") == "odoo_code_graph"), {})
+        discovery_ok = bool(direct_targets and focused_paths) or (
+            bool(focused_paths) and float(graph_result.get("confidence") or 0) >= 0.45
+        )
+        if not discovery_ok:
             lexical_results, lexical_paths, lexical_lines = _focused_search(repo, project_path, module.path, patterns, payload.max_search_matches)
             search_results.extend(lexical_results)
             for rel in lexical_paths:

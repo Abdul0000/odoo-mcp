@@ -156,3 +156,28 @@ def test_search_index_cache_invalidates_when_dirty_file_changes(tmp_path, monkey
     assert first["cached"] is False
     assert second["cached"] is True
     assert third["cached"] is False
+
+
+def test_search_scans_broadly_but_parses_only_bounded_candidates(tmp_path, monkeypatch):
+    project, module = _build_module(tmp_path)
+    unrelated = module / "models" / "unrelated"
+    unrelated.mkdir()
+    for index in range(30):
+        (unrelated / f"noise_{index}.py").write_text(
+            f'class Noise{index}:\n    value = "unrelated"\n', encoding="utf-8"
+        )
+    monkeypatch.setattr(search_module, "resolve_allowed_path", lambda value: project.resolve())
+    monkeypatch.setattr(settings, "repo_index_enabled", False)
+
+    result = OdooCodeSearchService().search(
+        project_path=str(project),
+        module_path=module.relative_to(project).as_posix(),
+        task_description="Change Billing Ready Records rate",
+        target_hint="Billing Ready Records billing_code_id.rate",
+        task_type="python_model",
+    )
+
+    assert result["strategy"] == "targeted"
+    assert result["scanned_files"] >= 33
+    assert result["indexed_files"] <= 18
+    assert result["indexed_files"] < result["scanned_files"]

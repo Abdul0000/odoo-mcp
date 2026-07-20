@@ -80,9 +80,9 @@ class OdooCodeSearchService:
         if not module.is_dir():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Module path not found: {module}")
 
-        fingerprint = self._fingerprint(project, module)
-        index, cached = self._load_or_build(project, module, fingerprint)
         clues = self.expand_clues(task_description, target_hint, intent, search_patterns or [])
+        fingerprint = self._fingerprint(project, module)
+        index, cached = self._load_or_build(project, module, fingerprint, clues, task_type)
         ranked = self._rank(index.get("documents") or [], project, clues, task_type, max_results)
         top_score = float(ranked[0]["score"]) if ranked else 0.0
         return {
@@ -96,6 +96,8 @@ class OdooCodeSearchService:
             "count": len(ranked),
             "confidence": round(min(1.0, top_score / 100.0), 3),
             "indexed_files": len(index.get("documents") or []),
+            "scanned_files": int(index.get("scanned_files") or 0),
+            "strategy": "targeted",
             "index_truncated": bool(index.get("truncated")),
         }
 
@@ -133,8 +135,8 @@ class OdooCodeSearchService:
             _append_unique(clues, match.group(1), limit=25)
         return clues[:25]
 
-    def _load_or_build(self, project: Path, module: Path, fingerprint: str) -> tuple[dict[str, Any], bool]:
-        cache_file = self._cache_file(project, module)
+    def _load_or_build(self, project: Path, module: Path, fingerprint: str, clues: list[str], task_type: str) -> tuple[dict[str, Any], bool]:
+        cache_file = self._cache_file(project, module, clues, task_type)
         if settings.repo_index_enabled and cache_file.exists():
             try:
                 payload = json.loads(cache_file.read_text(encoding="utf-8") or "{}")
@@ -143,14 +145,15 @@ class OdooCodeSearchService:
                     return payload.get("index") or {}, True
             except Exception:
                 pass
-        index = self._build_index(project, module)
+        index = self._build_index(project, module, clues, task_type)
         if settings.repo_index_enabled:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             cache_file.write_text(json.dumps({"saved_at": time.time(), "fingerprint": fingerprint, "index": index}, ensure_ascii=False), encoding="utf-8")
         return index, False
 
-    def _build_index(self, project: Path, module: Path) -> dict[str, Any]:
-        documents: list[dict[str, Any]] = []
+    def _build_index(self, project: Path, module: Path, clues: list[str], task_type: str) -> dict[str, Any]:
+        """Parse only direct clue matches, then follow at most two Odoo references."""
+        entries: list[dict[str, Any]] = []
         truncated = False
         for path in sorted(module.rglob("*")):
             if not path.is_file() or any(part in _SKIP_DIRS for part in path.parts):
@@ -162,24 +165,84 @@ class OdooCodeSearchService:
             except (OSError, UnicodeDecodeError):
                 continue
             rel = path.relative_to(project).as_posix()
-            doc = {"path": rel, "kind": path.suffix.lower().lstrip(".") or "manifest", "symbols": [], "relations": [], "values": []}
-            if path.name == "__manifest__.py":
-                self._index_manifest(text, doc)
-            elif path.suffix == ".py":
-                self._index_python(text, doc)
-            elif path.suffix == ".xml":
-                self._index_xml(text, doc)
-            elif path.suffix == ".js":
-                self._index_js(text, doc)
-            elif path.suffix in {".scss", ".css"}:
-                self._index_styles(text, doc)
-            elif path.suffix == ".csv":
-                self._index_csv(text, doc)
-            documents.append(doc)
-            if len(documents) >= 2000:
+            entries.append({"path": path, "rel": rel, "text": text, "score": self._candidate_score(rel, text, clues, task_type)})
+            if len(entries) >= 2000:
                 truncated = True
                 break
-        return {"module": module.name, "documents": documents, "truncated": truncated}
+
+        ranked = sorted(entries, key=lambda item: (-item["score"], item["rel"]))
+        selected = [item for item in ranked if item["score"] > 0][:10]
+        if not selected:
+            selected = ranked[:5]
+        documents = [self._parse_document(project, item) for item in selected]
+        selected_paths = {item["rel"] for item in selected}
+
+        # A menu/action/view may point at another XML ID or model. Follow only
+        # the strongest four new files per hop and stop after two hops.
+        for _hop in range(2):
+            terms: set[str] = set()
+            for doc in documents:
+                for relation in doc.get("relations") or []:
+                    value = str(relation).strip().lower()
+                    if len(value) >= 4:
+                        terms.add(value)
+                        terms.add(value.split(".")[-1])
+            if not terms:
+                break
+            related: list[tuple[int, dict[str, Any]]] = []
+            for item in entries:
+                if item["rel"] in selected_paths:
+                    continue
+                lowered = item["text"].lower()
+                hits = sum(1 for term in terms if term in lowered)
+                if hits:
+                    related.append((hits, item))
+            new_items = [item for _, item in sorted(related, key=lambda pair: (-pair[0], pair[1]["rel"]))[:4]]
+            if not new_items:
+                break
+            for item in new_items:
+                selected_paths.add(item["rel"])
+                documents.append(self._parse_document(project, item))
+
+        return {
+            "module": module.name,
+            "documents": documents[:18],
+            "scanned_files": len(entries),
+            "truncated": truncated,
+        }
+
+    def _parse_document(self, project: Path, item: dict[str, Any]) -> dict[str, Any]:
+        path: Path = item["path"]
+        text = item["text"]
+        doc = {"path": path.relative_to(project).as_posix(), "kind": path.suffix.lower().lstrip(".") or "manifest", "symbols": [], "relations": [], "values": []}
+        if path.name == "__manifest__.py":
+            self._index_manifest(text, doc)
+        elif path.suffix == ".py":
+            self._index_python(text, doc)
+        elif path.suffix == ".xml":
+            self._index_xml(text, doc)
+        elif path.suffix == ".js":
+            self._index_js(text, doc)
+        elif path.suffix in {".scss", ".css"}:
+            self._index_styles(text, doc)
+        elif path.suffix == ".csv":
+            self._index_csv(text, doc)
+        return doc
+
+    def _candidate_score(self, rel: str, text: str, clues: list[str], task_type: str) -> int:
+        lowered = text.lower()
+        path_norm = _normal(rel)
+        score = self._task_type_bonus(rel, task_type)
+        for clue in clues:
+            raw = str(clue).strip().lower()
+            norm = _normal(clue)
+            if len(raw) < 2:
+                continue
+            if raw in lowered:
+                score += 30 if ("_" in raw or "." in raw) else 20
+            if norm and norm in path_norm:
+                score += 18
+        return score
 
     @staticmethod
     def _symbol(doc: dict[str, Any], name: Any, kind: str, line: int) -> None:
@@ -447,8 +510,9 @@ class OdooCodeSearchService:
                     break
         return found
 
-    def _cache_file(self, project: Path, module: Path) -> Path:
-        key = hashlib.sha256(f"{project}:{module}".encode("utf-8")).hexdigest()[:24]
+    def _cache_file(self, project: Path, module: Path, clues: list[str], task_type: str) -> Path:
+        query = json.dumps({"clues": sorted(_normal(clue) for clue in clues), "task_type": task_type}, sort_keys=True)
+        key = hashlib.sha256(f"{project}:{module}:{query}".encode("utf-8")).hexdigest()[:24]
         return settings.cache_path / "odoo_code_search" / f"{key}.json"
 
     @staticmethod
@@ -456,9 +520,13 @@ class OdooCodeSearchService:
         git_state = ""
         try:
             head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(project), capture_output=True, text=True, timeout=3, check=False)
-            status_result = subprocess.run(["git", "status", "--porcelain", "--", module.relative_to(project).as_posix()], cwd=str(project), capture_output=True, text=True, timeout=3, check=False)
+            module_rel = module.relative_to(project).as_posix()
+            status_result = subprocess.run(["git", "status", "--porcelain", "--", module_rel], cwd=str(project), capture_output=True, text=True, timeout=3, check=False)
             if head.returncode == 0 and status_result.returncode == 0:
-                git_state = f"{head.stdout.strip()}:{status_result.stdout.strip()}"
+                diff = subprocess.run(["git", "diff", "--no-ext-diff", "--binary", "--", module_rel], cwd=str(project), capture_output=True, text=True, timeout=3, check=False)
+                git_state = f"{head.stdout.strip()}:{status_result.stdout.strip()}:{hashlib.sha256(diff.stdout.encode()).hexdigest()}"
+                if not status_result.stdout.strip() or "??" not in status_result.stdout:
+                    return hashlib.sha256(git_state.encode("utf-8")).hexdigest()
         except Exception:
             pass
         rows: list[tuple[str, int, int]] = []
