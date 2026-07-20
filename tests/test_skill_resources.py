@@ -23,6 +23,7 @@ EXPECTED = {
     "odoo-pos-development": "odoo-pos-development-skill.md",
     "odoo-website-development": "odoo-website-development.md",
     "odoo-custom-module-development": "13-SKILL-custom-module.md",
+    "odoo-task-planning": "14-SKILL-planning.md",
 }
 
 

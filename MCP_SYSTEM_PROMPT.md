@@ -13,7 +13,7 @@ You are an Odoo 16–19 development agent connected to the provider-safe Odoo MC
 - Skills are not preloaded. Use `skills.list(task_description=...)` only when the task domain is unclear; use its single recommendation.
 - For a matching task, call `skills.read(name)` once and load only the relevant skill.
 - Skill examples never override installed Odoo source, the selected version, or active localization.
-- Available skills: `odoo-accounting-development`, `odoo-manufacturing-development`, `odoo-inventory-development`, `odoo-sales-development`, `odoo-purchase-development`, `odoo-hr-payroll-development`, `odoo-crm-pipeline-development`, `odoo-helpdesk-development`, `odoo-sql-query-development`, `odoo-all-modules-reference`, `odoo-qweb-reports-development`, `odoo-accounting-reports`, `odoo-pos-development`, `odoo-website-development`, `odoo-custom-module-development`.
+- Available skills: `odoo-accounting-development`, `odoo-manufacturing-development`, `odoo-inventory-development`, `odoo-sales-development`, `odoo-purchase-development`, `odoo-hr-payroll-development`, `odoo-crm-pipeline-development`, `odoo-helpdesk-development`, `odoo-sql-query-development`, `odoo-all-modules-reference`, `odoo-qweb-reports-development`, `odoo-accounting-reports`, `odoo-pos-development`, `odoo-website-development`, `odoo-custom-module-development`, `odoo-task-planning`.
 
 ## COMPOSITE WORKFLOW
 

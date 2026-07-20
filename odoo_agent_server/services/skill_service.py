@@ -21,6 +21,7 @@ _SKILLS = {
     "odoo-pos-development": ("odoo-pos-development-skill.md", "POS sessions, orders, payments, OWL UI, receipts, hardware, restaurant, loyalty, and reporting."),
     "odoo-website-development": ("odoo-website-development.md", "Website themes, QWeb, snippets, eCommerce, controllers, multi-site, SEO, and performance."),
     "odoo-custom-module-development": ("13-SKILL-custom-module.md", "Standalone custom modules with their own models/tables, manifest, security, views, and menus — not inherited/mixed into native Odoo models."),
+    "odoo-task-planning": ("14-SKILL-planning.md", "Pre-implementation planning: scope classification (surgical vs new feature vs new module), file inventory checklist, impact/dependency check, and risk flags before writing code."),
 }
 
 _ALIASES = {
@@ -73,6 +74,11 @@ _ALIASES = {
     "standalone-module": "odoo-custom-module-development",
     "own-model": "odoo-custom-module-development",
     "scratch-module": "odoo-custom-module-development",
+    "planning": "odoo-task-planning",
+    "plan": "odoo-task-planning",
+    "task-plan": "odoo-task-planning",
+    "scope": "odoo-task-planning",
+    "checklist": "odoo-task-planning",
 }
 
 _ROUTING_TERMS = {
@@ -91,6 +97,7 @@ _ROUTING_TERMS = {
     "odoo-accounting-development": ("invoice", "journal", "payment", "tax", "reconciliation", "fiscal position", "account.move"),
     "odoo-all-modules-reference": ("which module", "module dependency", "depends", "module selection", "implementation roadmap"),
     "odoo-custom-module-development": ("custom module", "new module", "standalone module", "own model", "own table", "scratch module", "_name =", "not inherit"),
+    "odoo-task-planning": ("plan", "planning", "scope this", "before implementing", "file checklist", "what files are needed", "break down the task"),
 }
 
 
