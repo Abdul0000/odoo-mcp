@@ -2731,12 +2731,9 @@ async def _dispatch(name: str, args: dict) -> object:
 # ---------------------------------------------------------------------------
 # MCP outputSchema derivation (OpenAI/MCP 2025-06-18 "structured content"
 # recommendation: declare the shape of a tool's result so the calling model
-# doesn't have to guess it from prose). Purely static — parses _dispatch's
-# own source to see which function/method each tool's `return` calls, then
-# reads that callable's return-type annotation. Nothing is instantiated or
-# invoked; a tool whose return type can't be resolved to a pydantic model
-# (plain dict, Any, or an untraceable call) simply gets no outputSchema,
-# which is valid per the MCP spec — never a fabricated/guessed schema.
+# doesn't have to guess it from prose). Pydantic-backed tools use their exact
+# serialization schema. Dynamic dict/list tools use a permissive family schema
+# that documents stable result fields while allowing tool-specific additions.
 # ---------------------------------------------------------------------------
 
 
@@ -2815,7 +2812,7 @@ def _tool_output_schemas() -> dict:
             )
             if inspect.isclass(annotation) and issubclass(annotation, BaseModel):
                 try:
-                    schemas[tool_name] = annotation.model_json_schema()
+                    schemas[tool_name] = annotation.model_json_schema(mode="serialization")
                 except Exception:
                     continue
     except Exception:
@@ -2823,8 +2820,96 @@ def _tool_output_schemas() -> dict:
     return schemas
 
 
-def tool_output_schema(name: str) -> dict | None:
-    return deepcopy(_tool_output_schemas().get(internal_tool_name(name)))
+def _dynamic_tool_output_schema(name: str) -> dict:
+    """Return a truthful minimum contract for dynamic tool results.
+
+    MCP result normalization guarantees an object. No field is required because
+    success, running, warning, and failure paths legitimately return different
+    subsets. ``additionalProperties`` stays enabled for exact domain payloads.
+    """
+    internal = internal_tool_name(name)
+    properties: dict[str, Any] = {
+        "status": {"type": "string", "description": "Tool or workflow status."},
+        "message": {"type": "string", "description": "Human-readable outcome or next-step explanation."},
+        "error": {"type": "string", "description": "Error detail when the operation failed."},
+        "next_call": {"type": "object", "description": "Exact follow-up tool call; null or absent when terminal.", "additionalProperties": True},
+    }
+
+    if internal == "connector.health":
+        properties.update({"service": {"type": "string"}})
+    elif internal == "skills.list":
+        properties.update({
+            "skills": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "count": {"type": "integer"},
+            "loading": {"type": "string"},
+            "recommendation": {"type": "object", "additionalProperties": True},
+        })
+    elif internal == "skills.read":
+        properties.update({
+            "name": {"type": "string"}, "description": {"type": "string"},
+            "content": {"type": "string"}, "source": {"type": "string"},
+            "exact": {"type": "boolean"},
+        })
+    elif internal == "client.check":
+        properties.update({
+            "validated": {"type": "boolean"}, "client_name": {"type": "string"},
+            "coding_ready": {"type": "boolean"}, "deploy_ready": {"type": "boolean"},
+            "summary": {"type": "string"},
+        })
+    elif internal.startswith("workflow."):
+        properties.update({
+            "job_id": {"type": "string"}, "steps": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "summary": {"type": "object", "additionalProperties": True},
+            "completion_required": {"type": "boolean"}, "success_allowed": {"type": "boolean"},
+            "tool_exit_allowed": {"type": "boolean"}, "deploy_confirmed": {"type": "boolean"},
+            "already_deployed_confirmed": {"type": "boolean"}, "terminal_action": {"type": "string"},
+            "writes_required": {"type": "boolean"}, "inspection": {"type": "object", "additionalProperties": True},
+        })
+    elif internal.startswith("repo."):
+        properties.update({
+            "path": {"type": "string"}, "content": {"type": "string"},
+            "matches": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "changed_files": {"type": "array", "items": {"type": "string"}},
+        })
+    elif internal.startswith("git."):
+        properties.update({
+            "sha": {"type": "string"}, "branch": {"type": "string"},
+            "stdout": {"type": "string"}, "stderr": {"type": "string"},
+            "exit_code": {"type": "integer"},
+        })
+    elif internal.startswith("odoosh."):
+        properties.update({
+            "deployed": {"type": "boolean"}, "expected_sha": {"type": "string"},
+            "current_sha": {"type": "string"}, "stdout": {"type": "string"},
+            "stderr": {"type": "string"}, "exit_code": {"type": "integer"},
+            "job_id": {"type": "string"},
+        })
+    elif internal.startswith("odoo."):
+        properties.update({
+            "records": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "groups": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "count": {"type": "integer"}, "job_id": {"type": "string"},
+            "stdout": {"type": "string"}, "stderr": {"type": "string"},
+        })
+    elif internal.startswith("jobs.") or internal.startswith("approvals.") or internal.startswith("audit."):
+        properties.update({
+            "items": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "count": {"type": "integer"}, "job_id": {"type": "string"},
+            "completion_required": {"type": "boolean"}, "deploy_confirmed": {"type": "boolean"},
+            "terminal_action": {"type": "string"},
+        })
+    elif internal == "artifacts.read":
+        properties.update({
+            "artifact_id": {"type": "string"}, "content": {"type": "string"},
+            "offset": {"type": "integer"}, "next_offset": {"type": "integer"},
+            "truncated": {"type": "boolean"},
+        })
+    return {"type": "object", "properties": properties, "additionalProperties": True}
+
+
+def tool_output_schema(name: str) -> dict:
+    internal = internal_tool_name(name)
+    return deepcopy(_tool_output_schemas().get(internal) or _dynamic_tool_output_schema(internal))
 
 
 # ---------------------------------------------------------------------------
