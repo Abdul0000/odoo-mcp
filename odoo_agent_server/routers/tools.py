@@ -4,15 +4,18 @@ import asyncio
 import ast
 from copy import deepcopy
 import difflib
+import inspect
 import json
 import re
+import textwrap
 import time
+import typing
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from ..auth import AuthDependency
 from ..config import settings, get_odoo_clients, normalise_client
@@ -2723,6 +2726,105 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "workflow.verify_pos_change":
         return await verify_pos_change(PosChangeVerifyRequest.model_validate(args))
     raise HTTPException(status_code=404, detail=f"Unknown tool: {name}")
+
+
+# ---------------------------------------------------------------------------
+# MCP outputSchema derivation (OpenAI/MCP 2025-06-18 "structured content"
+# recommendation: declare the shape of a tool's result so the calling model
+# doesn't have to guess it from prose). Purely static — parses _dispatch's
+# own source to see which function/method each tool's `return` calls, then
+# reads that callable's return-type annotation. Nothing is instantiated or
+# invoked; a tool whose return type can't be resolved to a pydantic model
+# (plain dict, Any, or an untraceable call) simply gets no outputSchema,
+# which is valid per the MCP spec — never a fabricated/guessed schema.
+# ---------------------------------------------------------------------------
+
+
+def _unwrap_optional_annotation(annotation: Any) -> Any:
+    origin = typing.get_origin(annotation)
+    if origin is typing.Union:
+        args = [a for a in typing.get_args(annotation) if a is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return annotation
+
+
+def _resolve_dispatch_return_annotation(node: ast.AST, namespace: dict) -> Any:
+    """Side-effect-free resolution of the return type of the function/method
+    called by a `return <expr>` branch inside _dispatch.
+
+    Modules here use `from __future__ import annotations`, so
+    inspect.signature(...).return_annotation is a string, not the class.
+    typing.get_type_hints() evaluates those forward references using the
+    target callable's own __globals__, which is what we need.
+    """
+    if not isinstance(node, ast.Call):
+        return inspect.Signature.empty
+    func_node = node.func
+    target: Any = None
+    try:
+        if isinstance(func_node, ast.Attribute):
+            base = func_node.value
+            if isinstance(base, ast.Call) and isinstance(base.func, ast.Name):
+                cls = namespace.get(base.func.id)
+                if inspect.isclass(cls):
+                    target = getattr(cls, func_node.attr, None)
+        elif isinstance(func_node, ast.Name):
+            target = namespace.get(func_node.id)
+        if callable(target):
+            hints = typing.get_type_hints(target)
+            return hints.get("return", inspect.Signature.empty)
+    except Exception:
+        pass
+    return inspect.Signature.empty
+
+
+@lru_cache(maxsize=1)
+def _tool_output_schemas() -> dict:
+    schemas: dict[str, dict] = {}
+    try:
+        source = inspect.getsource(_dispatch)
+        tree = ast.parse(textwrap.dedent(source))
+        namespace = globals()
+        func_def = tree.body[0]
+        for node in func_def.body:
+            if not isinstance(node, ast.If):
+                continue
+            test = node.test
+            if not (
+                isinstance(test, ast.Compare)
+                and isinstance(test.left, ast.Name)
+                and test.left.id == "name"
+                and len(test.ops) == 1
+                and isinstance(test.ops[0], ast.Eq)
+                and isinstance(test.comparators[0], ast.Constant)
+            ):
+                continue
+            tool_name = test.comparators[0].value
+            return_node = None
+            for stmt in node.body:
+                if isinstance(stmt, ast.Return):
+                    return_node = stmt
+            if return_node is None or return_node.value is None:
+                continue
+            value = return_node.value
+            if isinstance(value, ast.Await):
+                value = value.value
+            annotation = _unwrap_optional_annotation(
+                _resolve_dispatch_return_annotation(value, namespace)
+            )
+            if inspect.isclass(annotation) and issubclass(annotation, BaseModel):
+                try:
+                    schemas[tool_name] = annotation.model_json_schema()
+                except Exception:
+                    continue
+    except Exception:
+        return {}
+    return schemas
+
+
+def tool_output_schema(name: str) -> dict | None:
+    return deepcopy(_tool_output_schemas().get(internal_tool_name(name)))
 
 
 # ---------------------------------------------------------------------------

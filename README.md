@@ -25,6 +25,13 @@ No Codex, no CLI agent, no backend AI model, and no frontend UI are required. Th
 - `POST /tools/call`
 - `POST /mcp`
 
+`tools/list` (both `/tools/list` metadata and the MCP `tools/list` JSON-RPC
+method) includes an `outputSchema` alongside `inputSchema` for every tool
+whose result is backed by a pydantic model. This is derived statically —
+no fabricated schemas — from each tool's actual return type, so a calling
+model knows the shape of a result before parsing it. Tools that return a
+plain dict have no `outputSchema` entry, which is valid per the MCP spec.
+
 ### Self verification and workflow
 
 - `POST /qa/self-run`

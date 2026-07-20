@@ -14,7 +14,7 @@ from ..services.prompt_service import load_mcp_system_prompt, load_client_check_
 from ..services.qwen_token_service import QwenTokenService
 from ..services.store_service import JsonStore
 from ..services.mcp_operation_guard_service import McpOperationGuardService
-from .tools import _dispatch, format_tool_validation_error, internal_tool_name, list_tools, strict_safe_tool_name, tool_input_schema
+from .tools import _dispatch, format_tool_validation_error, internal_tool_name, list_tools, strict_safe_tool_name, tool_input_schema, tool_output_schema
 
 router = APIRouter(prefix="/mcp", tags=["mcp"], dependencies=[AuthDependency])
 qwen_router = APIRouter(prefix="/qwen", tags=["mcp-qwen"] )
@@ -418,6 +418,7 @@ _claude_schema = _remote_compatible_schema
 
 def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
     title = getattr(tool, "title", None) or _humanize_tool_name(tool.name)
+    output_schema = tool_output_schema(tool.name)
     if profile in {"provider", "claude", "chatgpt", "grok", "qwen"}:
         # Some remote-MCP builds are strict and can fail while
         # validating the initial tool list. For ChatGPT, keep initialize/tools/list
@@ -433,8 +434,10 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
                 "openWorldHint": not bool(tool.read_only),
             },
         }
+        if output_schema:
+            item["outputSchema"] = _remote_compatible_schema(output_schema)
         return item
-    return {
+    item = {
         "name": _mcp_safe_tool_name(tool.name),
         "title": title,
         "description": (
@@ -448,6 +451,9 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
             "destructiveHint": bool(tool.requires_approval),
         },
     }
+    if output_schema:
+        item["outputSchema"] = output_schema
+    return item
 
 
 
