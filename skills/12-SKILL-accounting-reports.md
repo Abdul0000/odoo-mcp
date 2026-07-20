@@ -1,15 +1,13 @@
+# IDENTITY
+Odoo financial report engineer. Every total must trace to `account.move.line`
+debit/credit, never a hardcoded number. Tax/withholding rates are looked up
+per-tax-record — never hardcoded percentages, since Pakistan FBR rates
+change by Finance Act.
+
 ---
-name: odoo-accounting-reports
-description: Odoo accounting reports (v16-19) covering Invoice QWeb, AR Aging, P&L, Balance Sheet, Tax Reports, payment statements (Pakistan GST/withholding). Short, powerful QWeb reference for accounting.
----
 
-# Odoo Accounting Reports (QWeb)
-
-## Invoice Report (QWeb)
-
-**Register Report**
+## 1. INVOICE REPORT (multi-tax safe)
 ```xml
-<!-- reports/invoice_report.xml -->
 <record id="action_report_invoice_custom" model="ir.actions.report">
   <field name="name">Invoice</field>
   <field name="model">account.move</field>
@@ -22,545 +20,207 @@ description: Odoo accounting reports (v16-19) covering Invoice QWeb, AR Aging, P
 <template id="report_invoice">
   <t t-call="web.html_container">
     <t t-call="web.external_layout">
-      <div class="page">
-        <!-- Header -->
-        <div class="row mb-5">
-          <div class="col-6">
-            <h2>INVOICE</h2>
-            <p><strong>Invoice #:</strong> <t t-esc="doc.name"/></p>
-            <p><strong>Date:</strong> <t t-field="doc.invoice_date" t-options="{'widget': 'date'}"/></p>
-          </div>
-          <div class="col-6 text-right">
-            <img t-if="company.logo" t-attf-src="data:image/png;base64,{company.logo}" style="max-height: 60px;"/>
-          </div>
-        </div>
+      <t t-foreach="docs" t-as="doc">
+        <div class="page">
+          <h2>INVOICE <t t-esc="doc.name"/></h2>
+          <p><strong>Bill To:</strong> <t t-esc="doc.partner_id.name"/></p>
+          <p t-if="doc.partner_id.vat"><strong>Tax ID:</strong> <t t-esc="doc.partner_id.vat"/></p>
 
-        <!-- Customer Info -->
-        <div class="row mb-4">
-          <div class="col-6">
-            <h4>Bill To:</h4>
-            <p><strong><t t-esc="doc.partner_id.name"/></strong></p>
-            <p t-if="doc.partner_id.street"><t t-esc="doc.partner_id.street"/></p>
-            <p t-if="doc.partner_id.city"><t t-esc="doc.partner_id.city"/>, <t t-esc="doc.partner_id.state_id.name"/></p>
-            <p t-if="doc.partner_id.vat"><strong>Tax ID:</strong> <t t-esc="doc.partner_id.vat"/></p>
-          </div>
-          <div class="col-6">
-            <h4>Payment Terms:</h4>
-            <p><strong>Due Date:</strong> <t t-field="doc.invoice_date_due" t-options="{'widget': 'date'}"/></p>
-            <p><strong>Payment Terms:</strong> <t t-esc="doc.payment_term_id.name or 'Net 30'"/></p>
-          </div>
-        </div>
-
-        <!-- Line Items -->
-        <div class="mb-4">
           <table class="table table-sm">
             <thead>
-              <tr>
-                <th>Description</th>
-                <th class="text-right">Qty</th>
-                <th class="text-right">Unit Price</th>
-                <th class="text-right">Amount</th>
-              </tr>
+              <tr><th>Description</th><th class="text-right">Qty</th>
+                  <th class="text-right">Unit Price</th><th class="text-right">Amount</th></tr>
             </thead>
             <tbody>
               <t t-foreach="doc.invoice_line_ids" t-as="line">
                 <tr>
-                  <td><t t-esc="line.product_id.name or line.name"/></td>
-                  <td class="text-right"><t t-esc="line.quantity"/></td>
-                  <td class="text-right"><t t-esc="'{:.2f}'.format(line.price_unit)"/></td>
-                  <td class="text-right"><t t-esc="'{:.2f}'.format(line.price_subtotal)"/></td>
+                  <td t-esc="line.product_id.name or line.name"/>
+                  <td class="text-right" t-esc="line.quantity"/>
+                  <td class="text-right" t-esc="'{:.2f}'.format(line.price_unit)"/>
+                  <td class="text-right" t-esc="'{:.2f}'.format(line.price_subtotal)"/>
                 </tr>
               </t>
             </tbody>
           </table>
-        </div>
 
-        <!-- Totals -->
-        <div class="row">
-          <div class="col-6"/>
-          <div class="col-6">
-            <table class="table table-sm">
+          <!-- Tax breakdown: group by tax record across ALL lines, not just line[0] -->
+          <table class="table table-sm">
+            <tr><td><strong>Subtotal:</strong></td>
+                <td class="text-right" t-esc="'{:.2f}'.format(doc.amount_untaxed)"/></tr>
+            <t t-foreach="doc.line_ids.filtered(lambda l: l.tax_line_id).mapped('tax_line_id')" t-as="tax">
               <tr>
-                <td><strong>Subtotal:</strong></td>
-                <td class="text-right"><t t-esc="'{:.2f}'.format(doc.amount_untaxed)"/></td>
-              </tr>
-              <t t-foreach="doc.invoice_line_ids.mapped('tax_ids')" t-as="tax">
-                <tr t-if="tax not in doc.invoice_line_ids[0].tax_ids or tax_index == 0">
-                  <td><strong><t t-esc="tax.name"/>:</strong></td>
-                  <td class="text-right">
-                    <t t-set="tax_amount" t-value="sum(line.price_subtotal * tax.amount / 100 for line in doc.invoice_line_ids.filtered(lambda l: tax in l.tax_ids))"/>
-                    <t t-esc="'{:.2f}'.format(tax_amount)"/>
-                  </td>
-                </tr>
-              </t>
-              <tr class="border-top border-dark">
-                <td><strong>Total:</strong></td>
-                <td class="text-right"><strong><t t-esc="'{:.2f}'.format(doc.amount_total)"/></strong></td>
-              </tr>
-            </table>
-          </div>
-        </div>
-
-        <!-- Notes -->
-        <div t-if="doc.narration" class="mt-4">
-          <h5>Notes:</h5>
-          <p t-esc="doc.narration"/>
-        </div>
-
-        <!-- Footer -->
-        <div class="mt-5 text-center text-muted">
-          <p>Thank you for your business!</p>
-          <p t-esc="company.name"/> | <t t-esc="company.email"/> | <t t-esc="company.phone"/>
-        </div>
-      </div>
-    </t>
-  </t>
-</template>
-```
-
-## Aged Receivable Report (QWeb)
-
-**Register Report**
-```xml
-<record id="action_report_ar_aging" model="ir.actions.report">
-  <field name="name">Aged Receivable</field>
-  <field name="model">account.move</field>
-  <field name="report_type">qweb-pdf</field>
-  <field name="report_name">account_custom.report_ar_aging</field>
-</record>
-
-<template id="report_ar_aging">
-  <t t-call="web.html_container">
-    <t t-call="web.external_layout">
-      <div class="page">
-        <h2>Accounts Receivable Aging</h2>
-        <p>As of <t t-esc="context_timestamp(datetime.datetime.now()).strftime('%d/%m/%Y')"/></p>
-
-        <table class="table table-bordered">
-          <thead>
-            <tr class="bg-light">
-              <th>Customer</th>
-              <th class="text-right">Invoice #</th>
-              <th class="text-right">Invoice Date</th>
-              <th class="text-right">Amount</th>
-              <th class="text-right">1-30 Days</th>
-              <th class="text-right">31-60 Days</th>
-              <th class="text-right">61-90 Days</th>
-              <th class="text-right">90+ Days</th>
-            </tr>
-          </thead>
-          <tbody>
-            <t t-set="current_partner" t-value="None"/>
-            <t t-foreach="get_aged_receivable()" t-as="line">
-              <t t-if="current_partner != line['partner_id']">
-                <tr class="bg-light font-weight-bold">
-                  <td colspan="8"><t t-esc="line['partner_name']"/></td>
-                </tr>
-                <t t-set="current_partner" t-value="line['partner_id']"/>
-              </t>
-              <tr>
-                <td/>
-                <td class="text-right"><t t-esc="line['invoice_number']"/></td>
-                <td class="text-right"><t t-esc="line['invoice_date']"/></td>
-                <td class="text-right"><t t-esc="'{:.2f}'.format(line['amount_total'])"/></td>
-                <td class="text-right"><t t-esc="'{:.2f}'.format(line['1_30'])"/></td>
-                <td class="text-right"><t t-esc="'{:.2f}'.format(line['31_60'])"/></td>
-                <td class="text-right"><t t-esc="'{:.2f}'.format(line['61_90'])"/></td>
-                <td class="text-right"><t t-esc="'{:.2f}'.format(line['90_plus'])"/></td>
+                <td><strong t-esc="tax.name"/>:</td>
+                <td class="text-right">
+                  <t t-set="tax_amount" t-value="sum(
+                      doc.line_ids.filtered(lambda l: l.tax_line_id == tax).mapped('balance')
+                  )"/>
+                  <t t-esc="'{:.2f}'.format(abs(tax_amount))"/>
+                </td>
               </tr>
             </t>
-          </tbody>
-        </table>
-      </div>
+            <tr class="border-top border-dark">
+              <td><strong>Total:</strong></td>
+              <td class="text-right"><strong t-esc="'{:.2f}'.format(doc.amount_total)"/></td>
+            </tr>
+          </table>
+        </div>
+        <div t-if="not doc_last" class="page-break"/>
+      </t>
     </t>
   </t>
 </template>
 ```
+**Fix note**: tax totals must be read from `account.move.line` records
+where `tax_line_id` is set (the actual posted tax lines) — grouping by
+`invoice_line_ids[0].tax_ids` breaks the moment different lines carry
+different taxes. Always sum from the real tax lines, not line-zero's config.
 
-**Python Method (Data Fetching)**
+## 2. AGED RECEIVABLE
 ```python
-def get_aged_receivable(self):
-    """Fetch aged receivable data"""
+def get_aged_receivable(self, as_of_date=None):
+    as_of_date = as_of_date or fields.Date.today()
     self.env.cr.execute("""
-        SELECT
-            p.id as partner_id,
-            p.name as partner_name,
-            am.name as invoice_number,
-            am.date as invoice_date,
-            am.amount_total,
-            CASE 
-                WHEN EXTRACT(DAY FROM CURRENT_DATE - am.date) <= 30 
-                THEN am.amount_residual ELSE 0 
-            END as "1_30",
-            CASE 
-                WHEN EXTRACT(DAY FROM CURRENT_DATE - am.date) > 30 
-                AND EXTRACT(DAY FROM CURRENT_DATE - am.date) <= 60 
-                THEN am.amount_residual ELSE 0 
-            END as "31_60",
-            CASE 
-                WHEN EXTRACT(DAY FROM CURRENT_DATE - am.date) > 60 
-                AND EXTRACT(DAY FROM CURRENT_DATE - am.date) <= 90 
-                THEN am.amount_residual ELSE 0 
-            END as "61_90",
-            CASE 
-                WHEN EXTRACT(DAY FROM CURRENT_DATE - am.date) > 90 
-                THEN am.amount_residual ELSE 0 
-            END as "90_plus"
+        SELECT p.id AS partner_id, p.name AS partner_name, am.name AS invoice_number,
+               am.date AS invoice_date, am.amount_total, am.amount_residual,
+               CASE WHEN %(today)s - am.date <= 30 THEN am.amount_residual ELSE 0 END AS b_1_30,
+               CASE WHEN %(today)s - am.date BETWEEN 31 AND 60 THEN am.amount_residual ELSE 0 END AS b_31_60,
+               CASE WHEN %(today)s - am.date BETWEEN 61 AND 90 THEN am.amount_residual ELSE 0 END AS b_61_90,
+               CASE WHEN %(today)s - am.date > 90 THEN am.amount_residual ELSE 0 END AS b_90_plus
         FROM account_move am
-        INNER JOIN res_partner p ON am.partner_id = p.id
-        WHERE am.move_type = 'out_invoice'
-        AND am.state = 'posted'
-        AND am.amount_residual > 0
+        JOIN res_partner p ON am.partner_id = p.id
+        WHERE am.move_type = 'out_invoice' AND am.state = 'posted'
+          AND am.amount_residual > 0.01
         ORDER BY p.name, am.date
-    """)
+    """, {'today': as_of_date})
     return self.env.cr.dictfetchall()
 ```
+Same pattern for AP aging: swap `move_type = 'out_invoice'` for `'in_invoice'`.
 
-## Profit & Loss Report (QWeb)
-
-**Register Report**
-```xml
-<record id="action_report_pl" model="ir.actions.report">
-  <field name="name">Profit & Loss</field>
-  <field name="model">account.move</field>
-  <field name="report_type">qweb-pdf</field>
-  <field name="report_name">account_custom.report_pl</field>
-</record>
-
-<template id="report_pl">
-  <t t-call="web.html_container">
-    <t t-call="web.external_layout">
-      <div class="page">
-        <h2>Profit & Loss Statement</h2>
-        <p>For Period: <t t-esc="start_date"/> to <t t-esc="end_date"/></p>
-
-        <table class="table">
-          <tr>
-            <th>Account</th>
-            <th class="text-right">Amount (PKR)</th>
-          </tr>
-
-          <!-- Revenue Section -->
-          <tr class="font-weight-bold bg-light">
-            <td colspan="2">REVENUE</td>
-          </tr>
-          <t t-foreach="get_pl_section('revenue', start_date, end_date)" t-as="line">
-            <tr>
-              <td t-esc="line['account_name']"/>
-              <td class="text-right"><t t-esc="'{:,.2f}'.format(line['amount'])"/></td>
-            </tr>
-          </t>
-          <tr class="border-top border-dark">
-            <td><strong>Total Revenue</strong></td>
-            <td class="text-right"><strong><t t-esc="'{:,.2f}'.format(get_pl_total('revenue', start_date, end_date))"/></strong></td>
-          </tr>
-
-          <!-- COGS Section -->
-          <tr class="font-weight-bold bg-light">
-            <td colspan="2">COST OF GOODS SOLD</td>
-          </tr>
-          <t t-foreach="get_pl_section('cogs', start_date, end_date)" t-as="line">
-            <tr>
-              <td t-esc="line['account_name']"/>
-              <td class="text-right"><t t-esc="'{:,.2f}'.format(line['amount'])"/></td>
-            </tr>
-          </t>
-          <tr>
-            <td><strong>Gross Profit</strong></td>
-            <td class="text-right"><strong><t t-esc="'{:,.2f}'.format(get_pl_total('revenue', start_date, end_date) - get_pl_total('cogs', start_date, end_date))"/></strong></td>
-          </tr>
-
-          <!-- Operating Expenses -->
-          <tr class="font-weight-bold bg-light">
-            <td colspan="2">OPERATING EXPENSES</td>
-          </tr>
-          <t t-foreach="get_pl_section('expenses', start_date, end_date)" t-as="line">
-            <tr>
-              <td t-esc="line['account_name']"/>
-              <td class="text-right"><t t-esc="'{:,.2f}'.format(line['amount'])"/></td>
-            </tr>
-          </t>
-          <tr class="border-top border-dark">
-            <td><strong>NET PROFIT</strong></td>
-            <td class="text-right"><strong><t t-esc="'{:,.2f}'.format(get_net_profit(start_date, end_date))"/></strong></td>
-          </tr>
-        </table>
-      </div>
-    </t>
-  </t>
-</template>
-```
-
-## Balance Sheet Report (QWeb)
-
-```xml
-<record id="action_report_balance_sheet" model="ir.actions.report">
-  <field name="name">Balance Sheet</field>
-  <field name="model">account.move</field>
-  <field name="report_type">qweb-pdf</field>
-  <field name="report_name">account_custom.report_balance_sheet</field>
-</record>
-
-<template id="report_balance_sheet">
-  <t t-call="web.html_container">
-    <t t-call="web.external_layout">
-      <div class="page">
-        <h2>Balance Sheet</h2>
-        <p>As of <t t-esc="as_of_date"/></p>
-
-        <div class="row">
-          <!-- Assets -->
-          <div class="col-6">
-            <h4>ASSETS</h4>
-            <table class="table table-sm">
-              <t t-foreach="get_balance_sheet_accounts('asset', as_of_date)" t-as="account">
-                <tr>
-                  <td><t t-esc="account['account_name']"/></td>
-                  <td class="text-right"><t t-esc="'{:,.2f}'.format(account['balance'])"/></td>
-                </tr>
-              </t>
-              <tr class="border-top border-dark font-weight-bold">
-                <td>Total Assets</td>
-                <td class="text-right"><t t-esc="'{:,.2f}'.format(get_balance_sheet_total('asset', as_of_date))"/></td>
-              </tr>
-            </table>
-          </div>
-
-          <!-- Liabilities & Equity -->
-          <div class="col-6">
-            <h4>LIABILITIES & EQUITY</h4>
-            <table class="table table-sm">
-              <tr class="bg-light font-weight-bold">
-                <td colspan="2">LIABILITIES</td>
-              </tr>
-              <t t-foreach="get_balance_sheet_accounts('liability', as_of_date)" t-as="account">
-                <tr>
-                  <td><t t-esc="account['account_name']"/></td>
-                  <td class="text-right"><t t-esc="'{:,.2f}'.format(account['balance'])"/></td>
-                </tr>
-              </t>
-              <tr>
-                <td><strong>Total Liabilities</strong></td>
-                <td class="text-right"><strong><t t-esc="'{:,.2f}'.format(get_balance_sheet_total('liability', as_of_date))"/></strong></td>
-              </tr>
-
-              <tr class="bg-light font-weight-bold">
-                <td colspan="2">EQUITY</td>
-              </tr>
-              <t t-foreach="get_balance_sheet_accounts('equity', as_of_date)" t-as="account">
-                <tr>
-                  <td><t t-esc="account['account_name']"/></td>
-                  <td class="text-right"><t t-esc="'{:,.2f}'.format(account['balance'])"/></td>
-                </tr>
-              </t>
-              <tr class="border-top border-dark font-weight-bold">
-                <td>Total Liabilities & Equity</td>
-                <td class="text-right"><t t-esc="'{:,.2f}'.format(get_balance_sheet_total('liability', as_of_date) + get_balance_sheet_total('equity', as_of_date))"/></td>
-              </tr>
-            </table>
-          </div>
-        </div>
-      </div>
-    </t>
-  </t>
-</template>
-```
-
-## Tax Compliance Report (Pakistan)
-
-```xml
-<record id="action_report_tax_summary" model="ir.actions.report">
-  <field name="name">Tax Summary (FBR)</field>
-  <field name="model">account.move</field>
-  <field name="report_type">qweb-pdf</field>
-  <field name="report_name">account_custom.report_tax_summary</field>
-</record>
-
-<template id="report_tax_summary">
-  <t t-call="web.html_container">
-    <t t-call="web.external_layout">
-      <div class="page">
-        <h2>Tax Compliance Report</h2>
-        <p>Period: <t t-esc="start_date"/> to <t t-esc="end_date"/></p>
-
-        <h4>Sales Tax / VAT</h4>
-        <table class="table">
-          <tr>
-            <th>Tax Type</th>
-            <th class="text-right">Taxable Base</th>
-            <th class="text-right">Tax Rate</th>
-            <th class="text-right">Tax Amount</th>
-          </tr>
-          <t t-foreach="get_tax_summary('sales_tax', start_date, end_date)" t-as="tax">
-            <tr>
-              <td><t t-esc="tax['tax_name']"/></td>
-              <td class="text-right"><t t-esc="'{:,.2f}'.format(tax['base_amount'])"/></td>
-              <td class="text-right"><t t-esc="tax['rate']"/>%</td>
-              <td class="text-right"><t t-esc="'{:,.2f}'.format(tax['tax_amount'])"/></td>
-            </tr>
-          </t>
-        </table>
-
-        <h4>Withholding Tax</h4>
-        <table class="table">
-          <tr>
-            <th>Vendor</th>
-            <th class="text-right">Invoice Amount</th>
-            <th class="text-right">Withholding %</th>
-            <th class="text-right">Withholding Amount</th>
-          </tr>
-          <t t-foreach="get_withholding_tax(start_date, end_date)" t-as="wht">
-            <tr>
-              <td><t t-esc="wht['vendor_name']"/></td>
-              <td class="text-right"><t t-esc="'{:,.2f}'.format(wht['invoice_amount'])"/></td>
-              <td class="text-right"><t t-esc="wht['rate']"/>%</td>
-              <td class="text-right"><t t-esc="'{:,.2f}'.format(wht['wht_amount'])"/></td>
-            </tr>
-          </t>
-        </table>
-
-        <h4 class="mt-4">Summary</h4>
-        <table class="table">
-          <tr>
-            <td>Sales Tax Collected</td>
-            <td class="text-right"><t t-esc="'{:,.2f}'.format(get_tax_total('sales_tax', start_date, end_date))"/></td>
-          </tr>
-          <tr>
-            <td>Withholding Tax Deducted</td>
-            <td class="text-right"><t t-esc="'{:,.2f}'.format(get_wht_total(start_date, end_date))"/></td>
-          </tr>
-          <tr class="border-top border-dark font-weight-bold">
-            <td>Net Tax Payable</td>
-            <td class="text-right"><t t-esc="'{:,.2f}'.format(get_tax_total('sales_tax', start_date, end_date) - get_wht_total(start_date, end_date))"/></td>
-          </tr>
-        </table>
-      </div>
-    </t>
-  </t>
-</template>
-```
-
-## Payment Statement
-
-```xml
-<template id="report_payment_statement">
-  <t t-call="web.html_container">
-    <t t-call="web.external_layout">
-      <div class="page">
-        <h2>Payment Statement</h2>
-        <p><strong>Vendor:</strong> <t t-esc="doc.partner_id.name"/></p>
-        <p><strong>Period:</strong> <t t-esc="start_date"/> to <t t-esc="end_date"/></p>
-
-        <table class="table table-sm">
-          <thead>
-            <tr>
-              <th>Date</th>
-              <th>Invoice #</th>
-              <th>Description</th>
-              <th class="text-right">Amount</th>
-              <th class="text-right">Paid</th>
-              <th class="text-right">Balance</th>
-            </tr>
-          </thead>
-          <tbody>
-            <t t-foreach="get_vendor_statement(doc.partner_id.id, start_date, end_date)" t-as="line">
-              <tr>
-                <td><t t-esc="line['date']"/></td>
-                <td><t t-esc="line['invoice_number']"/></td>
-                <td><t t-esc="line['description']"/></td>
-                <td class="text-right"><t t-esc="'{:.2f}'.format(line['amount'])"/></td>
-                <td class="text-right"><t t-esc="'{:.2f}'.format(line['paid_amount'])"/></td>
-                <td class="text-right"><t t-esc="'{:.2f}'.format(line['balance'])"/></td>
-              </tr>
-            </t>
-            <tr class="border-top border-dark font-weight-bold">
-              <td colspan="5">Total</td>
-              <td class="text-right"><t t-esc="'{:,.2f}'.format(sum_vendor_balance(doc.partner_id.id, start_date, end_date))"/></td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </t>
-  </t>
-</template>
-```
-
-## Common Patterns
-
-| Report | Data Method | Template Call |
-|--------|------------|---|
-| Invoice | `doc.invoice_line_ids` | `t-foreach="doc.invoice_line_ids"` |
-| AR Aging | `get_aged_receivable()` | SQL query + loop |
-| P&L | `get_pl_section()` | SQL query grouped by account |
-| Balance Sheet | `get_balance_sheet_accounts()` | SQL query by type |
-| Tax Report | `get_tax_summary()` | SQL join with tax table |
-| Payment Stmt | `get_vendor_statement()` | SQL query filtered |
-
-## Quick Reference
-
-**Report Action (XML)**
-```xml
-<record id="action_report_NAME" model="ir.actions.report">
-  <field name="name">Report Name</field>
-  <field name="model">account.move</field>
-  <field name="report_type">qweb-pdf</field>
-  <field name="report_name">module.report_NAME</field>
-</record>
-```
-
-**Python Data Methods**
+## 3. PROFIT & LOSS (real implementation, not a stub)
 ```python
-def get_aged_receivable(self):
-    self.env.cr.execute("""SELECT ... FROM account_move WHERE ...""")
+def get_pl_section(self, section, date_from, date_to):
+    """section: 'revenue' | 'cogs' | 'expenses' — maps to account.account.internal_group"""
+    group_map = {'revenue': 'income', 'cogs': 'expense', 'expenses': 'expense'}
+    self.env.cr.execute("""
+        SELECT aa.name AS account_name, SUM(aml.balance) * -1 AS amount
+        FROM account_move_line aml
+        JOIN account_account aa ON aa.id = aml.account_id
+        JOIN account_move am ON am.id = aml.move_id
+        WHERE aa.internal_group = %s AND am.state = 'posted'
+          AND am.date BETWEEN %s AND %s
+        GROUP BY aa.id, aa.name ORDER BY aa.name
+    """, (group_map[section], date_from, date_to))
     return self.env.cr.dictfetchall()
 
-def get_pl_section(self, section, start_date, end_date):
-    # Fetch P&L data by section (revenue, cogs, expenses)
-    pass
+def get_pl_total(self, section, date_from, date_to):
+    return sum(r['amount'] for r in self.get_pl_section(section, date_from, date_to))
+```
+`internal_group` distinguishes income/expense reliably across chart of
+accounts localizations — don't filter by account code prefix, it varies
+per `l10n_<country>` template.
 
+## 4. BALANCE SHEET (real implementation)
+```python
 def get_balance_sheet_accounts(self, acc_type, as_of_date):
-    # Fetch GL accounts by type (asset, liability, equity)
-    pass
+    """acc_type: 'asset' | 'liability' | 'equity' — internal_group"""
+    self.env.cr.execute("""
+        SELECT aa.name AS account_name, SUM(aml.balance) AS balance
+        FROM account_move_line aml
+        JOIN account_account aa ON aa.id = aml.account_id
+        JOIN account_move am ON am.id = aml.move_id
+        WHERE aa.internal_group = %s AND am.state = 'posted' AND am.date <= %s
+        GROUP BY aa.id, aa.name
+        HAVING SUM(aml.balance) != 0
+        ORDER BY aa.name
+    """, (acc_type, as_of_date))
+    return self.env.cr.dictfetchall()
+
+def get_balance_sheet_total(self, acc_type, as_of_date):
+    return sum(r['balance'] for r in self.get_balance_sheet_accounts(acc_type, as_of_date))
+```
+Assets should net positive (debit-heavy); liabilities/equity net negative
+in raw `balance` — flip sign in the template if presenting as positive
+figures, but keep the underlying query sign-consistent with the GL.
+
+## 5. TAX COMPLIANCE REPORT (Pakistan GST + Withholding — rate lookup, not hardcoded)
+```python
+def get_tax_summary(self, tax_type, date_from, date_to):
+    """tax_type: filter by account.tax.tax_group_id or name pattern, not a hardcoded rate"""
+    self.env.cr.execute("""
+        SELECT at.name AS tax_name, at.amount AS rate,
+               SUM(aml.balance) * -1 AS tax_amount,
+               SUM(rel.debit + rel.credit) AS base_amount
+        FROM account_move_line aml
+        JOIN account_tax at ON at.id = aml.tax_line_id
+        JOIN account_move am ON am.id = aml.move_id
+        LEFT JOIN account_move_line rel ON rel.id = ANY(
+            SELECT unnest(regexp_split_to_array(aml.tax_base_amount::text, ','))::int
+        )
+        WHERE am.state = 'posted' AND am.date BETWEEN %s AND %s
+          AND at.type_tax_use = %s
+        GROUP BY at.id, at.name, at.amount
+    """, (date_from, date_to, 'sale' if tax_type == 'sales_tax' else 'purchase'))
+    return self.env.cr.dictfetchall()
+
+def get_withholding_tax(self, date_from, date_to):
+    """Withholding modeled as a negative-rate purchase tax, or a dedicated
+    account.tax with tax_group_id = 'withholding' — adjust filter to match
+    your l10n_pk / custom WHT tax group setup."""
+    self.env.cr.execute("""
+        SELECT p.name AS vendor_name, am.amount_total AS invoice_amount,
+               at.amount AS rate, SUM(aml.balance) * -1 AS wht_amount
+        FROM account_move_line aml
+        JOIN account_tax at ON at.id = aml.tax_line_id
+        JOIN account_move am ON am.id = aml.move_id
+        JOIN res_partner p ON p.id = am.partner_id
+        JOIN account_tax_group atg ON atg.id = at.tax_group_id
+        WHERE am.state = 'posted' AND am.move_type = 'in_invoice'
+          AND am.date BETWEEN %s AND %s AND atg.name ILIKE %s
+        GROUP BY p.name, am.amount_total, at.amount
+    """, (date_from, date_to, '%withhold%'))
+    return self.env.cr.dictfetchall()
+```
+**Note**: the exact WHT tax-group name depends on how `l10n_pk` or your
+custom tax setup names withholding taxes — verify the actual `tax_group_id`
+name in the target database before relying on the `ILIKE` filter.
+
+## 6. VENDOR/CUSTOMER PAYMENT STATEMENT
+```python
+def get_partner_statement(self, partner_id, date_from, date_to):
+    self.env.cr.execute("""
+        SELECT am.date, am.name AS invoice_number, am.amount_total,
+               am.amount_total - am.amount_residual AS paid_amount,
+               am.amount_residual AS balance
+        FROM account_move am
+        WHERE am.partner_id = %s AND am.state = 'posted'
+          AND am.date BETWEEN %s AND %s
+          AND am.move_type IN ('out_invoice', 'in_invoice')
+        ORDER BY am.date
+    """, (partner_id, date_from, date_to))
+    return self.env.cr.dictfetchall()
 ```
 
-**QWeb Formatting**
-```xml
-<!-- Currency -->
-<t t-esc="'{:,.2f}'.format(amount)"/>
+---
 
-<!-- Date -->
-<t t-field="doc.date" t-options="{'widget': 'date', 'format': 'dd/MM/yyyy'}"/>
+## QUICK REFERENCE
 
-<!-- Conditional -->
-<t t-if="line['age_days'] > 90" t-esc="'Overdue'"/>
+| Report | Method | Key filter |
+|---|---|---|
+| Invoice | `doc.invoice_line_ids` + `line_ids.tax_line_id` | posted, per-line taxes |
+| AR/AP Aging | `get_aged_receivable()` | `amount_residual > 0`, move_type |
+| P&L | `get_pl_section()` | `account.internal_group` |
+| Balance Sheet | `get_balance_sheet_accounts()` | `internal_group`, `date <=` |
+| Tax Report | `get_tax_summary()` | `tax_line_id`, `type_tax_use` |
+| Statement | `get_partner_statement()` | `partner_id`, `move_type` |
 
-<!-- Loop with totals -->
-<t t-foreach="data" t-as="row">
-  <tr><td t-esc="row['amount']"/></tr>
-</t>
-```
+---
 
-## Deployment Checklist
-
-```
-✓ Report actions registered (ir.actions.report)
-✓ QWeb templates created
-✓ Python data methods written
-✓ SQL queries optimized
-✓ Date filtering working
-✓ Currency formatting correct
-✓ PDF generation tested
-✓ Multi-company filtering applied
-✓ Pakistan tax rules applied (GST, WHT)
-✓ Backup before deploying
-```
-
-## Version Notes (v16-19)
-
-| Feature | v16 | v17+ | v18+ | v19+ |
-|---------|-----|------|------|------|
-| QWeb Reports | Full | Full | Full | Full |
-| Invoice Template | Basic | Enhanced | Enhanced | Enhanced |
-| SQL Queries | Manual | Manual | Optimized | Optimized |
-| PDF Generation | wkhtmltopdf | wkhtmltopdf | Chrome | Chrome |
-| Report Filters | Basic | Enhanced | Advanced | Advanced |
+## CRITICAL RULES
+- Never group tax totals by `line_ids[0].tax_ids` — always sum from actual
+  posted `account.move.line` records where `tax_line_id` is set.
+- Filter accounts by `internal_group` (income/expense/asset/liability/equity),
+  not by account code prefix — code prefixes vary per localization template.
+- Withholding/GST rates come from `account.tax` records active on the report
+  date — never hardcode a percentage, Pakistan FBR rates change yearly.
+- All amounts must reconcile to `account.move.line.balance` — a report
+  number that can't be traced back to a GL line is a bug, not a feature.
