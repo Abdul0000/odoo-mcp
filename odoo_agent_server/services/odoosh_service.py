@@ -1171,7 +1171,7 @@ class OdooShService:
             "set +e; "
             f"cd {odoo_path}; "
             f"./odoo-bin shell -d {safe_db} --addons-path={safe_addons} --no-http --log-level=error <<'PY'\n"
-            "import base64, json, traceback\n"
+            "import ast, base64, json, os, traceback\n"
             f"payload = json.loads(base64.b64decode({payload_b64!r}).decode('utf-8'))\n"
             f"marker = {marker!r}\n"
             "try:\n"
@@ -1182,7 +1182,21 @@ class OdooShService:
             "        raise RuntimeError('Module not found after update_list: %s' % payload['module'])\n"
             "    before = module.state\n"
             "    if before == 'uninstallable':\n"
-            "        raise RuntimeError('Module remains uninstallable after update_list; inspect deployed manifest and dependency availability instead of trusting stale database state')\n"
+            f"        manifest_path = os.path.join({self._user_addons_path()!r}, payload['module'], '__manifest__.py')\n"
+            "        manifest = {}\n"
+            "        manifest_error = None\n"
+            "        try:\n"
+            "            with open(manifest_path, 'r', encoding='utf-8') as manifest_file:\n"
+            "                parsed_manifest = ast.literal_eval(manifest_file.read())\n"
+            "            manifest = parsed_manifest if isinstance(parsed_manifest, dict) else {}\n"
+            "        except Exception as manifest_exc:\n"
+            "            manifest_error = str(manifest_exc)\n"
+            "        dep_names = [str(name) for name in (manifest.get('depends') or [])]\n"
+            "        dep_rows = modules.search_read([('name', 'in', dep_names)], ['name', 'state']) if dep_names else []\n"
+            "        dep_by_name = {row['name']: row.get('state') for row in dep_rows}\n"
+            "        dependency_states = [{'name': name, 'state': dep_by_name.get(name, 'not_found')} for name in dep_names]\n"
+            "        data = {'status': 'failed', 'failure_kind': 'registry_uninstallable_after_refresh', 'module': payload['module'], 'state_before': before, 'deployed_manifest': {'path': manifest_path, 'exists': os.path.isfile(manifest_path), 'installable': manifest.get('installable', True) if manifest_error is None else None, 'depends': dep_names, 'parse_error': manifest_error}, 'dependency_states': dependency_states, 'source_repair_allowed': False, 'next_action': 'Do not edit the manifest from this state alone. If installable is true, diagnose any missing dependency or obtain the real Odoo traceback/log error first.'}\n"
+            "        raise RuntimeError('MCP_UNINSTALLABLE_DIAGNOSTIC:' + json.dumps(data, ensure_ascii=False))\n"
             "    operation = 'upgrade' if before in ('installed', 'to upgrade', 'to remove') else 'install'\n"
             "    if operation == 'upgrade':\n"
             "        module.button_immediate_upgrade()\n"
@@ -1192,7 +1206,11 @@ class OdooShService:
             "    data = {'status': 'ok', 'module': payload['module'], 'state_before': before, 'operation': operation}\n"
             "except Exception as exc:\n"
             "    env.cr.rollback()\n"
-            "    data = {'status': 'failed', 'module': payload['module'], 'error': str(exc), 'traceback': traceback.format_exc()[-12000:]}\n"
+            "    raw_error = str(exc)\n"
+            "    if raw_error.startswith('MCP_UNINSTALLABLE_DIAGNOSTIC:'):\n"
+            "        data = json.loads(raw_error.split(':', 1)[1])\n"
+            "    else:\n"
+            "        data = {'status': 'failed', 'failure_kind': 'odoo_runtime_error', 'module': payload['module'], 'error': raw_error, 'traceback': traceback.format_exc()[-12000:]}\n"
             "print(marker + json.dumps(data, ensure_ascii=False))\n"
             "PY\n"
         )
@@ -1210,10 +1228,11 @@ class OdooShService:
         except json.JSONDecodeError:
             payload = {"status": "failed", "error": "Could not parse module shell deploy result.", "raw": payload_line[-4000:]}
         if payload.get("status") != "ok" or result.exit_code != 0:
+            diagnostic = "MCP_MODULE_DEPLOY_DIAGNOSTIC:" + json.dumps(payload, ensure_ascii=False)
             return result.model_copy(update={
                 "command": ["odoosh.module_shell_deploy", module_name],
                 "exit_code": result.exit_code or 3,
-                "stderr": (result.stderr or "") + "\n" + str(payload.get("traceback") or payload.get("error") or payload),
+                "stderr": diagnostic + "\n" + str(payload.get("traceback") or payload.get("error") or ""),
             })
         prefix = f"MCP_HYBRID_DEPLOY probe=odoo_shell mode={payload.get('operation')} state={payload.get('state_before')} module={module_name}\n"
         return result.model_copy(update={

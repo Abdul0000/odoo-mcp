@@ -290,7 +290,9 @@ _TOOL_DESCRIPTORS = [
             "Immediately starts the guarded Odoo install/upgrade job without repo inspection, history lookup, "
             "skill loading, module-status prechecks, or planning. Returns job_id/next_call for jobs.get. "
             "On terminal failure, use its traceback (or odoosh.error_pack once) as evidence for "
-            "workflow.odoo_code_change; successful code repair redeploys through that composite workflow."
+            "workflow.odoo_code_change; successful code repair redeploys through that composite workflow. "
+            "An uninstallable registry state triggers a direct read of the deployed manifest and dependency states; "
+            "when source_repair_allowed=false, do not edit the manifest without a concrete source error."
         ),
         requires_approval=True,
     ),

@@ -378,6 +378,10 @@ def test_single_shell_fallback_contains_state_and_both_orm_operations(monkeypatc
     assert result.exit_code == 0
     assert "modules.update_list()" in captured["script"]
     assert "before == 'uninstallable'" in captured["script"]
+    assert "ast.literal_eval" in captured["script"]
+    assert "deployed_manifest" in captured["script"]
+    assert "dependency_states" in captured["script"]
+    assert "source_repair_allowed" in captured["script"]
     assert "button_immediate_install()" in captured["script"]
     assert "button_immediate_upgrade()" in captured["script"]
     assert "probe=odoo_shell mode=install" in result.stdout
