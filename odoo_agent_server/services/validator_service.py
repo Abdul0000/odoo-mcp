@@ -76,6 +76,8 @@ class OdooModuleValidator:
         findings.extend(self._validate_python_package_inits(module_path))
         findings.extend(self._validate_import_closure(module_path))
         findings.extend(self._validate_manifest_registration(module_path, manifest))
+        findings.extend(self._validate_implementation_completeness(module_path))
+        findings.extend(self._validate_odoo_controllers(module_path))
         findings.extend(self._validate_python_files(module_path))
         findings.extend(self._validate_xml_files(module_path))
         findings.extend(self._validate_security_csv(module_path))
@@ -649,6 +651,154 @@ class OdooModuleValidator:
                 continue
             # Fix 8: validate Odoo-specific import patterns line-by-line
             findings.extend(self._validate_odoo_imports(py_file, source))
+        return findings
+
+    @staticmethod
+    def _function_is_placeholder(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+        body = [item for item in node.body if not (
+            isinstance(item, ast.Expr)
+            and isinstance(item.value, ast.Constant)
+            and isinstance(item.value.value, str)
+        )]
+        if not body:
+            return True
+        if len(body) != 1:
+            return False
+        only = body[0]
+        if isinstance(only, ast.Pass):
+            decorator_names = {ast.unparse(item) for item in node.decorator_list}
+            return not any("abstractmethod" in name for name in decorator_names)
+        return isinstance(only, ast.Expr) and isinstance(only.value, ast.Constant) and only.value.value is Ellipsis
+
+    def _validate_implementation_completeness(self, module_path: Path) -> list[Finding]:
+        """Reject empty shells and placeholder implementations before deploy."""
+        findings: list[Finding] = []
+        excluded_parts = {"migrations", "static", "__pycache__"}
+        for py_file in module_path.rglob("*.py"):
+            relative = py_file.relative_to(module_path)
+            if any(part in excluded_parts or part.startswith(".") for part in relative.parts[:-1]):
+                continue
+            if py_file.name in {"__init__.py", "__manifest__.py", "__openerp__.py"}:
+                continue
+            source = py_file.read_text(encoding="utf-8", errors="ignore")
+            try:
+                tree = ast.parse(source, filename=str(py_file))
+            except SyntaxError:
+                continue  # The syntax validator reports the precise failure.
+            substantive = [
+                node for node in tree.body
+                if not isinstance(node, (ast.Import, ast.ImportFrom))
+                and not (
+                    isinstance(node, ast.Expr)
+                    and isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, str)
+                )
+            ]
+            if not substantive:
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="IMPLEMENTATION_FILE_EMPTY",
+                    message=f"Python implementation file contains no functional code: {relative.as_posix()}",
+                    file=str(py_file),
+                    hint="Implement the requested Odoo behavior; imports or comments alone are not a completed file.",
+                ))
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and self._function_is_placeholder(node):
+                    findings.append(Finding(
+                        severity=Severity.error,
+                        code="PLACEHOLDER_IMPLEMENTATION",
+                        message=f"Function/method is still an empty placeholder: {node.name}",
+                        file=str(py_file),
+                        line=node.lineno,
+                        hint="Replace pass/ellipsis with the requested functional implementation.",
+                    ))
+
+        for xml_file in module_path.rglob("*.xml"):
+            try:
+                root = ET.parse(xml_file).getroot()
+            except ET.ParseError:
+                continue
+            meaningful = [node for node in root.iter() if node is not root and node.tag not in {"data"}]
+            if not meaningful:
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="IMPLEMENTATION_FILE_EMPTY",
+                    message=f"XML implementation file contains no records/templates/views: {xml_file.relative_to(module_path).as_posix()}",
+                    file=str(xml_file),
+                ))
+
+        for csv_file in module_path.rglob("*.csv"):
+            rows = [line for line in csv_file.read_text(encoding="utf-8", errors="ignore").splitlines() if line.strip()]
+            if len(rows) <= 1:
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="IMPLEMENTATION_FILE_EMPTY",
+                    message=f"CSV implementation file has no data rows: {csv_file.relative_to(module_path).as_posix()}",
+                    file=str(csv_file),
+                ))
+
+        for pattern in ("*.js", "*.scss", "*.css"):
+            for asset_file in module_path.rglob(pattern):
+                source = asset_file.read_text(encoding="utf-8", errors="ignore")
+                without_comments = re.sub(r"/\*.*?\*/|//[^\r\n]*", "", source, flags=re.DOTALL).strip()
+                if without_comments:
+                    continue
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="IMPLEMENTATION_FILE_EMPTY",
+                    message=f"Frontend implementation file contains only whitespace/comments: {asset_file.relative_to(module_path).as_posix()}",
+                    file=str(asset_file),
+                ))
+        return findings
+
+    def _validate_odoo_controllers(self, module_path: Path) -> list[Finding]:
+        """Controllers must use Odoo's HTTP framework, never requests as a substitute."""
+        findings: list[Finding] = []
+        controller_files = [
+            path for folder in ("controllers", "controller")
+            for path in (module_path / folder).rglob("*.py")
+            if (module_path / folder).is_dir() and path.name != "__init__.py"
+        ]
+        if not controller_files:
+            return findings
+
+        has_controller_class = False
+        has_route = False
+        for py_file in controller_files:
+            source = py_file.read_text(encoding="utf-8", errors="ignore")
+            try:
+                tree = ast.parse(source, filename=str(py_file))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.Import, ast.ImportFrom)):
+                    imported_module = node.module if isinstance(node, ast.ImportFrom) else ""
+                    imported_names = [alias.name for alias in node.names]
+                    if (imported_module or "").startswith("requests") or any(name == "requests" or name.startswith("requests.") for name in imported_names):
+                        findings.append(Finding(
+                            severity=Severity.error,
+                            code="CONTROLLER_REQUESTS_FORBIDDEN",
+                            message="Odoo controller imports requests instead of using the Odoo HTTP controller framework.",
+                            file=str(py_file),
+                            line=node.lineno,
+                            hint="Use from odoo import http, subclass http.Controller, and expose endpoints with @http.route; keep outbound HTTP clients in a service/handler layer.",
+                        ))
+                if isinstance(node, ast.ClassDef):
+                    bases = {ast.unparse(base) for base in node.bases}
+                    has_controller_class = has_controller_class or any(base in {"http.Controller", "Controller"} for base in bases)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    decorators = {ast.unparse(item) for item in node.decorator_list}
+                    has_route = has_route or any(name.startswith(("http.route", "route")) for name in decorators)
+
+        if not has_controller_class or not has_route:
+            findings.append(Finding(
+                severity=Severity.error,
+                code="ODOO_CONTROLLER_FRAMEWORK_MISSING",
+                message="Controller package does not contain a complete Odoo http.Controller with an @http.route endpoint.",
+                file=str(module_path / "controllers"),
+                hint="Implement the endpoint with Odoo http.Controller/@http.route and use odoo.http.request/request.env for Odoo access.",
+            ))
         return findings
 
     def _validate_odoo_imports(self, py_file: Path, source: str) -> list[Finding]:

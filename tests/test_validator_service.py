@@ -159,6 +159,110 @@ def test_tests_python_folder_also_requires_init(tmp_path):
     )
 
 
+def test_import_only_and_placeholder_python_files_are_blocked(tmp_path):
+    module = tmp_path / "x_module"
+    models = module / "models"
+    models.mkdir(parents=True)
+    (module / "__init__.py").write_text("from . import models\n", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'X', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': []}", encoding="utf-8"
+    )
+    (models / "__init__.py").write_text("from . import empty, stub\n", encoding="utf-8")
+    (models / "empty.py").write_text("from odoo import models\n", encoding="utf-8")
+    (models / "stub.py").write_text("def unfinished():\n    pass\n", encoding="utf-8")
+
+    findings = OdooModuleValidator().validate(module)
+    codes = {finding.code for finding in findings}
+
+    assert "IMPLEMENTATION_FILE_EMPTY" in codes
+    assert "PLACEHOLDER_IMPLEMENTATION" in codes
+
+
+def test_empty_xml_and_header_only_csv_are_blocked(tmp_path):
+    module = tmp_path / "x_module"
+    (module / "views").mkdir(parents=True)
+    (module / "security").mkdir()
+    (module / "__init__.py").write_text("", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'X', 'version': '18.0.1.0.0', 'depends': ['base'], "
+        "'data': ['security/ir.model.access.csv', 'views/empty.xml']}", encoding="utf-8"
+    )
+    (module / "views" / "empty.xml").write_text("<odoo><data/></odoo>", encoding="utf-8")
+    (module / "security" / "ir.model.access.csv").write_text(
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n", encoding="utf-8"
+    )
+
+    findings = OdooModuleValidator().validate(module)
+    empty_files = [finding for finding in findings if finding.code == "IMPLEMENTATION_FILE_EMPTY"]
+
+    assert len(empty_files) == 2
+
+
+def test_comment_only_frontend_asset_is_blocked(tmp_path):
+    module = tmp_path / "x_module"
+    assets = module / "static" / "src" / "js"
+    assets.mkdir(parents=True)
+    (module / "__init__.py").write_text("", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'X', 'version': '18.0.1.0.0', 'depends': ['base'], "
+        "'data': [], 'assets': {'web.assets_backend': ['x_module/static/src/js/empty.js']}}",
+        encoding="utf-8",
+    )
+    (assets / "empty.js").write_text("/** @odoo-module **/\n// TODO\n", encoding="utf-8")
+
+    findings = OdooModuleValidator().validate(module)
+
+    assert any(
+        finding.code == "IMPLEMENTATION_FILE_EMPTY" and finding.file == str(assets / "empty.js")
+        for finding in findings
+    )
+
+
+def test_requests_based_controller_is_blocked(tmp_path):
+    module = tmp_path / "x_module"
+    controllers = module / "controllers"
+    controllers.mkdir(parents=True)
+    (module / "__init__.py").write_text("from . import controllers\n", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'X', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': []}", encoding="utf-8"
+    )
+    (controllers / "__init__.py").write_text("from . import api\n", encoding="utf-8")
+    (controllers / "api.py").write_text(
+        "import requests\n\ndef heartbeat(url):\n    return requests.post(url).json()\n", encoding="utf-8"
+    )
+
+    findings = OdooModuleValidator().validate(module)
+    codes = {finding.code for finding in findings}
+
+    assert "CONTROLLER_REQUESTS_FORBIDDEN" in codes
+    assert "ODOO_CONTROLLER_FRAMEWORK_MISSING" in codes
+
+
+def test_complete_odoo_http_controller_passes_controller_gate(tmp_path):
+    module = tmp_path / "x_module"
+    controllers = module / "controllers"
+    controllers.mkdir(parents=True)
+    (module / "__init__.py").write_text("from . import controllers\n", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'X', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': []}", encoding="utf-8"
+    )
+    (controllers / "__init__.py").write_text("from . import api\n", encoding="utf-8")
+    (controllers / "api.py").write_text(
+        "from odoo import http\nfrom odoo.http import request\n\n"
+        "class DeviceApi(http.Controller):\n"
+        "    @http.route('/iot/device', type='json', auth='user')\n"
+        "    def device(self):\n"
+        "        return {'count': request.env['ir.model'].search_count([])}\n",
+        encoding="utf-8",
+    )
+
+    findings = OdooModuleValidator().validate(module)
+    codes = {finding.code for finding in findings}
+
+    assert "CONTROLLER_REQUESTS_FORBIDDEN" not in codes
+    assert "ODOO_CONTROLLER_FRAMEWORK_MISSING" not in codes
+
+
 def test_detailed_iot_prompt_builds_enforceable_module_contract():
     prompt = """
     Develop a comprehensive Odoo module with all necessary files and deliverables.

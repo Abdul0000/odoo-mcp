@@ -30,6 +30,7 @@ The server workflow performs impact-based source reads, native-pattern preflight
 - Apply structural closure to complete and partial changes. Never commit or push while mandatory addon structure is incomplete.
 - Preserve the user's full requirements in `task_description`; do not replace a detailed module specification with a short summary. Before writing, follow the returned `module_contract` inventory. A complete module/MVP must implement every requested package, model, view type, endpoint, method, test, and data layer—not one representative file.
 - Handle folders dynamically, not from a fixed list: every runtime Python package needs `__init__.py`, imports for its Python children, and a parent/root import; tests and migrations follow Odoo's non-runtime conventions. Every deployable XML/CSV file and static source asset must be registered in manifest data/demo/qweb/assets. Keep dependencies, ACLs, security load order, and XML/model/action/menu references closed. Missing or ambiguous structure blocks deploy.
+- Every delivered file must contain functional implementation: imports-only/empty/pass/ellipsis Python, empty XML/CSV, and comment-only frontend assets block deployment. Controllers must use Odoo `http.Controller`, `@http.route`, and `odoo.http.request`; never use `requests` as a substitute for Odoo controller routing.
 - More than 50 files may be written in local non-deploy batches, but commit/push/deploy is allowed only after the final whole-module structure gate passes.
 
 ## CHANGE SCOPE
