@@ -1132,8 +1132,71 @@ class OdooShService:
             return self._run_module_shell_deploy(module_name, timeout_seconds)
         flag = "-u" if state in {"installed", "to upgrade", "to remove"} else "-i"
         result = self._run_module_cli(module_name, flag, timeout_seconds)
+        failure_text = f"{result.stdout}\n{result.stderr}".lower()
+        if result.exit_code != 0 and "not installable" in failure_text:
+            diagnostic = self._diagnose_deployed_manifest(module_name)
+            result = result.model_copy(update={
+                "stderr": (result.stderr or "") + "\nMCP_MODULE_DEPLOY_DIAGNOSTIC:" + json.dumps(diagnostic, ensure_ascii=False),
+            })
         prefix = f"MCP_HYBRID_DEPLOY probe=psql mode={'upgrade' if flag == '-u' else 'install'} state={state} module={module_name}\n"
         return result.model_copy(update={"command": ["odoosh.module_deploy_ssh", module_name, flag], "stdout": prefix + (result.stdout or "")})
+
+    def _diagnose_deployed_manifest(self, module_name: str) -> dict:
+        """Read deployed manifest and dependency states without starting Odoo."""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", module_name or ""):
+            return {"failure_kind": "invalid_module_name", "source_repair_allowed": False}
+        marker = "MCP_DEPLOYED_MANIFEST_JSON:"
+        script = (
+            "python3 - <<'PY'\n"
+            "import ast, json, os, subprocess\n"
+            f"base = {self._user_addons_path()!r}\n"
+            f"module = {module_name!r}\n"
+            f"database = {self._db_name()!r}\n"
+            f"marker = {marker!r}\n"
+            "path = os.path.realpath(os.path.join(base, module, '__manifest__.py'))\n"
+            "allowed = os.path.realpath(base) + os.sep\n"
+            "manifest = {}\n"
+            "parse_error = None\n"
+            "exists = path.startswith(allowed) and os.path.isfile(path)\n"
+            "try:\n"
+            "    if not exists:\n"
+            "        raise FileNotFoundError(path)\n"
+            "    with open(path, 'r', encoding='utf-8') as handle:\n"
+            "        parsed = ast.literal_eval(handle.read())\n"
+            "    if not isinstance(parsed, dict):\n"
+            "        raise ValueError('manifest is not a dictionary')\n"
+            "    manifest = parsed\n"
+            "except Exception as exc:\n"
+            "    parse_error = str(exc)\n"
+            "depends = [str(name) for name in (manifest.get('depends') or [])]\n"
+            "dependency_states = []\n"
+            "for name in depends:\n"
+            "    escaped = name.replace(chr(39), chr(39) * 2)\n"
+            "    sql = \"SELECT state FROM ir_module_module WHERE name = '%s' LIMIT 1;\" % escaped\n"
+            "    proc = subprocess.run(['psql', '-X', '-d', database, '-Atq', '-v', 'ON_ERROR_STOP=1', '-c', sql], capture_output=True, text=True)\n"
+            "    state = (proc.stdout or '').strip().splitlines()[-1] if proc.returncode == 0 and (proc.stdout or '').strip() else 'not_found'\n"
+            "    dependency_states.append({'name': name, 'state': state})\n"
+            "installable = manifest.get('installable', True) if parse_error is None else None\n"
+            "data = {'status': 'failed', 'failure_kind': 'cli_not_installable', 'module': module, 'deployed_manifest': {'path': path, 'exists': exists, 'installable': installable, 'depends': depends, 'parse_error': parse_error}, 'dependency_states': dependency_states, 'source_repair_allowed': bool(parse_error or installable is False), 'next_action': 'Use this deployed manifest evidence. Do not edit source when installable is true; resolve a missing dependency or obtain the concrete runtime traceback.'}\n"
+            "print(marker + json.dumps(data, ensure_ascii=False))\n"
+            "PY"
+        )
+        result = self.run_shell(script, timeout_seconds=30)
+        for line in reversed((result.stdout or "").splitlines()):
+            if line.startswith(marker):
+                try:
+                    parsed = json.loads(line[len(marker):])
+                    if isinstance(parsed, dict):
+                        return parsed
+                except json.JSONDecodeError:
+                    break
+        return {
+            "status": "failed",
+            "failure_kind": "deployed_manifest_diagnostic_failed",
+            "module": module_name,
+            "diagnostic_error": (result.stderr or result.stdout or "No diagnostic output")[-2000:],
+            "source_repair_allowed": False,
+        }
 
     def _module_state_via_psql(self, module_name: str) -> str | None:
         """Return module state without starting Odoo; None means probe unavailable."""

@@ -302,6 +302,67 @@ def test_odoosh_module_deploy_ssh_uses_upgrade_for_installed_module(monkeypatch)
     assert "probe=psql mode=upgrade" in result.stdout
 
 
+def test_cli_not_installable_failure_reads_deployed_manifest_before_any_repair(monkeypatch):
+    diagnostic = {
+        "failure_kind": "cli_not_installable",
+        "deployed_manifest": {"installable": True, "depends": ["base"]},
+        "dependency_states": [{"name": "base", "state": "installed"}],
+        "source_repair_allowed": False,
+    }
+    monkeypatch.setattr(OdooShService, "_module_state_via_psql", lambda self, module_name: "installed")
+    monkeypatch.setattr(
+        OdooShService,
+        "_run_module_cli",
+        lambda self, module_name, flag, timeout_seconds: CommandResult(
+            command=["odoo-bin", flag, module_name],
+            cwd="odoosh:ssh",
+            exit_code=3,
+            stderr=f"module {module_name}: not installable, skipped",
+        ),
+    )
+    calls = {"diagnose": 0}
+
+    def fake_diagnose(self, module_name):
+        calls["diagnose"] += 1
+        return diagnostic
+
+    monkeypatch.setattr(OdooShService, "_diagnose_deployed_manifest", fake_diagnose)
+
+    result = OdooShService().module_deploy_ssh("iot_device_management")
+
+    assert result.exit_code == 3
+    assert calls["diagnose"] == 1
+    assert "MCP_MODULE_DEPLOY_DIAGNOSTIC:" in result.stderr
+    assert '"installable": true' in result.stderr
+    assert '"source_repair_allowed": false' in result.stderr
+
+
+def test_deployed_manifest_diagnostic_parses_true_installable_and_dependency_states(monkeypatch):
+    service = OdooShService()
+    payload = {
+        "status": "failed",
+        "failure_kind": "cli_not_installable",
+        "module": "iot_device_management",
+        "deployed_manifest": {"installable": True, "depends": ["base"]},
+        "dependency_states": [{"name": "base", "state": "installed"}],
+        "source_repair_allowed": False,
+    }
+    monkeypatch.setattr(
+        service,
+        "run_shell",
+        lambda script, timeout_seconds=30: CommandResult(
+            command=["ssh"], cwd="odoosh:ssh", exit_code=0,
+            stdout="MCP_DEPLOYED_MANIFEST_JSON:" + __import__("json").dumps(payload),
+        ),
+    )
+
+    result = service._diagnose_deployed_manifest("iot_device_management")
+
+    assert result["deployed_manifest"]["installable"] is True
+    assert result["dependency_states"] == [{"name": "base", "state": "installed"}]
+    assert result["source_repair_allowed"] is False
+
+
 def test_odoosh_module_deploy_ssh_uses_install_for_uninstalled_module(monkeypatch):
     called = {}
 
