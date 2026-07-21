@@ -2016,6 +2016,32 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "success_allowed": False,
         }
     effective_module_name = module.module_name
+    deploy_diagnostics = state_store.load_session_state(client_name).get("module_deploy_diagnostics") or {}
+    deploy_diagnostic = deploy_diagnostics.get(effective_module_name) if isinstance(deploy_diagnostics, dict) else None
+    if isinstance(deploy_diagnostic, dict) and deploy_diagnostic.get("source_repair_allowed") is False:
+        evidence = "\n".join(str(item) for item in payload.investigation_evidence)
+        has_concrete_source_error = bool(
+            evidence.strip()
+            and re.search(r"(?:Traceback \(most recent call last\)|\b(?:ImportError|ModuleNotFoundError|ParseError|ValidationError|KeyError|AttributeError|TypeError|ValueError|AssertionError)\b)", evidence)
+        )
+        if not has_concrete_source_error:
+            return {
+                "status": "diagnosis_required",
+                "message": "SOURCE_REPAIR_BLOCKED: the deployed manifest was already read directly. Registry state alone cannot start workflow.odoo_code_change.",
+                "client_name": client_name,
+                "project_path": project_path,
+                "module_name": effective_module_name,
+                "deploy_diagnostic": deploy_diagnostic,
+                "writes_blocked": True,
+                "source_repair_allowed": False,
+                "success_allowed": False,
+                "completion_required": True,
+                "next_call": {
+                    "tool": "odoosh.error_pack",
+                    "arguments": {"client_name": client_name, "tail_lines": 500},
+                },
+                "resume_rule": "Only retry workflow.odoo_code_change when investigation_evidence contains a concrete Odoo traceback/exception. Missing dependencies must be installed, not repaired in this addon's manifest blindly.",
+            }
     current_contract = OdooModuleValidator.requested_contract(payload.task_description, payload.create_module)
     issue_fingerprint = code_change_issue_fingerprint(
         project_path=project_path,

@@ -360,6 +360,15 @@ def start_odoo_module_deploy_job(
             result = guarded or _odoo_service_for_client(client).module_deploy(payload.module_name)
         except Exception as exc:
             result = OdooResult(status="failed", error=f"Unexpected error: {exc}")
+        session_client = client.name if client else payload.client_name
+        session = store.load_session_state(session_client)
+        diagnostics = dict(session.get("module_deploy_diagnostics") or {})
+        deploy_diagnostic = result.result.get("deploy_diagnostic") if isinstance(result.result, dict) else None
+        if isinstance(deploy_diagnostic, dict):
+            diagnostics[payload.module_name] = deploy_diagnostic
+        elif result.status == "ok":
+            diagnostics.pop(payload.module_name, None)
+        store.save_session_state({"module_deploy_diagnostics": diagnostics}, client_name=session_client)
         j = store.get_job(job.id)
         store.finish_job(j, JobStatus.passed if result.status == "ok" else JobStatus.failed, result.model_dump(mode="json"))
         if approval:

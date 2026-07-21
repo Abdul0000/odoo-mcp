@@ -78,6 +78,58 @@ def test_module_deploy_falls_back_to_ssh_when_module_missing_after_update_list(m
     assert result.result["ssh"]["stdout"] == "SSH_DEPLOY_OK"
 
 
+def test_module_deploy_exposes_structured_uninstallable_diagnostic(monkeypatch):
+    diagnostic = {
+        "failure_kind": "registry_uninstallable_after_refresh",
+        "deployed_manifest": {"installable": True, "depends": ["base"]},
+        "dependency_states": [{"name": "base", "state": "installed"}],
+        "source_repair_allowed": False,
+    }
+    monkeypatch.setattr(
+        OdooShService,
+        "module_deploy_ssh",
+        lambda self, module_name, timeout_seconds=600: CommandResult(
+            command=["odoosh.module_shell_deploy", module_name],
+            cwd="odoosh:ssh",
+            exit_code=3,
+            stderr="MCP_MODULE_DEPLOY_DIAGNOSTIC:" + __import__("json").dumps(diagnostic),
+        ),
+    )
+
+    result = OdooService().module_deploy("iot_device_management")
+
+    assert result.status == "failed"
+    assert result.result["deploy_diagnostic"] == diagnostic
+
+
+def test_failed_deploy_persists_source_repair_guard(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    diagnostic = {
+        "failure_kind": "registry_uninstallable_after_refresh",
+        "deployed_manifest": {"installable": True},
+        "source_repair_allowed": False,
+    }
+    monkeypatch.setattr(
+        OdooService,
+        "module_deploy",
+        lambda self, module_name: OdooResult(
+            status="failed",
+            error="registry diagnostic",
+            result={"deploy_diagnostic": diagnostic},
+        ),
+    )
+
+    result = start_odoo_module_deploy_job(OdooModuleRequest(
+        module_name="iot_device_management",
+        wait_timeout_seconds=2,
+        poll_interval_seconds=0.25,
+    ))
+
+    assert result.status == "failed"
+    stored = JsonStore().load_session_state()["module_deploy_diagnostics"]
+    assert stored["iot_device_management"] == diagnostic
+
+
 def test_internal_module_deploy_job_does_not_require_second_approval(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     monkeypatch.setattr(settings, "require_approval", True)

@@ -280,6 +280,17 @@ class OdooService:
 
     def _command_result(self, operation: str, result: CommandResult) -> OdooResult:
         payload = {"operation": operation, "ssh": result.model_dump(mode="json")}
+        marker = "MCP_MODULE_DEPLOY_DIAGNOSTIC:"
+        for line in reversed(((result.stderr or "") + "\n" + (result.stdout or "")).splitlines()):
+            if marker not in line:
+                continue
+            try:
+                diagnostic = json.loads(line.split(marker, 1)[1])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(diagnostic, dict):
+                payload["deploy_diagnostic"] = diagnostic
+                break
         if result.exit_code == 0:
             return OdooResult(status="ok", database=self._database(), result=payload)
         return OdooResult(status="failed", database=self._database(), error=(result.stderr or result.stdout or f"{operation} failed")[-4000:], result=payload)
