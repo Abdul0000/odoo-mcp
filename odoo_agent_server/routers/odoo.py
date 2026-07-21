@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import APIRouter
 
 from ..auth import AuthDependency
@@ -365,7 +367,10 @@ def start_odoo_module_deploy_job(
         diagnostics = dict(session.get("module_deploy_diagnostics") or {})
         deploy_diagnostic = result.result.get("deploy_diagnostic") if isinstance(result.result, dict) else None
         if isinstance(deploy_diagnostic, dict):
-            diagnostics[payload.module_name] = deploy_diagnostic
+            diagnostics[payload.module_name] = {
+                **deploy_diagnostic,
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+            }
         elif result.status == "ok":
             diagnostics.pop(payload.module_name, None)
         store.save_session_state({"module_deploy_diagnostics": diagnostics}, client_name=session_client)

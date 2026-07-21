@@ -1963,6 +1963,15 @@ def _workflow_module_analyze(payload: ModuleAnalyzeRequest) -> dict[str, Any]:
     })
     return result
 
+def _is_installability_repair_request(payload: OdooCodeChangeRequest) -> bool:
+    text = " ".join(filter(None, [payload.task_description, payload.intent, payload.target_hint])).lower()
+    return bool(re.search(
+        r"(?:\bnot[ _-]?installable\b|\buninstallable\b|\binstallability\b|"
+        r"\b(?:install|upgrade)\s+(?:failure|error)\b|\brepair\b.{0,40}\bmanifest\b|\bfix\b.{0,40}\bmanifest\b)",
+        text,
+    ))
+
+
 async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     """Provider-safe composite Odoo code-change workflow.
 
@@ -2018,7 +2027,12 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     effective_module_name = module.module_name
     deploy_diagnostics = state_store.load_session_state(client_name).get("module_deploy_diagnostics") or {}
     deploy_diagnostic = deploy_diagnostics.get(effective_module_name) if isinstance(deploy_diagnostics, dict) else None
-    if isinstance(deploy_diagnostic, dict) and deploy_diagnostic.get("source_repair_allowed") is False:
+    installability_repair = _is_installability_repair_request(payload)
+    if (
+        installability_repair
+        and isinstance(deploy_diagnostic, dict)
+        and deploy_diagnostic.get("source_repair_allowed") is False
+    ):
         evidence = "\n".join(str(item) for item in payload.investigation_evidence)
         has_concrete_source_error = bool(
             evidence.strip()

@@ -1338,11 +1338,21 @@ class OdooShService:
         return self.run_shell(script, timeout_seconds=120)
 
     def _addons_path(self) -> str:
-        return ",".join([
+        odoo_path = self._odoo_path().rstrip("/")
+        source_root = odoo_path.rsplit("/", 1)[0] if "/" in odoo_path else odoo_path
+        # Odoo.sh keeps Enterprise and design themes beside the Community
+        # checkout. Omitting these paths makes an otherwise valid installed
+        # addon look uninstallable when its temporary -i/-u process builds the
+        # registry and encounters Enterprise dependencies.
+        paths = [
             f"{self._odoo_path()}/odoo/addons",
             f"{self._odoo_path()}/addons",
+            f"{source_root}/enterprise",
+            f"{source_root}/themes",
+            f"{source_root}/design-themes",
             self._user_addons_path(),
-        ])
+        ]
+        return ",".join(dict.fromkeys(path.rstrip("/") for path in paths if path))
 
     def _run_module_cli(self, module_name: str, flag: str, timeout_seconds: int) -> CommandResult:
         if flag not in {"-i", "-u"}:

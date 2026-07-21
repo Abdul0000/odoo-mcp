@@ -6,7 +6,8 @@ from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
 from odoo_agent_server.routers.odoo import start_odoo_module_deploy_job
 from odoo_agent_server.schemas import CommandResult, OdooResult
-from odoo_agent_server.schemas import OdooModuleRequest
+from odoo_agent_server.schemas import OdooCodeChangeRequest, OdooModuleRequest
+from odoo_agent_server.routers.tools import _is_installability_repair_request
 from odoo_agent_server.services.approval_service import ApprovalService
 from odoo_agent_server.services.odoo_service import OdooService
 from odoo_agent_server.services.odoosh_service import OdooShService
@@ -127,7 +128,9 @@ def test_failed_deploy_persists_source_repair_guard(monkeypatch, tmp_path):
 
     assert result.status == "failed"
     stored = JsonStore().load_session_state()["module_deploy_diagnostics"]
-    assert stored["iot_device_management"] == diagnostic
+    stored_diagnostic = stored["iot_device_management"]
+    assert {key: stored_diagnostic[key] for key in diagnostic} == diagnostic
+    assert stored_diagnostic["recorded_at"]
 
 
 def test_internal_module_deploy_job_does_not_require_second_approval(monkeypatch, tmp_path):
@@ -361,6 +364,34 @@ def test_deployed_manifest_diagnostic_parses_true_installable_and_dependency_sta
     assert result["deployed_manifest"]["installable"] is True
     assert result["dependency_states"] == [{"name": "base", "state": "installed"}]
     assert result["source_repair_allowed"] is False
+
+
+def test_temporary_odoo_process_includes_standard_enterprise_addons_paths(monkeypatch):
+    service = OdooShService()
+    monkeypatch.setattr(service, "_odoo_path", lambda: "/home/odoo/src/odoo")
+    monkeypatch.setattr(service, "_user_addons_path", lambda: "/home/odoo/src/user")
+
+    paths = service._addons_path().split(",")
+
+    assert "/home/odoo/src/odoo/odoo/addons" in paths
+    assert "/home/odoo/src/enterprise" in paths
+    assert "/home/odoo/src/themes" in paths
+    assert "/home/odoo/src/design-themes" in paths
+    assert "/home/odoo/src/user" in paths
+
+
+def test_stale_install_diagnostic_does_not_block_normal_feature_work():
+    normal = OdooCodeChangeRequest(
+        module_name="iot_device_management",
+        task_description="Add a device status field and show it in the list view",
+    )
+    repair = OdooCodeChangeRequest(
+        module_name="iot_device_management",
+        task_description="Repair the manifest because Odoo says the module is not installable",
+    )
+
+    assert _is_installability_repair_request(normal) is False
+    assert _is_installability_repair_request(repair) is True
 
 
 def test_odoosh_module_deploy_ssh_uses_install_for_uninstalled_module(monkeypatch):
