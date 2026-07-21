@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import csv
+from fnmatch import fnmatch
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -55,7 +56,7 @@ class ParsedModel:
 class OdooModuleValidator:
     """Static checks that catch common module errors before Odoo.sh build time."""
 
-    def validate(self, module_path: Path, task_description: str = "") -> list[Finding]:
+    def validate(self, module_path: Path, task_description: str = "", create_module: bool = False) -> list[Finding]:
         findings: list[Finding] = []
         findings.extend(self._validate_basic_structure(module_path))
         manifest, manifest_findings = self._read_manifest(module_path)
@@ -72,7 +73,7 @@ class OdooModuleValidator:
         findings.extend(self._validate_manifest_dependency_hints(module_path, manifest, parsed_models))
         findings.extend(self._validate_xml_references_and_order(module_path, manifest, parsed_models))
         findings.extend(self._validate_custom_view_fields(module_path, parsed_models))
-        findings.extend(self._validate_requested_features(module_path, manifest, parsed_models, task_description))
+        findings.extend(self._validate_requested_features(module_path, manifest, parsed_models, task_description, create_module))
         return findings
 
     def _validate_basic_structure(self, module_path: Path) -> list[Finding]:
@@ -143,6 +144,22 @@ class OdooModuleValidator:
                 imported.update(alias.name.split(".", 1)[0] for alias in node.names)
         return imported
 
+    @staticmethod
+    def _relative_import_targets(init_path: Path) -> set[str]:
+        try:
+            tree = ast.parse(init_path.read_text(encoding="utf-8"), filename=str(init_path))
+        except Exception:
+            return set()
+        targets: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level != 1:
+                continue
+            if node.module:
+                targets.add(node.module.split(".", 1)[0])
+            else:
+                targets.update(alias.name.split(".", 1)[0] for alias in node.names)
+        return targets
+
     def _validate_import_closure(self, module_path: Path) -> list[Finding]:
         """Require every functional Python package/file to be reachable from root."""
         findings: list[Finding] = []
@@ -172,6 +189,15 @@ class OdooModuleValidator:
                     hint=f"Create __init__.py and import: {', '.join(sorted(expected))}.",
                 ))
                 continue
+            for target in sorted(self._relative_import_targets(init_path)):
+                if not (directory / f"{target}.py").is_file() and not (directory / target / "__init__.py").is_file():
+                    findings.append(Finding(
+                        severity=Severity.error,
+                        code="PYTHON_IMPORT_TARGET_MISSING",
+                        message=f"{init_path.relative_to(module_path)} imports missing module/package: {target}",
+                        file=str(init_path),
+                        hint=f"Create {target}.py or {target}/__init__.py, or remove the invalid import.",
+                    ))
             missing = expected - self._relative_imports(init_path)
             if missing:
                 findings.append(Finding(
@@ -183,17 +209,131 @@ class OdooModuleValidator:
                 ))
         return findings
 
+    @staticmethod
+    def requested_contract(task_description: str, create_module: bool = False) -> dict:
+        text = str(task_description or "")
+        lowered = text.lower()
+        full_module = bool(
+            create_module and re.search(r"\b(?:complete|full|comprehensive|fully functional|installable)\b|\ball necessary files\b|\bdeliverables\b|\bmvp\b", lowered)
+        ) or bool(re.search(r"\b(?:complete|full|comprehensive)\s+(?:odoo\s+)?(?:module|addon)\b|\bmvp\b", lowered))
+
+        packages: list[str] = []
+        package_rules = (
+            ("controllers", ("controller", "endpoint", "route")),
+            ("iot_handlers", ("iot_handlers", "interface", "driver")),
+            ("wizard", ("wizard",)),
+            ("tests", ("unit test", "tests covering", "test coverage")),
+        )
+        for package, terms in package_rules:
+            if any(term in lowered for term in terms):
+                packages.append(package)
+        # Arbitrary technical package names requested as folders/directories
+        # are part of the contract; this is not limited to known Odoo folders.
+        non_python_folders = {"views", "security", "data", "demo", "static", "report", "reports", "i18n"}
+        for match in re.finditer(r"`?([a-z][a-z0-9_]*)`?\s+(?:folder|directory|package)\b", lowered):
+            package = match.group(1)
+            if package not in non_python_folders and package not in packages:
+                packages.append(package)
+
+        view_types = [
+            view_type for view_type, terms in (
+                ("list", ("list view", "tree view", "tree,", "tree (")),
+                ("form", ("form view", "detail view")),
+                ("search", ("search view", "advanced filtering")),
+                ("kanban", ("kanban",)),
+                ("menu", ("menu item", "menu items", "menus")),
+                ("action", ("window action", "ir.actions.act_window", "actions and menus")),
+            ) if any(term in lowered for term in terms)
+        ]
+        if "menu" in view_types and any(view_type in view_types for view_type in ("list", "form", "kanban")):
+            view_types.append("action")
+
+        layers = [
+            layer for layer, terms in (
+                ("models", ("data model", "models", "all python models", "model:")),
+                ("security", ("security", "access rights", "record rule", "user group")),
+                ("views", ("xml view", "views", "all xml views", "list view", "form view", "kanban")),
+                ("dashboard", ("dashboard",)),
+                ("demo", ("demo data",)),
+                ("automation", ("ir.cron", "scheduled action", "automation")),
+                ("controllers", ("controller", "endpoint", "route")),
+                ("handlers", ("iot_handlers", "interface", "driver")),
+                ("wizard", ("wizard",)),
+                ("tests", ("unit test", "tests covering", "test coverage")),
+            ) if any(term in lowered for term in terms)
+        ]
+        if re.search(r"\breports?\b", lowered):
+            layers.append("report")
+
+        models = sorted(set(re.findall(r"(?im)^\s*#{2,4}\s*Model:\s*`([^`]+)`", text)))
+        routes: set[str] = set()
+        for quoted in re.findall(r"`([^`]+)`", text):
+            if quoted.startswith("/"):
+                routes.add(quoted.split()[0].rstrip(".,:;"))
+            elif quoted.startswith(("http://", "https://")):
+                match = re.match(r"https?://[^/]+(/[^\s]+)", quoted)
+                if match:
+                    routes.add(match.group(1).rstrip(".,:;"))
+        for match in re.finditer(r"(?i)\b(?:GET|POST|PUT|PATCH|DELETE)\s+[`*]*(/[^`*\s:,]+)", text):
+            routes.add(match.group(1).rstrip(".,:;"))
+        methods = sorted(set(
+            match for match in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)\s*\([^`]*\)`", text)
+            if len(match) > 2
+        ))
+        return {
+            "full_module_requested": full_module,
+            "required_packages": packages,
+            "required_layers": layers,
+            "required_models": models,
+            "required_view_types": view_types,
+            "required_routes": sorted(routes),
+            "required_methods": methods,
+        }
+
     def _validate_manifest_registration(self, module_path: Path, manifest: dict) -> list[Finding]:
-        """Require deployable XML/CSV files to be registered in manifest data."""
+        """Require every deployable data/view/asset file to be in the manifest."""
         findings: list[Finding] = []
-        entries = [item.replace("\\", "/") for item in (manifest.get("data") or []) if isinstance(item, str)]
+        entries: list[str] = []
+        for key in ("data", "demo", "qweb"):
+            entries.extend(item.replace("\\", "/") for item in (manifest.get(key) or []) if isinstance(item, str))
         entry_set = set(entries)
-        structural_dirs = {"security", "views", "data", "report", "reports", "wizard", "wizards"}
+        asset_patterns: list[str] = []
+
+        def collect_assets(value: object) -> None:
+            if isinstance(value, str):
+                pattern = value.replace("\\", "/")
+                prefix = f"{module_path.name}/"
+                asset_patterns.append(pattern[len(prefix):] if pattern.startswith(prefix) else pattern)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    collect_assets(child)
+            elif isinstance(value, dict):
+                for child in value.values():
+                    collect_assets(child)
+
+        collect_assets(manifest.get("assets") or {})
+        excluded_dirs = {"tests", "test", "migrations", "upgrades", "i18n", "__pycache__"}
         for path in module_path.rglob("*"):
-            if not path.is_file() or path.suffix.lower() not in {".xml", ".csv"}:
+            if not path.is_file():
                 continue
-            rel = path.relative_to(module_path).as_posix()
-            if not path.relative_to(module_path).parts or path.relative_to(module_path).parts[0] not in structural_dirs:
+            relative = path.relative_to(module_path)
+            if any(part in excluded_dirs or part.startswith(".") for part in relative.parts):
+                continue
+            rel = relative.as_posix()
+            suffix = path.suffix.lower()
+            is_static_asset = len(relative.parts) >= 2 and relative.parts[0] == "static" and relative.parts[1] == "src" and suffix in {".js", ".xml", ".scss", ".css"}
+            if is_static_asset:
+                registered = rel in entry_set or any(fnmatch(rel, pattern) for pattern in asset_patterns)
+                if not registered:
+                    findings.append(Finding(
+                        severity=Severity.error,
+                        code="MANIFEST_ASSET_UNREGISTERED",
+                        message=f"Static source asset is not registered in manifest assets: {rel}",
+                        file=str(module_path / "__manifest__.py"),
+                        hint=f"Add '{module_path.name}/{rel}' to the correct asset bundle, or use a covering glob.",
+                    ))
+                continue
+            if relative.parts[0] == "static" or suffix not in {".xml", ".csv"}:
                 continue
             if rel not in entry_set:
                 findings.append(Finding(
@@ -203,8 +343,9 @@ class OdooModuleValidator:
                     file=str(module_path / "__manifest__.py"),
                     hint=f"Add '{rel}' to manifest data in dependency/load order.",
                 ))
-        first_non_security = next((index for index, item in enumerate(entries) if not item.startswith("security/")), len(entries))
-        late_security = [item for index, item in enumerate(entries) if item.startswith("security/") and index > first_non_security]
+        data_entries = [item.replace("\\", "/") for item in (manifest.get("data") or []) if isinstance(item, str)]
+        first_non_security = next((index for index, item in enumerate(data_entries) if not item.startswith("security/")), len(data_entries))
+        late_security = [item for index, item in enumerate(data_entries) if item.startswith("security/") and index > first_non_security]
         if late_security:
             findings.append(Finding(
                 severity=Severity.error,
@@ -220,35 +361,151 @@ class OdooModuleValidator:
         manifest: dict,
         parsed_models: dict[str, ParsedModel],
         task_description: str,
+        create_module: bool,
     ) -> list[Finding]:
-        """Block a 'complete module' response that silently omits requested layers."""
-        text = str(task_description or "").lower()
-        complete = bool(re.search(r"\b(?:complete|full)\s+(?:odoo\s+)?(?:module|addon)\b|\bmvp\b", text))
-        if not complete:
+        """Prove that generated files satisfy the original request contract."""
+        contract = self.requested_contract(task_description, create_module)
+        if not any(value for value in contract.values()):
             return []
+        text = str(task_description or "").lower()
         findings: list[Finding] = []
         entries = [item for item in (manifest.get("data") or []) if isinstance(item, str)]
-        checks = {
+        layer_checks = {
             "models": (bool(parsed_models), "models with imported Python files"),
-            "security": (any(item.startswith("security/") for item in entries), "security XML/ACL files registered in manifest"),
+            "security": (
+                any(item == "security/ir.model.access.csv" for item in entries)
+                and any(item.startswith("security/") and item.endswith(".xml") for item in entries),
+                "security XML and ACL files registered in manifest",
+            ),
             "views": (any(item.startswith(("views/", "wizard/", "wizards/")) for item in entries), "views registered in manifest"),
-            "menu": (any("menuitem" in path.read_text(encoding="utf-8", errors="ignore") for path in module_path.rglob("*.xml")), "menu XML"),
             "report": (any(item.startswith(("report/", "reports/")) for item in entries), "report files registered in manifest"),
             "dashboard": (any("dashboard" in item.lower() for item in entries) or any("dashboard" in path.name.lower() for path in module_path.rglob("*")), "dashboard implementation"),
             "demo": (bool(manifest.get("demo")), "demo files registered in manifest demo"),
             "automation": (any("ir.cron" in path.read_text(encoding="utf-8", errors="ignore") for path in module_path.rglob("*.xml")), "automation/ir.cron data"),
+            "controllers": (
+                (module_path / "controllers" / "__init__.py").is_file()
+                and any(path.name != "__init__.py" for path in (module_path / "controllers").glob("*.py")),
+                "controllers package and endpoint implementation",
+            ),
+            "handlers": (
+                (module_path / "iot_handlers" / "__init__.py").is_file()
+                and any(path.name != "__init__.py" for path in (module_path / "iot_handlers").glob("*.py")),
+                "iot_handlers package and implementation",
+            ),
+            "wizard": (
+                any((module_path / folder / "__init__.py").is_file() for folder in ("wizard", "wizards"))
+                and any(item.startswith(("wizard/", "wizards/")) for item in entries),
+                "wizard Python package and registered XML view",
+            ),
+            "tests": ((module_path / "tests").is_dir() and any((module_path / "tests").glob("test_*.py")), "unit test files"),
         }
-        for keyword, (present, requirement) in checks.items():
-            if keyword in text and not present:
+        for layer in contract["required_layers"]:
+            present, requirement = layer_checks[layer]
+            if not present:
                 findings.append(Finding(
                     severity=Severity.error,
                     code="REQUESTED_MODULE_LAYER_MISSING",
-                    message=f"Complete-module request includes '{keyword}' but the module lacks {requirement}.",
+                    message=f"Request includes '{layer}' but the module lacks {requirement}.",
                     file=str(module_path),
                     hint="Complete the requested layer before commit/push.",
                 ))
+
+        package_aliases = {"wizard": ("wizard", "wizards")}
+        for package in contract["required_packages"]:
+            choices = package_aliases.get(package, (package,))
+            if package == "tests":
+                exists = any(
+                    (module_path / choice / "__init__.py").is_file()
+                    and any((module_path / choice).glob("test_*.py"))
+                    for choice in choices
+                )
+            else:
+                exists = any(
+                    (module_path / choice / "__init__.py").is_file()
+                    and any(path.name != "__init__.py" for path in (module_path / choice).glob("*.py"))
+                    for choice in choices
+                )
+            if not exists:
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="REQUESTED_PACKAGE_MISSING",
+                    message=f"Requested package/folder is missing: {package}",
+                    file=str(module_path / choices[0]),
+                ))
+
+        for model_name in contract["required_models"]:
+            if model_name not in parsed_models:
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="REQUESTED_MODEL_MISSING",
+                    message=f"Requested model is not implemented: {model_name}",
+                    file=str(module_path / "models"),
+                ))
+
+        xml_text = "\n".join(path.read_text(encoding="utf-8", errors="ignore") for path in module_path.rglob("*.xml"))
+        view_markers = {
+            "list": ("<list", "<tree"), "form": ("<form",), "search": ("<search",),
+            "kanban": ("<kanban",), "menu": ("<menuitem",), "action": ("ir.actions.act_window",),
+        }
+        for view_type in contract["required_view_types"]:
+            if not any(marker in xml_text for marker in view_markers[view_type]):
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="REQUESTED_VIEW_TYPE_MISSING",
+                    message=f"Requested Odoo view/UI type is missing: {view_type}",
+                    file=str(module_path / "views"),
+                ))
+
+        # For explicitly named models, list/form/search coverage is checked per
+        # model instead of accepting one token view somewhere in the module.
+        per_model_types = {view_type for view_type in contract["required_view_types"] if view_type in {"list", "form", "search"}}
+        model_view_types: dict[str, set[str]] = {model: set() for model in contract["required_models"]}
+        action_models: set[str] = set()
+        for xml_path in module_path.rglob("*.xml"):
+            try:
+                root = ET.parse(xml_path).getroot()
+            except ET.ParseError:
+                continue
+            for record in root.iter("record"):
+                record_model = record.attrib.get("model")
+                if record_model == "ir.ui.view":
+                    target_model = self._get_record_field_text(record, "model")
+                    arch = self._get_record_field_node(record, "arch")
+                    if target_model in model_view_types and arch is not None:
+                        rendered = ET.tostring(arch, encoding="unicode")
+                        for view_type, markers in {"list": ("<list", "<tree"), "form": ("<form",), "search": ("<search",)}.items():
+                            if any(marker in rendered for marker in markers):
+                                model_view_types[target_model].add(view_type)
+                elif record_model == "ir.actions.act_window":
+                    target_model = self._get_record_field_text(record, "res_model")
+                    if target_model:
+                        action_models.add(target_model)
+        for model_name, present_types in model_view_types.items():
+            for missing_type in sorted(per_model_types - present_types):
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="REQUESTED_MODEL_VIEW_MISSING",
+                    message=f"Requested model {model_name} lacks a {missing_type} view.",
+                    file=str(module_path / "views"),
+                ))
+            if "action" in contract["required_view_types"] and model_name not in action_models:
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="REQUESTED_MODEL_ACTION_MISSING",
+                    message=f"Requested model {model_name} lacks an ir.actions.act_window action.",
+                    file=str(module_path / "views"),
+                ))
+
+        python_text = "\n".join(path.read_text(encoding="utf-8", errors="ignore") for path in module_path.rglob("*.py"))
+        for route in contract["required_routes"]:
+            if route not in python_text:
+                findings.append(Finding(severity=Severity.error, code="REQUESTED_ROUTE_MISSING", message=f"Requested route is missing: {route}", file=str(module_path / "controllers")))
+        for method in contract["required_methods"]:
+            if not re.search(rf"\bdef\s+{re.escape(method)}\s*\(", python_text):
+                findings.append(Finding(severity=Severity.error, code="REQUESTED_METHOD_MISSING", message=f"Requested method is missing: {method}", file=str(module_path)))
+
         functional_files = [path for path in module_path.rglob("*") if path.is_file() and path.name not in {"__init__.py", "__manifest__.py"}]
-        if not functional_files:
+        if contract["full_module_requested"] and not functional_files:
             findings.append(Finding(
                 severity=Severity.error,
                 code="COMPLETE_MODULE_EMPTY",

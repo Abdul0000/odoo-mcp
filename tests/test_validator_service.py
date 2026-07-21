@@ -101,3 +101,92 @@ def test_access_reference_preserves_underscores_in_model_name(tmp_path):
 
     findings = OdooModuleValidator().validate(module)
     assert not any(finding.code == "ACCESS_ROW_MISSING_STATIC" for finding in findings)
+
+
+def test_reverse_import_gate_blocks_imports_to_missing_packages(tmp_path):
+    module = tmp_path / "iot_device_management"
+    (module / "models").mkdir(parents=True)
+    (module / "__init__.py").write_text(
+        "from . import controllers\nfrom . import iot_handlers\nfrom . import models\nfrom . import wizard\n",
+        encoding="utf-8",
+    )
+    (module / "models" / "__init__.py").write_text("", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'IoT', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': []}",
+        encoding="utf-8",
+    )
+
+    findings = OdooModuleValidator().validate(module)
+    missing = {finding.message.rsplit(": ", 1)[-1] for finding in findings if finding.code == "PYTHON_IMPORT_TARGET_MISSING"}
+
+    assert missing == {"controllers", "iot_handlers", "wizard"}
+
+
+def test_detailed_iot_prompt_builds_enforceable_module_contract():
+    prompt = """
+    Develop a comprehensive Odoo module with all necessary files and deliverables.
+    ### Model: `iot.box`
+    ### Model: `iot.device`
+    Implement controllers and endpoints POST `/iot/v1/heartbeat` and `/iot/v1/data/<token>`.
+    Add an `iot_handlers` directory with Interface and Driver implementations.
+    Build a wizard with `execute_command()`, implement `_sync_devices()` and `action_trigger()`.
+    Add security groups, access rights and record rules, demo data, automation triggers, and unit tests.
+    Create list view, form view, search view, kanban dashboard, menu items, and window actions.
+    """
+
+    contract = OdooModuleValidator.requested_contract(prompt, create_module=True)
+
+    assert contract["full_module_requested"] is True
+    assert set(contract["required_packages"]) == {"controllers", "iot_handlers", "wizard", "tests"}
+    assert set(contract["required_models"]) == {"iot.box", "iot.device"}
+    assert {"list", "form", "search", "kanban", "menu", "action"} <= set(contract["required_view_types"])
+    assert {"security", "demo", "automation", "controllers", "handlers", "wizard", "tests"} <= set(contract["required_layers"])
+    assert set(contract["required_methods"]) == {"_sync_devices", "action_trigger", "execute_command"}
+    assert set(contract["required_routes"]) == {"/iot/v1/heartbeat", "/iot/v1/data/<token>"}
+
+
+def test_arbitrary_requested_python_package_is_discovered_dynamically():
+    contract = OdooModuleValidator.requested_contract(
+        "Create a new `device_plugins` directory with Python driver implementations.",
+        create_module=True,
+    )
+    assert "device_plugins" in contract["required_packages"]
+
+
+def test_arbitrary_xml_folder_and_static_assets_require_manifest_registration(tmp_path):
+    module = tmp_path / "x_module"
+    (module / "configuration").mkdir(parents=True)
+    (module / "static" / "src" / "js").mkdir(parents=True)
+    (module / "__init__.py").write_text("", encoding="utf-8")
+    (module / "configuration" / "device_views.xml").write_text("<odoo/>", encoding="utf-8")
+    (module / "static" / "src" / "js" / "device.js").write_text("/** @odoo-module **/\n", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'X', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': [], 'assets': {}}",
+        encoding="utf-8",
+    )
+
+    findings = OdooModuleValidator().validate(module)
+    codes = {finding.code for finding in findings}
+
+    assert "MANIFEST_FILE_UNREGISTERED" in codes
+    assert "MANIFEST_ASSET_UNREGISTERED" in codes
+
+
+def test_nested_python_packages_require_init_and_parent_imports(tmp_path):
+    module = tmp_path / "x_module"
+    plugins = module / "device_plugins"
+    drivers = plugins / "drivers"
+    drivers.mkdir(parents=True)
+    (module / "__init__.py").write_text("", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'X', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': []}",
+        encoding="utf-8",
+    )
+    (plugins / "__init__.py").write_text("", encoding="utf-8")
+    (drivers / "usb_driver.py").write_text("DRIVER = True\n", encoding="utf-8")
+
+    findings = OdooModuleValidator().validate(module)
+    codes = {finding.code for finding in findings}
+
+    assert "PYTHON_PACKAGE_INIT_MISSING" in codes
+    assert "PYTHON_IMPORT_CLOSURE_MISSING" in codes

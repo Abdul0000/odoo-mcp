@@ -28,8 +28,8 @@ The server workflow performs impact-based source reads, native-pattern preflight
 ## UNIVERSAL MODULE STRUCTURE GATE
 
 - Apply structural closure to complete and partial changes. Never commit or push while mandatory addon structure is incomplete.
-- Before writing, inventory every file required by the requested features. A complete module/MVP must implement every requested layer, not only one representative file.
-- Keep root/package `__init__.py` imports, manifest dependencies/data/assets, model ACLs, security load order, and XML/model/action/menu references closed. Missing or ambiguous mandatory structure must return exact findings and block deploy.
+- Preserve the user's full requirements in `task_description`; do not replace a detailed module specification with a short summary. Before writing, follow the returned `module_contract` inventory. A complete module/MVP must implement every requested package, model, view type, endpoint, method, test, and data layer—not one representative file.
+- Handle folders dynamically, not from a fixed list: every runtime Python package needs `__init__.py`, imports for its Python children, and a parent/root import; tests and migrations follow Odoo's non-runtime conventions. Every deployable XML/CSV file and static source asset must be registered in manifest data/demo/qweb/assets. Keep dependencies, ACLs, security load order, and XML/model/action/menu references closed. Missing or ambiguous structure blocks deploy.
 - More than 50 files may be written in local non-deploy batches, but commit/push/deploy is allowed only after the final whole-module structure gate passes.
 
 ## CHANGE SCOPE

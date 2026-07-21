@@ -83,3 +83,12 @@ def test_provider_workflow_accepts_up_to_fifty_atomic_writes():
     assert len(request.writes) == 50
     with pytest.raises(ValidationError):
         OdooCodeChangeRequest(module_name="x_module", task_description="Update module XML", writes=[*writes, writes[0]])
+
+
+def test_provider_workflow_preserves_long_module_requirements():
+    request = OdooCodeChangeRequest(
+        module_name="x_module",
+        create_module=True,
+        task_description="Build a comprehensive module. " + ("Detailed requirement. " * 300),
+    )
+    assert len(request.task_description) > 2000

@@ -118,7 +118,8 @@ class ArtifactReadRequest(BaseModel):
 
 class SelfRunRequest(BaseProjectRequest):
     module_name: str = Field(..., description="Custom module folder name inside the repo")
-    task_description: str = Field(default="", max_length=2000, description="Original task used to enforce requested complete-module features before push.")
+    task_description: str = Field(default="", max_length=20000, description="Original task used to enforce requested module features before push.")
+    create_module: bool = Field(default=False, description="Whether this task creates a new addon; used by the module contract gate.")
     run_pytest: bool = Field(default=True)
     include_git_status: bool = Field(default=True)
     timeout_seconds: int = Field(default=90, ge=5, le=600)
@@ -232,7 +233,7 @@ class OdooCodeChangeRequest(BaseModel):
     project_path: str | None = Field(default=None, description="Existing checkout path. If omitted, resolved from client_name and prepared if needed.")
     module_name: str = Field(..., description="Custom module technical name or human hint. The workflow resolves fuzzy hints against actual custom modules before using paths.")
     create_module: bool = Field(default=False, description="Create a missing addon as a direct child of the repository checkout. Requires an exact lowercase technical module_name; nested addon creation is rejected.")
-    task_description: str = Field(..., min_length=3, max_length=2000, description="Natural-language task/change request. Quoted labels, selectors, XML IDs, routes, and method names are extracted automatically for focused inspection.")
+    task_description: str = Field(..., min_length=3, max_length=20000, description="Full natural-language task/change request. Preserve detailed deliverables; identifiers, selectors, XML IDs, routes, and method names are extracted automatically for focused inspection and structure validation.")
     search_patterns: list[str] = Field(default_factory=list, max_length=10, description="Optional search terms to locate target files when writes are not yet provided")
     # Generic task-routing fields.  These are optional shortcuts; explicit writes[] remain
     # the universal path for any Odoo task (Python, XML, QWeb, JS/OWL/POS, SCSS, CSV, data).
@@ -282,7 +283,7 @@ class FrontendVisualImplementRequest(BaseModel):
     module_name: str = Field(..., description="Custom module technical name or human hint.")
     create_module: bool = Field(default=False, description="Create module_name at the repository root when it does not exist. Never creates an addon inside another addon.")
     target_area: str = Field(default="auto", max_length=80, description="Odoo frontend area: pos, dashboard, website, backend, report, or auto.")
-    design_goal: str = Field(..., min_length=3, max_length=2000, description="Natural-language visual goal, e.g. create a metallic trolley pipe border matching the reference.")
+    design_goal: str = Field(..., min_length=3, max_length=20000, description="Full natural-language visual goal and deliverables.")
     reference_images: list[str] = Field(default_factory=list, max_length=10, description="Optional local/container paths or URLs to reference screenshots/images for planning.")
     component_type: str = Field(default="auto", max_length=80, description="Visual component type: border, background, logo, icon, card, dashboard, full_ui, illustration, or auto.")
     allowed_methods: list[str] = Field(default_factory=list, max_length=10, description="Allowed implementation methods: scss, svg_asset, owl_xml, js_patch, image_asset. If omitted, the tool chooses safely.")

@@ -20,7 +20,7 @@ def self_run(payload: SelfRunRequest) -> SelfRunReport:
     commands = []
 
     validator = OdooModuleValidator()
-    findings.extend(validator.validate(module_path, task_description=payload.task_description))
+    findings.extend(validator.validate(module_path, task_description=payload.task_description, create_module=payload.create_module))
 
     project_path_valid = project_path.exists() and project_path.is_dir()
     if not project_path_valid:

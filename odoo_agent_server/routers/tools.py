@@ -132,6 +132,7 @@ from ..services.store_service import JsonStore
 from ..services.frontend_visual_service import FrontendVisualService
 from ..services.deploy_impact_service import classify_deploy_impact
 from ..services.skill_service import SkillService
+from ..services.validator_service import OdooModuleValidator
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
@@ -1835,6 +1836,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "success_allowed": False,
         }
     effective_module_name = module.module_name
+    module_contract = OdooModuleValidator.requested_contract(payload.task_description, payload.create_module)
     issue_fingerprint = code_change_issue_fingerprint(
         project_path=project_path,
         module_name=effective_module_name,
@@ -2235,6 +2237,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "generated_autopatch_reason": generated_autopatch_reason,
             "supported_autopatch_cases": ["style_rule", "text_replace"],
             "task_profile": _task_profile(payload, frontend_paths),
+            "module_contract": module_contract,
             "recommended_live_verifier": _task_profile(payload, frontend_paths).get("live_verifier"),
             "scope_advice": scope.model_dump(mode="json") if scope is not None else None,
             "frontend_preflight": frontend_preflight.model_dump(mode="json") if frontend_preflight is not None else None,
@@ -2303,6 +2306,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         client_name=client_name,
         module_name=effective_module_name,
         task_description=payload.task_description,
+        create_module=payload.create_module,
         run_pytest=False,
         include_git_status=True,
     ))
@@ -2323,6 +2327,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "git_diff": {"exit_code": diff.exit_code, "stdout": diff.stdout[-12000:], "stderr": diff.stderr[-4000:]},
             "qa": qa.model_dump(mode="json"),
             "verify_against_core": verify.model_dump(mode="json"),
+            "module_contract": module_contract,
             "module_structure_complete": False,
             "success_allowed": False,
             "completion_required": True,
@@ -2455,7 +2460,7 @@ async def _workflow_frontend_visual_implement(payload: FrontendVisualImplementRe
         project_path=payload.project_path,
         module_name=payload.module_name,
         create_module=payload.create_module,
-        task_description=description[:2000],
+        task_description=description[:20000],
         task_type="scss_css" if visual_plan.get("implementation_type") in {"svg_asset", "scss"} else "js_owl",
         intent="frontend_visual_implement",
         target_hint=payload.css_selector or payload.component_type,
@@ -2874,6 +2879,7 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             "already_deployed_confirmed": {"type": "boolean"}, "terminal_action": {"type": "string"},
             "writes_required": {"type": "boolean"}, "inspection": {"type": "object", "additionalProperties": True},
             "module_structure_complete": {"type": "boolean"},
+            "module_contract": {"type": "object", "additionalProperties": True},
         })
     elif internal.startswith("repo."):
         properties.update({
