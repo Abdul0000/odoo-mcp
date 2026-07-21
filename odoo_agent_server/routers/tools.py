@@ -1278,6 +1278,43 @@ def _infer_code_change_search_patterns(payload: OdooCodeChangeRequest) -> list[s
     return patterns[:10]
 
 
+def _analysis_index_target_paths(analysis: dict[str, Any] | None, payload: OdooCodeChangeRequest) -> list[str]:
+    """Rank exact custom files from the cached module-analysis evidence."""
+    if not isinstance(analysis, dict):
+        return []
+    patterns = [item.lower() for item in _infer_code_change_search_patterns(payload) if len(item.strip()) >= 3]
+    task_type = _normalized_task_type(payload)
+    folder_hints: set[str] = set()
+    if task_type in {"python_model", "model", "orm", "field"}:
+        folder_hints.add("models")
+    elif task_type in {"controller", "route", "api"}:
+        folder_hints.update({"controllers", "controller"})
+    elif task_type in {"xml_view", "qweb_template", "data_xml", "security_csv"}:
+        folder_hints.update({"views", "security", "data", "report", "reports", "wizard", "wizards"})
+    elif task_type in {"js_owl", "pos_owl", "scss_css", "style"}:
+        folder_hints.add("static")
+
+    ranked: list[tuple[float, str]] = []
+    for item in analysis.get("source_evidence") or []:
+        path = str(item.get("path") or "").replace("\\", "/")
+        if not path:
+            continue
+        content = str(item.get("content") or "").lower()
+        path_lower = path.lower()
+        first = path_lower.split("/", 1)[0]
+        score = 2.0 if first in folder_hints else 0.0
+        for pattern in patterns:
+            if pattern in path_lower:
+                score += 4.0
+            if pattern in content:
+                technical = any(char in pattern for char in ("_", ".", "/", "#", "[", "]"))
+                score += 3.0 if technical else 1.0
+        if score > 0:
+            ranked.append((score, path))
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+    return [path for _, path in ranked[:8]]
+
+
 def _file_preview(content: str, max_chars: int = 6000) -> str:
     if len(content) <= max_chars:
         return content
@@ -2005,6 +2042,32 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     manifest_abs = project / manifest_rel
     steps.append({"step": "repo.list_custom_modules", "status": "ok", "module": effective_module_name, "module_path": module.path, "module_resolution": module_resolution})
 
+    # For ordinary inspect-then-write requests, reuse the same local architecture
+    # cache as workflow.module_analyze. Explicit writes/targets already provide a
+    # faster deterministic path and do not need a whole-module index.
+    analysis_index: dict[str, Any] | None = None
+    analysis_source_cache: dict[str, dict[str, Any]] = {}
+    if not payload.writes and not payload.target_files:
+        analysis_index = ModuleAnalysisService().analyze(
+            project=project,
+            module_path=module_dir,
+            module_name=effective_module_name,
+            analysis_goal=payload.task_description,
+            max_files=50,
+            max_total_chars=12000,
+        )
+        analysis_source_cache = {
+            f"{module.path.rstrip('/')}/{str(item.get('path') or '').lstrip('/')}": item
+            for item in analysis_index.get("source_evidence") or []
+            if item.get("path")
+        }
+        steps.append({
+            "step": "workflow.module_analyze.index",
+            "status": "cached" if analysis_index.get("cache_hit") else "built",
+            "files": analysis_index.get("inventory", {}).get("returned_files", 0),
+            "git_sha": analysis_index.get("git_sha"),
+        })
+
     # 3) Read custom manifest + target/custom files.  This also records gate evidence.
     custom_rel_paths: list[str] = [manifest_rel]
     for raw in payload.target_files:
@@ -2045,6 +2108,21 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                             focused_match_lines[rel].append(line)
 
         if not focused_paths:
+            cached_targets = _analysis_index_target_paths(analysis_index, payload)
+            for module_rel in cached_targets:
+                rel = f"{module.path.rstrip('/')}/{module_rel.lstrip('/')}"
+                if (project / rel).is_file() and rel not in focused_paths:
+                    focused_paths.append(rel)
+            if focused_paths:
+                search_results.append({
+                    "engine": "module_analysis_cache",
+                    "status": "ok",
+                    "confidence": 0.9,
+                    "target_count": len(focused_paths),
+                    "paths": focused_paths[:8],
+                })
+
+        if not focused_paths:
             try:
                 graph_search = OdooCodeSearchService().search(
                     project_path=project_path,
@@ -2070,7 +2148,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
 
         # Preserve the old lexical search as a bounded fallback only when the
         # Odoo graph cannot produce confident target files.
-        graph_result = next((item for item in search_results if item.get("engine") == "odoo_code_graph"), {})
+        graph_result = next((item for item in search_results if item.get("engine") in {"module_analysis_cache", "odoo_code_graph"}), {})
         discovery_ok = bool(direct_targets and focused_paths) or (
             bool(focused_paths) and float(graph_result.get("confidence") or 0) >= 0.45
         )
@@ -2131,8 +2209,18 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                     "preview": "\n\n... focused match window ...\n\n".join(str(item["content"]) for item in range_reads),
                 })
             else:
-                content = _read_text_safe(target)
-                custom_reads.append({"relative_path": rel, "status": "read", "read_mode": "file_preview", "size": target.stat().st_size, "preview": _file_preview(content, 3000)})
+                cached_source = analysis_source_cache.get(rel)
+                if cached_source is not None:
+                    custom_reads.append({
+                        "relative_path": rel,
+                        "status": "read",
+                        "read_mode": "module_analysis_cache",
+                        "size": target.stat().st_size,
+                        "preview": _file_preview(str(cached_source.get("content") or ""), 3000),
+                    })
+                else:
+                    content = _read_text_safe(target)
+                    custom_reads.append({"relative_path": rel, "status": "read", "read_mode": "file_preview", "size": target.stat().st_size, "preview": _file_preview(content, 3000)})
         except UnicodeDecodeError:
             custom_reads.append({"relative_path": rel, "status": "binary_skipped"})
     steps.append({"step": "repo.read_custom", "status": "ok", "count": len([r for r in custom_reads if r.get("status") == "read"])})

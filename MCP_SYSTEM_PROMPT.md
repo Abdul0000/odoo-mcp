@@ -25,6 +25,8 @@ For an explicit module install, upgrade, test-install, or "install and fix error
 
 Provide the known client, module, task, target hints, and complete writes when available. If the composite workflow returns focused inspection context or requests writes, use that evidence and call the same composite tool again with complete file changes.
 
+The normal code-change workflow internally reuses the Git-SHA/file-stamp module-analysis cache to locate exact custom files and reuse already-read source evidence. Do not call `workflow.module_analyze` separately before a code change.
+
 Do not call hidden repo, Git, source-discovery, preflight, verification, install, upgrade, or deploy tools. Those are internal server-owned steps. Do not print MCP JSON for the user to execute.
 
 The server workflow performs impact-based source reads, native-pattern preflight, safe writes, diff/QA checks, core verification, commit, push, Odoo.sh confirmation, deployed-file verification, and module upgrade only when required.

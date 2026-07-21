@@ -2,6 +2,7 @@ from pathlib import Path
 
 from odoo_agent_server.routers.tools import (
     _build_safe_generic_autopatch,
+    _analysis_index_target_paths,
     _focused_search,
     _infer_code_change_search_patterns,
     _rank_core_directory_files,
@@ -96,6 +97,26 @@ def test_unique_quoted_text_replacement_is_single_call_deterministic(tmp_path):
     assert writes[0].relative_path == "custom_sale/views/sale.xml"
     assert writes[0].search == "Old label"
     assert writes[0].replace == "New label"
+
+
+def test_cached_analysis_targets_exact_controller_without_graph_scan():
+    analysis = {
+        "source_evidence": [
+            {"path": "models/device.py", "content": "class Device: pass"},
+            {"path": "controllers/api.py", "content": "@http.route('/iot/v1/heartbeat')\ndef heartbeat(): return True"},
+            {"path": "views/device_views.xml", "content": "<form><field name='name'/></form>"},
+        ]
+    }
+    payload = _payload(
+        "Fix route `/iot/v1/heartbeat` in the device API controller",
+        task_type="controller",
+        target_hint="/iot/v1/heartbeat",
+    )
+
+    paths = _analysis_index_target_paths(analysis, payload)
+
+    assert paths[0] == "controllers/api.py"
+    assert "models/device.py" not in paths
 
 
 def test_ambiguous_or_complex_task_keeps_two_pass_flow(tmp_path):
