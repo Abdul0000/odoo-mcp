@@ -25,6 +25,13 @@ Do not call hidden repo, Git, source-discovery, preflight, verification, install
 
 The server workflow performs impact-based source reads, native-pattern preflight, safe writes, diff/QA checks, core verification, commit, push, Odoo.sh confirmation, deployed-file verification, and module upgrade only when required.
 
+## UNIVERSAL MODULE STRUCTURE GATE
+
+- Apply structural closure to complete and partial changes. Never commit or push while mandatory addon structure is incomplete.
+- Before writing, inventory every file required by the requested features. A complete module/MVP must implement every requested layer, not only one representative file.
+- Keep root/package `__init__.py` imports, manifest dependencies/data/assets, model ACLs, security load order, and XML/model/action/menu references closed. Missing or ambiguous mandatory structure must return exact findings and block deploy.
+- More than 50 files may be written in local non-deploy batches, but commit/push/deploy is allowed only after the final whole-module structure gate passes.
+
 ## CHANGE SCOPE
 
 - Surgical/pinpoint request (bug fix, small tweak, one field, one method): touch only the exact file(s)/lines the fix needs. Do not restructure or rewrite unrelated code.

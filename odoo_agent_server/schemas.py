@@ -118,6 +118,7 @@ class ArtifactReadRequest(BaseModel):
 
 class SelfRunRequest(BaseProjectRequest):
     module_name: str = Field(..., description="Custom module folder name inside the repo")
+    task_description: str = Field(default="", max_length=2000, description="Original task used to enforce requested complete-module features before push.")
     run_pytest: bool = Field(default=True)
     include_git_status: bool = Field(default=True)
     timeout_seconds: int = Field(default=90, ge=5, le=600)

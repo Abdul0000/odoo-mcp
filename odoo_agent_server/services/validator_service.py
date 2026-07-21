@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import csv
+import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,12 +55,14 @@ class ParsedModel:
 class OdooModuleValidator:
     """Static checks that catch common module errors before Odoo.sh build time."""
 
-    def validate(self, module_path: Path) -> list[Finding]:
+    def validate(self, module_path: Path, task_description: str = "") -> list[Finding]:
         findings: list[Finding] = []
         findings.extend(self._validate_basic_structure(module_path))
         manifest, manifest_findings = self._read_manifest(module_path)
         findings.extend(manifest_findings)
         findings.extend(self._validate_manifest_files(module_path, manifest))
+        findings.extend(self._validate_import_closure(module_path))
+        findings.extend(self._validate_manifest_registration(module_path, manifest))
         findings.extend(self._validate_python_files(module_path))
         findings.extend(self._validate_xml_files(module_path))
         findings.extend(self._validate_security_csv(module_path))
@@ -69,6 +72,7 @@ class OdooModuleValidator:
         findings.extend(self._validate_manifest_dependency_hints(module_path, manifest, parsed_models))
         findings.extend(self._validate_xml_references_and_order(module_path, manifest, parsed_models))
         findings.extend(self._validate_custom_view_fields(module_path, parsed_models))
+        findings.extend(self._validate_requested_features(module_path, manifest, parsed_models, task_description))
         return findings
 
     def _validate_basic_structure(self, module_path: Path) -> list[Finding]:
@@ -82,7 +86,7 @@ class OdooModuleValidator:
             findings.append(Finding(severity=Severity.error, code="MISSING_MANIFEST", message="Missing __manifest__.py", file=str(manifest)))
         init_file = module_path / "__init__.py"
         if not init_file.exists():
-            findings.append(Finding(severity=Severity.warning, code="MISSING_INIT", message="Missing __init__.py", file=str(init_file), hint="Most Odoo modules should have __init__.py even if it is empty."))
+            findings.append(Finding(severity=Severity.error, code="MISSING_INIT", message="Missing mandatory __init__.py", file=str(init_file), hint="Create __init__.py before commit/push."))
         return findings
 
     def _read_manifest(self, module_path: Path) -> tuple[dict, list[Finding]]:
@@ -100,7 +104,7 @@ class OdooModuleValidator:
         findings: list[Finding] = []
         for required_key in ("name", "version", "depends"):
             if required_key not in manifest:
-                findings.append(Finding(severity=Severity.warning if required_key == "version" else Severity.error, code="MANIFEST_MISSING_KEY", message=f"Manifest is missing key: {required_key}", file=str(manifest_path)))
+                findings.append(Finding(severity=Severity.error, code="MANIFEST_MISSING_KEY", message=f"Manifest is missing mandatory key: {required_key}", file=str(manifest_path)))
         depends = manifest.get("depends", [])
         if not isinstance(depends, list) or not all(isinstance(dep, str) for dep in depends):
             findings.append(Finding(severity=Severity.error, code="MANIFEST_BAD_DEPENDS", message="Manifest 'depends' must be a list of module technical names.", file=str(manifest_path)))
@@ -121,6 +125,136 @@ class OdooModuleValidator:
                 target = module_path / rel_path
                 if not target.exists():
                     findings.append(Finding(severity=Severity.error, code="MANIFEST_FILE_MISSING", message=f"Manifest references missing file: {rel_path}", file=str(manifest_path), hint="Create the file or remove it from the manifest."))
+        return findings
+
+    @staticmethod
+    def _relative_imports(init_path: Path) -> set[str]:
+        try:
+            tree = ast.parse(init_path.read_text(encoding="utf-8"), filename=str(init_path))
+        except Exception:
+            return set()
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level < 1:
+                continue
+            if node.module:
+                imported.add(node.module.split(".", 1)[0])
+            else:
+                imported.update(alias.name.split(".", 1)[0] for alias in node.names)
+        return imported
+
+    def _validate_import_closure(self, module_path: Path) -> list[Finding]:
+        """Require every functional Python package/file to be reachable from root."""
+        findings: list[Finding] = []
+        excluded = {"tests", "test", "migrations", "static", "__pycache__"}
+        directories = [module_path]
+        directories.extend(
+            path for path in module_path.rglob("*")
+            if path.is_dir() and not any(part in excluded or part.startswith(".") for part in path.relative_to(module_path).parts)
+        )
+        for directory in directories:
+            py_modules = sorted(path.stem for path in directory.glob("*.py") if path.name not in {"__init__.py", "__manifest__.py", "__openerp__.py"})
+            child_packages = sorted(
+                child.name for child in directory.iterdir()
+                if child.is_dir() and child.name not in excluded and not child.name.startswith(".")
+                and any(path.is_file() and path.suffix == ".py" for path in child.rglob("*.py"))
+            )
+            expected = set(py_modules + child_packages)
+            if not expected:
+                continue
+            init_path = directory / "__init__.py"
+            if not init_path.is_file():
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="PYTHON_PACKAGE_INIT_MISSING",
+                    message=f"Python package is missing __init__.py: {directory.relative_to(module_path)}",
+                    file=str(init_path),
+                    hint=f"Create __init__.py and import: {', '.join(sorted(expected))}.",
+                ))
+                continue
+            missing = expected - self._relative_imports(init_path)
+            if missing:
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="PYTHON_IMPORT_CLOSURE_MISSING",
+                    message=f"{init_path.relative_to(module_path)} does not import: {', '.join(sorted(missing))}",
+                    file=str(init_path),
+                    hint="Add relative imports before commit/push.",
+                ))
+        return findings
+
+    def _validate_manifest_registration(self, module_path: Path, manifest: dict) -> list[Finding]:
+        """Require deployable XML/CSV files to be registered in manifest data."""
+        findings: list[Finding] = []
+        entries = [item.replace("\\", "/") for item in (manifest.get("data") or []) if isinstance(item, str)]
+        entry_set = set(entries)
+        structural_dirs = {"security", "views", "data", "report", "reports", "wizard", "wizards"}
+        for path in module_path.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in {".xml", ".csv"}:
+                continue
+            rel = path.relative_to(module_path).as_posix()
+            if not path.relative_to(module_path).parts or path.relative_to(module_path).parts[0] not in structural_dirs:
+                continue
+            if rel not in entry_set:
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="MANIFEST_FILE_UNREGISTERED",
+                    message=f"Module file is not registered in manifest data: {rel}",
+                    file=str(module_path / "__manifest__.py"),
+                    hint=f"Add '{rel}' to manifest data in dependency/load order.",
+                ))
+        first_non_security = next((index for index, item in enumerate(entries) if not item.startswith("security/")), len(entries))
+        late_security = [item for index, item in enumerate(entries) if item.startswith("security/") and index > first_non_security]
+        if late_security:
+            findings.append(Finding(
+                severity=Severity.error,
+                code="MANIFEST_SECURITY_ORDER",
+                message=f"Security files must load before views/data: {', '.join(late_security)}",
+                file=str(module_path / "__manifest__.py"),
+            ))
+        return findings
+
+    def _validate_requested_features(
+        self,
+        module_path: Path,
+        manifest: dict,
+        parsed_models: dict[str, ParsedModel],
+        task_description: str,
+    ) -> list[Finding]:
+        """Block a 'complete module' response that silently omits requested layers."""
+        text = str(task_description or "").lower()
+        complete = bool(re.search(r"\b(?:complete|full)\s+(?:odoo\s+)?(?:module|addon)\b|\bmvp\b", text))
+        if not complete:
+            return []
+        findings: list[Finding] = []
+        entries = [item for item in (manifest.get("data") or []) if isinstance(item, str)]
+        checks = {
+            "models": (bool(parsed_models), "models with imported Python files"),
+            "security": (any(item.startswith("security/") for item in entries), "security XML/ACL files registered in manifest"),
+            "views": (any(item.startswith(("views/", "wizard/", "wizards/")) for item in entries), "views registered in manifest"),
+            "menu": (any("menuitem" in path.read_text(encoding="utf-8", errors="ignore") for path in module_path.rglob("*.xml")), "menu XML"),
+            "report": (any(item.startswith(("report/", "reports/")) for item in entries), "report files registered in manifest"),
+            "dashboard": (any("dashboard" in item.lower() for item in entries) or any("dashboard" in path.name.lower() for path in module_path.rglob("*")), "dashboard implementation"),
+            "demo": (bool(manifest.get("demo")), "demo files registered in manifest demo"),
+            "automation": (any("ir.cron" in path.read_text(encoding="utf-8", errors="ignore") for path in module_path.rglob("*.xml")), "automation/ir.cron data"),
+        }
+        for keyword, (present, requirement) in checks.items():
+            if keyword in text and not present:
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="REQUESTED_MODULE_LAYER_MISSING",
+                    message=f"Complete-module request includes '{keyword}' but the module lacks {requirement}.",
+                    file=str(module_path),
+                    hint="Complete the requested layer before commit/push.",
+                ))
+        functional_files = [path for path in module_path.rglob("*") if path.is_file() and path.name not in {"__init__.py", "__manifest__.py"}]
+        if not functional_files:
+            findings.append(Finding(
+                severity=Severity.error,
+                code="COMPLETE_MODULE_EMPTY",
+                message="Complete-module request produced only scaffold files and no functional implementation.",
+                file=str(module_path),
+            ))
         return findings
 
     # Fix 8: Odoo-specific wrong-import patterns that pass Python syntax but fail at runtime.
@@ -247,19 +381,20 @@ class OdooModuleValidator:
         return findings
 
     def _validate_missing_access(self, module_path: Path, parsed_models: dict[str, ParsedModel]) -> list[Finding]:
-        access_models: set[str] = set()
+        access_model_refs: set[str] = set()
         for csv_file in self._iter_files(module_path, "ir.model.access.csv"):
             with csv_file.open(newline="", encoding="utf-8") as handle:
                 for row in csv.DictReader(handle):
                     model_ref = row.get("model_id:id") or ""
                     if model_ref.startswith("model_"):
-                        access_models.add(model_ref[6:].replace("_", "."))
+                        access_model_refs.add(model_ref)
         findings: list[Finding] = []
         for model_name, model in sorted(parsed_models.items()):
             if model.inherited_model or model.transient:
                 continue
-            if model_name not in access_models:
-                findings.append(Finding(severity=Severity.warning, code="ACCESS_ROW_MISSING_STATIC", message=f"No access row found for custom model {model_name}.", file=str(model.file) if model.file else None, hint=f"Add model_{model_name.replace('.', '_')} to security/ir.model.access.csv unless it is intentionally private."))
+            expected_ref = f"model_{model_name.replace('.', '_')}"
+            if expected_ref not in access_model_refs:
+                findings.append(Finding(severity=Severity.error, code="ACCESS_ROW_MISSING_STATIC", message=f"No access row found for custom model {model_name}.", file=str(model.file) if model.file else None, hint=f"Add model_{model_name.replace('.', '_')} to security/ir.model.access.csv. New persistent models cannot be pushed without explicit access control."))
         return findings
 
     def _validate_manifest_dependency_hints(self, module_path: Path, manifest: dict, parsed_models: dict[str, ParsedModel]) -> list[Finding]:

@@ -2298,10 +2298,14 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if deploy_impact.impact == "asset_only":
-        qa = OdooResult(status="ok", result={"skipped": True, "reason": "asset-only fast path uses focused syntax/core verification"})
-    else:
-        qa = self_run(SelfRunRequest(project_path=project_path, client_name=client_name, module_name=effective_module_name, run_pytest=False, include_git_status=True))
+    qa = self_run(SelfRunRequest(
+        project_path=project_path,
+        client_name=client_name,
+        module_name=effective_module_name,
+        task_description=payload.task_description,
+        run_pytest=False,
+        include_git_status=True,
+    ))
     verify = verify_against_core(SyntaxVerifyRequest(written_files=written_files_abs, project_path=project_path, client_name=client_name, fix_cycle=0))
     steps.append({"step": "git.diff", "status": "ok" if diff.exit_code == 0 else "failed", "exit_code": diff.exit_code})
     steps.append({"step": "qa.self_run", "status": qa.status})
@@ -2319,6 +2323,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "git_diff": {"exit_code": diff.exit_code, "stdout": diff.stdout[-12000:], "stderr": diff.stderr[-4000:]},
             "qa": qa.model_dump(mode="json"),
             "verify_against_core": verify.model_dump(mode="json"),
+            "module_structure_complete": False,
             "success_allowed": False,
             "completion_required": True,
         }
@@ -2333,6 +2338,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "steps": steps,
             "write_results": write_results,
             "verify_against_core": verify.model_dump(mode="json"),
+            "module_structure_complete": True,
             "success_allowed": False,
             "completion_required": True,
         }
@@ -2405,6 +2411,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "source_deployed": False,
         "module_upgraded": False,
         "core_verified": not verify.push_blocked,
+        "module_structure_complete": True,
         "frontend_touched": frontend_touched,
         "allowed_summary": "Code was written and verified; deploy is running. Do not claim pushed/deployed/upgraded until jobs.get returns terminal passed with deploy_confirmed=true.",
         "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}} if job_id else None,
@@ -2866,6 +2873,7 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             "tool_exit_allowed": {"type": "boolean"}, "deploy_confirmed": {"type": "boolean"},
             "already_deployed_confirmed": {"type": "boolean"}, "terminal_action": {"type": "string"},
             "writes_required": {"type": "boolean"}, "inspection": {"type": "object", "additionalProperties": True},
+            "module_structure_complete": {"type": "boolean"},
         })
     elif internal.startswith("repo."):
         properties.update({

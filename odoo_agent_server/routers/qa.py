@@ -20,7 +20,7 @@ def self_run(payload: SelfRunRequest) -> SelfRunReport:
     commands = []
 
     validator = OdooModuleValidator()
-    findings.extend(validator.validate(module_path))
+    findings.extend(validator.validate(module_path, task_description=payload.task_description))
 
     project_path_valid = project_path.exists() and project_path.is_dir()
     if not project_path_valid:
@@ -89,5 +89,6 @@ def self_run(payload: SelfRunRequest) -> SelfRunReport:
             "infos": sum(1 for item in findings if item.severity == Severity.info),
             "commands_run": len(commands),
             "project_path_valid": project_path_valid,
+            "module_structure_complete": error_count == 0,
         },
     )

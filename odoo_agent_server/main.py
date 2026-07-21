@@ -83,7 +83,7 @@ def agent_instructions() -> dict:
             "rules": [
                 "Select and validate the client before any coding workflow when multiple clients exist.",
                 "Load only the matching skill with skills.read; never preload all skill bodies.",
-                "For code changes call workflow.odoo_code_change. For explicit visual asset generation call workflow.frontend_visual_implement.",
+                "For code changes call workflow.odoo_code_change. For explicit visual asset generation call workflow.frontend_visual_implement. Complete and partial changes must pass the universal module-structure gate before any commit/push.",
                 "Do not call hidden repo, Git, source-discovery, verification, or deploy tools; the composite workflow owns those steps.",
                 "When a response returns next_call or a running status, use jobs.get or workflow.resume_job until terminal.",
                 "Retry diagnosed failures at most three times; never blind retry or restart a completed workflow.",
