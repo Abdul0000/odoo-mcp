@@ -4,6 +4,7 @@ import ast
 import csv
 from fnmatch import fnmatch
 import re
+import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,6 +73,7 @@ class OdooModuleValidator:
         findings.extend(self._validate_basic_structure(module_path))
         manifest, manifest_findings = self._read_manifest(module_path)
         findings.extend(manifest_findings)
+        findings.extend(self._validate_manifest_version_unchanged(module_path, manifest))
         findings.extend(self._validate_manifest_files(module_path, manifest))
         findings.extend(self._validate_python_package_inits(module_path))
         findings.extend(self._validate_import_closure(module_path))
@@ -141,6 +143,53 @@ class OdooModuleValidator:
                 if not target.exists():
                     findings.append(Finding(severity=Severity.error, code="MANIFEST_FILE_MISSING", message=f"Manifest references missing file: {rel_path}", file=str(manifest_path), hint="Create the file or remove it from the manifest."))
         return findings
+
+    def _validate_manifest_version_unchanged(self, module_path: Path, manifest: dict) -> list[Finding]:
+        """Existing addons may never mutate the manifest version."""
+        manifest_path = module_path / "__manifest__.py"
+        if not manifest_path.is_file():
+            return []
+        try:
+            root_result = subprocess.run(
+                ["git", "-C", str(module_path), "rev-parse", "--show-toplevel"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if root_result.returncode != 0:
+                return []
+            repo_root = Path(root_result.stdout.strip()).resolve()
+            relative_manifest = manifest_path.resolve().relative_to(repo_root).as_posix()
+            baseline_result = subprocess.run(
+                ["git", "-C", str(repo_root), "show", f"HEAD:{relative_manifest}"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return []
+        # An untracked/new addon has no baseline version and may set its initial version.
+        if baseline_result.returncode != 0:
+            return []
+        try:
+            baseline = ast.literal_eval(baseline_result.stdout)
+        except (SyntaxError, ValueError):
+            return []
+        if not isinstance(baseline, dict):
+            return []
+        baseline_version = baseline.get("version")
+        current_version = manifest.get("version")
+        if baseline_version == current_version:
+            return []
+        return [Finding(
+            severity=Severity.error,
+            code="MANIFEST_VERSION_CHANGED",
+            message=f"Manifest version must remain unchanged: {baseline_version!r} -> {current_version!r}.",
+            file=str(manifest_path),
+            hint=f"Restore the existing version exactly to {baseline_version!r}; version changes are forbidden for connector code tasks.",
+        )]
 
     @staticmethod
     def _relative_imports(init_path: Path) -> set[str]:

@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 from odoo_agent_server.schemas import Severity
 from odoo_agent_server.services.validator_service import OdooModuleValidator
@@ -261,6 +262,45 @@ def test_complete_odoo_http_controller_passes_controller_gate(tmp_path):
 
     assert "CONTROLLER_REQUESTS_FORBIDDEN" not in codes
     assert "ODOO_CONTROLLER_FRAMEWORK_MISSING" not in codes
+
+
+def test_existing_manifest_version_change_is_blocked(tmp_path):
+    repo = tmp_path / "repo"
+    module = repo / "x_module"
+    module.mkdir(parents=True)
+    (module / "__init__.py").write_text("", encoding="utf-8")
+    manifest = module / "__manifest__.py"
+    manifest.write_text(
+        "{'name': 'X', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': []}", encoding="utf-8"
+    )
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "baseline"], cwd=repo, check=True, capture_output=True)
+    manifest.write_text(
+        "{'name': 'X', 'version': '18.0.2.0.0', 'depends': ['base'], 'data': []}", encoding="utf-8"
+    )
+
+    findings = OdooModuleValidator().validate(module)
+
+    assert any(finding.code == "MANIFEST_VERSION_CHANGED" for finding in findings)
+
+
+def test_new_untracked_module_may_set_initial_manifest_version(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    module = repo / "new_module"
+    module.mkdir()
+    (module / "__init__.py").write_text("", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'New', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': []}", encoding="utf-8"
+    )
+
+    findings = OdooModuleValidator().validate(module)
+
+    assert not any(finding.code == "MANIFEST_VERSION_CHANGED" for finding in findings)
 
 
 def test_detailed_iot_prompt_builds_enforceable_module_contract():
