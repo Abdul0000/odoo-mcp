@@ -269,6 +269,33 @@ class OdooCodeChangeRequest(BaseModel):
         return value
 
 
+class ModuleAnalyzeRequest(BaseModel):
+    """Fast read-only custom-addon architecture analysis."""
+    client_name: str | None = Field(default=None, description="Validated ODOO_CLIENTS entry")
+    project_path: str | None = Field(default=None, description="Existing checkout; client path is used when omitted")
+    module_name: str = Field(..., description="Custom addon technical name or safe human hint")
+    module_hint: str | None = Field(default=None, max_length=200, description="Optional alternate addon hint")
+    analysis_goal: str = Field(default="Explain architecture, use cases, and practical gaps", min_length=3, max_length=4000)
+    max_files: int = Field(default=50, ge=5, le=50, description="Maximum relevant module files to return")
+    max_total_chars: int = Field(default=12000, ge=4000, le=12000, description="Bounded source evidence character budget")
+    search_patterns: list[str] = Field(default_factory=list, max_length=10)
+    target_files: list[str] = Field(default_factory=list, max_length=20)
+
+    @property
+    def task_description(self) -> str:
+        return self.analysis_goal
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe_or_hint(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
+
+
 
 
 class FrontendVisualImplementRequest(BaseModel):

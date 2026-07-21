@@ -35,6 +35,7 @@ from ..schemas import (
     MenuCrawlerRequest,
     CodingTaskPlanRequest,
     OdooCodeChangeRequest,
+    ModuleAnalyzeRequest,
     FrontendVisualImplementRequest,
     EmptyRequest,
     SkillListRequest,
@@ -133,6 +134,7 @@ from ..services.frontend_visual_service import FrontendVisualService
 from ..services.deploy_impact_service import classify_deploy_impact
 from ..services.skill_service import SkillService
 from ..services.validator_service import OdooModuleValidator
+from ..services.module_analysis_service import ModuleAnalysisService
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
@@ -268,6 +270,17 @@ _TOOL_DESCRIPTORS = [
             "An exact quoted replacement that occurs once can complete in one call; ambiguous or complex work returns focused context for a second call with exact writes."
         ),
         requires_approval=True,
+    ),
+    ToolDescriptor(
+        name="workflow.module_analyze",
+        title="Analyze custom module fast",
+        description=(
+            "DIRECT READ-ONLY FAST PATH for explaining a custom addon's architecture, behavior, use cases, "
+            "security, workflows, and practical gaps. Reads the cached local checkout once, prioritizes manifest/init/models/controllers/security/views/data/tests, "
+            "returns bounded source evidence plus parsed architecture and validator gaps, and caches by Git SHA + file stamp. "
+            "Never prepares/pulls the repo, reads Odoo core/Odoo.sh, runs QA, deploys, or retries broad inspection."
+        ),
+        read_only=True,
     ),
     ToolDescriptor(
         name="workflow.module_install_and_check",
@@ -708,6 +721,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.capability_check": EmptyRequest,
     "workflow.coding_task_plan": CodingTaskPlanRequest,
     "workflow.odoo_code_change": OdooCodeChangeRequest,
+    "workflow.module_analyze": ModuleAnalyzeRequest,
     "workflow.module_install_and_check": OdooModuleRequest,
     "workflow.frontend_visual_implement": FrontendVisualImplementRequest,
     "workflow.smart_tool_router": SmartToolRouteRequest,
@@ -1865,6 +1879,51 @@ def _contract_continuation_task(task_description: str, module_name: str) -> str:
         "The connector retained the original complete requirements; implement every returned contract item and finding."
     )
 
+
+def _workflow_module_analyze(payload: ModuleAnalyzeRequest) -> dict[str, Any]:
+    """Analyze one custom addon locally without entering the coding pipeline."""
+    client = ClientResolverService().resolve_client(
+        client_name=payload.client_name,
+        project_path=payload.project_path,
+        require_complete=False,
+    )
+    effective_client_name = payload.client_name or (client.name if client else None)
+    if effective_client_name:
+        ClientGateService().require_validated_client(effective_client_name, "workflow.module_analyze")
+    project_path = payload.project_path or (client.path if client else None)
+    if not project_path:
+        raise HTTPException(status_code=400, detail="client_name or project_path is required for workflow.module_analyze")
+    repo = RepoService()
+    project = repo.project(project_path)
+    if not project.is_dir():
+        raise HTTPException(status_code=404, detail=f"Existing checkout not found: {project}")
+    modules = repo.list_custom_modules(str(project), max_depth=5, include_uninstallable=True)
+    module, resolution = _resolve_fuzzy_module(payload, modules)
+    if not module:
+        return {
+            "status": "module_not_found",
+            "project_path": str(project),
+            "module_resolution": resolution,
+            "available_modules": [item.module_name for item in modules[:50]],
+            "success_allowed": False,
+            "completion_required": False,
+        }
+    module_path = project / module.path
+    result = ModuleAnalysisService().analyze(
+        project=project,
+        module_path=module_path,
+        module_name=module.module_name,
+        analysis_goal=payload.analysis_goal,
+        max_files=payload.max_files,
+        max_total_chars=payload.max_total_chars,
+    )
+    result.update({
+        "client_name": effective_client_name,
+        "project_path": str(project),
+        "module_resolution": resolution,
+    })
+    return result
+
 async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     """Provider-safe composite Odoo code-change workflow.
 
@@ -2667,6 +2726,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return coding_task_plan(CodingTaskPlanRequest.model_validate(args))
     if name == "workflow.odoo_code_change":
         return await _workflow_odoo_code_change(OdooCodeChangeRequest.model_validate(args))
+    if name == "workflow.module_analyze":
+        return _workflow_module_analyze(ModuleAnalyzeRequest.model_validate(args))
     if name == "workflow.module_install_and_check":
         return odoo_module_deploy(OdooModuleRequest.model_validate(_force_mcp_async_deploy_args(args)))
     if name == "workflow.frontend_visual_implement":
@@ -3019,6 +3080,18 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             "validated": {"type": "boolean"}, "client_name": {"type": "string"},
             "coding_ready": {"type": "boolean"}, "deploy_ready": {"type": "boolean"},
             "summary": {"type": "string"},
+        })
+    elif internal == "workflow.module_analyze":
+        properties.update({
+            "module_name": {"type": "string"}, "project_path": {"type": "string"},
+            "git_sha": {"type": "string"}, "cache_hit": {"type": "boolean"},
+            "analysis_goal": {"type": "string"}, "manifest": {"type": "object", "additionalProperties": True},
+            "inventory": {"type": "object", "additionalProperties": True},
+            "architecture": {"type": "object", "additionalProperties": True},
+            "validator_findings": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "source_evidence": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "complete_for_analysis": {"type": "boolean"}, "completion_required": {"type": "boolean"},
+            "success_allowed": {"type": "boolean"}, "inspection_instructions": {"type": "string"},
         })
     elif internal.startswith("workflow."):
         properties.update({
