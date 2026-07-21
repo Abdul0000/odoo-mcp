@@ -122,6 +122,43 @@ def test_reverse_import_gate_blocks_imports_to_missing_packages(tmp_path):
     assert missing == {"controllers", "iot_handlers", "wizard"}
 
 
+def test_controller_python_file_requires_controller_init(tmp_path):
+    module = tmp_path / "iot_device_management"
+    controllers = module / "controllers"
+    controllers.mkdir(parents=True)
+    (module / "__init__.py").write_text("", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'IoT', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': []}",
+        encoding="utf-8",
+    )
+    (controllers / "api.py").write_text("from odoo import http\n", encoding="utf-8")
+
+    findings = OdooModuleValidator().validate(module)
+    missing = [finding for finding in findings if finding.code == "PYTHON_PACKAGE_INIT_MISSING"]
+
+    assert len(missing) == 1
+    assert missing[0].file == str(controllers / "__init__.py")
+
+
+def test_tests_python_folder_also_requires_init(tmp_path):
+    module = tmp_path / "iot_device_management"
+    tests = module / "tests"
+    tests.mkdir(parents=True)
+    (module / "__init__.py").write_text("", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'IoT', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': []}",
+        encoding="utf-8",
+    )
+    (tests / "test_device.py").write_text("def test_device():\n    assert True\n", encoding="utf-8")
+
+    findings = OdooModuleValidator().validate(module)
+
+    assert any(
+        finding.code == "PYTHON_PACKAGE_INIT_MISSING" and finding.file == str(tests / "__init__.py")
+        for finding in findings
+    )
+
+
 def test_detailed_iot_prompt_builds_enforceable_module_contract():
     prompt = """
     Develop a comprehensive Odoo module with all necessary files and deliverables.

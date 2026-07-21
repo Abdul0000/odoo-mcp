@@ -73,6 +73,7 @@ class OdooModuleValidator:
         manifest, manifest_findings = self._read_manifest(module_path)
         findings.extend(manifest_findings)
         findings.extend(self._validate_manifest_files(module_path, manifest))
+        findings.extend(self._validate_python_package_inits(module_path))
         findings.extend(self._validate_import_closure(module_path))
         findings.extend(self._validate_manifest_registration(module_path, manifest))
         findings.extend(self._validate_python_files(module_path))
@@ -192,13 +193,7 @@ class OdooModuleValidator:
                 continue
             init_path = directory / "__init__.py"
             if not init_path.is_file():
-                findings.append(Finding(
-                    severity=Severity.error,
-                    code="PYTHON_PACKAGE_INIT_MISSING",
-                    message=f"Python package is missing __init__.py: {directory.relative_to(module_path)}",
-                    file=str(init_path),
-                    hint=f"Create __init__.py and import: {', '.join(sorted(expected))}.",
-                ))
+                # Reported by the independent file-driven package invariant.
                 continue
             for target in sorted(self._relative_import_targets(init_path)):
                 if not (directory / f"{target}.py").is_file() and not (directory / target / "__init__.py").is_file():
@@ -218,6 +213,46 @@ class OdooModuleValidator:
                     file=str(init_path),
                     hint="Add relative imports before commit/push.",
                 ))
+        return findings
+
+    def _validate_python_package_inits(self, module_path: Path) -> list[Finding]:
+        """Every addon directory containing Python source must be a package.
+
+        This is deliberately file-driven and independent from import-closure
+        inference, so standard folders such as controllers/wizard/tests and
+        arbitrary nested packages cannot be skipped accidentally.
+        """
+        findings: list[Finding] = []
+        exempt_parts = {"migrations", "static", "__pycache__"}
+        directories: set[Path] = set()
+        for py_file in module_path.rglob("*.py"):
+            try:
+                relative_parts = py_file.relative_to(module_path).parts
+            except ValueError:
+                continue
+            if any(part in exempt_parts or part.startswith(".") for part in relative_parts[:-1]):
+                continue
+            if py_file.name in {"__init__.py", "__manifest__.py", "__openerp__.py"}:
+                continue
+            directories.add(py_file.parent)
+
+        for directory in sorted(directories, key=lambda item: item.as_posix()):
+            init_path = directory / "__init__.py"
+            if init_path.is_file():
+                continue
+            python_children = sorted(
+                path.stem for path in directory.glob("*.py")
+                if path.name not in {"__init__.py", "__manifest__.py", "__openerp__.py"}
+            )
+            rel = directory.relative_to(module_path)
+            display = "." if not rel.parts else rel.as_posix()
+            findings.append(Finding(
+                severity=Severity.error,
+                code="PYTHON_PACKAGE_INIT_MISSING",
+                message=f"Python source folder is missing mandatory __init__.py: {display}",
+                file=str(init_path),
+                hint=f"Create {display}/__init__.py and import: {', '.join(python_children)}.",
+            ))
         return findings
 
     @staticmethod
