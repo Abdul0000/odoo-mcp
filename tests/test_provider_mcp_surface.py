@@ -1,8 +1,11 @@
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
 from odoo_agent_server.routers.mcp import provider_tool_names_safe
+from odoo_agent_server.schemas import OdooCodeChangeRequest, OdooCodeFileChange
 
 _PROVIDER_TOOLS = {
     "connector_health",
@@ -68,3 +71,15 @@ def test_provider_mcp_workflow_schema_contains_autopatch_fields():
         if isinstance(value, dict)
     ]
     assert all(len(description) <= 80 for description in descriptions)
+
+
+def test_provider_workflow_accepts_up_to_fifty_atomic_writes():
+    tools = _mcp_tools_list()
+    workflow = next(tool for tool in tools if tool["name"] == "workflow_odoo_code_change")
+    assert workflow["inputSchema"]["properties"]["writes"]["maxItems"] == 50
+
+    writes = [OdooCodeFileChange(relative_path=f"x_module/views/view_{index}.xml", content="<odoo/>") for index in range(50)]
+    request = OdooCodeChangeRequest(module_name="x_module", task_description="Update module XML", writes=writes)
+    assert len(request.writes) == 50
+    with pytest.raises(ValidationError):
+        OdooCodeChangeRequest(module_name="x_module", task_description="Update module XML", writes=[*writes, writes[0]])

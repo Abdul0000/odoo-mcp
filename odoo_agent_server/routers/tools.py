@@ -1872,7 +1872,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         ))
         if direct_targets:
             search_results.append({"engine": "direct_target", "status": "ok", "target_count": len(direct_targets)})
-            for target_rel in direct_targets[:20]:
+            for target_rel in direct_targets[:50]:
                 if not (project / target_rel).is_file():
                     search_results.append({"engine": "direct_target", "status": "missing", "path": target_rel})
                     continue
@@ -1943,7 +1943,9 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
 
     custom_file_paths_abs: list[str] = []
     custom_reads: list[dict[str, Any]] = []
-    for rel in list(dict.fromkeys(custom_rel_paths))[:30]:
+    # One manifest plus up to 50 requested target/write paths. Keep this cap in
+    # sync with OdooCodeChangeRequest so accepted writes are never left unread.
+    for rel in list(dict.fromkeys(custom_rel_paths))[:51]:
         target = project / rel
         if not target.exists() or not target.is_file():
             custom_reads.append({"relative_path": rel, "status": "missing"})
@@ -2223,7 +2225,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "project_path": project_path,
             "module_name": effective_module_name,
             "steps": steps,
-            "custom_reads": custom_reads[:20],
+            "custom_reads": custom_reads[:50],
             "search_results": search_results[:10],
             "task_type": _normalized_task_type(payload),
             "intent": payload.intent,
