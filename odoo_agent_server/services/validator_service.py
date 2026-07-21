@@ -56,6 +56,11 @@ class ParsedModel:
 class OdooModuleValidator:
     """Static checks that catch common module errors before Odoo.sh build time."""
 
+    _NON_PACKAGE_WORDS = {
+        "root", "extension", "python", "module", "addon", "source", "code",
+        "file", "files", "structure", "custom", "base", "odoo",
+    }
+
     def validate(
         self,
         module_path: Path,
@@ -226,7 +231,7 @@ class OdooModuleValidator:
         packages: list[str] = []
         package_rules = (
             ("controllers", ("controller", "endpoint", "route")),
-            ("iot_handlers", ("iot_handlers", "interface", "driver")),
+            ("iot_handlers", ("iot_handlers",)),
             ("wizard", ("wizard",)),
             ("tests", ("unit test", "tests covering", "test coverage")),
         )
@@ -236,9 +241,15 @@ class OdooModuleValidator:
         # Arbitrary technical package names requested as folders/directories
         # are part of the contract; this is not limited to known Odoo folders.
         non_python_folders = {"views", "security", "data", "demo", "static", "report", "reports", "i18n"}
-        for match in re.finditer(r"`?([a-z][a-z0-9_]*)`?\s+(?:folder|directory|package)\b", lowered):
+        explicit_packages = list(re.finditer(r"`([a-z][a-z0-9_]*)`\s+(?:folder|directory|package)\b", lowered))
+        explicit_packages.extend(re.finditer(
+            r"\b(?:create|add|include|implement|build)\s+(?:(?:a|an|the)\s+)?(?:new\s+)?"
+            r"([a-z][a-z0-9_]*_[a-z0-9_]+)\s+(?:folder|directory|package)\b",
+            lowered,
+        ))
+        for match in explicit_packages:
             package = match.group(1)
-            if package not in non_python_folders and package not in packages:
+            if package not in non_python_folders and package not in OdooModuleValidator._NON_PACKAGE_WORDS and package not in packages:
                 packages.append(package)
 
         view_types = [
@@ -317,6 +328,8 @@ class OdooModuleValidator:
                     continue
                 for value in contract.get(key) or []:
                     item = str(value).strip()
+                    if key == "required_packages" and item.lower() in OdooModuleValidator._NON_PACKAGE_WORDS:
+                        continue
                     if item and item not in merged[key]:
                         merged[key].append(item)
         return merged

@@ -153,6 +153,29 @@ def test_arbitrary_requested_python_package_is_discovered_dynamically():
     assert "device_plugins" in contract["required_packages"]
 
 
+def test_unquoted_explicit_technical_folder_is_discovered_dynamically():
+    contract = OdooModuleValidator.requested_contract(
+        "Add a new device_plugins folder with the concrete drivers.",
+        create_module=True,
+    )
+    assert "device_plugins" in contract["required_packages"]
+
+
+def test_prose_words_are_not_inferred_as_python_packages():
+    contract = OdooModuleValidator.requested_contract(
+        "Keep the module root clean, implement this Python extension, and preserve the existing source package layout.",
+        create_module=False,
+    )
+    assert contract["required_packages"] == []
+
+
+def test_merge_contracts_removes_legacy_false_positive_packages():
+    contract = OdooModuleValidator.merge_contracts({
+        "required_packages": ["root", "extension", "python", "device_plugins"],
+    })
+    assert contract["required_packages"] == ["device_plugins"]
+
+
 def test_arbitrary_xml_folder_and_static_assets_require_manifest_registration(tmp_path):
     module = tmp_path / "x_module"
     (module / "configuration").mkdir(parents=True)
