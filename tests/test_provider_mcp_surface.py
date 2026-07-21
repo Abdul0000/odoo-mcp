@@ -14,6 +14,7 @@ _PROVIDER_TOOLS = {
     "client_check",
     "workflow_agent_instructions",
     "workflow_odoo_code_change",
+    "workflow_module_install_and_check",
     "workflow_frontend_visual_implement",
     "odoo_query",
     "odoo_search_read",
@@ -83,6 +84,35 @@ def test_provider_workflow_accepts_up_to_fifty_atomic_writes():
     assert len(request.writes) == 50
     with pytest.raises(ValidationError):
         OdooCodeChangeRequest(module_name="x_module", task_description="Update module XML", writes=[*writes, writes[0]])
+
+
+def test_provider_install_fast_path_dispatches_without_planning(monkeypatch):
+    captured = {}
+
+    async def fake_dispatch(name, arguments):
+        captured["name"] = name
+        captured["arguments"] = arguments
+        return {"status": "running", "job_id": "install-job", "next_call": {"tool": "jobs.get"}}
+
+    monkeypatch.setattr("odoo_agent_server.routers.mcp._dispatch", fake_dispatch)
+    client = TestClient(app)
+    response = client.post(
+        "/mcp",
+        headers={"Authorization": f"Bearer {settings.api_token}"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "workflow_module_install_and_check",
+                "arguments": {"client_name": "Test 18", "module_name": "iot_device_management"},
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["name"] == "workflow.module_install_and_check"
+    assert captured["arguments"]["module_name"] == "iot_device_management"
 
 
 def test_provider_workflow_preserves_long_module_requirements():

@@ -92,6 +92,7 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "odoo-crm-pipeline-development",
         "odoo-helpdesk-development",
         "workflow.odoo_code_change",
+        "workflow.module_install_and_check",
         "workflow.frontend_visual_implement",
         "workflow.resume_job",
         "jobs.get",

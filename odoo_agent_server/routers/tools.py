@@ -270,6 +270,18 @@ _TOOL_DESCRIPTORS = [
         requires_approval=True,
     ),
     ToolDescriptor(
+        name="workflow.module_install_and_check",
+        title="Install module and check errors",
+        description=(
+            "DIRECT FAST PATH for an explicit install, upgrade, or install-and-fix request. "
+            "Immediately starts the guarded Odoo install/upgrade job without repo inspection, history lookup, "
+            "skill loading, module-status prechecks, or planning. Returns job_id/next_call for jobs.get. "
+            "On terminal failure, use its traceback (or odoosh.error_pack once) as evidence for "
+            "workflow.odoo_code_change; successful code repair redeploys through that composite workflow."
+        ),
+        requires_approval=True,
+    ),
+    ToolDescriptor(
         name="workflow.frontend_visual_implement",
         title="Implement frontend visual asset",
         description=(
@@ -696,6 +708,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.capability_check": EmptyRequest,
     "workflow.coding_task_plan": CodingTaskPlanRequest,
     "workflow.odoo_code_change": OdooCodeChangeRequest,
+    "workflow.module_install_and_check": OdooModuleRequest,
     "workflow.frontend_visual_implement": FrontendVisualImplementRequest,
     "workflow.smart_tool_router": SmartToolRouteRequest,
     "workflow.repo_index": RepoIndexRequest,
@@ -2654,6 +2667,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return coding_task_plan(CodingTaskPlanRequest.model_validate(args))
     if name == "workflow.odoo_code_change":
         return await _workflow_odoo_code_change(OdooCodeChangeRequest.model_validate(args))
+    if name == "workflow.module_install_and_check":
+        return odoo_module_deploy(OdooModuleRequest.model_validate(_force_mcp_async_deploy_args(args)))
     if name == "workflow.frontend_visual_implement":
         return await _workflow_frontend_visual_implement(FrontendVisualImplementRequest.model_validate(args))
     if name == "workflow.smart_tool_router":

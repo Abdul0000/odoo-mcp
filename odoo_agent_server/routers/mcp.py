@@ -253,6 +253,7 @@ _PROVIDER_TOOL_NAMES = {
     "client.check",
     "workflow.agent_instructions",
     "workflow.odoo_code_change",
+    "workflow.module_install_and_check",
     "workflow.frontend_visual_implement",
     # Live read-only model access. OdooService uses Odoo.sh SSH first and falls
     # back to HTTPS JSON-RPC; no raw SQL or write method is exposed.

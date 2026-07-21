@@ -20,6 +20,7 @@ _PROVIDER_TOOLS = {
     "client_check",
     "workflow_agent_instructions",
     "workflow_odoo_code_change",
+    "workflow_module_install_and_check",
     "workflow_frontend_visual_implement",
     "odoo_query",
     "odoo_search_read",
