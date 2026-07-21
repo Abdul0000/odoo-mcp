@@ -42,6 +42,7 @@ The server workflow performs impact-based source reads, native-pattern preflight
 
 - A running status is not success.
 - When a response contains `next_call`, execute it.
+- When `repair_required=true` or `contract_status=pending`, generate complete repair writes from `structure_findings` and the persisted `module_contract`, then execute `next_call` immediately. Do not summarize or start deployment while the contract is pending; stop after three diagnosed repair attempts and report the exact remaining blocker.
 - Use `jobs.get` for bounded polling and `workflow.resume_job` to recover an interrupted deployment.
 - Use `artifacts.read` only for a referenced large result and `odoosh.error_pack` only for a diagnosed deployment failure.
 - Diagnose before retrying; retry a failure at most three times and never restart an already-running or completed workflow.

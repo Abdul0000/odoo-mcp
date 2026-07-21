@@ -190,3 +190,28 @@ def test_nested_python_packages_require_init_and_parent_imports(tmp_path):
 
     assert "PYTHON_PACKAGE_INIT_MISSING" in codes
     assert "PYTHON_IMPORT_CLOSURE_MISSING" in codes
+
+
+def test_persisted_contract_is_enforced_when_followup_prompt_is_short(tmp_path):
+    module = tmp_path / "iot_device_management"
+    module.mkdir()
+    (module / "__init__.py").write_text("", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'IoT', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': []}",
+        encoding="utf-8",
+    )
+    persisted = OdooModuleValidator.requested_contract(
+        "Build a complete module with controllers, wizard, list view and form view.\n### Model: `iot.device`",
+        create_module=True,
+    )
+
+    findings = OdooModuleValidator().validate(
+        module,
+        task_description="continue",
+        module_contract=persisted,
+    )
+    codes = {finding.code for finding in findings if finding.severity == Severity.error}
+
+    assert "REQUESTED_MODEL_MISSING" in codes
+    assert "REQUESTED_PACKAGE_MISSING" in codes
+    assert "REQUESTED_VIEW_TYPE_MISSING" in codes

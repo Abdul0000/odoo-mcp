@@ -120,6 +120,7 @@ class SelfRunRequest(BaseProjectRequest):
     module_name: str = Field(..., description="Custom module folder name inside the repo")
     task_description: str = Field(default="", max_length=20000, description="Original task used to enforce requested module features before push.")
     create_module: bool = Field(default=False, description="Whether this task creates a new addon; used by the module contract gate.")
+    module_contract: dict[str, Any] = Field(default_factory=dict, description="Persisted project/module requirements merged with the current task contract.")
     run_pytest: bool = Field(default=True)
     include_git_status: bool = Field(default=True)
     timeout_seconds: int = Field(default=90, ge=5, le=600)

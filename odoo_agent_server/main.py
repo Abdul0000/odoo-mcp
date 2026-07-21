@@ -86,7 +86,7 @@ def agent_instructions() -> dict:
                 "For code changes call workflow.odoo_code_change. For explicit visual asset generation call workflow.frontend_visual_implement. Complete and partial changes must pass the universal module-structure gate before any commit/push.",
                 "Do not call hidden repo, Git, source-discovery, verification, or deploy tools; the composite workflow owns those steps.",
                 "When a response returns next_call or a running status, use jobs.get or workflow.resume_job until terminal.",
-                "Retry diagnosed failures at most three times; never blind retry or restart a completed workflow.",
+                "When repair_required=true or contract_status=pending, generate repairs from structure_findings and the persisted module_contract, then execute next_call; allow at most three diagnosed repair cycles and never deploy an incomplete contract.",
                 "When deploy_confirmed or already_deployed_confirmed is true, stop immediately and give a concise summary.",
                 "Never expose credentials, create normal module schema through Studio/ORM shortcuts, or put Pydantic code inside Odoo addons.",
             ],

@@ -56,7 +56,13 @@ class ParsedModel:
 class OdooModuleValidator:
     """Static checks that catch common module errors before Odoo.sh build time."""
 
-    def validate(self, module_path: Path, task_description: str = "", create_module: bool = False) -> list[Finding]:
+    def validate(
+        self,
+        module_path: Path,
+        task_description: str = "",
+        create_module: bool = False,
+        module_contract: dict | None = None,
+    ) -> list[Finding]:
         findings: list[Finding] = []
         findings.extend(self._validate_basic_structure(module_path))
         manifest, manifest_findings = self._read_manifest(module_path)
@@ -73,7 +79,7 @@ class OdooModuleValidator:
         findings.extend(self._validate_manifest_dependency_hints(module_path, manifest, parsed_models))
         findings.extend(self._validate_xml_references_and_order(module_path, manifest, parsed_models))
         findings.extend(self._validate_custom_view_fields(module_path, parsed_models))
-        findings.extend(self._validate_requested_features(module_path, manifest, parsed_models, task_description, create_module))
+        findings.extend(self._validate_requested_features(module_path, manifest, parsed_models, task_description, create_module, module_contract))
         return findings
 
     def _validate_basic_structure(self, module_path: Path) -> list[Finding]:
@@ -290,6 +296,31 @@ class OdooModuleValidator:
             "required_methods": methods,
         }
 
+    @staticmethod
+    def merge_contracts(*contracts: dict | None) -> dict:
+        """Monotonically merge persisted and current module requirements."""
+        merged = {
+            "full_module_requested": False,
+            "required_packages": [],
+            "required_layers": [],
+            "required_models": [],
+            "required_view_types": [],
+            "required_routes": [],
+            "required_methods": [],
+        }
+        for contract in contracts:
+            if not isinstance(contract, dict):
+                continue
+            merged["full_module_requested"] = bool(merged["full_module_requested"] or contract.get("full_module_requested"))
+            for key in merged:
+                if key == "full_module_requested":
+                    continue
+                for value in contract.get(key) or []:
+                    item = str(value).strip()
+                    if item and item not in merged[key]:
+                        merged[key].append(item)
+        return merged
+
     def _validate_manifest_registration(self, module_path: Path, manifest: dict) -> list[Finding]:
         """Require every deployable data/view/asset file to be in the manifest."""
         findings: list[Finding] = []
@@ -362,9 +393,10 @@ class OdooModuleValidator:
         parsed_models: dict[str, ParsedModel],
         task_description: str,
         create_module: bool,
+        module_contract: dict | None,
     ) -> list[Finding]:
         """Prove that generated files satisfy the original request contract."""
-        contract = self.requested_contract(task_description, create_module)
+        contract = self.merge_contracts(module_contract, self.requested_contract(task_description, create_module))
         if not any(value for value in contract.values()):
             return []
         text = str(task_description or "").lower()

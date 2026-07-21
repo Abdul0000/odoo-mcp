@@ -1783,6 +1783,75 @@ def _git_status_changed_module_files(project_path: str, module_path: str) -> lis
                 changed.append(rel)
     return list(dict.fromkeys(changed))
 
+
+def _persist_module_contract(
+    store: JsonStore,
+    *,
+    client_name: str,
+    project_path: str,
+    module_name: str,
+    current_contract: dict[str, Any] | None,
+    task_description: str = "",
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Keep original deliverables enforceable across short follow-up calls."""
+    state = store.load_session_state(client_name)
+    contracts = dict(state.get("module_contracts") or {})
+    previous = contracts.get(module_name) if isinstance(contracts.get(module_name), dict) else {}
+    resolved_project = str(Path(project_path).resolve())
+    same_project = str(previous.get("project_path") or "") == resolved_project
+    previous_contract = previous.get("contract") if same_project else None
+    merged = OdooModuleValidator.merge_contracts(previous_contract, current_contract)
+    unchanged = same_project and previous_contract == merged
+    requirement_sources = list(previous.get("requirement_sources") or []) if same_project else []
+    current_requirements = str(task_description or "").strip()
+    trivial_followup = current_requirements.lower() in {
+        "continue", "implement", "apply", "apply kro", "fix", "fix kro", "push", "deploy", "yes", "haan", "han",
+    }
+    new_requirement = bool(current_requirements and not trivial_followup and current_requirements not in requirement_sources)
+    if new_requirement:
+        requirement_sources.append(current_requirements)
+    requirement_sources = requirement_sources[-5:]
+    record = {
+        "project_path": resolved_project,
+        "module_name": module_name,
+        "contract": merged,
+        "status": previous.get("status", "pending") if unchanged and not new_requirement else "pending",
+        "repair_attempts": int(previous.get("repair_attempts") or 0) if unchanged and not new_requirement else 0,
+        "requirement_sources": requirement_sources,
+        "updated_at": time.time(),
+    }
+    contracts[module_name] = record
+    store.save_session_state({"module_contracts": contracts}, client_name=client_name)
+    return merged, record
+
+
+def _update_module_contract_status(
+    store: JsonStore,
+    *,
+    client_name: str,
+    module_name: str,
+    status: str,
+    increment_repair: bool = False,
+) -> dict[str, Any]:
+    state = store.load_session_state(client_name)
+    contracts = dict(state.get("module_contracts") or {})
+    record = dict(contracts.get(module_name) or {})
+    record["status"] = status
+    record["repair_attempts"] = (int(record.get("repair_attempts") or 0) + 1) if increment_repair else 0
+    record["updated_at"] = time.time()
+    contracts[module_name] = record
+    store.save_session_state({"module_contracts": contracts}, client_name=client_name)
+    return record
+
+
+def _contract_continuation_task(task_description: str, module_name: str) -> str:
+    if len(task_description) <= 2000:
+        return task_description
+    return (
+        f"Continue the persisted module-contract implementation and structural repair for {module_name}. "
+        "The connector retained the original complete requirements; implement every returned contract item and finding."
+    )
+
 async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     """Provider-safe composite Odoo code-change workflow.
 
@@ -1836,7 +1905,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "success_allowed": False,
         }
     effective_module_name = module.module_name
-    module_contract = OdooModuleValidator.requested_contract(payload.task_description, payload.create_module)
+    current_contract = OdooModuleValidator.requested_contract(payload.task_description, payload.create_module)
     issue_fingerprint = code_change_issue_fingerprint(
         project_path=project_path,
         module_name=effective_module_name,
@@ -1846,6 +1915,20 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         target_hint=_target_hint(payload),
     )
     module_dir = project / module.path
+    module_contract, contract_record = _persist_module_contract(
+        state_store,
+        client_name=client_name,
+        project_path=project_path,
+        module_name=effective_module_name,
+        current_contract=current_contract,
+        task_description=payload.task_description,
+    )
+    persisted_requirements = "\n\n--- Additional requirement ---\n\n".join(contract_record.get("requirement_sources") or [])
+    structure_findings = [
+        finding.model_dump(mode="json")
+        for finding in OdooModuleValidator().validate(module_dir, module_contract=module_contract)
+        if finding.severity.value == "error"
+    ]
     manifest_rel = module.manifest_path
     manifest_abs = project / manifest_rel
     steps.append({"step": "repo.list_custom_modules", "status": "ok", "module": effective_module_name, "module_path": module.path, "module_resolution": module_resolution})
@@ -2238,6 +2321,10 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "supported_autopatch_cases": ["style_rule", "text_replace"],
             "task_profile": _task_profile(payload, frontend_paths),
             "module_contract": module_contract,
+            "persisted_requirements": persisted_requirements,
+            "contract_status": contract_record.get("status", "pending"),
+            "repair_required": bool(structure_findings),
+            "structure_findings": structure_findings,
             "recommended_live_verifier": _task_profile(payload, frontend_paths).get("live_verifier"),
             "scope_advice": scope.model_dump(mode="json") if scope is not None else None,
             "frontend_preflight": frontend_preflight.model_dump(mode="json") if frontend_preflight is not None else None,
@@ -2250,7 +2337,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                     "client_name": client_name,
                     "project_path": project_path,
                     "module_name": effective_module_name,
-                    "task_description": payload.task_description,
+                    "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
                     "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
                     "writes": "Generate exact writes internally: [{relative_path, content}] or [{relative_path, search, replace, regex, count}]. Do not ask the user to edit files.",
                 },
@@ -2305,8 +2392,9 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         project_path=project_path,
         client_name=client_name,
         module_name=effective_module_name,
-        task_description=payload.task_description,
+        task_description=(persisted_requirements or payload.task_description)[-20000:],
         create_module=payload.create_module,
+        module_contract=module_contract,
         run_pytest=False,
         include_git_status=True,
     ))
@@ -2316,9 +2404,28 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     steps.append({"step": "workflow.verify_against_core", "status": verify.status, "push_blocked": verify.push_blocked, "critical_count": verify.critical_count})
 
     if qa.status == "failed" or verify.push_blocked:
+        qa_errors = [item for item in qa.findings if item.severity.value == "error"]
+        core_errors = [item for item in verify.findings if item.severity.value == "CRITICAL"]
+        repair_findings = (
+            [item.model_dump(mode="json") for item in qa_errors]
+            + [item.model_dump(mode="json") for item in core_errors]
+        )
+        repair_record = _update_module_contract_status(
+            state_store,
+            client_name=client_name,
+            module_name=effective_module_name,
+            status="pending",
+            increment_repair=True,
+        )
+        repair_attempts = int(repair_record.get("repair_attempts") or 0)
+        repair_targets = list(dict.fromkeys(
+            [str(item.file) for item in qa_errors if item.file]
+            + [str(item.file) for item in core_errors if item.file]
+            + [str(r.get("relative_path")) for r in custom_reads if r.get("status") == "read" and r.get("relative_path")]
+        ))
         return {
             "status": "verify_failed",
-            "message": "Code was written but deploy is blocked by QA/core verification. Fix findings and rerun workflow.odoo_code_change.",
+            "message": "INTERNAL_REPAIR_REQUIRED: code was written but structure/QA is incomplete. Apply the returned findings and immediately rerun workflow.odoo_code_change; do not summarize or deploy.",
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
@@ -2328,10 +2435,34 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "qa": qa.model_dump(mode="json"),
             "verify_against_core": verify.model_dump(mode="json"),
             "module_contract": module_contract,
+            "persisted_requirements": persisted_requirements,
+            "contract_status": "pending",
+            "repair_required": True,
+            "repair_attempts": repair_attempts,
+            "max_repair_attempts": 3,
+            "structure_findings": repair_findings,
             "module_structure_complete": False,
             "success_allowed": False,
             "completion_required": True,
+            "next_call": {
+                "tool": "workflow.odoo_code_change",
+                "arguments": {
+                    "client_name": client_name,
+                    "project_path": project_path,
+                    "module_name": effective_module_name,
+                    "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
+                    "target_files": repair_targets,
+                    "writes": "Generate exact repair writes internally from structure_findings and module_contract. Do not ask the user to edit files.",
+                },
+            } if repair_attempts <= 3 else None,
         }
+
+    _update_module_contract_status(
+        state_store,
+        client_name=client_name,
+        module_name=effective_module_name,
+        status="fulfilled",
+    )
 
     if not payload.auto_deploy:
         return {
@@ -2344,6 +2475,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "write_results": write_results,
             "verify_against_core": verify.model_dump(mode="json"),
             "module_structure_complete": True,
+            "module_contract": module_contract,
+            "contract_status": "fulfilled",
             "success_allowed": False,
             "completion_required": True,
         }
@@ -2417,6 +2550,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "module_upgraded": False,
         "core_verified": not verify.push_blocked,
         "module_structure_complete": True,
+        "module_contract": module_contract,
+        "contract_status": "fulfilled",
         "frontend_touched": frontend_touched,
         "allowed_summary": "Code was written and verified; deploy is running. Do not claim pushed/deployed/upgraded until jobs.get returns terminal passed with deploy_confirmed=true.",
         "next_call": {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}} if job_id else None,
@@ -2880,6 +3015,9 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             "writes_required": {"type": "boolean"}, "inspection": {"type": "object", "additionalProperties": True},
             "module_structure_complete": {"type": "boolean"},
             "module_contract": {"type": "object", "additionalProperties": True},
+            "persisted_requirements": {"type": "string"},
+            "contract_status": {"type": "string"}, "repair_required": {"type": "boolean"},
+            "repair_attempts": {"type": "integer"}, "structure_findings": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
         })
     elif internal.startswith("repo."):
         properties.update({
