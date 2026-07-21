@@ -1114,24 +1114,105 @@ class OdooShService:
         return self._run_module_cli(module_name, "-u", timeout_seconds)
 
     def module_deploy_ssh(self, module_name: str, timeout_seconds: int = 600) -> CommandResult:
-        """Install or upgrade a module via Odoo.sh SSH without Odoo shell admin rights.
+        """Fast hybrid deploy: cheap SQL state probe, one Odoo process.
 
-        This is the no-blockage path used when Odoo shell update_list or module
-        buttons fail with Access Denied. It first tries to read module state via
-        Odoo shell (module_status usually works for non-admin users). If the module
-        is installed, it uses -u. If it is uninstalled or not listed yet, it uses
-        -i. If Odoo shell state cannot be read, it uses a remote odoo-bin shell
-        probe and falls back to -u only when the probe is inconclusive, because
-        that is the safest operation for already-installed modules.
+        The common path uses a read-only PostgreSQL query (no Odoo startup) and
+        then exactly one ``odoo-bin -i/-u`` process. If psql is unavailable, one
+        ``odoo-bin shell`` process performs update_list, state detection and the
+        appropriate ORM button. A module failure is never retried through the
+        alternate path, avoiding duplicate/partial upgrades.
         """
-        dep_error = self._dependency_guard(module_name)
-        if dep_error:
-            return dep_error
-        state = self._module_state_best_effort(module_name)
+        state = self._module_state_via_psql(module_name)
+        if state is None:
+            return self._run_module_shell_deploy(module_name, timeout_seconds)
         flag = "-u" if state in {"installed", "to upgrade", "to remove"} else "-i"
         result = self._run_module_cli(module_name, flag, timeout_seconds)
-        prefix = f"MCP_SSH_DEPLOY mode={'upgrade' if flag == '-u' else 'install'} state={state or 'unknown'} module={module_name}\n"
+        prefix = f"MCP_HYBRID_DEPLOY probe=psql mode={'upgrade' if flag == '-u' else 'install'} state={state} module={module_name}\n"
         return result.model_copy(update={"command": ["odoosh.module_deploy_ssh", module_name, flag], "stdout": prefix + (result.stdout or "")})
+
+    def _module_state_via_psql(self, module_name: str) -> str | None:
+        """Return module state without starting Odoo; None means probe unavailable."""
+        if not self._db_name() or not re.fullmatch(r"[A-Za-z0-9_.-]+", module_name or ""):
+            return None
+        safe_db = shlex.quote(self._db_name() or "")
+        sql_module = module_name.replace("'", "''")
+        sql = f"SELECT state FROM ir_module_module WHERE name = '{sql_module}' LIMIT 1;"
+        script = f"psql -X -d {safe_db} -Atq -v ON_ERROR_STOP=1 -c {shlex.quote(sql)}"
+        result = self.run_shell(script, timeout_seconds=15)
+        if result.exit_code != 0:
+            return None
+        states = {"installed", "uninstalled", "to install", "to upgrade", "to remove", "uninstallable"}
+        for line in reversed((result.stdout or "").splitlines()):
+            state = line.strip()
+            if state in states:
+                return state
+        return "not_found"
+
+    def _run_module_shell_deploy(self, module_name: str, timeout_seconds: int) -> CommandResult:
+        """Single-process ORM fallback when the lightweight SQL probe is unavailable."""
+        if not self._db_name():
+            return CommandResult(
+                command=["odoosh.module_shell_deploy", module_name],
+                cwd="odoosh:ssh",
+                exit_code=2,
+                stderr="ODOOSH_DB_NAME is not configured. Set the exact database name for the target build.",
+            )
+        safe_db = shlex.quote(self._db_name() or "")
+        odoo_path = shlex.quote(self._odoo_path())
+        safe_addons = shlex.quote(self._addons_path())
+        payload_b64 = base64.b64encode(json.dumps({"module": module_name}).encode("utf-8")).decode("ascii")
+        marker = "MCP_MODULE_SHELL_DEPLOY_JSON:"
+        script = (
+            "set +e; "
+            f"cd {odoo_path}; "
+            f"./odoo-bin shell -d {safe_db} --addons-path={safe_addons} --no-http --log-level=error <<'PY'\n"
+            "import base64, json, traceback\n"
+            f"payload = json.loads(base64.b64decode({payload_b64!r}).decode('utf-8'))\n"
+            f"marker = {marker!r}\n"
+            "try:\n"
+            "    modules = env['ir.module.module'].sudo()\n"
+            "    modules.update_list()\n"
+            "    module = modules.search([('name', '=', payload['module'])], limit=1)\n"
+            "    if not module:\n"
+            "        raise RuntimeError('Module not found after update_list: %s' % payload['module'])\n"
+            "    before = module.state\n"
+            "    operation = 'upgrade' if before in ('installed', 'to upgrade', 'to remove') else 'install'\n"
+            "    if operation == 'upgrade':\n"
+            "        module.button_immediate_upgrade()\n"
+            "    else:\n"
+            "        module.button_immediate_install()\n"
+            "    env.cr.commit()\n"
+            "    data = {'status': 'ok', 'module': payload['module'], 'state_before': before, 'operation': operation}\n"
+            "except Exception as exc:\n"
+            "    env.cr.rollback()\n"
+            "    data = {'status': 'failed', 'module': payload['module'], 'error': str(exc), 'traceback': traceback.format_exc()[-12000:]}\n"
+            "print(marker + json.dumps(data, ensure_ascii=False))\n"
+            "PY\n"
+        )
+        result = self.run_shell(script, timeout_seconds=timeout_seconds)
+        payload_line = next(
+            (line[len(marker):] for line in reversed((result.stdout or "").splitlines()) if line.startswith(marker)),
+            "",
+        )
+        if not payload_line:
+            return self._classify_module_update_result(result.model_copy(update={
+                "command": ["odoosh.module_shell_deploy", module_name],
+            }))
+        try:
+            payload = json.loads(payload_line)
+        except json.JSONDecodeError:
+            payload = {"status": "failed", "error": "Could not parse module shell deploy result.", "raw": payload_line[-4000:]}
+        if payload.get("status") != "ok" or result.exit_code != 0:
+            return result.model_copy(update={
+                "command": ["odoosh.module_shell_deploy", module_name],
+                "exit_code": result.exit_code or 3,
+                "stderr": (result.stderr or "") + "\n" + str(payload.get("traceback") or payload.get("error") or payload),
+            })
+        prefix = f"MCP_HYBRID_DEPLOY probe=odoo_shell mode={payload.get('operation')} state={payload.get('state_before')} module={module_name}\n"
+        return result.model_copy(update={
+            "command": ["odoosh.module_shell_deploy", module_name],
+            "stdout": prefix + (result.stdout or ""),
+        })
 
     def _module_state_best_effort(self, module_name: str) -> str | None:
         try:

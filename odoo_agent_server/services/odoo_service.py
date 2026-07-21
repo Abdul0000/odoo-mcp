@@ -223,9 +223,10 @@ class OdooService:
             result.result = {}
         if isinstance(result.result, dict):
             result.result.setdefault("fallback", "odoosh")
+            result.result.setdefault("strategy", "hybrid_psql_state_then_single_cli_with_single_shell_fallback")
             if result.result.get("operation") == "module_deploy":
                 result.result["operation"] = "deploy"
-            result.result.setdefault("cause", f"Module {module_name} not found in ir.module.module or live shell deploy path was unavailable; used Odoo.sh SSH deploy.")
+            result.result.setdefault("cause", "Used the Odoo.sh SSH hybrid deploy engine: lightweight SQL state probe plus one Odoo process, or one-process Odoo shell fallback.")
         return result
 
     def registry_smoke_test(self, module_name: str, model_names: list[str] | None = None, menu_names: list[str] | None = None, strict: bool = True) -> OdooResult:

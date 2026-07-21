@@ -74,7 +74,7 @@ def test_module_deploy_falls_back_to_ssh_when_module_missing_after_update_list(m
     assert result.status == "ok"
     assert result.result["fallback"] == "odoosh"
     assert result.result["operation"] == "deploy"
-    assert "not found in ir.module.module" in result.result["cause"]
+    assert result.result["strategy"] == "hybrid_psql_state_then_single_cli_with_single_shell_fallback"
     assert result.result["ssh"]["stdout"] == "SSH_DEPLOY_OK"
 
 
@@ -233,9 +233,6 @@ def test_public_module_deploy_runs_after_manual_push_guard_passes(monkeypatch, t
 
 
 def test_odoosh_module_deploy_ssh_uses_upgrade_for_installed_module(monkeypatch):
-    def fake_module_status(self, module_name):
-        return OdooResult(status="ok", result=[{"name": module_name, "state": "installed"}])
-
     called = {}
 
     def fake_run_module_cli(self, module_name, flag, timeout_seconds):
@@ -243,33 +240,94 @@ def test_odoosh_module_deploy_ssh_uses_upgrade_for_installed_module(monkeypatch)
         called["flag"] = flag
         return CommandResult(command=["odoo-bin", flag, module_name], cwd="odoosh:ssh", exit_code=0, stdout="OK")
 
-    monkeypatch.setattr(OdooService, "module_status", fake_module_status)
-    monkeypatch.setattr(OdooShService, "_dependency_guard", lambda self, module_name: None)
+    monkeypatch.setattr(OdooShService, "_module_state_via_psql", lambda self, module_name: "installed")
     monkeypatch.setattr(OdooShService, "_run_module_cli", fake_run_module_cli)
 
     result = OdooShService().module_deploy_ssh("sample_custom_module")
 
     assert result.exit_code == 0
     assert called == {"module_name": "sample_custom_module", "flag": "-u"}
-    assert "mode=upgrade" in result.stdout
+    assert "probe=psql mode=upgrade" in result.stdout
 
 
 def test_odoosh_module_deploy_ssh_uses_install_for_uninstalled_module(monkeypatch):
-    def fake_module_status(self, module_name):
-        return OdooResult(status="ok", result=[{"name": module_name, "state": "uninstalled"}])
-
     called = {}
 
     def fake_run_module_cli(self, module_name, flag, timeout_seconds):
         called["flag"] = flag
         return CommandResult(command=["odoo-bin", flag, module_name], cwd="odoosh:ssh", exit_code=0, stdout="OK")
 
-    monkeypatch.setattr(OdooService, "module_status", fake_module_status)
-    monkeypatch.setattr(OdooShService, "_dependency_guard", lambda self, module_name: None)
+    monkeypatch.setattr(OdooShService, "_module_state_via_psql", lambda self, module_name: "uninstalled")
     monkeypatch.setattr(OdooShService, "_run_module_cli", fake_run_module_cli)
 
     result = OdooShService().module_deploy_ssh("new_module")
 
     assert result.exit_code == 0
     assert called["flag"] == "-i"
-    assert "mode=install" in result.stdout
+    assert "probe=psql mode=install" in result.stdout
+
+
+def test_odoosh_module_deploy_uses_single_shell_fallback_when_psql_is_unavailable(monkeypatch):
+    calls = {"shell": 0, "cli": 0}
+
+    monkeypatch.setattr(OdooShService, "_module_state_via_psql", lambda self, module_name: None)
+
+    def fake_shell(self, module_name, timeout_seconds):
+        calls["shell"] += 1
+        return CommandResult(command=["odoo-bin", "shell"], cwd="odoosh:ssh", exit_code=0, stdout="MCP_HYBRID_DEPLOY probe=odoo_shell")
+
+    def fake_cli(self, module_name, flag, timeout_seconds):
+        calls["cli"] += 1
+        return CommandResult(command=["odoo-bin", flag], cwd="odoosh:ssh", exit_code=0)
+
+    monkeypatch.setattr(OdooShService, "_run_module_shell_deploy", fake_shell)
+    monkeypatch.setattr(OdooShService, "_run_module_cli", fake_cli)
+
+    result = OdooShService().module_deploy_ssh("sample_custom_module")
+
+    assert result.exit_code == 0
+    assert calls == {"shell": 1, "cli": 0}
+
+
+def test_fast_module_state_probe_uses_read_only_psql_without_odoo_startup(monkeypatch):
+    captured = {}
+    service = OdooShService()
+    monkeypatch.setattr(service, "_db_name", lambda: "test_db")
+
+    def fake_run_shell(script, timeout_seconds):
+        captured["script"] = script
+        captured["timeout"] = timeout_seconds
+        return CommandResult(command=["ssh"], cwd="odoosh:ssh", exit_code=0, stdout="installed\n")
+
+    monkeypatch.setattr(service, "run_shell", fake_run_shell)
+
+    state = service._module_state_via_psql("sample_custom_module")
+
+    assert state == "installed"
+    assert "SELECT state FROM ir_module_module" in captured["script"]
+    assert "odoo-bin" not in captured["script"]
+    assert captured["timeout"] == 15
+
+
+def test_single_shell_fallback_contains_state_and_both_orm_operations(monkeypatch):
+    captured = {}
+    service = OdooShService()
+    monkeypatch.setattr(service, "_db_name", lambda: "test_db")
+    monkeypatch.setattr(service, "_odoo_path", lambda: "/home/odoo/src")
+    monkeypatch.setattr(service, "_addons_path", lambda: "/home/odoo/src/addons")
+
+    def fake_run_shell(script, timeout_seconds):
+        captured["script"] = script
+        marker = "MCP_MODULE_SHELL_DEPLOY_JSON:"
+        payload = '{"status":"ok","module":"x_module","state_before":"uninstalled","operation":"install"}'
+        return CommandResult(command=["ssh"], cwd="odoosh:ssh", exit_code=0, stdout=marker + payload)
+
+    monkeypatch.setattr(service, "run_shell", fake_run_shell)
+
+    result = service._run_module_shell_deploy("x_module", 600)
+
+    assert result.exit_code == 0
+    assert "modules.update_list()" in captured["script"]
+    assert "button_immediate_install()" in captured["script"]
+    assert "button_immediate_upgrade()" in captured["script"]
+    assert "probe=odoo_shell mode=install" in result.stdout
