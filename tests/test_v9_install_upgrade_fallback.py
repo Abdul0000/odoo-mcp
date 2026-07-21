@@ -289,6 +289,55 @@ def test_odoosh_module_deploy_uses_single_shell_fallback_when_psql_is_unavailabl
     assert calls == {"shell": 1, "cli": 0}
 
 
+def test_stale_uninstallable_state_forces_update_list_shell_refresh(monkeypatch):
+    calls = {"shell": 0, "cli": 0}
+    monkeypatch.setattr(OdooShService, "_module_state_via_psql", lambda self, module_name: "uninstallable")
+
+    def fake_shell(self, module_name, timeout_seconds):
+        calls["shell"] += 1
+        return CommandResult(
+            command=["odoo-bin", "shell"], cwd="odoosh:ssh", exit_code=0,
+            stdout="MCP_HYBRID_DEPLOY probe=odoo_shell mode=install state=uninstalled",
+        )
+
+    def fake_cli(self, module_name, flag, timeout_seconds):
+        calls["cli"] += 1
+        return CommandResult(command=["odoo-bin", flag], cwd="odoosh:ssh", exit_code=0)
+
+    monkeypatch.setattr(OdooShService, "_run_module_shell_deploy", fake_shell)
+    monkeypatch.setattr(OdooShService, "_run_module_cli", fake_cli)
+
+    result = OdooShService().module_deploy_ssh("iot_device_management")
+
+    assert result.exit_code == 0
+    assert calls == {"shell": 1, "cli": 0}
+
+
+def test_not_found_state_also_refreshes_apps_registry_before_install(monkeypatch):
+    calls = {"shell": 0, "cli": 0}
+    monkeypatch.setattr(OdooShService, "_module_state_via_psql", lambda self, module_name: "not_found")
+    monkeypatch.setattr(
+        OdooShService,
+        "_run_module_shell_deploy",
+        lambda self, module_name, timeout_seconds: (
+            calls.__setitem__("shell", calls["shell"] + 1)
+            or CommandResult(command=["odoo-bin", "shell"], cwd="odoosh:ssh", exit_code=0, stdout="refreshed")
+        ),
+    )
+    monkeypatch.setattr(
+        OdooShService,
+        "_run_module_cli",
+        lambda self, module_name, flag, timeout_seconds: (
+            calls.__setitem__("cli", calls["cli"] + 1)
+            or CommandResult(command=["odoo-bin", flag], cwd="odoosh:ssh", exit_code=0)
+        ),
+    )
+
+    OdooShService().module_deploy_ssh("iot_device_management")
+
+    assert calls == {"shell": 1, "cli": 0}
+
+
 def test_fast_module_state_probe_uses_read_only_psql_without_odoo_startup(monkeypatch):
     captured = {}
     service = OdooShService()
@@ -328,6 +377,7 @@ def test_single_shell_fallback_contains_state_and_both_orm_operations(monkeypatc
 
     assert result.exit_code == 0
     assert "modules.update_list()" in captured["script"]
+    assert "before == 'uninstallable'" in captured["script"]
     assert "button_immediate_install()" in captured["script"]
     assert "button_immediate_upgrade()" in captured["script"]
     assert "probe=odoo_shell mode=install" in result.stdout

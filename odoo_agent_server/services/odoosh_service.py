@@ -1125,6 +1125,11 @@ class OdooShService:
         state = self._module_state_via_psql(module_name)
         if state is None:
             return self._run_module_shell_deploy(module_name, timeout_seconds)
+        # These states can be stale when a manifest/dependency was fixed in a
+        # newly deployed commit. Refresh the Apps registry inside the same Odoo
+        # process before deciding that source is actually uninstallable/missing.
+        if state in {"uninstallable", "not_found"}:
+            return self._run_module_shell_deploy(module_name, timeout_seconds)
         flag = "-u" if state in {"installed", "to upgrade", "to remove"} else "-i"
         result = self._run_module_cli(module_name, flag, timeout_seconds)
         prefix = f"MCP_HYBRID_DEPLOY probe=psql mode={'upgrade' if flag == '-u' else 'install'} state={state} module={module_name}\n"
@@ -1176,6 +1181,8 @@ class OdooShService:
             "    if not module:\n"
             "        raise RuntimeError('Module not found after update_list: %s' % payload['module'])\n"
             "    before = module.state\n"
+            "    if before == 'uninstallable':\n"
+            "        raise RuntimeError('Module remains uninstallable after update_list; inspect deployed manifest and dependency availability instead of trusting stale database state')\n"
             "    operation = 'upgrade' if before in ('installed', 'to upgrade', 'to remove') else 'install'\n"
             "    if operation == 'upgrade':\n"
             "        module.button_immediate_upgrade()\n"
