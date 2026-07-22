@@ -378,6 +378,9 @@ def test_temporary_odoo_process_includes_standard_enterprise_addons_paths(monkey
     assert "/home/odoo/src/themes" in paths
     assert "/home/odoo/src/design-themes" in paths
     assert "/home/odoo/src/user" in paths
+    setup = service._addons_path_shell_setup()
+    assert '[ -d "$MCP_ADDON_DIR" ]' in setup
+    assert 'MCP_ADDONS_PATH="$MCP_ADDONS_PATH,$MCP_ADDON_DIR"' in setup
 
 
 def test_stale_install_diagnostic_does_not_block_normal_feature_work():

@@ -148,11 +148,12 @@ class OdooService:
         ssh = self._ssh()
         safe_db = shlex.quote(ssh._db_name() or "")
         odoo_path = shlex.quote(ssh._odoo_path())
-        safe_addons = shlex.quote(ssh._addons_path())
+        addons_setup = ssh._addons_path_shell_setup()
         script = (
             "set +e; "
+            f"{addons_setup}"
             f"cd {odoo_path}; "
-            f"./odoo-bin shell -d {safe_db} --addons-path={safe_addons} --no-http --log-level=error <<'PY'\n"
+            f"./odoo-bin shell -d {safe_db} --addons-path=\"$MCP_ADDONS_PATH\" --no-http --log-level=error <<'PY'\n"
             "import base64, json, traceback\n"
             f"payload = json.loads(base64.b64decode({payload_b64!r}).decode('utf-8'))\n"
             f"marker = {marker!r}\n"

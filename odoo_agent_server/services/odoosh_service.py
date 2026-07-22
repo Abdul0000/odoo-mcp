@@ -987,12 +987,13 @@ class OdooShService:
         payload_b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
         safe_db = shlex.quote(self._db_name() or "")
         odoo_path = shlex.quote(self._odoo_path())
-        safe_addons = shlex.quote(self._addons_path())
+        addons_setup = self._addons_path_shell_setup()
         marker = "MCP_ODOOSH_QUERY_JSON:"
         script = (
             "set +e; "
+            f"{addons_setup}"
             f"cd {odoo_path}; "
-            f"./odoo-bin shell -d {safe_db} --addons-path={safe_addons} --no-http --log-level=error <<'PY'\n"
+            f"./odoo-bin shell -d {safe_db} --addons-path=\"$MCP_ADDONS_PATH\" --no-http --log-level=error <<'PY'\n"
             "import base64, datetime, json, traceback\n"
             f"payload = json.loads(base64.b64decode({payload_b64!r}).decode('utf-8'))\n"
             "marker = 'MCP_ODOOSH_QUERY_JSON:'\n"
@@ -1227,13 +1228,14 @@ class OdooShService:
             )
         safe_db = shlex.quote(self._db_name() or "")
         odoo_path = shlex.quote(self._odoo_path())
-        safe_addons = shlex.quote(self._addons_path())
+        addons_setup = self._addons_path_shell_setup()
         payload_b64 = base64.b64encode(json.dumps({"module": module_name}).encode("utf-8")).decode("ascii")
         marker = "MCP_MODULE_SHELL_DEPLOY_JSON:"
         script = (
             "set +e; "
+            f"{addons_setup}"
             f"cd {odoo_path}; "
-            f"./odoo-bin shell -d {safe_db} --addons-path={safe_addons} --no-http --log-level=error <<'PY'\n"
+            f"./odoo-bin shell -d {safe_db} --addons-path=\"$MCP_ADDONS_PATH\" --no-http --log-level=error <<'PY'\n"
             "import ast, base64, json, os, traceback\n"
             f"payload = json.loads(base64.b64decode({payload_b64!r}).decode('utf-8'))\n"
             f"marker = {marker!r}\n"
@@ -1324,12 +1326,13 @@ class OdooShService:
     def _run_module_state_probe(self, module_name: str) -> CommandResult:
         safe_db = shlex.quote(self._db_name() or "")
         odoo_path = shlex.quote(self._odoo_path())
-        safe_addons = shlex.quote(self._addons_path())
+        addons_setup = self._addons_path_shell_setup()
         module_literal = repr(module_name)
         script = (
             "set +e; "
+            f"{addons_setup}"
             f"cd {odoo_path}; "
-            f"./odoo-bin shell -d {safe_db} --addons-path={safe_addons} --no-http --log-level=error <<'PY'\n"
+            f"./odoo-bin shell -d {safe_db} --addons-path=\"$MCP_ADDONS_PATH\" --no-http --log-level=error <<'PY'\n"
             f"module_name = {module_literal}\n"
             "mod = env['ir.module.module'].search([('name', '=', module_name)], limit=1)\n"
             "print('MCP_MODULE_STATE=%s' % (mod.state if mod else 'not_found'))\n"
@@ -1354,6 +1357,17 @@ class OdooShService:
         ]
         return ",".join(dict.fromkeys(path.rstrip("/") for path in paths if path))
 
+    def _addons_path_shell_setup(self) -> str:
+        """Select only addon directories that exist on the remote Odoo.sh build."""
+        candidates = " ".join(shlex.quote(path) for path in self._addons_path().split(",") if path)
+        return (
+            "MCP_ADDONS_PATH=''; "
+            f"for MCP_ADDON_DIR in {candidates}; do "
+            "if [ -d \"$MCP_ADDON_DIR\" ]; then "
+            "if [ -n \"$MCP_ADDONS_PATH\" ]; then MCP_ADDONS_PATH=\"$MCP_ADDONS_PATH,$MCP_ADDON_DIR\"; "
+            "else MCP_ADDONS_PATH=\"$MCP_ADDON_DIR\"; fi; fi; done; "
+        )
+
     def _run_module_cli(self, module_name: str, flag: str, timeout_seconds: int) -> CommandResult:
         if flag not in {"-i", "-u"}:
             raise ValueError("flag must be -i or -u")
@@ -1367,11 +1381,12 @@ class OdooShService:
         safe_module = shlex.quote(module_name)
         safe_db = shlex.quote(self._db_name())
         odoo_path = shlex.quote(self._odoo_path())
-        safe_addons = shlex.quote(self._addons_path())
+        addons_setup = self._addons_path_shell_setup()
         script = (
             "set -e; "
+            f"{addons_setup}"
             f"cd {odoo_path}; "
-            f"./odoo-bin -d {safe_db} --addons-path={safe_addons} {flag} {safe_module} --stop-after-init --log-level=info"
+            f"./odoo-bin -d {safe_db} --addons-path=\"$MCP_ADDONS_PATH\" {flag} {safe_module} --stop-after-init --log-level=info"
         )
         result = self.run_shell(script, timeout_seconds=timeout_seconds)
         return self._classify_module_update_result(result)
