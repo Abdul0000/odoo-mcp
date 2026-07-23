@@ -267,7 +267,8 @@ _TOOL_DESCRIPTORS = [
             "For a missing addon, set create_module=true with an exact lowercase technical name; it is created only at the checkout root. "
             "A cached Odoo-aware index maps functional labels through menus/actions/views/models/fields/QWeb/JS relationships, then reads exact match-centered ranges. "
             "Task descriptions automatically supply quoted identifiers/selectors/XML IDs/methods for focused inspection. "
-            "An exact quoted replacement that occurs once can complete in one call; ambiguous or complex work returns focused context for a second call with exact writes."
+            "An exact quoted replacement that occurs once can complete in one call; ambiguous or complex work returns focused context for a second call with exact writes. "
+            "Existing-addon surgical changes use baseline-delta QA: unchanged unrelated legacy findings are reported but do not block commit/deploy; new, task-required, manifest/version, and changed-scope errors still block."
         ),
         requires_approval=True,
     ),
@@ -1974,6 +1975,53 @@ def _is_installability_repair_request(payload: OdooCodeChangeRequest) -> bool:
     ))
 
 
+_ALWAYS_BLOCKING_QA_CODES = {
+    "MODULE_NOT_FOUND",
+    "MODULE_NOT_DIRECTORY",
+    "MISSING_MANIFEST",
+    "MISSING_INIT",
+    "MANIFEST_SYNTAX_ERROR",
+    "MANIFEST_PARSE_ERROR",
+    "MANIFEST_NOT_DICT",
+    "MANIFEST_MISSING_KEY",
+    "MANIFEST_BAD_DEPENDS",
+    "MANIFEST_VERSION_CHANGED",
+}
+
+
+def _qa_finding_fingerprint(item: Any) -> tuple[str, str, str]:
+    data = item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item or {})
+    raw_file = str(data.get("file") or "").replace("\\", "/")
+    try:
+        normalized_file = Path(raw_file).resolve().as_posix().casefold() if raw_file else ""
+    except Exception:
+        normalized_file = raw_file.casefold()
+    message = re.sub(r"\s+", " ", str(data.get("message") or "")).strip().casefold()
+    return str(data.get("code") or ""), normalized_file, message
+
+
+def _partition_surgical_qa_errors(
+    baseline_findings: list[dict[str, Any]],
+    current_errors: list[Any],
+    *,
+    strict_module_validation: bool,
+) -> tuple[list[Any], list[Any]]:
+    """Separate new/task-critical failures from unrelated pre-existing debt."""
+    if strict_module_validation:
+        return list(current_errors), []
+    baseline = {_qa_finding_fingerprint(item) for item in baseline_findings}
+    blocking: list[Any] = []
+    preexisting: list[Any] = []
+    for item in current_errors:
+        code = str(getattr(item, "code", "") or "")
+        task_required = code.startswith("REQUESTED_") or code.startswith("COMPLETE_MODULE_")
+        if task_required or code in _ALWAYS_BLOCKING_QA_CODES or _qa_finding_fingerprint(item) not in baseline:
+            blocking.append(item)
+        else:
+            preexisting.append(item)
+    return blocking, preexisting
+
+
 async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     """Provider-safe composite Odoo code-change workflow.
 
@@ -2571,8 +2619,14 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 raise HTTPException(status_code=409, detail=f"Search text not found in {rel}")
         result = repo_write(RepoWriteRequest(project_path=project_path, client_name=client_name, relative_path=rel, content=new_content))
         written_abs = str((project / rel).resolve())
-        written_files_abs.append(written_abs)
+        if written_abs not in written_files_abs:
+            written_files_abs.append(written_abs)
         write_results.append({"relative_path": rel, "status": "written", "size": result.size, "extra": result.extra})
+        for auto_rel in result.extra.get("auto_wired_init_files", []) if isinstance(result.extra, dict) else []:
+            auto_abs = str((project / str(auto_rel)).resolve())
+            if auto_abs not in written_files_abs:
+                written_files_abs.append(auto_abs)
+                write_results.append({"relative_path": str(auto_rel), "status": "auto_wired", "size": Path(auto_abs).stat().st_size})
     steps.append({"step": "repo.write", "status": "ok", "written_count": len(written_files_abs)})
 
     # 6) Diff, QA, verify against core before deploy.
@@ -2603,15 +2657,36 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         include_git_status=True,
     ))
     verify = verify_against_core(SyntaxVerifyRequest(written_files=written_files_abs, project_path=project_path, client_name=client_name, fix_cycle=0))
+    qa_errors = [item for item in qa.findings if item.severity.value == "error"]
+    strict_module_validation = bool(payload.create_module or current_contract.get("full_module_requested"))
+    blocking_qa_errors, preexisting_qa_errors = _partition_surgical_qa_errors(
+        structure_findings,
+        qa_errors,
+        strict_module_validation=strict_module_validation,
+    )
+    qa_struct = qa.model_dump(mode="json")
+    qa_struct["module_wide_status"] = qa.status
+    qa_struct["status"] = "failed" if blocking_qa_errors else "warning" if preexisting_qa_errors else qa.status
+    qa_struct["scope_gate"] = {
+        "mode": "strict_module" if strict_module_validation else "baseline_delta",
+        "blocking_error_count": len(blocking_qa_errors),
+        "preexisting_nonblocking_count": len(preexisting_qa_errors),
+        "preexisting_nonblocking_findings": [item.model_dump(mode="json") for item in preexisting_qa_errors],
+    }
     steps.append({"step": "git.diff", "status": "ok" if diff.exit_code == 0 else "failed", "exit_code": diff.exit_code})
-    steps.append({"step": "qa.self_run", "status": qa.status})
+    steps.append({
+        "step": "qa.self_run",
+        "status": "failed" if blocking_qa_errors else "passed_with_preexisting_findings" if preexisting_qa_errors else qa.status,
+        "mode": "strict_module" if strict_module_validation else "baseline_delta",
+        "blocking_errors": len(blocking_qa_errors),
+        "preexisting_nonblocking": len(preexisting_qa_errors),
+    })
     steps.append({"step": "workflow.verify_against_core", "status": verify.status, "push_blocked": verify.push_blocked, "critical_count": verify.critical_count})
 
-    if qa.status == "failed" or verify.push_blocked:
-        qa_errors = [item for item in qa.findings if item.severity.value == "error"]
+    if blocking_qa_errors or verify.push_blocked:
         core_errors = [item for item in verify.findings if item.severity.value == "CRITICAL"]
         repair_findings = (
-            [item.model_dump(mode="json") for item in qa_errors]
+            [item.model_dump(mode="json") for item in blocking_qa_errors]
             + [item.model_dump(mode="json") for item in core_errors]
         )
         repair_record = _update_module_contract_status(
@@ -2623,7 +2698,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         )
         repair_attempts = int(repair_record.get("repair_attempts") or 0)
         repair_targets = list(dict.fromkeys(
-            [str(item.file) for item in qa_errors if item.file]
+            [str(item.file) for item in blocking_qa_errors if item.file]
             + [str(item.file) for item in core_errors if item.file]
             + [str(r.get("relative_path")) for r in custom_reads if r.get("status") == "read" and r.get("relative_path")]
         ))
@@ -2636,7 +2711,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "steps": steps,
             "write_results": write_results,
             "git_diff": {"exit_code": diff.exit_code, "stdout": diff.stdout[-12000:], "stderr": diff.stderr[-4000:]},
-            "qa": qa.model_dump(mode="json"),
+            "qa": qa_struct,
             "verify_against_core": verify.model_dump(mode="json"),
             "module_contract": module_contract,
             "persisted_requirements": persisted_requirements,
@@ -2671,14 +2746,16 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     if not payload.auto_deploy:
         return {
             "status": "ready_to_deploy",
-            "message": "Code written and verified. auto_deploy=false, so no deploy job was started.",
+            "message": "Requested change passed scoped verification. auto_deploy=false, so no deploy job was started.",
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
             "steps": steps,
             "write_results": write_results,
+            "qa": qa_struct,
             "verify_against_core": verify.model_dump(mode="json"),
-            "module_structure_complete": True,
+            "module_structure_complete": not preexisting_qa_errors,
+            "surgical_scope_verified": True,
             "module_contract": module_contract,
             "contract_status": "fulfilled",
             "success_allowed": False,
@@ -2713,7 +2790,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "steps": steps + [{"step": "workflow.safe_deploy_module", "status": "blocked", "detail": deploy_detail}],
             "write_results": write_results,
             "git_diff": {"exit_code": diff.exit_code, "stdout_preview": diff.stdout[-12000:], "stderr_preview": diff.stderr[-4000:]},
-            "qa": qa.model_dump(mode="json"),
+            "qa": qa_struct,
             "verify_against_core": verify.model_dump(mode="json"),
             "deploy_validation": deploy_detail,
             "success_allowed": False,
@@ -2741,7 +2818,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "target_hint": _target_hint(payload),
         "patch_strategy": _normalized_patch_strategy(payload),
         "git_diff": {"exit_code": diff.exit_code, "stdout_preview": diff.stdout[-12000:], "stderr_preview": diff.stderr[-4000:]},
-        "qa": qa.model_dump(mode="json"),
+        "qa": qa_struct,
         "verify_against_core": verify.model_dump(mode="json"),
         "deploy_impact": deploy_impact.as_dict(),
         "safe_deploy": deploy_struct,
@@ -2753,7 +2830,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "source_deployed": False,
         "module_upgraded": False,
         "core_verified": not verify.push_blocked,
-        "module_structure_complete": True,
+        "module_structure_complete": not preexisting_qa_errors,
+        "surgical_scope_verified": True,
         "module_contract": module_contract,
         "contract_status": "fulfilled",
         "frontend_touched": frontend_touched,

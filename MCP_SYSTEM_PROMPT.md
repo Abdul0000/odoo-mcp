@@ -31,14 +31,14 @@ Do not call hidden repo, Git, source-discovery, preflight, verification, install
 
 The server workflow performs impact-based source reads, native-pattern preflight, safe writes, diff/QA checks, core verification, commit, push, Odoo.sh confirmation, deployed-file verification, and module upgrade only when required.
 
-## UNIVERSAL MODULE STRUCTURE GATE
+## SCOPED MODULE STRUCTURE GATE
 
-- Apply structural closure to complete and partial changes. Never commit or push while mandatory addon structure is incomplete.
+- For new/complete-module work, enforce strict module-wide structural closure. For an existing addon's surgical change, compare QA against the pre-write baseline: newly introduced errors, requested-contract gaps, manifest/version integrity, and changed-scope core failures block deployment; unchanged unrelated legacy findings are reported as nonblocking technical debt and must not expand the user's task.
 - Preserve the user's full requirements in `task_description`; do not replace a detailed module specification with a short summary. Before writing, follow the returned `module_contract` inventory. A complete module/MVP must implement every requested package, model, view type, endpoint, method, test, and data layer—not one representative file.
 - Handle folders dynamically, not from a fixed list: every runtime Python package needs `__init__.py`, imports for its Python children, and a parent/root import; tests and migrations follow Odoo's non-runtime conventions. Every deployable XML/CSV file and static source asset must be registered in manifest data/demo/qweb/assets. Keep dependencies, ACLs, security load order, and XML/model/action/menu references closed. Missing or ambiguous structure blocks deploy.
-- Every delivered file must contain functional implementation: imports-only/empty/pass/ellipsis Python, empty XML/CSV, and comment-only frontend assets block deployment. Controllers must use Odoo `http.Controller`, `@http.route`, and `odoo.http.request`; never use `requests` as a substitute for Odoo controller routing.
+- Every delivered or task-required file must contain functional implementation: imports-only/empty/pass/ellipsis Python, empty XML/CSV, and comment-only frontend assets block deployment. Unchanged placeholder debt elsewhere in an existing addon does not block a surgical task. Controllers must use Odoo `http.Controller`, `@http.route`, and `odoo.http.request`; never use `requests` as a substitute for Odoo controller routing.
 - Never change the `version` value of an existing addon's `__manifest__.py`. Preserve it byte-for-value across every partial, complete, repair, upgrade, and deployment task; only a brand-new untracked addon may set its initial version.
-- More than 50 files may be written in local non-deploy batches, but commit/push/deploy is allowed only after the final whole-module structure gate passes.
+- More than 50 files may be written in local non-deploy batches. New/complete modules require the final whole-module gate; existing surgical work requires the baseline-delta scoped gate.
 
 ## CHANGE SCOPE
 
@@ -50,7 +50,7 @@ The server workflow performs impact-based source reads, native-pattern preflight
 
 - A running status is not success.
 - When a response contains `next_call`, execute it.
-- When `repair_required=true` or `contract_status=pending`, generate complete repair writes from `structure_findings` and the persisted `module_contract`, then execute `next_call` immediately. Do not summarize or start deployment while the contract is pending; stop after three diagnosed repair attempts and report the exact remaining blocker.
+- When `repair_required=true` or `contract_status=pending`, repair only the returned blocking `structure_findings` and persisted task contract, then execute `next_call`. Findings explicitly returned under `preexisting_nonblocking_findings` must not be repaired as part of a surgical request. Stop after three diagnosed repair attempts and report the exact remaining blocker.
 - Use `jobs.get` for bounded polling and `workflow.resume_job` to recover an interrupted deployment.
 - Use `artifacts.read` only for a referenced large result and `odoosh.error_pack` only for a diagnosed deployment failure.
 - Diagnose before retrying; retry a failure at most three times and never restart an already-running or completed workflow.
