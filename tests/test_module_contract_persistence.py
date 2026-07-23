@@ -16,7 +16,7 @@ class MemoryStore:
         return dict(self.state)
 
 
-def test_module_contract_survives_short_followups_and_reopens_when_expanded(tmp_path):
+def test_module_contract_survives_short_followups_but_resets_for_new_task(tmp_path):
     store = MemoryStore()
     original = {
         "full_module_requested": True,
@@ -52,14 +52,72 @@ def test_module_contract_survives_short_followups_and_reopens_when_expanded(tmp_
     assert retained["required_models"] == ["iot.device"]
     assert second["requirement_sources"] == ["Build the complete IoT module with all requested device fields and views."]
 
-    expanded, third = _persist_module_contract(
+    independent, third = _persist_module_contract(
+        store,
+        client_name="odoo 18",
+        project_path=str(tmp_path),
+        module_name="iot_device_management",
+        current_contract={"required_layers": ["models"]},
+        task_description="Swap two field labels and calculate value from units.",
+    )
+    assert third["status"] == "pending"
+    assert independent["required_layers"] == ["models"]
+    assert independent["required_models"] == []
+    assert independent["required_packages"] == []
+    assert third["requirement_sources"] == ["Swap two field labels and calculate value from units."]
+
+
+def test_module_contract_merges_explicit_continuation(tmp_path):
+    store = MemoryStore()
+    original = {
+        "full_module_requested": True,
+        "required_layers": ["models", "report"],
+        "required_models": ["iot.device"],
+    }
+    _persist_module_contract(
+        store,
+        client_name="odoo 18",
+        project_path=str(tmp_path),
+        module_name="iot_device_management",
+        current_contract=original,
+        task_description="Build the complete IoT module with a status report.",
+    )
+
+    expanded, record = _persist_module_contract(
         store,
         client_name="odoo 18",
         project_path=str(tmp_path),
         module_name="iot_device_management",
         current_contract={"required_methods": ["execute_command"]},
-        task_description="Add execute_command to the original module scope.",
+        task_description="Additionally add execute_command to the same task.",
     )
-    assert third["status"] == "pending"
-    assert expanded["required_methods"] == ["execute_command"]
+
+    assert record["status"] == "pending"
+    assert expanded["required_layers"] == ["models", "report"]
     assert expanded["required_models"] == ["iot.device"]
+    assert expanded["required_methods"] == ["execute_command"]
+
+
+def test_pending_contract_does_not_contaminate_unrelated_surgical_task(tmp_path):
+    store = MemoryStore()
+    _persist_module_contract(
+        store,
+        client_name="odoo 18",
+        project_path=str(tmp_path),
+        module_name="rethink_bh_connector",
+        current_contract={"required_layers": ["report"], "required_view_types": ["form"]},
+        task_description="Build an operational report and report form.",
+    )
+
+    surgical, record = _persist_module_contract(
+        store,
+        client_name="odoo 18",
+        project_path=str(tmp_path),
+        module_name="rethink_bh_connector",
+        current_contract={"required_layers": ["models"]},
+        task_description="Swap Hours and Units labels and calculate Value from units.",
+    )
+
+    assert surgical["required_layers"] == ["models"]
+    assert surgical["required_view_types"] == []
+    assert record["requirement_sources"] == ["Swap Hours and Units labels and calculate Value from units."]

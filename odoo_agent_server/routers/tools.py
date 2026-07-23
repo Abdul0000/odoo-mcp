@@ -1862,20 +1862,32 @@ def _persist_module_contract(
     current_contract: dict[str, Any] | None,
     task_description: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Keep original deliverables enforceable across short follow-up calls."""
+    """Keep deliverables across continuations without leaking them into new tasks."""
     state = store.load_session_state(client_name)
     contracts = dict(state.get("module_contracts") or {})
     previous = contracts.get(module_name) if isinstance(contracts.get(module_name), dict) else {}
     resolved_project = str(Path(project_path).resolve())
     same_project = str(previous.get("project_path") or "") == resolved_project
-    previous_contract = previous.get("contract") if same_project else None
-    merged = OdooModuleValidator.merge_contracts(previous_contract, current_contract)
-    unchanged = same_project and previous_contract == merged
-    requirement_sources = list(previous.get("requirement_sources") or []) if same_project else []
     current_requirements = str(task_description or "").strip()
-    trivial_followup = current_requirements.lower() in {
+    lowered_requirements = current_requirements.lower()
+    trivial_followup = lowered_requirements in {
         "continue", "implement", "apply", "apply kro", "fix", "fix kro", "push", "deploy", "yes", "haan", "han",
     }
+    previous_task = str(previous.get("task_description") or "").strip()
+    explicit_continuation = bool(
+        trivial_followup
+        or current_requirements == previous_task
+        or lowered_requirements.startswith("continue the persisted module-contract implementation")
+        or re.match(
+            r"^(?:also|additionally|further|continue|same task|for the same task|to the original (?:task|module scope))\b",
+            lowered_requirements,
+        )
+    )
+    continue_previous = bool(same_project and previous and explicit_continuation)
+    previous_contract = previous.get("contract") if continue_previous else None
+    merged = OdooModuleValidator.merge_contracts(previous_contract, current_contract)
+    unchanged = continue_previous and previous_contract == merged
+    requirement_sources = list(previous.get("requirement_sources") or []) if continue_previous else []
     new_requirement = bool(current_requirements and not trivial_followup and current_requirements not in requirement_sources)
     if new_requirement:
         requirement_sources.append(current_requirements)
@@ -1887,6 +1899,7 @@ def _persist_module_contract(
         "status": previous.get("status", "pending") if unchanged and not new_requirement else "pending",
         "repair_attempts": int(previous.get("repair_attempts") or 0) if unchanged and not new_requirement else 0,
         "requirement_sources": requirement_sources,
+        "task_description": previous_task if trivial_followup and previous_task else current_requirements,
         "updated_at": time.time(),
     }
     contracts[module_name] = record
