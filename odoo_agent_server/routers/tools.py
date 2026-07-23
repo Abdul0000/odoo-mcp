@@ -387,7 +387,8 @@ _TOOL_DESCRIPTORS = [
             "First call: chunk_index=0, total_chunks=N. "
             "Next calls: chunk_index=1,2...N-1 with total_chunks=N. "
             "Each chunk is appended. Response shows progress and confirms when complete. "
-            "NEVER write partial files without chunked mode."
+            "NEVER write partial files without chunked mode. Inside an Odoo addon, Python writes automatically "
+            "create missing __init__.py files and propagate safe relative imports without changing the manifest."
         ),
         requires_approval=True,
     ),
@@ -398,7 +399,8 @@ _TOOL_DESCRIPTORS = [
             "PREFERRED for multi-file writes. Auto-selects fast-safe lock+backup+rollback for small related edits "
             "and falls back to git temp-worktree atomic for large/risky writes. Keeps quality high while avoiding "
             "slow repo.write_many_atomic for normal OWL/POS/website/XML changes. Each file should use "
-            "relative_path; path is also accepted as a compatibility alias."
+            "relative_path; path is also accepted as a compatibility alias. Odoo Python package init files/imports "
+            "are added to the same protected transaction automatically."
         ),
         requires_approval=True,
     ),
@@ -418,7 +420,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="repo.apply_patch",
         title="Apply code patch", description="[LEGACY — use repo.apply_patch_atomic instead] Check/apply a unified diff patch", requires_approval=True, deprecated=True),
     ToolDescriptor(name="repo.apply_patch_atomic",
-        title="Apply patch safely (atomic)", description="Apply a patch through an isolated temp worktree/branch before touching the real checkout", requires_approval=True),
+        title="Apply patch safely (atomic)", description="Apply a patch through an isolated temp worktree/branch before touching the real checkout; new Odoo Python files receive package __init__.py wiring inside the same transaction", requires_approval=True),
     ToolDescriptor(name="repo.clean_pyc",
         title="Clean compiled Python files", description="Remove .pyc and __pycache__ from a project", requires_approval=True),
     ToolDescriptor(name="git.status",

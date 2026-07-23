@@ -18,6 +18,7 @@ from ..schemas import CommandResult, CustomModuleItem, FileContent, FileListItem
 from .client_resolver_service import ClientResolverService
 from .path_service import resolve_allowed_path
 from .lock_service import RepoLockService
+from .odoo_package_wiring_service import OdooPackageWiringService
 
 _TEXT_LIMIT_HINT = "File is too large for this endpoint. Increase max_bytes or use a narrower file."
 
@@ -419,6 +420,7 @@ class RepoService:
         """
         self._reject_git_internal_path(relative_path)
         with RepoLockService().locked(project_path, owner="repo.write", timeout_seconds=60):
+            project = self.project(project_path)
             target = self.target(project_path, relative_path)
             if create_dirs:
                 target.parent.mkdir(parents=True, exist_ok=True)
@@ -429,6 +431,7 @@ class RepoService:
                 )
 
             # Fix 6: capture old content before overwrite for diff preview
+            old_target_bytes = target.read_bytes() if target.exists() and target.is_file() else None
             old_content: str | None = None
             if total_chunks == 1 and target.exists() and target.is_file():
                 try:
@@ -488,6 +491,49 @@ class RepoService:
                 with open(target, "a", encoding="utf-8") as f:
                     f.write(content)
 
+            auto_wired: list[str] = []
+            should_wire = target.suffix == ".py" and (total_chunks == 1 or chunk_index == total_chunks - 1)
+            if should_wire:
+                wiring_backups: dict[str, bytes | None] = {}
+                primary_rel = target.relative_to(project).as_posix()
+                try:
+                    expanded, auto_wired = OdooPackageWiringService().expand(project, [{
+                        "relative_path": primary_rel,
+                        "content": target.read_text(encoding="utf-8"),
+                        "create_dirs": create_dirs,
+                        "mode": "overwrite",
+                        "force": force,
+                    }])
+                    for item in expanded:
+                        rel = str(item["relative_path"])
+                        if rel == primary_rel:
+                            continue
+                        init_target = self._safe_join(project, rel)
+                        wiring_backups[rel] = init_target.read_bytes() if init_target.is_file() else None
+                        init_target.parent.mkdir(parents=True, exist_ok=True)
+                        tmp = init_target.with_name(f".{init_target.name}.tmp.{uuid4().hex[:8]}")
+                        tmp.write_text(str(item["content"]), encoding="utf-8")
+                        tmp.replace(init_target)
+                except Exception as exc:  # noqa: BLE001
+                    if old_target_bytes is None:
+                        target.unlink(missing_ok=True)
+                    else:
+                        rollback = target.with_name(f".{target.name}.rollback.{uuid4().hex[:8]}")
+                        rollback.write_bytes(old_target_bytes)
+                        rollback.replace(target)
+                    for rel, prior in wiring_backups.items():
+                        init_target = self._safe_join(project, rel)
+                        if prior is None:
+                            init_target.unlink(missing_ok=True)
+                        else:
+                            rollback = init_target.with_name(f".{init_target.name}.rollback.{uuid4().hex[:8]}")
+                            rollback.write_bytes(prior)
+                            rollback.replace(init_target)
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Python write rolled back because Odoo package auto-wiring failed: {exc}",
+                    ) from exc
+
             size = target.stat().st_size
             written_text = target.read_text(encoding="utf-8") if target.exists() else ""
             lines = written_text.count("\n")
@@ -527,6 +573,8 @@ class RepoService:
                     extra["diff_preview"] = diff_preview if diff_preview else "[no changes — content identical]"
                 else:
                     extra["diff_preview"] = "[new file created]"
+            if auto_wired:
+                extra["auto_wired_init_files"] = auto_wired
 
             return FileContent(
                 path=target.relative_to(self.project(project_path)).as_posix(),
@@ -613,7 +661,7 @@ class RepoService:
             transaction_name="repo.write_many_atomic",
             timeout_seconds=timeout_seconds,
             check_only=check_only,
-            mutate_worktree=lambda worktree: self._write_many_inside_worktree(worktree, normalized_files),
+            mutate_worktree=lambda worktree: self._write_many_inside_worktree_with_wiring(worktree, normalized_files),
         )
 
     def write_many_fast_safe(self, project_path: str, files: list[object], check_only: bool = False, timeout_seconds: int = 30) -> CommandResult:
@@ -627,6 +675,7 @@ class RepoService:
         """
         project = self.project(project_path)
         normalized_files = self._normalise_write_many_files(project, files, action="repo.write_many_fast_safe")
+        normalized_files, auto_wired = self._expand_odoo_package_writes(project, normalized_files)
         allowed, reason = self._fast_safe_write_allowed(normalized_files)
         if not allowed:
             return CommandResult(
@@ -649,7 +698,8 @@ class RepoService:
                 stdout=(
                     f"Fast-safe check-only passed for {len(normalized_files)} file(s), "
                     f"{total_bytes} bytes total. Real checkout unchanged.\n"
-                    f"files={', '.join(str(item['relative_path']) for item in normalized_files)}"
+                    f"files={', '.join(str(item['relative_path']) for item in normalized_files)}\n"
+                    f"auto_wired_init_files={auto_wired}"
                 ),
             )
 
@@ -711,6 +761,7 @@ class RepoService:
                 "Fast-safe write applied with repo lock + backups + rollback protection.\n"
                 f"changed={changed}\n"
                 f"unchanged={unchanged}\n"
+                f"auto_wired_init_files={auto_wired}\n"
                 f"files={len(normalized_files)} total_bytes={total_bytes} elapsed_ms={elapsed_ms}\n"
                 "Next: run git.diff and workflow.verify_against_core on these changed files only."
             ),
@@ -720,6 +771,7 @@ class RepoService:
         """Choose the fastest safe writer without weakening validation quality."""
         project = self.project(project_path)
         normalized_files = self._normalise_write_many_files(project, files, action="repo.write_many_smart")
+        normalized_files, _ = self._expand_odoo_package_writes(project, normalized_files)
         strategy = (strategy or "auto").strip().lower()
         if strategy not in {"auto", "fast_safe", "atomic"}:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="strategy must be one of: auto, fast_safe, atomic")
@@ -819,7 +871,55 @@ class RepoService:
         check = self._run(["git", "apply", "--check", str(patch_path)], worktree, timeout_seconds)
         if check.exit_code != 0:
             return check
-        return self._run(["git", "apply", str(patch_path)], worktree, timeout_seconds)
+        applied = self._run(["git", "apply", str(patch_path)], worktree, timeout_seconds)
+        if applied.exit_code != 0:
+            return applied
+        patch_text = patch_path.read_text(encoding="utf-8")
+        python_files: list[dict[str, object]] = []
+        for rel in self._patch_target_paths(patch_text):
+            target = self._safe_join(worktree, rel)
+            if target.suffix != ".py" or not target.is_file():
+                continue
+            python_files.append({
+                "relative_path": rel,
+                "content": target.read_text(encoding="utf-8"),
+                "create_dirs": True,
+                "mode": "overwrite",
+                "force": False,
+            })
+        if not python_files:
+            return applied
+        try:
+            expanded, auto_wired = OdooPackageWiringService().expand(worktree, python_files)
+        except Exception as exc:  # noqa: BLE001
+            return CommandResult(
+                command=["git", "apply", "+", "odoo-package-auto-wire"],
+                cwd=str(worktree),
+                exit_code=1,
+                stderr=f"Odoo Python package auto-wiring failed: {exc}",
+            )
+        wired = self._write_many_inside_worktree(worktree, expanded)
+        if wired.exit_code != 0:
+            return wired
+        return applied.model_copy(update={
+            "command": ["git", "apply", "+", "odoo-package-auto-wire"],
+            "stdout": (applied.stdout + f"\nauto_wired_init_files={auto_wired}").strip(),
+        })
+
+    @staticmethod
+    def _patch_target_paths(patch: str) -> list[str]:
+        paths: list[str] = []
+        for line in patch.splitlines():
+            if not line.startswith("+++ "):
+                continue
+            raw = line[4:].split("\t", 1)[0].strip().strip('"')
+            if raw == "/dev/null":
+                continue
+            if raw.startswith("b/"):
+                raw = raw[2:]
+            if raw and raw not in paths:
+                paths.append(raw)
+        return paths
 
     def _write_many_inside_worktree(self, worktree: Path, files: list[dict[str, object]]) -> CommandResult:
         changed: list[str] = []
@@ -846,6 +946,31 @@ class RepoService:
             tmp.replace(target)
             changed.append(rel)
         return CommandResult(command=["repo", "write_many_atomic"], cwd=str(worktree), exit_code=0, stdout="Prepared files: " + ", ".join(changed))
+
+    def _write_many_inside_worktree_with_wiring(self, worktree: Path, files: list[dict[str, object]]) -> CommandResult:
+        try:
+            expanded, auto_wired = OdooPackageWiringService().expand(worktree, files)
+        except Exception as exc:  # noqa: BLE001
+            return CommandResult(
+                command=["repo", "write_many_atomic", "+", "odoo-package-auto-wire"],
+                cwd=str(worktree),
+                exit_code=1,
+                stderr=f"Odoo Python package auto-wiring failed: {exc}",
+            )
+        result = self._write_many_inside_worktree(worktree, expanded)
+        if result.exit_code == 0:
+            result.stdout = result.stdout + f"\nauto_wired_init_files={auto_wired}"
+        return result
+
+    @staticmethod
+    def _expand_odoo_package_writes(project: Path, files: list[dict[str, object]]) -> tuple[list[dict[str, object]], list[str]]:
+        try:
+            return OdooPackageWiringService().expand(project, files)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Odoo Python package auto-wiring failed: {exc}",
+            ) from exc
 
     def _run_atomic_worktree_transaction(self, project: Path, transaction_name: str, timeout_seconds: int, check_only: bool, mutate_worktree) -> CommandResult:
         if not (project / ".git").exists():
