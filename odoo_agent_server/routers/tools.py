@@ -2703,8 +2703,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             + [str(r.get("relative_path")) for r in custom_reads if r.get("status") == "read" and r.get("relative_path")]
         ))
         return {
-            "status": "verify_failed",
-            "message": "INTERNAL_REPAIR_REQUIRED: code was written but structure/QA is incomplete. Apply the returned findings and immediately rerun workflow.odoo_code_change; do not summarize or deploy.",
+            "status": "internal_repair_required",
+            "message": "INTERNAL_CONTINUATION_REQUIRED: a newly introduced or task-required verification error remains. Apply only the returned blocking findings and immediately rerun workflow.odoo_code_change; do not stop, summarize, or ask the user to repair files.",
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
@@ -2719,6 +2719,11 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "repair_required": True,
             "repair_attempts": repair_attempts,
             "max_repair_attempts": 3,
+            "terminal": False,
+            "must_continue": repair_attempts <= 3,
+            "summary_allowed": False,
+            "tool_exit_allowed": False,
+            "blocking_scope": "new_task_required_or_integrity_only",
             "structure_findings": repair_findings,
             "module_structure_complete": False,
             "success_allowed": False,
@@ -3316,6 +3321,8 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             "persisted_requirements": {"type": "string"},
             "contract_status": {"type": "string"}, "repair_required": {"type": "boolean"},
             "repair_attempts": {"type": "integer"}, "structure_findings": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "terminal": {"type": "boolean"}, "must_continue": {"type": "boolean"},
+            "summary_allowed": {"type": "boolean"}, "blocking_scope": {"type": "string"},
         })
     elif internal.startswith("repo."):
         properties.update({

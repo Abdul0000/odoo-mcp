@@ -86,7 +86,7 @@ def agent_instructions() -> dict:
                 "For code changes call workflow.odoo_code_change; for read-only custom-addon explanation call workflow.module_analyze immediately; for visual generation call workflow.frontend_visual_implement; for explicit install/upgrade/install-and-fix call workflow.module_install_and_check immediately, poll jobs.get, and only enter code change on a terminal installation error. New/complete modules require strict structure; existing surgical changes use baseline-delta QA and are not blocked by unchanged unrelated legacy findings.",
                 "Do not call hidden repo, Git, source-discovery, verification, or deploy tools; the composite workflow owns those steps.",
                 "When a response returns next_call or a running status, use jobs.get or workflow.resume_job until terminal.",
-                "When repair_required=true or contract_status=pending, generate repairs from structure_findings and the persisted module_contract, then execute next_call; allow at most three diagnosed repair cycles and never deploy an incomplete contract.",
+                "When repair_required=true, must_continue=true, or contract_status=pending, treat it as non-terminal: generate only the blocking repairs from structure_findings and execute next_call immediately without summarizing or asking the user; allow at most three diagnosed repair cycles.",
                 "When deploy_confirmed or already_deployed_confirmed is true, stop immediately and give a concise summary.",
                 "Never expose credentials, create normal module schema through Studio/ORM shortcuts, or put Pydantic code inside Odoo addons.",
             ],
