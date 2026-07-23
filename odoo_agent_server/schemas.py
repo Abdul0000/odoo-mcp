@@ -6,7 +6,7 @@ import re
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import AliasChoices, BaseModel, Field, computed_field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, computed_field, field_validator
 
 
 class Severity(str, Enum):
@@ -360,9 +360,30 @@ class RepoSearchRequest(BaseProjectRequest):
 
 
 class RepoWriteRequest(BaseProjectRequest, ApprovalMixin):
+    model_config = ConfigDict(extra="forbid")
+
     relative_path: str
     content: str
     create_dirs: bool = True
+    mode: Literal["overwrite", "append"] = Field(
+        default="overwrite",
+        description=(
+            "'overwrite' (default) replaces the entire file with content — this is the ONLY "
+            "behavior prior versions supported, preserved here for compatibility. 'append' adds "
+            "content to the end of the existing file without touching prior content; the file is "
+            "created if it does not exist. There is no 'insert at line' or 'patch' mode here — "
+            "use repo.apply_patch for surgical/partial edits to existing content."
+        ),
+    )
+    force: bool = Field(
+        default=False,
+        description=(
+            "Required to be true when mode='overwrite' targets an existing non-empty file and the "
+            "new content is much smaller than the current file (looks like accidental data loss). "
+            "Set force=true only after reviewing the returned diff_preview and confirming the "
+            "shrink is intentional."
+        ),
+    )
     # Chunked write support for large files (>1000 lines)
     # chunk_index: 0-based index of this chunk
     # total_chunks: total number of chunks to expect
@@ -372,21 +393,35 @@ class RepoWriteRequest(BaseProjectRequest, ApprovalMixin):
 
 
 class RepoWriteItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     relative_path: str = Field(
         validation_alias=AliasChoices("relative_path", "path"),
         description="Path relative to project_path. The alias 'path' is accepted for compatibility with MCP clients.",
     )
     content: str
     create_dirs: bool = True
+    mode: Literal["overwrite", "append"] = Field(
+        default="overwrite",
+        description="'overwrite' replaces the whole file (default, matches prior behavior). 'append' adds to the end without touching existing content.",
+    )
+    force: bool = Field(
+        default=False,
+        description="Required true when mode='overwrite' would shrink an existing non-empty file dramatically — confirms the overwrite is intentional.",
+    )
 
 
 class RepoWriteManyAtomicRequest(BaseProjectRequest, ApprovalMixin):
+    model_config = ConfigDict(extra="forbid")
+
     files: list[RepoWriteItem] = Field(..., min_length=1, max_length=200, description="Files to write as one atomic multi-file transaction")
     check_only: bool = Field(default=False, description="Validate the transaction without changing the real checkout")
     timeout_seconds: int = Field(default=60, ge=5, le=300)
 
 
 class RepoWriteManyFastSafeRequest(BaseProjectRequest, ApprovalMixin):
+    model_config = ConfigDict(extra="forbid")
+
     files: list[RepoWriteItem] = Field(..., min_length=1, max_length=50, description="Small related files to write using lock + backup + rollback, without git worktree overhead")
     check_only: bool = Field(default=False, description="Validate paths, limits, and parent directories without changing the checkout")
     timeout_seconds: int = Field(default=30, ge=5, le=180, description="Lock timeout for the fast-safe write")

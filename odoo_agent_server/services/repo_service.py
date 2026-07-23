@@ -376,6 +376,11 @@ class RepoService:
     # Fix 6: unified-diff line limit to include in response (keeps payload small)
     _DIFF_PREVIEW_LINES = 60
 
+    # Fix 7: below this fraction of prior size, a single-write overwrite of an
+    # existing non-empty file is treated as a likely accidental data-loss and
+    # rejected unless the caller explicitly passes force=True.
+    _OVERWRITE_SHRINK_GUARD_RATIO = 0.3
+
     def write_file(
         self,
         project_path: str,
@@ -384,6 +389,8 @@ class RepoService:
         create_dirs: bool = True,
         chunk_index: int = 0,
         total_chunks: int = 1,
+        mode: str = "overwrite",
+        force: bool = False,
     ) -> FileContent:
         """Write a file, with optional chunked mode for large files (>1000 lines).
 
@@ -399,6 +406,16 @@ class RepoService:
         Fix 6: When overwriting an existing file in single-write mode (chunk_index==0,
         total_chunks==1), the response always includes a short unified diff showing
         what changed, allowing the agent to verify correctness before committing.
+
+        Fix 7 (mode + shrink guard): mode='append' adds content to the end of an
+        existing file without touching prior content, instead of replacing it —
+        this was previously unsupported, causing silent full-file overwrites when
+        an agent intended to append. mode='overwrite' (default) preserves the
+        original behavior exactly. For mode='overwrite' against an existing
+        non-empty file, if the new content is dramatically smaller than the old
+        content (likely accidental truncation/overwrite) and force is not True,
+        the write is rejected with a 409 and the diff preview so the caller can
+        review before forcing it through.
         """
         self._reject_git_internal_path(relative_path)
         with RepoLockService().locked(project_path, owner="repo.write", timeout_seconds=60):
@@ -419,7 +436,39 @@ class RepoService:
                 except Exception:
                     old_content = None
 
-            if total_chunks == 1:
+            if total_chunks == 1 and mode == "append":
+                # Fix 7: explicit append mode — never touches existing content.
+                with open(target, "a", encoding="utf-8") as f:
+                    f.write(content)
+                content = (old_content or "") + content
+            elif total_chunks == 1 and mode == "overwrite" and old_content is not None and old_content.strip():
+                # Fix 7: shrink guard against accidental full-file overwrite.
+                old_len = len(old_content)
+                new_len = len(content)
+                if not force and old_len > 200 and new_len < old_len * self._OVERWRITE_SHRINK_GUARD_RATIO:
+                    diff_preview = self._unified_diff_preview(
+                        old_content,
+                        content,
+                        str(target.relative_to(self.project(project_path)).as_posix()),
+                        max_lines=self._DIFF_PREVIEW_LINES,
+                    )
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail={
+                            "error": "overwrite_shrink_guard",
+                            "message": (
+                                f"Refusing overwrite: new content ({new_len} bytes) is far smaller than "
+                                f"the existing file ({old_len} bytes) for {relative_path}. If you meant to "
+                                f"append instead of replace, resend with mode='append'. If this overwrite "
+                                f"is intentional, resend with force=true."
+                            ),
+                            "diff_preview": diff_preview,
+                        },
+                    )
+                tmp = target.with_name(f".{target.name}.tmp")
+                tmp.write_text(content, encoding="utf-8")
+                tmp.replace(target)
+            elif total_chunks == 1:
                 # Normal single-write: atomic replace
                 tmp = target.with_name(f".{target.name}.tmp")
                 tmp.write_text(content, encoding="utf-8")
@@ -625,9 +674,9 @@ class RepoService:
                 for item in normalized_files:
                     rel = str(item["relative_path"])
                     target = self._safe_join(project, rel)
-                    content = str(item["content"])
-                    new_bytes = content.encode("utf-8")
-                    if backups.get(rel) == new_bytes:
+                    existing_bytes = backups.get(rel)
+                    new_bytes = self._resolve_write_content(existing_bytes, item, rel)
+                    if existing_bytes == new_bytes:
                         unchanged.append(rel)
                         continue
                     tmp = target.with_name(f".{target.name}.tmp.{uuid4().hex[:8]}")
@@ -698,16 +747,46 @@ class RepoService:
             raw_path = str(getattr(item, "relative_path", ""))
             content = str(getattr(item, "content", ""))
             create_dirs = bool(getattr(item, "create_dirs", True))
+            mode = str(getattr(item, "mode", "overwrite") or "overwrite")
+            force = bool(getattr(item, "force", False))
+            if mode not in ("overwrite", "append"):
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid mode '{mode}' for {raw_path}: must be 'overwrite' or 'append'")
             self._reject_git_internal_path(raw_path)
             resolved = self._safe_join(project, raw_path)
             rel = resolved.relative_to(project).as_posix()
             if rel in seen:
                 raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Duplicate file in {action}: {rel}")
             seen.add(rel)
-            normalized_files.append({"relative_path": rel, "content": content, "create_dirs": create_dirs})
+            normalized_files.append({"relative_path": rel, "content": content, "create_dirs": create_dirs, "mode": mode, "force": force})
         if not normalized_files:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="files must not be empty")
         return normalized_files
+
+    def _resolve_write_content(self, existing_bytes: bytes | None, item: dict[str, object], rel: str) -> bytes:
+        """Apply mode + shrink-guard for one file inside a multi-file write. Returns final bytes to write."""
+        new_content = str(item["content"])
+        mode = str(item.get("mode", "overwrite"))
+        force = bool(item.get("force", False))
+        if mode == "append":
+            old_text = existing_bytes.decode("utf-8") if existing_bytes else ""
+            return (old_text + new_content).encode("utf-8")
+        # overwrite mode: shrink guard against accidental data loss
+        if existing_bytes is not None:
+            old_len = len(existing_bytes)
+            new_len = len(new_content.encode("utf-8"))
+            if not force and old_len > 200 and new_len < old_len * self._OVERWRITE_SHRINK_GUARD_RATIO:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": "overwrite_shrink_guard",
+                        "message": (
+                            f"Refusing overwrite of {rel}: new content ({new_len} bytes) is far smaller than "
+                            f"the existing file ({old_len} bytes). If you meant to append, resend with mode='append'. "
+                            f"If this overwrite is intentional, resend with force=true."
+                        ),
+                    },
+                )
+        return new_content.encode("utf-8")
 
     def _fast_safe_write_allowed(self, files: list[dict[str, object]]) -> tuple[bool, str]:
         max_files = max(1, int(getattr(settings, "fast_write_max_files", 8)))
@@ -756,8 +835,14 @@ class RepoService:
                     exit_code=1,
                     stderr=f"Parent directory not found: {target.parent}",
                 )
+            existing_bytes = target.read_bytes() if target.exists() else None
+            try:
+                new_bytes = self._resolve_write_content(existing_bytes, item, rel)
+            except HTTPException as exc:
+                detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+                return CommandResult(command=["repo", "write_many_atomic"], cwd=str(worktree), exit_code=1, stderr=detail)
             tmp = target.with_name(f".{target.name}.tmp")
-            tmp.write_text(str(item["content"]), encoding="utf-8")
+            tmp.write_bytes(new_bytes)
             tmp.replace(target)
             changed.append(rel)
         return CommandResult(command=["repo", "write_many_atomic"], cwd=str(worktree), exit_code=0, stdout="Prepared files: " + ", ".join(changed))
