@@ -191,6 +191,7 @@ name = fields.Char(default=lambda s: s.env['ir.sequence'].next_by_code('my.modul
   silent `AccessError`, including admins in some setups.
 - Never inject `Pydantic`/FastAPI-style code into Odoo addons — Odoo model
   fields and `@api.constrains`/`@api.depends` are the only validation layer.
+- For HTML chatter/audit notes, pass trusted `markupsafe.Markup` to `message_post` and escape every dynamic value; backfills must update an existing raw-HTML note in place instead of posting a duplicate.
 - New tables need a migration story: fresh install is free; on existing DBs,
   new required fields need a `default=` or a post-init data hook.
 - **Files must be complete per the prompt, not partial.** When a task asks
