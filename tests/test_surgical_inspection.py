@@ -3,6 +3,7 @@ from pathlib import Path
 from odoo_agent_server.routers.tools import (
     _build_safe_generic_autopatch,
     _analysis_index_target_paths,
+    _contract_candidate_paths,
     _exact_write_context,
     _focused_search,
     _infer_code_change_search_patterns,
@@ -121,6 +122,71 @@ def test_exact_write_context_recovers_method_line_from_task_when_preview_has_no_
 
     assert contexts[0]["context_type"] == "complete_python_function"
     assert "return {'body': 'full note'}" in contexts[0]["content"]
+
+
+def test_contract_candidates_include_implementation_and_existing_tests(tmp_path):
+    module = tmp_path / "rethink"
+    (module / "models").mkdir(parents=True)
+    (module / "tests").mkdir()
+    (module / "models" / "session_note.py").write_text(
+        "API_METHOD = 'GetAppointmentsByIdAsync'\n",
+        encoding="utf-8",
+    )
+    (module / "tests" / "test_session_note.py").write_text(
+        "def test_flow():\n    assert 'GetAppointmentsByIdAsync'\n",
+        encoding="utf-8",
+    )
+    payload = OdooCodeChangeRequest(
+        module_name="rethink",
+        task_description="Implement GetAppointmentsByIdAsync with mocked tests that pass",
+        target_hint="GetAppointmentsByIdAsync",
+    )
+    contract = {
+        "required_methods": [],
+        "required_symbols": ["GetAppointmentsByIdAsync"],
+        "required_layers": ["tests"],
+    }
+
+    paths = _contract_candidate_paths(tmp_path, "rethink", payload, contract)
+
+    assert "rethink/models/session_note.py" in paths
+    assert "rethink/tests/test_session_note.py" in paths
+
+
+def test_exact_write_context_returns_relevant_functions_across_multiple_files(tmp_path):
+    first = tmp_path / "rethink" / "models" / "session_note.py"
+    second = tmp_path / "rethink" / "services" / "browser.py"
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.write_text(
+        "def fetch_appointment():\n"
+        "    return 'GetAppointmentsByIdAsync'\n",
+        encoding="utf-8",
+    )
+    second.write_text(
+        "def fetch_response():\n"
+        "    return 'GetFormResponsesAsync'\n",
+        encoding="utf-8",
+    )
+    payload = OdooCodeChangeRequest(
+        module_name="rethink",
+        task_description="Implement GetAppointmentsByIdAsync then GetFormResponsesAsync",
+    )
+
+    contexts = _exact_write_context(
+        tmp_path,
+        [
+            {"relative_path": "rethink/models/session_note.py", "status": "read"},
+            {"relative_path": "rethink/services/browser.py", "status": "read"},
+        ],
+        payload=payload,
+    )
+
+    assert {context["relative_path"] for context in contexts} == {
+        "rethink/models/session_note.py",
+        "rethink/services/browser.py",
+    }
+    assert all(context["context_type"] == "complete_python_function" for context in contexts)
 
 
 def test_core_paths_and_directory_files_are_relevance_ranked(tmp_path):

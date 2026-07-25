@@ -215,10 +215,15 @@ class OdooShService:
 
     def run_shell(self, remote_script: str, timeout_seconds: int = 60) -> CommandResult:
         target = self._target()
-        command = self._base_ssh_command(target) + [remote_script]
+        # Send the script over stdin instead of embedding it in the remote
+        # command argument. OpenSSH joins remote argv into one shell command;
+        # nested quotes/heredocs can otherwise become an unterminated string.
+        command = self._base_ssh_command(target) + ["sh", "-s"]
+        script_input = remote_script if remote_script.endswith("\n") else remote_script + "\n"
         try:
             completed = subprocess.run(
                 command,
+                input=script_input,
                 capture_output=True,
                 text=True,
                 timeout=timeout_seconds,

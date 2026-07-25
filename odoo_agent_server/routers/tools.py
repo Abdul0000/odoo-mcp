@@ -1320,6 +1320,68 @@ def _analysis_index_target_paths(analysis: dict[str, Any] | None, payload: OdooC
     return [path for _, path in ranked[:8]]
 
 
+def _contract_candidate_paths(
+    project: Path,
+    module_path: str,
+    payload: OdooCodeChangeRequest,
+    contract: dict[str, Any],
+    *,
+    limit: int = 24,
+) -> list[str]:
+    """Find all likely implementation/test files for a persisted task contract."""
+    module_dir = project / module_path
+    patterns = {
+        value.lower()
+        for value in [
+            *_infer_code_change_search_patterns(payload),
+            *(contract.get("required_methods") or []),
+            *(contract.get("required_symbols") or []),
+        ]
+        if str(value).strip()
+    }
+    symbol_words: set[str] = set()
+    for symbol in contract.get("required_symbols") or []:
+        parts = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|\d+", str(symbol))
+        symbol_words.update(part.lower() for part in parts if len(part) >= 4 and part.lower() not in {"async", "response"})
+
+    ranked: list[tuple[float, str]] = []
+    for path in module_dir.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in {".py", ".js", ".xml", ".csv"}:
+            continue
+        relative = path.relative_to(project).as_posix()
+        module_relative = path.relative_to(module_dir).as_posix()
+        if any(part in {"__pycache__", ".pytest_cache", "node_modules", "static/lib"} for part in path.parts):
+            continue
+        content = path.read_text(encoding="utf-8", errors="ignore").lower()
+        path_lower = module_relative.lower()
+        score = 0.0
+        for pattern in patterns:
+            normalized = pattern.removesuffix("()")
+            if normalized in path_lower:
+                score += 6.0
+            if normalized in content:
+                score += 8.0
+        for word in symbol_words:
+            if word in path_lower:
+                score += 3.0
+            elif word in content:
+                score += 1.0
+        if "tests" in (contract.get("required_layers") or []) and path_lower.startswith("tests/"):
+            score += 10.0
+        if path.suffix.lower() == ".py" and path_lower.startswith(("models/", "services/", "controllers/")):
+            score += 1.0
+        if score > 0:
+            ranked.append((score, relative))
+    ranked.sort(key=lambda row: (-row[0], row[1]))
+    result = [path for _, path in ranked[:limit]]
+
+    if "tests" in (contract.get("required_layers") or []):
+        existing_tests = [path for path in result if f"{module_path.rstrip('/')}/tests/" in f"/{path}"]
+        if not existing_tests:
+            result.append(f"{module_path.rstrip('/')}/tests/test_requested_flow.py")
+    return list(dict.fromkeys(result))[:limit]
+
+
 def _file_preview(content: str, max_chars: int = 6000) -> str:
     if len(content) <= max_chars:
         return content
@@ -1331,10 +1393,22 @@ def _exact_write_context(
     custom_reads: list[dict[str, Any]],
     *,
     payload: OdooCodeChangeRequest | None = None,
-    max_chars: int = 12_000,
-    max_files: int = 3,
+    max_chars: int = 14_000,
+    max_files: int = 12,
 ) -> list[dict[str, Any]]:
-    """Return compact exact source units suitable for model-generated writes."""
+    """Return exact source units across all relevant task files within budget."""
+    context_patterns: list[str] = []
+    if payload is not None:
+        context_patterns.extend(
+            pattern.strip().removesuffix("()")
+            for pattern in _infer_code_change_search_patterns(payload)
+            if pattern.strip()
+        )
+        context_patterns.extend(re.findall(
+            r"\b(?:[A-Z][A-Za-z0-9]*[a-z0-9][A-Z][A-Za-z0-9]*|[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*)\b",
+            payload.task_description,
+        ))
+    context_patterns = list(dict.fromkeys(pattern for pattern in context_patterns if pattern))
     candidates = [
         item for item in custom_reads
         if item.get("status") == "read"
@@ -1364,55 +1438,61 @@ def _exact_write_context(
             if str(line).isdigit() and int(line) > 0
         })
         if not match_lines and payload is not None:
-            patterns = [
-                pattern.strip().removesuffix("()")
-                for pattern in _infer_code_change_search_patterns(payload)
-                if pattern.strip()
-            ]
             match_lines = [
                 line_number
                 for line_number, line in enumerate(lines, start=1)
-                if any(pattern in line for pattern in patterns)
+                if any(pattern in line for pattern in context_patterns)
             ][:20]
-        context: dict[str, Any] | None = None
+        file_contexts: list[dict[str, Any]] = []
 
         if target.suffix == ".py" and match_lines:
             try:
                 tree = ast.parse(content)
-                blocks: list[tuple[int, int]] = []
-                for node in ast.walk(tree):
-                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        continue
-                    start = int(node.lineno)
-                    end = int(node.end_lineno or node.lineno)
-                    if any(start <= line <= end for line in match_lines):
-                        blocks.append((start, end))
-                if blocks:
-                    start, end = min(blocks, key=lambda pair: pair[1] - pair[0])
+                blocks: set[tuple[int, int]] = set()
+                function_ranges = [
+                    (int(node.lineno), int(node.end_lineno or node.lineno))
+                    for node in ast.walk(tree)
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                ]
+                for line in match_lines:
+                    enclosing = [pair for pair in function_ranges if pair[0] <= line <= pair[1]]
+                    if enclosing:
+                        blocks.add(min(enclosing, key=lambda pair: pair[1] - pair[0]))
+                for start, end in sorted(blocks):
                     source = "".join(lines[start - 1:end])
-                    if len(source) <= remaining:
-                        context = {
+                    if len(source) > remaining:
+                        continue
+                    matched = [
+                        pattern for pattern in context_patterns
+                        if pattern and pattern in source
+                    ]
+                    file_contexts.append({
                             "relative_path": rel,
                             "context_type": "complete_python_function",
                             "complete_unit": True,
                             "start_line": start,
                             "end_line": end,
                             "content": source,
-                        }
+                            "matched_identifiers": matched,
+                        })
+                    remaining -= len(source)
+                    if remaining < 1000:
+                        break
             except SyntaxError:
                 pass
 
-        if context is None and len(content) <= remaining:
-            context = {
+        if not file_contexts and len(content) <= remaining:
+            file_contexts.append({
                 "relative_path": rel,
                 "context_type": "complete_file",
                 "complete_unit": True,
                 "start_line": 1,
                 "end_line": len(lines),
                 "content": content,
-            }
+            })
+            remaining -= len(content)
 
-        if context is None and match_lines and remaining >= 1000:
+        if not file_contexts and match_lines and remaining >= 1000:
             center = match_lines[0]
             start = max(1, center - 100)
             end = min(len(lines), center + 100)
@@ -1420,19 +1500,17 @@ def _exact_write_context(
             if len(source) > remaining:
                 source = source[:remaining]
                 end = start + source.count("\n")
-            context = {
+            file_contexts.append({
                 "relative_path": rel,
                 "context_type": "exact_match_range",
                 "complete_unit": False,
                 "start_line": start,
                 "end_line": end,
                 "content": source,
-            }
+            })
+            remaining -= len(source)
 
-        if context is None:
-            continue
-        contexts.append(context)
-        remaining -= len(str(context["content"]))
+        contexts.extend(file_contexts)
         if remaining < 1000:
             break
     return contexts
@@ -2382,6 +2460,9 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         for rel in focused_paths[:10]:
             if rel and rel not in custom_rel_paths:
                 custom_rel_paths.append(rel)
+        for rel in _contract_candidate_paths(project, module.path, payload, module_contract):
+            if rel and rel not in custom_rel_paths:
+                custom_rel_paths.append(rel)
 
     generated_writes: list[OdooCodeFileChange] = []
     generated_autopatch_strategy: str | None = None
@@ -2665,6 +2746,10 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     writes_to_apply = list(payload.writes or generated_writes)
     if not writes_to_apply:
         write_context = _exact_write_context(project, custom_reads, payload=payload)
+        write_context_text = "\n".join(str(item.get("content") or "") for item in write_context)
+        required_identifiers = list(dict.fromkeys(
+            [*(module_contract.get("required_methods") or []), *(module_contract.get("required_symbols") or [])]
+        ))
         custom_read_metadata = [
             {key: value for key, value in item.items() if key != "preview"}
             for item in custom_reads[:50]
@@ -2717,6 +2802,16 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "write_generation": {
                 "required": True,
                 "contexts": write_context,
+                "required_contract": module_contract,
+                "identifier_coverage": {
+                    "required": required_identifiers,
+                    "present_in_context": [value for value in required_identifiers if value in write_context_text],
+                    "not_in_returned_context": [value for value in required_identifiers if value not in write_context_text],
+                },
+                "suggested_write_targets": [
+                    item.get("relative_path") for item in custom_read_metadata
+                    if item.get("status") == "missing"
+                ],
                 "output_schema": [{
                     "relative_path": "Path copied from the selected context",
                     "search": "Exact source text to replace",
@@ -2725,7 +2820,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                     "count": 1,
                 }],
                 "rules": [
-                    "Generate at least one write before making next_call.",
+                    "Generate one complete write set for every required contract item before making next_call.",
+                    "Do not submit import, manifest, security, or scaffold-only writes when functional identifiers or tests remain missing.",
                     "Prefer literal search/replace with count=1 from a complete source unit.",
                     "Preserve unrelated code and do not rewrite omitted source.",
                 ],
@@ -2800,7 +2896,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         task_description=(persisted_requirements or payload.task_description)[-20000:],
         create_module=payload.create_module,
         module_contract=module_contract,
-        run_pytest=False,
+        run_pytest="tests" in (module_contract.get("required_layers") or []),
         include_git_status=True,
     ))
     verify = verify_against_core(SyntaxVerifyRequest(written_files=written_files_abs, project_path=project_path, client_name=client_name, fix_cycle=0))

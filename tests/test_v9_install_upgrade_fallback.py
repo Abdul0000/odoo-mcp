@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
@@ -12,6 +14,28 @@ from odoo_agent_server.services.approval_service import ApprovalService
 from odoo_agent_server.services.odoo_service import OdooService
 from odoo_agent_server.services.odoosh_service import OdooShService
 from odoo_agent_server.services.store_service import JsonStore
+
+
+def test_odoosh_run_shell_streams_complex_script_over_stdin(monkeypatch):
+    service = OdooShService()
+    captured = {}
+    monkeypatch.setattr(service, "_target", lambda: object())
+    monkeypatch.setattr(service, "_base_ssh_command", lambda target: ["ssh", "odoo@example"])
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr("odoo_agent_server.services.odoosh_service.subprocess.run", fake_run)
+    script = "value='quoted'; printf '%s\\n' \"$value\"\ncat <<'PY'\n{'nested': \"quotes\"}\nPY"
+
+    result = service.run_shell(script)
+
+    assert result.exit_code == 0
+    assert captured["command"] == ["ssh", "odoo@example", "sh", "-s"]
+    assert captured["kwargs"]["input"] == script + "\n"
+    assert script not in captured["command"]
 
 
 def test_approval_required_actions_do_not_block_when_global_approval_disabled(monkeypatch, tmp_path):

@@ -326,6 +326,102 @@ def test_detailed_iot_prompt_builds_enforceable_module_contract():
     assert set(contract["required_routes"]) == {"/iot/v1/heartbeat", "/iot/v1/data/<token>"}
 
 
+def test_session_note_prompt_captures_api_identifiers_and_mocked_tests():
+    prompt = """
+    Complete the Session Note flow:
+    Appointment ID → GetAppointmentsByIdAsync → sessionNoteResponseId
+    → clientId + isDraft → GetFormResponsesAsync → real record update.
+    Existing browser cron must process pending appointments and mocked tests must pass.
+    """
+
+    contract = OdooModuleValidator.requested_contract(prompt)
+
+    assert {
+        "GetAppointmentsByIdAsync",
+        "sessionNoteResponseId",
+        "clientId",
+        "isDraft",
+        "GetFormResponsesAsync",
+    } <= set(contract["required_symbols"])
+    assert "tests" in contract["required_layers"]
+    assert "tests" in contract["required_packages"]
+    assert set(contract["required_test_symbols"]) == set(contract["required_symbols"])
+
+
+def test_session_note_contract_blocks_structural_only_implementation(tmp_path):
+    module = tmp_path / "rethink"
+    (module / "models").mkdir(parents=True)
+    (module / "__init__.py").write_text("from . import models\n", encoding="utf-8")
+    (module / "models" / "__init__.py").write_text("from . import rethink_session_note\n", encoding="utf-8")
+    (module / "models" / "rethink_session_note.py").write_text(
+        "from odoo import models\n\nclass SessionNote(models.Model):\n"
+        "    _name = 'rethink.session.note'\n",
+        encoding="utf-8",
+    )
+    (module / "__manifest__.py").write_text(
+        "{'name': 'Rethink', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': []}",
+        encoding="utf-8",
+    )
+    prompt = (
+        "Implement GetAppointmentsByIdAsync, sessionNoteResponseId, clientId, isDraft, "
+        "GetFormResponsesAsync, and mocked tests that pass."
+    )
+
+    findings = OdooModuleValidator().validate(module, task_description=prompt)
+    requested_errors = {
+        finding.code for finding in findings
+        if finding.code.startswith("REQUESTED_")
+    }
+
+    assert "REQUESTED_SYMBOL_MISSING" in requested_errors
+    assert "REQUESTED_MODULE_LAYER_MISSING" in requested_errors
+    assert "REQUESTED_PACKAGE_MISSING" in requested_errors
+    assert "REQUESTED_TEST_COVERAGE_MISSING" in requested_errors
+
+
+def test_session_note_contract_accepts_named_flow_and_focused_tests(tmp_path):
+    module = tmp_path / "rethink"
+    (module / "models").mkdir(parents=True)
+    (module / "tests").mkdir()
+    (module / "__init__.py").write_text("from . import models\n", encoding="utf-8")
+    (module / "models" / "__init__.py").write_text("from . import rethink_session_note\n", encoding="utf-8")
+    (module / "tests" / "__init__.py").write_text("", encoding="utf-8")
+    symbols = [
+        "GetAppointmentsByIdAsync",
+        "sessionNoteResponseId",
+        "clientId",
+        "isDraft",
+        "GetFormResponsesAsync",
+    ]
+    (module / "models" / "rethink_session_note.py").write_text(
+        "from odoo import models\n\nclass SessionNote(models.Model):\n"
+        "    _name = 'rethink.session.note'\n"
+        f"    _flow_contract = {symbols!r}\n",
+        encoding="utf-8",
+    )
+    (module / "tests" / "test_session_note.py").write_text(
+        "def test_named_session_note_flow_contract():\n"
+        f"    assert {symbols!r}\n",
+        encoding="utf-8",
+    )
+    (module / "__manifest__.py").write_text(
+        "{'name': 'Rethink', 'version': '18.0.1.0.0', 'depends': ['base'], 'data': []}",
+        encoding="utf-8",
+    )
+    prompt = (
+        "Implement GetAppointmentsByIdAsync, sessionNoteResponseId, clientId, isDraft, "
+        "GetFormResponsesAsync, and mocked tests that pass."
+    )
+
+    findings = OdooModuleValidator().validate(module, task_description=prompt)
+    requested_errors = [
+        finding for finding in findings
+        if finding.code in {"REQUESTED_SYMBOL_MISSING", "REQUESTED_TEST_COVERAGE_MISSING"}
+    ]
+
+    assert requested_errors == []
+
+
 def test_arbitrary_requested_python_package_is_discovered_dynamically():
     contract = OdooModuleValidator.requested_contract(
         "Create a new `device_plugins` directory with Python driver implementations.",

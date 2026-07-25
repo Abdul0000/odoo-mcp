@@ -69,8 +69,9 @@ class OdooModuleValidator:
         create_module: bool = False,
         module_contract: dict | None = None,
     ) -> list[Finding]:
-        findings: list[Finding] = []
-        findings.extend(self._validate_basic_structure(module_path))
+        findings = self._validate_basic_structure(module_path)
+        if any(finding.code in {"MODULE_NOT_FOUND", "MODULE_NOT_DIRECTORY"} for finding in findings):
+            return findings
         manifest, manifest_findings = self._read_manifest(module_path)
         findings.extend(manifest_findings)
         findings.extend(self._validate_manifest_version_unchanged(module_path, manifest))
@@ -319,7 +320,7 @@ class OdooModuleValidator:
             ("controllers", ("controller", "endpoint", "route")),
             ("iot_handlers", ("iot_handlers",)),
             ("wizard", ("wizard",)),
-            ("tests", ("unit test", "tests covering", "test coverage")),
+            ("tests", ("unit test", "tests covering", "test coverage", "mocked test", "mock test", "regression test")),
         )
         for package, terms in package_rules:
             if any(term in lowered for term in terms):
@@ -362,9 +363,18 @@ class OdooModuleValidator:
                 ("controllers", ("controller", "endpoint", "route")),
                 ("handlers", ("iot_handlers", "interface", "driver")),
                 ("wizard", ("wizard",)),
-                ("tests", ("unit test", "tests covering", "test coverage")),
+                ("tests", ("unit test", "tests covering", "test coverage", "mocked test", "mock test", "regression test")),
             ) if any(term in lowered for term in terms)
         ]
+        if re.search(
+            r"\btests?\b.{0,40}\b(?:pass|cover|mock|implement|add|create|write|required)\b|"
+            r"\b(?:pass|cover|mock|implement|add|create|write|required)\b.{0,40}\btests?\b",
+            lowered,
+        ):
+            if "tests" not in packages:
+                packages.append("tests")
+            if "tests" not in layers:
+                layers.append("tests")
         if re.search(r"\breports?\b", lowered):
             layers.append("report")
 
@@ -383,6 +393,18 @@ class OdooModuleValidator:
             match for match in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)\s*\([^`]*\)`", text)
             if len(match) > 2
         ))
+        # Preserve explicit API/provider identifiers even when they are values
+        # used in a request payload rather than Python function definitions.
+        # Examples: GetAppointmentsByIdAsync, sessionNoteResponseId, clientId.
+        code_symbols = set(re.findall(
+            r"\b(?:[A-Z][A-Za-z0-9]*[a-z0-9][A-Z][A-Za-z0-9]*|[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*)\b",
+            text,
+        ))
+        for quoted in re.findall(r"`([A-Za-z_][A-Za-z0-9_]*)`", text):
+            if len(quoted) > 2:
+                code_symbols.add(quoted)
+        required_symbols = sorted(code_symbols - set(methods))
+        required_test_symbols = required_symbols if "tests" in layers else []
         return {
             "full_module_requested": full_module,
             "required_packages": packages,
@@ -391,6 +413,8 @@ class OdooModuleValidator:
             "required_view_types": view_types,
             "required_routes": sorted(routes),
             "required_methods": methods,
+            "required_symbols": required_symbols,
+            "required_test_symbols": required_test_symbols,
         }
 
     @staticmethod
@@ -404,6 +428,8 @@ class OdooModuleValidator:
             "required_view_types": [],
             "required_routes": [],
             "required_methods": [],
+            "required_symbols": [],
+            "required_test_symbols": [],
         }
         for contract in contracts:
             if not isinstance(contract, dict):
@@ -628,12 +654,40 @@ class OdooModuleValidator:
                 ))
 
         python_text = "\n".join(path.read_text(encoding="utf-8", errors="ignore") for path in module_path.rglob("*.py"))
+        source_text = "\n".join(
+            path.read_text(encoding="utf-8", errors="ignore")
+            for path in module_path.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".py", ".js", ".xml", ".csv"}
+        )
         for route in contract["required_routes"]:
             if route not in python_text:
                 findings.append(Finding(severity=Severity.error, code="REQUESTED_ROUTE_MISSING", message=f"Requested route is missing: {route}", file=str(module_path / "controllers")))
         for method in contract["required_methods"]:
             if not re.search(rf"\bdef\s+{re.escape(method)}\s*\(", python_text):
                 findings.append(Finding(severity=Severity.error, code="REQUESTED_METHOD_MISSING", message=f"Requested method is missing: {method}", file=str(module_path)))
+        for symbol in contract["required_symbols"]:
+            if not re.search(rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_])", source_text):
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="REQUESTED_SYMBOL_MISSING",
+                    message=f"Requested API/field identifier is missing: {symbol}",
+                    file=str(module_path),
+                    hint="Implement the complete named integration flow before commit/push.",
+                ))
+
+        test_text = "\n".join(
+            path.read_text(encoding="utf-8", errors="ignore")
+            for path in (module_path / "tests").glob("test_*.py")
+        ) if (module_path / "tests").is_dir() else ""
+        for symbol in contract["required_test_symbols"]:
+            if not re.search(rf"(?<![A-Za-z0-9_]){re.escape(symbol)}(?![A-Za-z0-9_])", test_text):
+                findings.append(Finding(
+                    severity=Severity.error,
+                    code="REQUESTED_TEST_COVERAGE_MISSING",
+                    message=f"Requested mocked/regression tests do not exercise identifier: {symbol}",
+                    file=str(module_path / "tests"),
+                    hint="Add a focused test that mocks or asserts this named integration step.",
+                ))
 
         functional_files = [path for path in module_path.rglob("*") if path.is_file() and path.name not in {"__init__.py", "__manifest__.py"}]
         if contract["full_module_requested"] and not functional_files:
