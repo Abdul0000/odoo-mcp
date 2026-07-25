@@ -50,6 +50,7 @@ The server workflow performs impact-based source reads, native-pattern preflight
 
 - A running status is not success.
 - When a response contains `next_call`, execute it.
+- `needs_writes` is an inspect-then-write continuation, not a diagnosed repair attempt. Generate a non-empty `writes` array from `write_generation.contexts`, merge it into `next_call.arguments`, and only then execute the call; never repeat the empty inspection call or count it toward the three repair cycles.
 - When `repair_required=true`, `must_continue=true`, or `contract_status=pending`, this is an internal non-terminal continuation—not a user-facing blocker. Repair only the returned blocking `structure_findings` and persisted task contract, then execute `next_call` immediately in the same task. Do not stop, summarize, or ask the user to continue. Findings under `preexisting_nonblocking_findings` must not be repaired as part of a surgical request. Stop only when the server returns no `next_call` after three diagnosed repair attempts, then report the exact remaining blocker.
 - Use `jobs.get` for bounded polling and `workflow.resume_job` to recover an interrupted deployment.
 - Use `artifacts.read` only for a referenced large result and `odoosh.error_pack` only for a diagnosed deployment failure.

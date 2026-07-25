@@ -3,6 +3,7 @@ from pathlib import Path
 from odoo_agent_server.routers.tools import (
     _build_safe_generic_autopatch,
     _analysis_index_target_paths,
+    _exact_write_context,
     _focused_search,
     _infer_code_change_search_patterns,
     _rank_core_directory_files,
@@ -55,6 +56,71 @@ def test_focused_search_returns_exact_match_lines_for_range_reads():
     assert results[0]["focused_count"] == 1
     assert paths == ["custom_sale/models/sale_order.py"]
     assert lines == {"custom_sale/models/sale_order.py": [121]}
+
+
+def test_exact_write_context_returns_complete_enclosing_python_method(tmp_path):
+    target = tmp_path / "custom_sale" / "models" / "sync.py"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "class Sync:\n"
+        "    def unrelated(self):\n"
+        "        return False\n\n"
+        "    def run_browser_note_sync(self):\n"
+        "        request = {\n"
+        "            'title': 'Narrative',\n"
+        "            'body': 'full note',\n"
+        "        }\n"
+        "        return request\n\n"
+        "    def after(self):\n"
+        "        return True\n",
+        encoding="utf-8",
+    )
+
+    contexts = _exact_write_context(
+        tmp_path,
+        [{
+            "relative_path": "custom_sale/models/sync.py",
+            "status": "read",
+            "read_mode": "match_range",
+            "match_lines": [5],
+        }],
+    )
+
+    assert len(contexts) == 1
+    assert contexts[0]["context_type"] == "complete_python_function"
+    assert contexts[0]["complete_unit"] is True
+    assert "def run_browser_note_sync" in contexts[0]["content"]
+    assert "'body': 'full note'" in contexts[0]["content"]
+    assert "def unrelated" not in contexts[0]["content"]
+    assert "def after" not in contexts[0]["content"]
+
+
+def test_exact_write_context_recovers_method_line_from_task_when_preview_has_no_matches(tmp_path):
+    target = tmp_path / "custom_sale" / "models" / "sync.py"
+    target.parent.mkdir(parents=True)
+    target.write_text(
+        "class Sync:\n"
+        "    def run_browser_note_sync(self):\n"
+        "        return {'body': 'full note'}\n"
+        + "\n" * 13_000,
+        encoding="utf-8",
+    )
+
+    contexts = _exact_write_context(
+        tmp_path,
+        [{
+            "relative_path": "custom_sale/models/sync.py",
+            "status": "read",
+            "read_mode": "module_analysis_cache",
+        }],
+        payload=_payload(
+            "Fix `run_browser_note_sync` so it sends the complete narrative",
+            target_hint="run_browser_note_sync",
+        ),
+    )
+
+    assert contexts[0]["context_type"] == "complete_python_function"
+    assert "return {'body': 'full note'}" in contexts[0]["content"]
 
 
 def test_core_paths_and_directory_files_are_relevance_ranked(tmp_path):

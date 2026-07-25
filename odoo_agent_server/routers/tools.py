@@ -267,7 +267,7 @@ _TOOL_DESCRIPTORS = [
             "For a missing addon, set create_module=true with an exact lowercase technical name; it is created only at the checkout root. "
             "A cached Odoo-aware index maps functional labels through menus/actions/views/models/fields/QWeb/JS relationships, then reads exact match-centered ranges. "
             "Task descriptions automatically supply quoted identifiers/selectors/XML IDs/methods for focused inspection. "
-            "An exact quoted replacement that occurs once can complete in one call; ambiguous or complex work returns focused context for a second call with exact writes. "
+            "An exact quoted replacement that occurs once can complete in one call; ambiguous or complex work returns exact editable source units in write_generation.contexts for a second call with non-empty writes. "
             "Existing-addon surgical changes use baseline-delta QA: unchanged unrelated legacy findings are reported but do not block commit/deploy; new, task-required, manifest/version, and changed-scope errors still block."
         ),
         requires_approval=True,
@@ -1324,6 +1324,118 @@ def _file_preview(content: str, max_chars: int = 6000) -> str:
     if len(content) <= max_chars:
         return content
     return content[: max_chars // 2] + f"\n\n...[{len(content)-max_chars} chars omitted]...\n\n" + content[-max_chars // 2 :]
+
+
+def _exact_write_context(
+    project: Path,
+    custom_reads: list[dict[str, Any]],
+    *,
+    payload: OdooCodeChangeRequest | None = None,
+    max_chars: int = 12_000,
+    max_files: int = 3,
+) -> list[dict[str, Any]]:
+    """Return compact exact source units suitable for model-generated writes."""
+    candidates = [
+        item for item in custom_reads
+        if item.get("status") == "read"
+        and str(item.get("relative_path") or "")
+        and not str(item.get("relative_path") or "").endswith("__manifest__.py")
+    ]
+    if not candidates:
+        candidates = [item for item in custom_reads if item.get("status") == "read"]
+    candidates.sort(key=lambda item: (
+        0 if item.get("match_lines") else 1,
+        0 if item.get("read_mode") == "match_range" else 1,
+        str(item.get("relative_path") or ""),
+    ))
+
+    contexts: list[dict[str, Any]] = []
+    remaining = max_chars
+    for item in candidates[:max_files]:
+        rel = str(item.get("relative_path") or "")
+        target = project / rel
+        try:
+            content = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        lines = content.splitlines(keepends=True)
+        match_lines = sorted({
+            int(line) for line in item.get("match_lines") or []
+            if str(line).isdigit() and int(line) > 0
+        })
+        if not match_lines and payload is not None:
+            patterns = [
+                pattern.strip().removesuffix("()")
+                for pattern in _infer_code_change_search_patterns(payload)
+                if pattern.strip()
+            ]
+            match_lines = [
+                line_number
+                for line_number, line in enumerate(lines, start=1)
+                if any(pattern in line for pattern in patterns)
+            ][:20]
+        context: dict[str, Any] | None = None
+
+        if target.suffix == ".py" and match_lines:
+            try:
+                tree = ast.parse(content)
+                blocks: list[tuple[int, int]] = []
+                for node in ast.walk(tree):
+                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    start = int(node.lineno)
+                    end = int(node.end_lineno or node.lineno)
+                    if any(start <= line <= end for line in match_lines):
+                        blocks.append((start, end))
+                if blocks:
+                    start, end = min(blocks, key=lambda pair: pair[1] - pair[0])
+                    source = "".join(lines[start - 1:end])
+                    if len(source) <= remaining:
+                        context = {
+                            "relative_path": rel,
+                            "context_type": "complete_python_function",
+                            "complete_unit": True,
+                            "start_line": start,
+                            "end_line": end,
+                            "content": source,
+                        }
+            except SyntaxError:
+                pass
+
+        if context is None and len(content) <= remaining:
+            context = {
+                "relative_path": rel,
+                "context_type": "complete_file",
+                "complete_unit": True,
+                "start_line": 1,
+                "end_line": len(lines),
+                "content": content,
+            }
+
+        if context is None and match_lines and remaining >= 1000:
+            center = match_lines[0]
+            start = max(1, center - 100)
+            end = min(len(lines), center + 100)
+            source = "".join(lines[start - 1:end])
+            if len(source) > remaining:
+                source = source[:remaining]
+                end = start + source.count("\n")
+            context = {
+                "relative_path": rel,
+                "context_type": "exact_match_range",
+                "complete_unit": False,
+                "start_line": start,
+                "end_line": end,
+                "content": source,
+            }
+
+        if context is None:
+            continue
+        contexts.append(context)
+        remaining -= len(str(context["content"]))
+        if remaining < 1000:
+            break
+    return contexts
 
 
 def _module_hint_tokens(value: str) -> set[str]:
@@ -2552,6 +2664,11 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
 
     writes_to_apply = list(payload.writes or generated_writes)
     if not writes_to_apply:
+        write_context = _exact_write_context(project, custom_reads, payload=payload)
+        custom_read_metadata = [
+            {key: value for key, value in item.items() if key != "preview"}
+            for item in custom_reads[:50]
+        ]
         # Persist unresolved implementation context so short follow-ups such as
         # "yes", "implement", "push", or "revert" can continue the latest task.
         # This is an internal continuation contract, not a user-facing result.
@@ -2570,12 +2687,12 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         }, client_name=client_name)
         return {
             "status": "needs_writes",
-            "message": "INTERNAL_CONTINUATION_REQUIRED: inspection is complete; generate exact writes and call workflow.odoo_code_change again. Do not present code or manual file-edit instructions to the user.",
+            "message": "INTERNAL_CONTINUATION_REQUIRED: inspection is complete. Build a non-empty writes array from write_generation.contexts, merge it into next_call.arguments, and call workflow.odoo_code_change again. Do not execute the empty continuation or present manual edits to the user.",
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
             "steps": steps,
-            "custom_reads": custom_reads[:50],
+            "custom_reads": custom_read_metadata,
             "search_results": search_results[:10],
             "task_type": _normalized_task_type(payload),
             "intent": payload.intent,
@@ -2596,6 +2713,23 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "core_reads": core_reads[:30],
             "success_allowed": False,
             "completion_required": True,
+            "writes_required": True,
+            "write_generation": {
+                "required": True,
+                "contexts": write_context,
+                "output_schema": [{
+                    "relative_path": "Path copied from the selected context",
+                    "search": "Exact source text to replace",
+                    "replace": "Complete replacement source text",
+                    "regex": False,
+                    "count": 1,
+                }],
+                "rules": [
+                    "Generate at least one write before making next_call.",
+                    "Prefer literal search/replace with count=1 from a complete source unit.",
+                    "Preserve unrelated code and do not rewrite omitted source.",
+                ],
+            },
             "next_call": {
                 "tool": "workflow.odoo_code_change",
                 "arguments": {
@@ -2604,8 +2738,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                     "module_name": effective_module_name,
                     "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
                     "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
-                    "writes": "Generate exact writes internally: [{relative_path, content}] or [{relative_path, search, replace, regex, count}]. Do not ask the user to edit files.",
                 },
+                "required_generated_arguments": ["writes"],
             },
         }
 
@@ -2749,8 +2883,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                     "module_name": effective_module_name,
                     "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
                     "target_files": repair_targets,
-                    "writes": "Generate exact repair writes internally from structure_findings and module_contract. Do not ask the user to edit files.",
                 },
+                "required_generated_arguments": ["writes"],
             } if repair_attempts <= 3 else None,
         }
 
@@ -3329,6 +3463,7 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             "tool_exit_allowed": {"type": "boolean"}, "deploy_confirmed": {"type": "boolean"},
             "already_deployed_confirmed": {"type": "boolean"}, "terminal_action": {"type": "string"},
             "writes_required": {"type": "boolean"}, "inspection": {"type": "object", "additionalProperties": True},
+            "write_generation": {"type": "object", "additionalProperties": True},
             "module_structure_complete": {"type": "boolean"},
             "module_contract": {"type": "object", "additionalProperties": True},
             "persisted_requirements": {"type": "string"},
