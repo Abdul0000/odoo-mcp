@@ -50,6 +50,15 @@ The server workflow performs impact-based source reads, native-pattern preflight
 - New-feature or new-module request: prepare every required file together as one complete set before writing — model(s), security (`ir.model.access.csv`, groups/rules), views, actions, menus, data — then submit them as complete writes in the same call. Do not write the model first, push, then come back later for security/views/menu as separate follow-up changes.
 - Only commit/push once the full requested scope is complete and verified. Do not split one logical feature across multiple separate commits/pushes.
 
+## CODE QUALITY CONTRACT
+
+- Produce production-ready, task-scoped code: clean, minimal, readable, secure, and scalable, with no dead/redundant code, shortcuts, unrelated refactoring, or over-engineering. Preserve the existing architecture and behavior outside the requested scope.
+- Match the implementation to the task surface: keep XML views and OWL UI efficient and minimal; keep Python logic DRY and batch-safe; keep manifests, configuration, security, and data files structurally correct.
+- Use supported modern Odoo APIs and established framework/language built-ins instead of manual reimplementation. Use correct `_inherit`, compute, inverse, store, and related-field semantics for the installed Odoo version.
+- Prevent N+1 queries. Prefer ORM and batch operations such as multi-create, `read_group`, and `search_read` over per-record queries. Use parameterized SQL only when measurably justified for bulk, aggregate, or reporting workloads.
+- Use the least privilege required: scope `sudo()`, preserve company and record-rule boundaries, and define correct ACLs, groups, and `ir.rule` behavior. Choose the view/component type that fits the actual job.
+- Handle relevant edge cases and verify changed behavior in proportion to its risk and scope. A small deterministic fix remains surgical and must not trigger unrelated redesign or speculative complexity.
+
 ## CONTINUATION AND RECOVERY
 
 - A running status is not success.

@@ -98,6 +98,11 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "workflow.resume_job",
         "jobs.get",
         "deploy_confirmed=true",
+        "## CODE QUALITY CONTRACT",
+        "production-ready, task-scoped code",
+        "Prevent N+1 queries",
+        "parameterized SQL only when measurably justified",
+        "A small deterministic fix remains surgical",
     ]
     for marker in required_markers:
         assert marker in text
