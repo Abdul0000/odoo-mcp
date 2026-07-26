@@ -48,3 +48,35 @@ def test_odoosh_read_user_file_reads_real_src_user_path(monkeypatch):
     assert result.content == "from odoo import models\n"
     assert result.extra["source"] == "odoosh_user"
     assert "/home/odoo/src/user" in captured["script"]
+
+
+def test_odoosh_grep_errors_filters_remotely_and_preserves_tracebacks(monkeypatch):
+    captured = {}
+
+    def fake_run_shell(self, script, timeout_seconds=60):
+        captured["script"] = script
+        return CommandResult(
+            command=["ssh"],
+            cwd="odoosh:ssh",
+            exit_code=0,
+            stdout=(
+                "__ODOO_MCP_LOG_FILE__:/home/odoo/logs/odoo.log\n"
+                "2026-01-01 10:00:00,000 42 ERROR db odoo.http: Request failed\n"
+                "Traceback (most recent call last):\n"
+                '  File "/src/custom.py", line 4, in run\n'
+                "ValueError: broken\n"
+            ),
+        )
+
+    monkeypatch.setattr(OdooShService, "run_shell", fake_run_shell)
+
+    result = OdooShService().grep_errors(150)
+
+    assert "tail -n 150" in captured["script"]
+    assert "awk -v file=" in captured["script"]
+    assert "(ERROR|CRITICAL)" in captured["script"]
+    assert "WARNING" not in captured["script"]
+    assert "INFO" not in captured["script"]
+    assert "Request failed" in result.stdout
+    assert 'File "/src/custom.py"' in result.stdout
+    assert "ValueError: broken" in result.stdout

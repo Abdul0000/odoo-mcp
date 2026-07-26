@@ -87,7 +87,7 @@ def agent_instructions() -> dict:
                 "Do not call hidden repo, Git, source-discovery, verification, or deploy tools; the composite workflow owns those steps.",
                 "When a response returns next_call or a running status, continue until terminal. For status=needs_writes, generate a non-empty writes array from write_generation.contexts, merge it into next_call.arguments, and never execute the empty continuation or count it as a repair attempt; use jobs.get or workflow.resume_job for running jobs.",
                 "When repair_required=true, must_continue=true, or contract_status=pending, treat it as non-terminal: generate only the blocking repairs from structure_findings and execute next_call immediately without summarizing or asking the user; allow at most three diagnosed repair cycles.",
-                "When deploy_confirmed or already_deployed_confirmed is true, stop and summarize for normal workflows; a debug session must continue through same-scenario replay and expected-result verification before success.",
+                "When deploy_confirmed or already_deployed_confirmed is true, stop and summarize for normal workflows; for debug work manual text/booleans remain untrusted, continue through replay, and say fixed only when truth_gate.verified_fixed=true—otherwise preserve claim_status such as implemented_unverified or blocked_with_evidence.",
                 "Never expose credentials, create normal module schema through Studio/ORM shortcuts, or put Pydantic code inside Odoo addons.",
             ],
             "provider_flow": {
@@ -99,6 +99,7 @@ def agent_instructions() -> dict:
                 "continuation": ["jobs.get", "workflow.resume_job"],
                 "diagnostics": ["artifacts.read", "odoosh.error_pack"],
                 "terminal_success": ["deploy_confirmed=true", "already_deployed_confirmed=true"],
+                "debug_terminal_success": "truth_gate.verified_fixed=true",
                 "terminal_action": "stop_and_summarize",
                 "inspect_then_write": "If the composite workflow requests writes, use its focused inspection result and call the same composite tool again with complete writes.",
             },

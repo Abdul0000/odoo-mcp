@@ -287,6 +287,58 @@ class JsonStore:
         safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", client_name)
         return self.root / f"session_state__{safe}.json"
 
+    def _debug_sessions_file_for_client(self, client_name: str | None) -> Path:
+        safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", client_name or "default")
+        return self.root / f"debug_sessions__{safe}.json"
+
+    def save_debug_session(self, session: dict[str, Any], client_name: str | None = None) -> dict[str, Any]:
+        """Atomically upsert one isolated debug session.
+
+        Debug sessions use a dedicated per-client collection so concurrent
+        workflows cannot overwrite the nested ``debug_sessions`` map inside the
+        general session-state file.
+        """
+        record = dict(session)
+        session_id = str(record.get("id") or "")
+        if not re.fullmatch(r"[a-f0-9]{32}", session_id):
+            raise ValueError("debug session requires a safe 32-character id")
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        path = self._debug_sessions_file_for_client(client_name)
+
+        def update(rows):
+            for index, row in enumerate(rows):
+                if row.get("id") == session_id:
+                    rows[index] = record
+                    break
+            else:
+                rows.append(record)
+            rows.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""))
+            if len(rows) > 50:
+                del rows[:-50]
+
+        self._update_list(path, update)
+        return dict(record)
+
+    def get_debug_session(self, session_id: str, client_name: str | None = None) -> dict[str, Any]:
+        for row in self._read_list(self._debug_sessions_file_for_client(client_name)):
+            if row.get("id") == session_id:
+                return dict(row)
+        # One-way compatibility with sessions created before isolated storage.
+        legacy = self.load_session_state(client_name=client_name)
+        sessions = legacy.get("debug_sessions") if isinstance(legacy, dict) else None
+        row = sessions.get(session_id) if isinstance(sessions, dict) else None
+        if isinstance(row, dict):
+            self.save_debug_session(row, client_name=client_name)
+            return dict(row)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Debug session not found for the selected client.")
+
+    def find_debug_session_by_operation(self, operation_id: str, client_name: str | None = None) -> dict[str, Any] | None:
+        rows = self._read_list(self._debug_sessions_file_for_client(client_name))
+        for row in reversed(rows):
+            if row.get("operation_id") == operation_id:
+                return dict(row)
+        return None
+
     def save_session_state(self, state: dict, client_name: str | None = None) -> dict:
         """Persist arbitrary session state (sha, module, step history, etc.).
 

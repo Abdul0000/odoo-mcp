@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.schemas import CommandResult, JobRecord, JobStatus, OdooModuleRequest
@@ -69,6 +70,29 @@ def test_running_job_updates_do_not_rewrite_audit_log(tmp_path, monkeypatch):
 
     store.finish_job(job, JobStatus.passed, {"ok": True})
     assert "job.update" in {event.action for event in store.list_audit()}
+
+
+def test_debug_sessions_are_atomically_isolated_under_concurrent_updates(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+
+    def save(index):
+        JsonStore().save_debug_session(
+            {
+                "id": f"{index:032x}",
+                "operation_id": f"operation-{index}",
+                "phase": "diagnosing",
+            },
+            client_name="Test 18",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(save, range(20)))
+
+    store = JsonStore()
+    for index in range(20):
+        session = store.get_debug_session(f"{index:032x}", client_name="Test 18")
+        assert session["operation_id"] == f"operation-{index}"
+    assert store.find_debug_session_by_operation("operation-7", client_name="Test 18")["id"] == f"{7:032x}"
 
 
 def test_odoo_background_wait_honors_request_timeout(tmp_path, monkeypatch):

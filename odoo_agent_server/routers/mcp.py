@@ -368,6 +368,8 @@ def _remote_compatible_schema(schema: dict[str, Any]) -> dict[str, Any]:
     when schemas contain lots of generated Pydantic metadata or nested $defs. This
     removes non-essential metadata and simplifies nullable anyOf values.
     """
+    definitions = schema.get("$defs") if isinstance(schema.get("$defs"), dict) else {}
+
     def clean(value: Any) -> Any:
         if isinstance(value, list):
             return [clean(item) for item in value]
@@ -375,6 +377,12 @@ def _remote_compatible_schema(schema: dict[str, Any]) -> dict[str, Any]:
             return value
 
         if "$ref" in value:
+            ref = str(value.get("$ref") or "")
+            definition_name = ref.rsplit("/", 1)[-1]
+            if definition_name == "OdooDebugRecordAssertion":
+                target = definitions.get(definition_name)
+                if isinstance(target, dict):
+                    return clean(target)
             return {"type": "object"}
         if "anyOf" in value:
             non_null = [item for item in value.get("anyOf", []) if not (isinstance(item, dict) and item.get("type") == "null")]

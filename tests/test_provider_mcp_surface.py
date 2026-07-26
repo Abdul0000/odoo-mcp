@@ -85,24 +85,35 @@ def test_provider_debug_workflow_exposes_persisted_replay_contract():
         "issue_description",
         "expected_result",
         "debug_session_id",
+        "operation_id",
         "correlation_id",
         "runtime_evidence",
         "verification_evidence",
+        "verification_assertion",
         "writes",
         "job_id",
         "reproduction_passed",
         "expected_result_verified",
         "max_fix_cycles",
+        "max_surgical_files",
+        "max_surgical_content_chars",
     ):
         assert field in properties
     assert properties["max_fix_cycles"]["maximum"] == 5
     assert properties["writes"]["maxItems"] == 50
+    assertion_properties = properties["verification_assertion"]["properties"]
+    assert {
+        "model", "domain", "fields", "expected_values",
+        "expected_count_min", "expected_count_max", "match_mode",
+    } <= set(assertion_properties)
 
     output = workflow["outputSchema"]["properties"]
     assert "debug_session" in output
     assert "deploy_confirmed" in output
     assert "reproduction_passed" in output
     assert "expected_result_verified" in output
+    assert "claim_status" in output
+    assert "truth_gate" in output
 
 
 def test_provider_workflow_accepts_up_to_fifty_atomic_writes():

@@ -6,7 +6,7 @@ import re
 from typing import Any, Literal
 from uuid import uuid4
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, computed_field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
 
 class Severity(str, Enum):
@@ -269,6 +269,94 @@ class OdooCodeChangeRequest(BaseModel):
         return value
 
 
+class OdooDebugRecordAssertion(BaseModel):
+    """Immutable read-only live-Odoo assertion used before and after a fix."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(..., description="Odoo model queried read-only after replay.")
+    domain: list[Any] = Field(default_factory=list, max_length=20, description="Bounded Odoo domain.")
+    fields: list[str] = Field(default_factory=list, max_length=20, description="Fields read for exact checks.")
+    expected_values: dict[str, Any] = Field(default_factory=dict, description="Exact field values expected.")
+    expected_count_min: int | None = Field(default=None, ge=0, le=200, description="Minimum matching rows.")
+    expected_count_max: int | None = Field(default=None, ge=0, le=199, description="Maximum matching rows; one overflow row is always queried.")
+    match_mode: Literal["first", "any", "all"] = Field(default="any", description="How exact values match rows.")
+
+    @field_validator("model")
+    @classmethod
+    def debug_assertion_model_must_be_safe(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]+", value):
+            raise ValueError("model must be a safe Odoo technical model name")
+        return value
+
+    @field_validator("fields")
+    @classmethod
+    def debug_assertion_fields_must_be_safe(cls, values: list[str]) -> list[str]:
+        clean: list[str] = []
+        for value in values:
+            name = str(value or "").strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise ValueError("fields must contain safe Odoo field names")
+            if name not in clean:
+                clean.append(name)
+        return clean
+
+    @model_validator(mode="after")
+    def debug_assertion_must_prove_something(self):
+        if (
+            self.expected_count_min is None
+            and self.expected_count_max is None
+            and not self.expected_values
+        ):
+            raise ValueError("verification assertion requires a count or exact-value expectation")
+        if (
+            self.expected_count_min is not None
+            and self.expected_count_max is not None
+            and self.expected_count_min > self.expected_count_max
+        ):
+            raise ValueError("expected_count_min cannot exceed expected_count_max")
+        unsafe_keys = [
+            key for key in self.expected_values
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(key))
+        ]
+        if unsafe_keys:
+            raise ValueError("expected_values keys must be safe Odoo field names")
+        sensitive_keys = [
+            key for key in self.expected_values
+            if re.search(r"(password|passwd|token|secret|api[_-]?key|authorization)", str(key), re.I)
+        ]
+        if sensitive_keys:
+            raise ValueError("verification assertions cannot persist credential or secret fields")
+        missing = sorted(set(self.expected_values) - set(self.fields))
+        if missing:
+            raise ValueError(f"fields must include expected_values keys: {', '.join(missing)}")
+        if self.match_mode == "all" and self.expected_count_max is None:
+            raise ValueError("match_mode=all requires expected_count_max for bounded proof")
+        return self
+
+
+class OdooDebugEvidenceRecord(BaseModel):
+    """Sanitized provenance record; only trusted records can authorize claims."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(default_factory=lambda: uuid4().hex)
+    kind: Literal[
+        "runtime_log", "traceback", "manual_observation", "code_inspection",
+        "write_scope", "qa", "deploy", "module_upgrade", "baseline_assertion",
+        "replay_assertion", "recovery",
+    ]
+    source: Literal["client", "odoo_mcp", "odoo_live", "job_store"]
+    summary: str = Field(..., max_length=8000)
+    trusted: bool = False
+    passed: bool | None = None
+    fingerprint: str
+    correlation_id: str | None = None
+    job_id: str | None = None
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
 class OdooDebugAndFixRequest(BaseModel):
     """Bounded runtime-debug orchestrator layered over the normal code workflow."""
 
@@ -284,17 +372,21 @@ class OdooDebugAndFixRequest(BaseModel):
     ] = Field(default="auto", description="Debug surface; auto selects from the issue.")
     action: Literal["auto", "start", "continue", "poll", "verify"] = Field(default="auto", description="Start or continue one persisted debug session.")
     debug_session_id: str | None = Field(default=None, max_length=64, description="Session ID returned by an earlier debug call.")
+    operation_id: str | None = Field(default=None, max_length=64, description="Stable idempotency key for start/retry.")
     correlation_id: str | None = Field(default=None, max_length=80, description="Safe request/record correlation identifier.")
     runtime_evidence: list[str] = Field(default_factory=list, max_length=50, description="New sanitized logs, traceback, console, or network evidence.")
     verification_evidence: list[str] = Field(default_factory=list, max_length=20, description="Evidence from replaying the same scenario after deploy.")
+    verification_assertion: OdooDebugRecordAssertion | None = Field(default=None, description="Live check: model/domain/fields plus expected_values or expected_count bounds.")
     writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=50, description="Exact writes generated from returned debug/code context.")
     job_id: str | None = Field(default=None, max_length=64, description="Safe-deploy job currently owned by this debug session.")
     reproduction_passed: bool | None = Field(default=None, description="True only when the same scenario passes after deploy.")
     expected_result_verified: bool | None = Field(default=None, description="True only when the expected DB/API/UI result is proven.")
     max_fix_cycles: int = Field(default=3, ge=1, le=5, description="Maximum evidence-based write/deploy cycles.")
-    tail_lines: int = Field(default=800, ge=50, le=2000, description="Odoo.sh log lines inspected per diagnosis.")
-    wait_for_result: bool = Field(default=True, description="Wait briefly when polling the owned deploy job.")
-    wait_timeout_seconds: int = Field(default=600, ge=1, le=600, description="Bounded server-side deploy poll window.")
+    max_surgical_files: int = Field(default=12, ge=1, le=20, description="Maximum files in one diagnosed fix.")
+    max_surgical_content_chars: int = Field(default=200000, ge=1000, le=500000, description="Maximum supplied replacement content per diagnosed fix.")
+    tail_lines: int = Field(default=150, ge=50, le=2000, description="Recent lines scanned remotely for ERROR/CRITICAL traceback blocks.")
+    wait_for_result: bool = Field(default=False, description="Poll immediately unless a bounded wait is requested.")
+    wait_timeout_seconds: int = Field(default=30, ge=1, le=600, description="Bounded server-side deploy poll window.")
     poll_interval_seconds: float = Field(default=1.0, ge=0.25, le=10.0, description="Delay between deploy-job status checks.")
     auto_deploy: bool = Field(default=True, description="Use the existing safe-deploy pipeline after verified writes.")
 
@@ -316,6 +408,16 @@ class OdooDebugAndFixRequest(BaseModel):
         value = value.strip()
         if not re.fullmatch(r"[a-f0-9]{32}", value):
             raise ValueError("debug_session_id must be the exact 32-character ID returned by the tool")
+        return value
+
+    @field_validator("operation_id")
+    @classmethod
+    def operation_id_must_be_safe(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value or not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+            raise ValueError("operation_id contains unsafe characters")
         return value
 
     @field_validator("correlation_id")

@@ -24,6 +24,8 @@ from odoo_agent_server.schemas import (
     OdooCodeChangeRequest,
     OdooCodeFileChange,
     OdooDebugAndFixRequest,
+    OdooDebugRecordAssertion,
+    OdooResult,
 )
 
 
@@ -55,6 +57,9 @@ class _DebugStore:
 
     def wait_job(self, job_id, timeout_seconds=600, poll_interval_seconds=1.0):
         return self.get_job(job_id)
+
+    def list_jobs(self, limit=100):
+        return list(self.jobs.values())[-limit:][::-1]
 
 
 def _debug_payload(issue: str, **overrides) -> OdooDebugAndFixRequest:
@@ -98,6 +103,14 @@ def test_debug_router_keeps_small_deterministic_changes_on_fast_path(monkeypatch
 
     assert result["status"] == "routed_to_code_change_fast_path"
     assert result["next_call"]["tool"] == "workflow.odoo_code_change"
+
+
+def test_debug_workflow_uses_compact_default_error_pack():
+    payload = _debug_payload("Controller raises an exception")
+
+    assert payload.tail_lines == 150
+    assert payload.wait_for_result is False
+    assert payload.wait_timeout_seconds == 30
 
 
 def test_debug_router_detects_runtime_surfaces_without_api_substring_false_positive():
@@ -146,7 +159,7 @@ def test_debug_runtime_session_reuses_code_workflow_and_requests_complete_writes
 
     assert result["status"] == "debug_needs_writes"
     assert result["debug_session"]["phase"] == "awaiting_writes"
-    assert result["debug_session"]["evidence_count"] == 1
+    assert result["debug_session"]["evidence_count"] >= 2
     assert result["next_call"]["tool"] == "workflow.odoo_debug_and_fix"
     assert result["next_call"]["required_generated_arguments"] == ["writes"]
     assert captured["payload"].investigation_evidence
@@ -166,9 +179,27 @@ def test_debug_session_owns_deploy_then_requires_and_accepts_replay_proof(monkey
             "write_generation": {"contexts": [{"relative_path": "custom_sale/controllers/main.py"}]},
         }
 
+    async def fake_live_assertion(session, assertion, phase):
+        return {
+            "phase": phase,
+            "query_status": "ok",
+            "passed": phase == "replay",
+            "assertion_fingerprint": "assertion-1",
+        }
+
     monkeypatch.setattr(tools_router, "_workflow_odoo_code_change", fake_code_change)
+    monkeypatch.setattr(tools_router, "_debug_run_live_assertion", fake_live_assertion)
+    assertion = OdooDebugRecordAssertion(
+        model="custom.sale",
+        domain=[["id", "=", 42]],
+        fields=["state"],
+        expected_values={"state": "done"},
+    )
     start = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
-        _debug_payload("Controller returns 500 while saving")
+        _debug_payload(
+            "Controller returns 500 while saving",
+            verification_assertion=assertion,
+        )
     ))
     session_id = start["debug_session"]["id"]
     continued = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
@@ -184,6 +215,7 @@ def test_debug_session_owns_deploy_then_requires_and_accepts_replay_proof(monkey
     ))
     assert continued["status"] == "debug_deploying"
     assert continued["debug_session"]["fix_cycles"] == 1
+    assert continued["next_call"]["arguments"]["wait_timeout_seconds"] == 30
 
     store.jobs["deploy-1"] = JobRecord(
         id="deploy-1",
@@ -224,6 +256,239 @@ def test_debug_session_owns_deploy_then_requires_and_accepts_replay_proof(monkey
     assert verified["deploy_confirmed"] is True
     assert verified["success_allowed"] is True
     assert calls["count"] == 2
+
+
+def test_debug_manual_replay_text_cannot_self_authorize_success(monkeypatch):
+    store = _prepare_debug_workflow(monkeypatch)
+
+    async def fake_code_change(payload):
+        if payload.writes:
+            return {"status": "deploy_started", "job_id": "deploy-manual"}
+        return {"status": "needs_writes", "write_generation": {"contexts": []}}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change", fake_code_change)
+    start = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload("Controller returns 500 during submit")
+    ))
+    session_id = start["debug_session"]["id"]
+    asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload(
+            "Controller returns 500 during submit",
+            action="continue",
+            debug_session_id=session_id,
+            writes=[OdooCodeFileChange(
+                relative_path="custom_sale/controllers/main.py",
+                content="def submit():\n    return True\n",
+            )],
+        )
+    ))
+    store.jobs["deploy-manual"] = JobRecord(
+        id="deploy-manual",
+        job_type="safe_deploy_module",
+        status=JobStatus.passed,
+        request={"upgrade_module": True},
+        result={
+            "odoosh_check_commit": {"deployed": True},
+            "module_upgrade": {"requested": True, "passed": True},
+        },
+    )
+
+    result = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload(
+            "Controller returns 500 during submit",
+            action="verify",
+            debug_session_id=session_id,
+            job_id="deploy-manual",
+            wait_for_result=False,
+            reproduction_passed=True,
+            expected_result_verified=True,
+            verification_evidence=["I checked it and it works"],
+        )
+    ))
+
+    assert result["status"] == "debug_implemented_unverified"
+    assert result["success_allowed"] is False
+    assert result["truth_gate"]["independent_replay_passed"] is False
+
+
+def test_debug_start_retry_reuses_operation_without_duplicate_inspection(monkeypatch):
+    _prepare_debug_workflow(monkeypatch)
+    calls = {"count": 0}
+
+    async def fake_code_change(payload):
+        calls["count"] += 1
+        return {"status": "needs_writes", "write_generation": {"contexts": []}}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change", fake_code_change)
+    payload = _debug_payload(
+        "Cron fails with a traceback",
+        operation_id="debug-cron-42",
+    )
+    first = asyncio.run(tools_router._workflow_odoo_debug_and_fix(payload))
+    retried = asyncio.run(tools_router._workflow_odoo_debug_and_fix(payload))
+
+    assert retried["debug_session"]["id"] == first["debug_session"]["id"]
+    assert retried["status"] == "debug_awaiting_writes"
+    assert calls["count"] == 1
+
+
+def test_debug_recovers_owned_deploy_job_after_interrupted_response(monkeypatch):
+    store = _prepare_debug_workflow(monkeypatch)
+
+    async def fake_code_change(payload):
+        return {"status": "needs_writes", "write_generation": {"contexts": []}}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change", fake_code_change)
+    start = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload("Cron fails with a traceback")
+    ))
+    session_id = start["debug_session"]["id"]
+    session = store.states["Test 18"]["debug_sessions"][session_id]
+    session["phase"] = "applying_fix"
+    session["operation_started_at"] = "2025-01-01T00:00:00+00:00"
+    store.jobs["recovered-job"] = JobRecord(
+        id="recovered-job",
+        job_type="safe_deploy_module",
+        status=JobStatus.running,
+        request={
+            "module_name": "custom_sale",
+            "project_path": "C:/repo",
+            "upgrade_module": True,
+        },
+    )
+
+    result = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload(
+            "Cron fails with a traceback",
+            action="poll",
+            debug_session_id=session_id,
+            wait_for_result=False,
+        )
+    ))
+
+    assert result["status"] == "debug_deploying"
+    assert result["job"]["id"] == "recovered-job"
+    assert result["debug_session"]["job_id"] == "recovered-job"
+
+
+def test_debug_surgical_budget_rejects_broad_multi_file_patch(monkeypatch):
+    _prepare_debug_workflow(monkeypatch)
+
+    async def fake_code_change(payload):
+        return {"status": "needs_writes", "write_generation": {"contexts": []}}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change", fake_code_change)
+    start = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload("Backend fails with a traceback", max_surgical_files=2)
+    ))
+
+    with pytest.raises(Exception, match="at most 2 files"):
+        asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+            _debug_payload(
+                "Backend fails with a traceback",
+                action="continue",
+                debug_session_id=start["debug_session"]["id"],
+                writes=[
+                    OdooCodeFileChange(relative_path=f"custom_sale/models/f{index}.py", content="x = 1\n")
+                    for index in range(3)
+                ],
+            )
+        ))
+
+
+def test_debug_surgical_scope_rejects_undiagnosed_source_file(monkeypatch):
+    _prepare_debug_workflow(monkeypatch)
+
+    async def fake_code_change(payload):
+        return {
+            "status": "needs_writes",
+            "module_name": "custom_sale",
+            "write_generation": {
+                "contexts": [{"relative_path": "custom_sale/controllers/main.py"}],
+            },
+        }
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change", fake_code_change)
+    start = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload("Controller fails with a traceback")
+    ))
+
+    with pytest.raises(Exception, match="undiagnosed paths"):
+        asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+            _debug_payload(
+                "Controller fails with a traceback",
+                action="continue",
+                debug_session_id=start["debug_session"]["id"],
+                writes=[OdooCodeFileChange(
+                    relative_path="custom_sale/models/unrelated.py",
+                    content="x = 1\n",
+                )],
+            )
+        ))
+
+
+def test_debug_live_assertion_is_evaluated_from_server_read(monkeypatch):
+    class FakeOdoo:
+        def search_read(self, *args, **kwargs):
+            return OdooResult(
+                status="ok",
+                result=[{"state": "done", "response_id": 99}],
+            )
+
+    monkeypatch.setattr(
+        tools_router.ClientResolverService,
+        "resolve_client",
+        lambda self, **kwargs: None,
+    )
+    monkeypatch.setattr(tools_router, "OdooService", lambda client=None: FakeOdoo())
+    session = {
+        "correlation_id": "dbg-assertion",
+        "client_name": "Test 18",
+        "project_path": "C:/repo",
+        "evidence_ledger": [],
+    }
+    assertion = OdooDebugRecordAssertion(
+        model="custom.sale",
+        domain=[["id", "=", 42]],
+        fields=["state", "response_id"],
+        expected_values={"state": "done", "response_id": 99},
+        expected_count_min=1,
+        expected_count_max=1,
+        match_mode="any",
+    )
+
+    proof = asyncio.run(tools_router._debug_run_live_assertion(
+        session,
+        assertion.model_dump(mode="json"),
+        phase="replay",
+    ))
+
+    assert proof["query_status"] == "ok"
+    assert proof["passed"] is True
+    assert session["evidence_ledger"][0]["trusted"] is True
+    assert session["evidence_ledger"][0]["source"] == "odoo_live"
+
+
+def test_debug_truth_gate_rejects_nondiscriminating_baseline():
+    session = {
+        "deploy_confirmed": True,
+        "verification_assertion": {"model": "custom.sale"},
+        "baseline_assertion": {"query_status": "ok", "passed": True},
+        "replay_assertion": {"query_status": "ok", "passed": True},
+        "reproduction_passed": True,
+        "expected_result_verified": True,
+        "evidence_ledger": [{
+            "kind": "manual_observation",
+            "source": "client",
+            "passed": True,
+        }],
+    }
+
+    truth = tools_router._debug_truth_gate(session)
+
+    assert truth["verified_fixed"] is False
+    assert truth["discriminating_baseline"] is False
+    assert truth["success_allowed"] is False
 
 
 def test_debug_session_rejects_unowned_job_and_out_of_phase_writes(monkeypatch):
@@ -273,6 +538,17 @@ def test_debug_request_rejects_forged_session_identifiers():
         _debug_payload(
             "Controller returns 500",
             debug_session_id="../../another-session",
+        )
+
+
+def test_debug_assertion_requires_explicit_bounded_expectation():
+    with pytest.raises(ValueError, match="requires a count or exact-value"):
+        OdooDebugRecordAssertion(model="custom.sale", fields=["state"])
+    with pytest.raises(ValueError, match="fields must include"):
+        OdooDebugRecordAssertion(
+            model="custom.sale",
+            fields=["id"],
+            expected_values={"state": "done"},
         )
 
 

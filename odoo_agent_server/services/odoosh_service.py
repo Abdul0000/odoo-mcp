@@ -757,19 +757,27 @@ class OdooShService:
         return self.run_shell(script, timeout_seconds=30)
 
     def grep_errors(self, tail_lines: int = 500) -> CommandResult:
-        """Return full recent traceback/error blocks, not just matching lines.
+        """Return only recent ERROR/CRITICAL records and complete tracebacks.
 
-        Odoo errors often span many lines. Grepping only keywords hides the real
-        cause, so this tails recent logs and extracts complete Python traceback
-        blocks plus nearby ERROR/CRITICAL windows.
+        Filtering happens on Odoo.sh before output is transferred. INFO and
+        WARNING records are skipped, while non-timestamped traceback frames and
+        exception lines following an error remain available for diagnosis.
         """
         safe_lines = max(100, min(tail_lines, 2000))
         script = (
             "set +e; "
             "for f in ~/logs/*.log; do "
             "  [ -f \"$f\" ] || continue; "
-            "  echo __ODOO_MCP_LOG_FILE__:$f; "
-            f"  tail -n {safe_lines} \"$f\"; "
+            f"  tail -n {safe_lines} \"$f\" | awk -v file=\"$f\" '"
+            "function emit(line) { "
+            "  if (!emitted) { print \"__ODOO_MCP_LOG_FILE__:\" file; emitted=1 } "
+            "  print line "
+            "} "
+            "/Traceback \\(most recent call last\\)/ { in_trace=1; emit($0); next } "
+            "in_trace && /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][[:space:]]/ { in_trace=0 } "
+            "in_trace { emit($0); next } "
+            "/(^|[[:space:]])(ERROR|CRITICAL)([[:space:]:]|$)/ { emit($0) }"
+            "'; "
             "done; exit 0"
         )
         result = self.run_shell(script, timeout_seconds=45)
