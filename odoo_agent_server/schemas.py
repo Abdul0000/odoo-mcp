@@ -122,6 +122,13 @@ class SelfRunRequest(BaseProjectRequest):
     create_module: bool = Field(default=False, description="Whether this task creates a new addon; used by the module contract gate.")
     module_contract: dict[str, Any] = Field(default_factory=dict, description="Persisted project/module requirements merged with the current task contract.")
     run_pytest: bool = Field(default=True)
+    test_strategy: Literal["auto", "pytest", "odoo_native", "none"] = Field(
+        default="auto",
+        description=(
+            "auto runs bounded pytest only for compatible pure-Python tests and defers Odoo-native "
+            "TransactionCase/SavepointCase tests to an Odoo test environment."
+        ),
+    )
     include_git_status: bool = Field(default=True)
     timeout_seconds: int = Field(default=90, ge=5, le=600)
 
@@ -251,12 +258,24 @@ class OdooCodeChangeRequest(BaseModel):
     allow_autopatch: bool = Field(default=False, description="Enable supported structured style/text autopatches. An explicit quoted replacement such as Replace 'Old' with 'New' is always eligible when it occurs exactly once; ambiguous or complex work remains two-pass.")
     target_files: list[str] = Field(default_factory=list, max_length=50, description="Candidate/target files inside the module to read and use for scope advice")
     writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=50, description="Actual file edits to apply (maximum 50). If empty, an unambiguous deterministic small edit may complete in one call; complex work returns focused inspection context for an exact second-call write.")
+    operation_id: str | None = Field(default=None, max_length=64, description="Stable idempotency key required for a multi-batch large-module write.")
+    batch_index: int = Field(default=0, ge=0, le=19, description="Zero-based local write batch index.")
+    total_batches: int = Field(default=1, ge=1, le=20, description="Total local write batches. Only the final batch can reach full QA/deploy.")
     commit_message: str | None = Field(default=None, max_length=300, description="Commit message for safe deploy. Defaults to a concise message from task_description.")
     auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
     deploy_mode: Literal["auto", "always_upgrade", "source_only"] = Field(default="auto", description="Automatic impact classification by default. always_upgrade forces -u; source_only is allowed only for verified non-structural changes.")
     max_search_matches: int = Field(default=20, ge=1, le=100, description="Max candidate matches returned during inspect mode")
     investigation_evidence: list[str] = Field(default_factory=list, max_length=50, description="Generic evidence gathered after repeated functional failure. Non-empty evidence unlocks a blocked follow-up write.")
     functional_verification_passed: bool = Field(default=False, description="Set true only when the user-visible behavior was verified; resets repeated-failure attempt history for this issue.")
+    clarification_answer: str | None = Field(
+        default=None,
+        max_length=5000,
+        description="User answer to a material clarification requested after focused inspection.",
+    )
+    verification_assertion: OdooDebugRecordAssertion | None = Field(
+        default=None,
+        description="Optional bounded live Odoo record/count assertion executed once after deployment and module upgrade.",
+    )
 
     @field_validator("module_name")
     @classmethod
@@ -267,6 +286,18 @@ class OdooCodeChangeRequest(BaseModel):
         if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
             raise ValueError("module_name contains unsafe characters")
         return value
+
+    @model_validator(mode="after")
+    def code_change_batch_contract_must_be_safe(self):
+        if self.batch_index >= self.total_batches:
+            raise ValueError("batch_index must be smaller than total_batches")
+        if self.total_batches > 1:
+            operation_id = str(self.operation_id or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,64}", operation_id):
+                raise ValueError("multi-batch writes require a stable 8-64 character operation_id")
+            if not self.writes:
+                raise ValueError("each explicit multi-batch call requires non-empty writes")
+        return self
 
 
 class OdooDebugRecordAssertion(BaseModel):
@@ -382,7 +413,12 @@ class OdooDebugAndFixRequest(BaseModel):
     reproduction_passed: bool | None = Field(default=None, description="True only when the same scenario passes after deploy.")
     expected_result_verified: bool | None = Field(default=None, description="True only when the expected DB/API/UI result is proven.")
     max_fix_cycles: int = Field(default=3, ge=1, le=5, description="Maximum evidence-based write/deploy cycles.")
-    max_surgical_files: int = Field(default=12, ge=1, le=20, description="Maximum files in one diagnosed fix.")
+    max_surgical_files: int = Field(
+        default=12,
+        ge=1,
+        le=20,
+        description="Requested diagnosed-fix file ceiling. The server applies an adaptive floor so clients cannot force fragmented repair cycles.",
+    )
     max_surgical_content_chars: int = Field(default=200000, ge=1000, le=500000, description="Maximum supplied replacement content per diagnosed fix.")
     tail_lines: int = Field(default=150, ge=50, le=2000, description="Recent lines scanned remotely for ERROR/CRITICAL traceback blocks.")
     wait_for_result: bool = Field(default=False, description="Poll immediately unless a bounded wait is requested.")
@@ -1030,6 +1066,7 @@ class JobStep(BaseModel):
     status: str
     started_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     finished_at: str | None = None
+    duration_ms: int | None = Field(default=None, ge=0, description="Measured wall time for this workflow stage when available.")
     result: Any = None
     error: str | None = None
 
@@ -1259,8 +1296,12 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     odoosh_deploy_poll_interval_seconds: float = Field(default=3.0, ge=0.25, le=60.0, description="Polling interval for Odoo.sh deployed SHA checks")
     odoo_module_deploy_timeout_seconds: int = Field(default=600, ge=0, le=900, description="Maximum time for the internal Odoo module install/upgrade job to finish before returning a non-success resumable state")
     odoo_module_deploy_poll_interval_seconds: float = Field(default=3.0, ge=0.25, le=60.0, description="Polling interval for the internal Odoo module install/upgrade job")
-    max_fix_cycles: int = Field(default=5, ge=1, le=5, description="Maximum safe-deploy upgrade/fix retry cycles before failing with upgrade_failed_after_retries")
+    max_fix_cycles: int = Field(default=3, ge=1, le=5, description="Maximum safe-deploy upgrade/fix retry cycles before failing with upgrade_failed_after_retries")
     expected_registry_fields: dict[str, list[str]] = Field(default_factory=dict, description="Optional live registry fields to verify after upgrade, e.g. {'purchase.order': ['custom_reference']}. If omitted, safe_deploy infers Python fields from changed addon files.")
+    verification_assertion: OdooDebugRecordAssertion | None = Field(
+        default=None,
+        description="Optional bounded live Odoo record/count assertion executed after source, upgrade, and registry verification.",
+    )
     force_new_deploy: bool = Field(
         default=False,
         description=(

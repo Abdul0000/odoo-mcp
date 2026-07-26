@@ -141,6 +141,7 @@ from ..services.deploy_impact_service import classify_deploy_impact
 from ..services.skill_service import SkillService
 from ..services.validator_service import OdooModuleValidator
 from ..services.module_analysis_service import ModuleAnalysisService
+from ..services.live_assertion_service import LiveAssertionService
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
@@ -1922,6 +1923,190 @@ def _task_profile(payload: OdooCodeChangeRequest, rel_paths: list[str] | None = 
     return profile
 
 
+def _adaptive_workflow_profile(
+    payload: OdooCodeChangeRequest,
+    module_contract: dict[str, Any],
+    rel_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Choose bounded inspection/write behavior from task scope, not agent guesses."""
+    paths = list(dict.fromkeys(str(path) for path in (rel_paths or []) if str(path).strip()))
+    required_layers = list(dict.fromkeys(module_contract.get("required_layers") or []))
+    required_units = len(module_contract.get("required_methods") or []) + len(module_contract.get("required_symbols") or [])
+    known_file_count = max(
+        len(payload.writes) * payload.total_batches,
+        len(payload.target_files),
+        len(paths),
+    )
+    full_module = bool(payload.create_module or module_contract.get("full_module_requested"))
+    if payload.total_batches > 1 or full_module or known_file_count > 15 or len(required_layers) >= 6 or required_units > 15:
+        tier = "large"
+    elif known_file_count > 5 or len(required_layers) >= 3 or required_units > 6:
+        tier = "medium"
+    else:
+        tier = "small"
+    settings_by_tier = {
+        "small": {"file_budget": 8, "inspection_file_limit": 12, "local_batch_size": 8},
+        "medium": {"file_budget": 20, "inspection_file_limit": 30, "local_batch_size": 10},
+        "large": {"file_budget": 50, "inspection_file_limit": 50, "local_batch_size": 15},
+    }
+    profile = settings_by_tier[tier]
+    return {
+        "tier": tier,
+        **profile,
+        "known_file_count": known_file_count,
+        "required_layer_count": len(required_layers),
+        "required_unit_count": required_units,
+        "full_module": full_module,
+        "multi_batch": payload.total_batches > 1,
+        "deployment_policy": "one_commit_one_deploy_after_contract_closure",
+        "batch_policy": (
+            "single_complete_write_set"
+            if tier == "small"
+            else "dependency_ordered_local_batches_no_partial_deploy"
+        ),
+    }
+
+
+def _material_clarification(payload: OdooCodeChangeRequest) -> dict[str, Any] | None:
+    """Detect explicit unresolved product choices; technical uncertainty stays autonomous."""
+    if str(payload.clarification_answer or "").strip():
+        return None
+    text = " ".join(
+        str(value or "")
+        for value in (payload.task_description, payload.intent, payload.target_hint)
+    ).strip()
+    lowered = text.lower()
+    ambiguity_markers = (
+        "either ", " or maybe ", "whichever ", "any suitable ", "as appropriate",
+        "as needed", "some users", "certain users", "whatever is best",
+        "you decide", "not sure", "koi bhi", "jo behtar",
+    )
+    material_markers = (
+        "permission", "security", "access", "group", "user", "company", "record rule",
+        "delete", "archive", "migrate", "default", "workflow", "state", "approval",
+        "visible", "button", "field", "view", "portal", "website",
+    )
+    if not any(marker in lowered for marker in ambiguity_markers):
+        return None
+    if not any(marker in lowered for marker in material_markers):
+        return None
+    return {
+        "required": True,
+        "reason": "A material user-visible, security, data, or workflow choice remains explicitly unresolved.",
+        "question": (
+            "Please confirm the exact desired behavior/actor/default for the unresolved choice before code is changed."
+        ),
+        "source_excerpt": text[:500],
+        "writes_blocked": True,
+    }
+
+
+def _code_batch_fingerprint(writes: list[OdooCodeFileChange]) -> str:
+    payload = [item.model_dump(mode="json") for item in writes]
+    return hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _prepare_code_batch(
+    store: JsonStore,
+    *,
+    client_name: str | None,
+    project_path: str,
+    module_name: str,
+    payload: OdooCodeChangeRequest,
+) -> tuple[dict[str, Any] | None, str | None, bool]:
+    """Validate ordered/idempotent local batches without permitting partial deploy."""
+    if payload.total_batches <= 1:
+        return None, None, False
+    operation_id = str(payload.operation_id)
+    fingerprint = _code_batch_fingerprint(payload.writes)
+    state = store.load_session_state(client_name)
+    operations = dict(state.get("code_change_batch_operations") or {})
+    record = dict(operations.get(operation_id) or {})
+    if record:
+        if (
+            record.get("project_path") != str(Path(project_path).resolve())
+            or record.get("module_name") != module_name
+            or int(record.get("total_batches") or 0) != payload.total_batches
+        ):
+            raise HTTPException(status_code=409, detail="operation_id is already bound to a different project/module/batch contract")
+    else:
+        record = {
+            "operation_id": operation_id,
+            "project_path": str(Path(project_path).resolve()),
+            "module_name": module_name,
+            "total_batches": payload.total_batches,
+            "completed": {},
+            "staged_paths": [],
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    completed = dict(record.get("completed") or {})
+    existing = completed.get(str(payload.batch_index))
+    if existing is not None:
+        if existing != fingerprint:
+            raise HTTPException(status_code=409, detail="completed batch cannot be replaced with different writes")
+        return record, fingerprint, True
+    expected_index = next(
+        (index for index in range(payload.total_batches) if str(index) not in completed),
+        payload.total_batches,
+    )
+    if payload.batch_index != expected_index:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Out-of-order batch: expected batch_index={expected_index}, received {payload.batch_index}",
+        )
+    operations[operation_id] = record
+    if len(operations) > 20:
+        operations = dict(list(operations.items())[-20:])
+    store.save_session_state({"code_change_batch_operations": operations}, client_name=client_name)
+    return record, fingerprint, False
+
+
+def _complete_code_batch(
+    store: JsonStore,
+    *,
+    client_name: str | None,
+    record: dict[str, Any],
+    batch_index: int,
+    fingerprint: str,
+    written_paths: list[str],
+) -> dict[str, Any]:
+    state = store.load_session_state(client_name)
+    operations = dict(state.get("code_change_batch_operations") or {})
+    current = dict(operations.get(record["operation_id"]) or record)
+    completed = dict(current.get("completed") or {})
+    completed[str(batch_index)] = fingerprint
+    current["completed"] = completed
+    current["staged_paths"] = list(dict.fromkeys([
+        *(current.get("staged_paths") or []),
+        *written_paths,
+    ]))[-1000:]
+    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+    operations[record["operation_id"]] = current
+    store.save_session_state({"code_change_batch_operations": operations}, client_name=client_name)
+    return current
+
+
+def _record_code_batch_deploy(
+    store: JsonStore,
+    *,
+    client_name: str | None,
+    record: dict[str, Any],
+    job_id: str | None,
+) -> dict[str, Any]:
+    """Persist the server-owned deploy checkpoint so a replay cannot deploy twice."""
+    state = store.load_session_state(client_name)
+    operations = dict(state.get("code_change_batch_operations") or {})
+    current = dict(operations.get(record["operation_id"]) or record)
+    if job_id:
+        current["deploy_job_id"] = job_id
+        current["deploy_started_at"] = datetime.now(timezone.utc).isoformat()
+    operations[record["operation_id"]] = current
+    store.save_session_state({"code_change_batch_operations": operations}, client_name=client_name)
+    return current
+
+
 def _core_relevance_terms(payload: OdooCodeChangeRequest, rel_paths: list[str]) -> list[str]:
     values = [*_infer_code_change_search_patterns(payload), *rel_paths]
     terms: list[str] = []
@@ -2329,11 +2514,17 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 },
                 "resume_rule": "Only retry workflow.odoo_code_change when investigation_evidence contains a concrete Odoo traceback/exception. Missing dependencies must be installed, not repaired in this addon's manifest blindly.",
             }
-    current_contract = OdooModuleValidator.requested_contract(payload.task_description, payload.create_module)
+    effective_task_description = payload.task_description
+    if str(payload.clarification_answer or "").strip():
+        effective_task_description = (
+            f"{payload.task_description}\n\nConfirmed user clarification:\n"
+            f"{str(payload.clarification_answer).strip()}"
+        )
+    current_contract = OdooModuleValidator.requested_contract(effective_task_description, payload.create_module)
     issue_fingerprint = code_change_issue_fingerprint(
         project_path=project_path,
         module_name=effective_module_name,
-        task_description=payload.task_description,
+        task_description=effective_task_description,
         task_type=_normalized_task_type(payload),
         intent=payload.intent,
         target_hint=_target_hint(payload),
@@ -2345,7 +2536,15 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         project_path=project_path,
         module_name=effective_module_name,
         current_contract=current_contract,
-        task_description=payload.task_description,
+        task_description=effective_task_description,
+    )
+    adaptive_profile = _adaptive_workflow_profile(
+        payload,
+        module_contract,
+        [
+            *payload.target_files,
+            *(write.relative_path for write in payload.writes),
+        ],
     )
     persisted_requirements = "\n\n--- Additional requirement ---\n\n".join(contract_record.get("requirement_sources") or [])
     structure_findings = [
@@ -2368,8 +2567,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             module_path=module_dir,
             module_name=effective_module_name,
             analysis_goal=payload.task_description,
-            max_files=50,
-            max_total_chars=12000,
+            max_files=adaptive_profile["inspection_file_limit"],
+            max_total_chars={"small": 12000, "medium": 18000, "large": 25000}[adaptive_profile["tier"]],
         )
         analysis_source_cache = {
             f"{module.path.rstrip('/')}/{str(item.get('path') or '').lstrip('/')}": item
@@ -2477,7 +2676,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 for line in lines:
                     if line not in focused_match_lines.setdefault(rel, []):
                         focused_match_lines[rel].append(line)
-        for rel in focused_paths[:10]:
+        for rel in focused_paths[: adaptive_profile["inspection_file_limit"]]:
             if rel and rel not in custom_rel_paths:
                 custom_rel_paths.append(rel)
         for rel in _contract_candidate_paths(project, module.path, payload, module_contract):
@@ -2498,7 +2697,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     custom_reads: list[dict[str, Any]] = []
     # One manifest plus up to 50 requested target/write paths. Keep this cap in
     # sync with OdooCodeChangeRequest so accepted writes are never left unread.
-    for rel in list(dict.fromkeys(custom_rel_paths))[:51]:
+    custom_read_limit = 51 if payload.writes else adaptive_profile["inspection_file_limit"] + 1
+    for rel in list(dict.fromkeys(custom_rel_paths))[:custom_read_limit]:
         target = project / rel
         if not target.exists() or not target.is_file():
             custom_reads.append({"relative_path": rel, "status": "missing"})
@@ -2774,6 +2974,49 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             {key: value for key, value in item.items() if key != "preview"}
             for item in custom_reads[:50]
         ]
+        clarification = _material_clarification(payload)
+        if clarification:
+            JsonStore().save_session_state({
+                "pending_code_change": {
+                    "client_name": client_name,
+                    "project_path": project_path,
+                    "module_name": effective_module_name,
+                    "task_description": payload.task_description,
+                    "task_type": _normalized_task_type(payload),
+                    "intent": payload.intent,
+                    "target_hint": _target_hint(payload),
+                    "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
+                    "status": "awaiting_user_clarification",
+                    "clarification": clarification,
+                }
+            }, client_name=client_name)
+            return {
+                "status": "needs_clarification",
+                "message": "Focused inspection is complete, but a material product choice remains unresolved. Ask the user one concise question before writes.",
+                "client_name": client_name,
+                "project_path": project_path,
+                "module_name": effective_module_name,
+                "steps": steps,
+                "workflow_profile": adaptive_profile,
+                "clarification_gate": clarification,
+                "module_contract": module_contract,
+                "contract_status": contract_record.get("status", "pending"),
+                "write_generation": {"required": False, "blocked_by": "material_clarification"},
+                "writes_blocked": True,
+                "success_allowed": False,
+                "completion_required": True,
+                "next_call": {
+                    "tool": "workflow.odoo_code_change",
+                    "arguments": {
+                        "client_name": client_name,
+                        "project_path": project_path,
+                        "module_name": effective_module_name,
+                        "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
+                        "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
+                    },
+                    "required_generated_arguments": ["clarification_answer"],
+                },
+            }
         # Persist unresolved implementation context so short follow-ups such as
         # "yes", "implement", "push", or "revert" can continue the latest task.
         # This is an internal continuation contract, not a user-facing result.
@@ -2806,6 +3049,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "generated_autopatch_strategy": generated_autopatch_strategy,
             "generated_autopatch_reason": generated_autopatch_reason,
             "supported_autopatch_cases": ["style_rule", "text_replace"],
+            "workflow_profile": adaptive_profile,
+            "clarification_gate": {"required": False, "reason": "No material unresolved choice detected."},
             "task_profile": _task_profile(payload, frontend_paths),
             "module_contract": module_contract,
             "persisted_requirements": persisted_requirements,
@@ -2859,10 +3104,87 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             },
         }
 
+    batch_record, batch_fingerprint, batch_already_staged = _prepare_code_batch(
+        state_store,
+        client_name=client_name,
+        project_path=project_path,
+        module_name=effective_module_name,
+        payload=payload,
+    )
+    if (
+        batch_already_staged
+        and batch_record is not None
+        and payload.batch_index < payload.total_batches - 1
+    ):
+        next_index = payload.batch_index + 1
+        return {
+            "status": "batch_already_staged",
+            "message": "This exact local batch was already verified and staged; no writes or deployment were repeated.",
+            "client_name": client_name,
+            "project_path": project_path,
+            "module_name": effective_module_name,
+            "workflow_profile": adaptive_profile,
+            "batch": {
+                "operation_id": payload.operation_id,
+                "batch_index": payload.batch_index,
+                "total_batches": payload.total_batches,
+                "completed_batches": sorted(int(index) for index in (batch_record.get("completed") or {})),
+            },
+            "success_allowed": False,
+            "completion_required": next_index < payload.total_batches,
+            "next_call": {
+                "tool": "workflow.odoo_code_change",
+                "arguments": {
+                    "client_name": client_name,
+                    "project_path": project_path,
+                    "module_name": effective_module_name,
+                    "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
+                    "operation_id": payload.operation_id,
+                    "batch_index": next_index,
+                    "total_batches": payload.total_batches,
+                    "auto_deploy": payload.auto_deploy,
+                },
+                "required_generated_arguments": ["writes"],
+            } if next_index < payload.total_batches else None,
+        }
+
     # 5) Apply writes through normal repo.write so the pre-write gate is still enforced.
-    written_files_abs: list[str] = []
-    write_results: list[dict[str, Any]] = []
-    for change in writes_to_apply:
+    final_batch_replay = bool(batch_already_staged and batch_record is not None)
+    if final_batch_replay and batch_record.get("deploy_job_id"):
+        job_id = str(batch_record["deploy_job_id"])
+        return {
+            "status": "deploy_already_started",
+            "message": "The final batch and deploy checkpoint already exist; no writes, commit, push, or deployment were repeated.",
+            "client_name": client_name,
+            "project_path": project_path,
+            "module_name": effective_module_name,
+            "workflow_profile": adaptive_profile,
+            "job_id": job_id,
+            "completion_required": True,
+            "success_allowed": False,
+            "next_call": {
+                "tool": "jobs.get",
+                "arguments": {
+                    "job_id": job_id,
+                    "wait_for_result": True,
+                    "wait_timeout_seconds": 600,
+                    "poll_interval_seconds": 1.0,
+                },
+            },
+        }
+    written_files_abs: list[str] = [
+        str((project / path).resolve())
+        for path in ((batch_record or {}).get("staged_paths") or [])
+        if (project / path).resolve().is_relative_to(project.resolve())
+    ] if final_batch_replay else []
+    write_results: list[dict[str, Any]] = (
+        [{"status": "skipped", "reason": "final_batch_already_staged"}]
+        if final_batch_replay
+        else []
+    )
+    write_batch_size = int(adaptive_profile["local_batch_size"])
+    writes_for_this_call = [] if final_batch_replay else writes_to_apply
+    for write_index, change in enumerate(writes_for_this_call, start=1):
         rel = _safe_module_relative(effective_module_name, change.relative_path)
         if change.content is not None and (change.search is not None or change.replace is not None):
             raise HTTPException(status_code=400, detail=f"Provide either content or search/replace, not both, for {rel}")
@@ -2890,7 +3212,116 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             if auto_abs not in written_files_abs:
                 written_files_abs.append(auto_abs)
                 write_results.append({"relative_path": str(auto_rel), "status": "auto_wired", "size": Path(auto_abs).stat().st_size})
-    steps.append({"step": "repo.write", "status": "ok", "written_count": len(written_files_abs)})
+        if write_index % write_batch_size == 0 or write_index == len(writes_for_this_call):
+            steps.append({
+                "step": "repo.write_batch",
+                "status": "ok",
+                "batch": ((write_index - 1) // write_batch_size) + 1,
+                "completed_writes": write_index,
+                "total_writes": len(writes_for_this_call),
+                "deploy_started": False,
+            })
+    steps.append({
+        "step": "repo.write",
+        "status": "replayed" if final_batch_replay else "ok",
+        "written_count": 0 if final_batch_replay else len(written_files_abs),
+    })
+
+    if batch_record is not None and payload.batch_index < payload.total_batches - 1:
+        batch_verify = verify_against_core(SyntaxVerifyRequest(
+            written_files=written_files_abs,
+            project_path=project_path,
+            client_name=client_name,
+            fix_cycle=0,
+        ))
+        steps.append({
+            "step": "workflow.verify_batch",
+            "status": batch_verify.status,
+            "push_blocked": batch_verify.push_blocked,
+            "critical_count": batch_verify.critical_count,
+        })
+        if batch_verify.push_blocked:
+            return {
+                "status": "batch_verification_failed",
+                "message": "The local batch was written but failed changed-file verification. Repair this same batch before continuing; nothing was committed or deployed.",
+                "client_name": client_name,
+                "project_path": project_path,
+                "module_name": effective_module_name,
+                "workflow_profile": adaptive_profile,
+                "steps": steps,
+                "write_results": write_results,
+                "verify_against_core": batch_verify.model_dump(mode="json"),
+                "batch": {
+                    "operation_id": payload.operation_id,
+                    "batch_index": payload.batch_index,
+                    "total_batches": payload.total_batches,
+                    "deployed": False,
+                },
+                "success_allowed": False,
+                "completion_required": True,
+                "next_call": {
+                    "tool": "workflow.odoo_code_change",
+                    "arguments": {
+                        "client_name": client_name,
+                        "project_path": project_path,
+                        "module_name": effective_module_name,
+                        "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
+                        "operation_id": payload.operation_id,
+                        "batch_index": payload.batch_index,
+                        "total_batches": payload.total_batches,
+                        "auto_deploy": payload.auto_deploy,
+                    },
+                    "required_generated_arguments": ["writes"],
+                },
+            }
+        completed_batch = _complete_code_batch(
+            state_store,
+            client_name=client_name,
+            record=batch_record,
+            batch_index=payload.batch_index,
+            fingerprint=str(batch_fingerprint),
+            written_paths=[
+                Path(path).resolve().relative_to(project.resolve()).as_posix()
+                for path in written_files_abs
+            ],
+        )
+        next_index = payload.batch_index + 1
+        return {
+            "status": "batch_staged",
+            "message": "Local batch passed changed-file verification. No commit, push, deployment, module upgrade, or full-module QA was started.",
+            "client_name": client_name,
+            "project_path": project_path,
+            "module_name": effective_module_name,
+            "workflow_profile": adaptive_profile,
+            "steps": steps,
+            "write_results": write_results,
+            "verify_against_core": batch_verify.model_dump(mode="json"),
+            "batch": {
+                "operation_id": payload.operation_id,
+                "batch_index": payload.batch_index,
+                "next_batch_index": next_index,
+                "total_batches": payload.total_batches,
+                "completed_batches": sorted(int(index) for index in completed_batch["completed"]),
+                "staged_path_count": len(completed_batch.get("staged_paths") or []),
+                "deployed": False,
+            },
+            "success_allowed": False,
+            "completion_required": True,
+            "next_call": {
+                "tool": "workflow.odoo_code_change",
+                "arguments": {
+                    "client_name": client_name,
+                    "project_path": project_path,
+                    "module_name": effective_module_name,
+                    "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
+                    "operation_id": payload.operation_id,
+                    "batch_index": next_index,
+                    "total_batches": payload.total_batches,
+                    "auto_deploy": payload.auto_deploy,
+                },
+                "required_generated_arguments": ["writes"],
+            },
+        }
 
     # 6) Diff, QA, verify against core before deploy.
     diff = GitService().diff(project_path, staged=False, timeout_seconds=60)
@@ -2899,6 +3330,11 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         [str(Path(path).resolve().relative_to(project.resolve()).as_posix()) for path in written_files_abs]
         + dirty_module_paths
     ))
+    verify_files_abs = [
+        str((project / path).resolve())
+        for path in deploy_paths
+        if (project / path).resolve().is_relative_to(project.resolve())
+    ]
     try:
         deploy_impact = classify_deploy_impact(
             project_path=project_path,
@@ -2919,7 +3355,12 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         run_pytest="tests" in (module_contract.get("required_layers") or []),
         include_git_status=True,
     ))
-    verify = verify_against_core(SyntaxVerifyRequest(written_files=written_files_abs, project_path=project_path, client_name=client_name, fix_cycle=0))
+    verify = verify_against_core(SyntaxVerifyRequest(
+        written_files=verify_files_abs,
+        project_path=project_path,
+        client_name=client_name,
+        fix_cycle=0,
+    ))
     qa_errors = [item for item in qa.findings if item.severity.value == "error"]
     strict_module_validation = bool(payload.create_module or current_contract.get("full_module_requested"))
     blocking_qa_errors, preexisting_qa_errors = _partition_surgical_qa_errors(
@@ -2977,6 +3418,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "qa": qa_struct,
             "verify_against_core": verify.model_dump(mode="json"),
             "module_contract": module_contract,
+            "workflow_profile": adaptive_profile,
             "persisted_requirements": persisted_requirements,
             "contract_status": "pending",
             "repair_required": True,
@@ -2999,10 +3441,26 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                     "module_name": effective_module_name,
                     "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
                     "target_files": repair_targets,
+                    **({
+                        "operation_id": payload.operation_id,
+                        "batch_index": payload.batch_index,
+                        "total_batches": payload.total_batches,
+                        "auto_deploy": payload.auto_deploy,
+                    } if batch_record is not None else {}),
                 },
                 "required_generated_arguments": ["writes"],
             } if repair_attempts <= 3 else None,
         }
+
+    if batch_record is not None:
+        _complete_code_batch(
+            state_store,
+            client_name=client_name,
+            record=batch_record,
+            batch_index=payload.batch_index,
+            fingerprint=str(batch_fingerprint),
+            written_paths=deploy_paths,
+        )
 
     _update_module_contract_status(
         state_store,
@@ -3025,6 +3483,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "module_structure_complete": not preexisting_qa_errors,
             "surgical_scope_verified": True,
             "module_contract": module_contract,
+            "workflow_profile": adaptive_profile,
             "contract_status": "fulfilled",
             "success_allowed": False,
             "completion_required": True,
@@ -3043,6 +3502,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         upgrade_module=deploy_impact.upgrade_required,
         deploy_impact=deploy_impact.impact,
         upgrade_reasons=list(deploy_impact.reasons),
+        verification_assertion=payload.verification_assertion,
     )
     try:
         deploy = await safe_deploy_module(deploy_payload)
@@ -3069,8 +3529,15 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "allowed_summary": "Code was written and verified, but not pushed/deployed/upgraded. Fix the deploy validation blocker, then rerun with auto_deploy=true.",
         }
     job_id = deploy_struct.get("job_id") if isinstance(deploy_struct, dict) else None
+    if batch_record is not None:
+        _record_code_batch_deploy(
+            state_store,
+            client_name=client_name,
+            record=batch_record,
+            job_id=job_id,
+        )
     record_code_change_deploy_attempt(client_name=client_name, fingerprint=issue_fingerprint, job_id=job_id)
-    frontend_touched = any(str(p).endswith((".xml", ".scss", ".css", ".js")) for p in written_files_abs)
+    frontend_touched = any(str(path).endswith((".xml", ".scss", ".css", ".js")) for path in deploy_paths)
     return {
         "status": "deploy_started" if deploy_struct.get("status") in {"running", "already_running", "already_in_progress", "resumable_existing_job"} else deploy_struct.get("status", "deploy_started"),
         "message": "Code change workflow completed through verify phase; safe deploy is server-owned. Poll jobs.get until terminal result before final answer.",
@@ -3101,6 +3568,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "module_structure_complete": not preexisting_qa_errors,
         "surgical_scope_verified": True,
         "module_contract": module_contract,
+        "workflow_profile": adaptive_profile,
         "contract_status": "fulfilled",
         "frontend_touched": frontend_touched,
         "allowed_summary": "Code was written and verified; deploy is running. Do not claim pushed/deployed/upgraded until jobs.get returns terminal passed with deploy_confirmed=true.",
@@ -3352,6 +3820,7 @@ def _debug_public_session(session: dict[str, Any]) -> dict[str, Any]:
         "phase": session.get("phase"),
         "fix_cycles": session.get("fix_cycles", 0),
         "max_fix_cycles": session.get("max_fix_cycles", 3),
+        "max_surgical_files": max(12, int(session.get("max_surgical_files") or 12)),
         "job_id": session.get("job_id"),
         "deploy_confirmed": session.get("deploy_confirmed", False),
         "already_deployed_confirmed": session.get("already_deployed_confirmed", False),
@@ -3413,10 +3882,11 @@ def _append_debug_evidence(
 
 
 def _debug_validate_surgical_writes(payload: OdooDebugAndFixRequest, session: dict[str, Any]) -> str:
-    if len(payload.writes) > int(session.get("max_surgical_files") or 12):
+    effective_file_budget = max(12, int(session.get("max_surgical_files") or 12))
+    if len(payload.writes) > effective_file_budget:
         raise HTTPException(
             status_code=409,
-            detail=f"Surgical fix allows at most {session.get('max_surgical_files', 12)} files in one cycle.",
+            detail=f"Surgical fix allows at most {effective_file_budget} files in one cycle.",
         )
     total_chars = sum(
         len(item.content or "") + len(item.search or "") + len(item.replace or "")
@@ -3508,65 +3978,14 @@ async def _debug_run_live_assertion(
     *,
     phase: str,
 ) -> dict[str, Any]:
-    assertion = OdooDebugRecordAssertion.model_validate(assertion_value)
-    client = ClientResolverService().resolve_client(
+    proof = await asyncio.to_thread(
+        LiveAssertionService().evaluate,
+        assertion_value,
         client_name=session.get("client_name"),
         project_path=session.get("project_path"),
-        require_complete=False,
+        phase=phase,
     )
-    fields = assertion.fields or ["id"]
-    result = await asyncio.to_thread(
-        OdooService(client).search_read,
-        assertion.model,
-        assertion.domain,
-        fields,
-        200,
-        0,
-        "id asc",
-        None,
-        120,
-    )
-    records = result.result if result.status == "ok" and isinstance(result.result, list) else []
-    count = len(records)
-    count_passed = (
-        (assertion.expected_count_min is None or count >= assertion.expected_count_min)
-        and (assertion.expected_count_max is None or count <= assertion.expected_count_max)
-    )
-
-    def values_match(record: Any) -> bool:
-        if not isinstance(record, dict):
-            return False
-        return all(record.get(key) == expected for key, expected in assertion.expected_values.items())
-
-    if not assertion.expected_values:
-        values_passed = True
-        matched_rows = count
-    else:
-        matches = [values_match(record) for record in records]
-        matched_rows = sum(1 for matched in matches if matched)
-        if assertion.match_mode == "first":
-            values_passed = bool(matches and matches[0])
-        elif assertion.match_mode == "all":
-            values_passed = bool(matches and all(matches))
-        else:
-            values_passed = any(matches)
-    passed = bool(result.status == "ok" and count_passed and values_passed)
-    proof = {
-        "phase": phase,
-        "query_status": result.status,
-        "passed": passed,
-        "model": assertion.model,
-        "count": count,
-        "matched_rows": matched_rows,
-        "expected_count_min": assertion.expected_count_min,
-        "expected_count_max": assertion.expected_count_max,
-        "checked_fields": sorted(assertion.expected_values),
-        "error": _redact_debug_text(result.error or "", 2_000) or None,
-        "assertion_fingerprint": _debug_evidence_fingerprint(
-            json.dumps(assertion.model_dump(mode="json"), sort_keys=True, default=str)
-        ),
-        "observed_at": datetime.now(timezone.utc).isoformat(),
-    }
+    passed = bool(proof.get("passed"))
     _debug_record_evidence(
         session,
         kind="baseline_assertion" if phase == "baseline" else "replay_assertion",
@@ -3670,7 +4089,7 @@ def _debug_next_call(
             "correlation_id": session.get("correlation_id"),
             "verification_assertion": session.get("verification_assertion"),
             "max_fix_cycles": session.get("max_fix_cycles", 3),
-            "max_surgical_files": session.get("max_surgical_files", 12),
+            "max_surgical_files": max(12, int(session.get("max_surgical_files") or 12)),
             "max_surgical_content_chars": session.get("max_surgical_content_chars", 200_000),
             "job_id": session.get("job_id"),
         },
@@ -3885,7 +4304,7 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
             "phase": "diagnosing",
             "fix_cycles": 0,
             "max_fix_cycles": payload.max_fix_cycles,
-            "max_surgical_files": payload.max_surgical_files,
+            "max_surgical_files": max(12, payload.max_surgical_files),
             "max_surgical_content_chars": payload.max_surgical_content_chars,
             "job_id": None,
             "deploy_confirmed": False,
@@ -4863,6 +5282,7 @@ _SAFE_DEPLOY_STEPS = [
     "odoo_module_deploy",
     "odoo_module_status",
     "registry_field_verify",
+    "combined_live_verification",
     "registry_smoke_test",
 ]
 _SAFE_DEPLOY_STEP_ALIASES = {
@@ -5031,8 +5451,17 @@ def _start_and_wait_module_deploy_for_resume(original_request: dict, module_name
         wait_timeout_seconds=0,
         poll_interval_seconds=1.0,
     )
+    pinned_client = ClientResolverService().resolve_client(
+        client_name=original_request.get("client_name"),
+        project_path=original_request.get("project_path"),
+        require_complete=False,
+    )
     try:
-        started = start_odoo_module_deploy_job(module_request, run_inline=True)
+        started = start_odoo_module_deploy_job(
+            module_request,
+            run_inline=True,
+            validated_client=pinned_client,
+        )
     except TypeError:
         started = start_odoo_module_deploy_job(module_request)
     started_payload = started.model_dump(mode="json") if hasattr(started, "model_dump") else started
@@ -5157,7 +5586,6 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                 break
     # Recover original request payload
     original_request = job.request or {}
-    ClientGateService().require_validated_client(original_request.get("client_name") or req.client_name, "workflow.resume_job")
     module_name = original_request.get("module_name")
     project_path = original_request.get("project_path")
     if not module_name or not project_path:
@@ -5165,6 +5593,12 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
             status_code=400,
             detail=f"Cannot resume: job {job_id} is missing module_name or project_path in its request payload.",
         )
+    ClientGateService().require_validated_client_or_job_lease(
+        original_request.get("client_name") or req.client_name,
+        "workflow.resume_job",
+        project_path=project_path,
+        lease=original_request.get("validation_lease"),
+    )
 
     client = ClientResolverService().resolve_client(
         client_name=original_request.get("client_name") or req.client_name,
@@ -5383,7 +5817,7 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                     if failure.exit_code == 1:
                         resume_results["status"] = "deploy_failed"
                         resume_results["message"] = "Odoo.sh reported failure evidence after the push. Module upgrade was not attempted."
-                        resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
+                        resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}}
                         return _persist_resume_result(store, job, resume_results, original_request)
 
             elif step_name == "odoosh_user_file_verify":
@@ -5395,7 +5829,7 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                 if result.exit_code != 0:
                     resume_results["status"] = "deploy_code_mismatch"
                     resume_results["message"] = "Odoo.sh source checkout did not match the changed local/GitHub files. Module upgrade was not attempted."
-                    resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
+                    resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}}
                     return _persist_resume_result(store, job, resume_results, original_request)
 
             elif step_name == "odoosh_verify_module_manifest":
@@ -5443,7 +5877,28 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                 if result.status != "ok":
                     resume_results["status"] = "registry_field_missing"
                     resume_results["message"] = "Module upgrade finished but the live Odoo registry is missing expected fields. Do not claim success."
-                    resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
+                    resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}}
+                    return _persist_resume_result(store, job, resume_results, original_request)
+
+            elif step_name == "combined_live_verification":
+                assertion = original_request.get("verification_assertion")
+                if not assertion:
+                    resume_results["steps_run"][step_name] = {"status": "skipped"}
+                    continue
+                result = LiveAssertionService().evaluate(
+                    assertion,
+                    client_name=original_request.get("client_name") or req.client_name,
+                    project_path=project_path,
+                    phase="post_deploy_resume",
+                )
+                resume_results["steps_run"][step_name] = {
+                    "status": "ok" if result.get("passed") else "failed",
+                    "result": result,
+                }
+                resume_results["live_verification"] = result
+                if not result.get("passed"):
+                    resume_results["status"] = "live_verification_failed"
+                    resume_results["message"] = "Resumed source/upgrade steps passed, but the task-specific live assertion failed."
                     return _persist_resume_result(store, job, resume_results, original_request)
 
             elif step_name == "registry_smoke_test":

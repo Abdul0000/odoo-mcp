@@ -103,6 +103,11 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "Prevent N+1 queries",
         "parameterized SQL only when measurably justified",
         "A small deterministic fix remains surgical",
+        "workflow_profile",
+        "needs_clarification",
+        "dependency-ordered local batches",
+        "Odoo-native addon tests",
+        "pinned validated client identity",
     ]
     for marker in required_markers:
         assert marker in text

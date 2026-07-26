@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -175,3 +176,35 @@ def test_client_check_shell_ok_without_ssh_does_not_enable_safe_deploy(monkeypat
     with pytest.raises(HTTPException) as blocked:
         ClientGateService().require_validated_client("Alpha", "workflow.safe_deploy_module")
     assert blocked.value.detail["required_capability"] == "deploy_ready"
+
+
+def test_server_owned_job_lease_survives_interactive_validation_expiry(monkeypatch, tmp_path):
+    state = tmp_path / "state"
+    checkout = tmp_path / "alpha"
+    _make_checkout(checkout)
+    monkeypatch.setattr(settings, "state_dir", str(state))
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    _set_clients(monkeypatch, [
+        _client("Alpha", "https://github.com/acme/a.git", "dev", str(checkout)),
+    ])
+    _patch_successful_validation(monkeypatch)
+
+    gate = ClientGateService()
+    gate.check(client_name="Alpha", validate=True)
+    lease = gate.issue_job_validation_lease(
+        "Alpha",
+        action="workflow.safe_deploy_module",
+        project_path=str(checkout),
+    )
+    stale = gate.validation_state("Alpha")
+    stale["validated_at"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    JsonStore().save_session_state({"client_validation": stale}, client_name="Alpha")
+
+    with pytest.raises(HTTPException):
+        gate.require_validated_client("Alpha", "workflow.resume_job")
+    gate.require_validated_client_or_job_lease(
+        "Alpha",
+        "workflow.resume_job",
+        project_path=str(checkout),
+        lease=lease,
+    )

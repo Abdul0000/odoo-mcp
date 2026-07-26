@@ -1,7 +1,11 @@
 from odoo_agent_server.schemas import FrontendPatternPreflightRequest, OdooCodeChangeRequest, SmartToolRouteRequest
 from odoo_agent_server.routers.workflow import smart_tool_router
 from odoo_agent_server.services.frontend_pattern_service import FrontendPatternService
-from odoo_agent_server.routers.tools import _looks_like_frontend_code_change
+from odoo_agent_server.routers.tools import (
+    _adaptive_workflow_profile,
+    _looks_like_frontend_code_change,
+    _material_clarification,
+)
 
 
 def test_product_word_does_not_trigger_pos():
@@ -22,6 +26,45 @@ def test_python_website_controller_skips_frontend_preflight():
         target_files=["sample_website_module/controllers/main.py"],
     )
     assert not _looks_like_frontend_code_change(payload, payload.target_files)
+
+
+def test_adaptive_workflow_profile_scales_without_agent_file_limit_guessing():
+    small = OdooCodeChangeRequest(
+        module_name="sample_module",
+        task_description="Add one configuration field",
+        target_files=["sample_module/models/config.py"],
+    )
+    large = OdooCodeChangeRequest(
+        module_name="sample_module",
+        task_description="Build the complete module across all requested layers",
+        create_module=True,
+    )
+
+    assert _adaptive_workflow_profile(small, {"required_layers": ["models"]})["tier"] == "small"
+    large_profile = _adaptive_workflow_profile(
+        large,
+        {"full_module_requested": True, "required_layers": ["models", "security", "views", "data", "tests", "controllers"]},
+    )
+    assert large_profile["tier"] == "large"
+    assert large_profile["file_budget"] == 50
+    assert large_profile["deployment_policy"] == "one_commit_one_deploy_after_contract_closure"
+
+
+def test_material_clarification_only_blocks_explicit_product_choice():
+    ambiguous = OdooCodeChangeRequest(
+        module_name="sample_module",
+        task_description="Allow either all users or maybe only managers to see the approval button",
+    )
+    clear = OdooCodeChangeRequest(
+        module_name="sample_module",
+        task_description="Only sales managers can see the approval button",
+    )
+
+    assert _material_clarification(ambiguous)["required"] is True
+    assert _material_clarification(clear) is None
+    assert _material_clarification(
+        ambiguous.model_copy(update={"clarification_answer": "Only sales managers."})
+    ) is None
 
 
 def test_real_frontend_file_still_triggers_preflight():

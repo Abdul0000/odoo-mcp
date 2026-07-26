@@ -80,3 +80,31 @@ def test_odoosh_grep_errors_filters_remotely_and_preserves_tracebacks(monkeypatc
     assert "Request failed" in result.stdout
     assert 'File "/src/custom.py"' in result.stdout
     assert "ValueError: broken" in result.stdout
+
+
+def test_recent_build_failure_defaults_to_remote_filtered_150_lines(monkeypatch):
+    captured = {}
+
+    def fake_run_shell(self, script, timeout_seconds=60):
+        captured["script"] = script
+        return CommandResult(
+            command=["ssh"],
+            cwd="odoosh:ssh",
+            exit_code=0,
+            stdout=(
+                "__ODOO_MCP_LOG_FILE__:/home/odoo/logs/build.log\n"
+                "2026-01-01 10:00:00,000 42 CRITICAL db odoo.modules: Failed to load registry\n"
+            ),
+        )
+
+    monkeypatch.setattr(OdooShService, "run_shell", fake_run_shell)
+
+    result = OdooShService().recent_build_failure(123)
+
+    assert "tail -n 150" in captured["script"]
+    assert "awk -v file=" in captured["script"]
+    assert "(ERROR|CRITICAL)" in captured["script"]
+    assert "WARNING" not in captured["script"]
+    assert "INFO" not in captured["script"]
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["failed"] is True

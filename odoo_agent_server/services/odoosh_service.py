@@ -756,7 +756,7 @@ class OdooShService:
         script = f"test -f {filename} && tail -n {safe_lines} {filename} || echo 'Log not found: {filename}'"
         return self.run_shell(script, timeout_seconds=30)
 
-    def grep_errors(self, tail_lines: int = 500) -> CommandResult:
+    def grep_errors(self, tail_lines: int = 150) -> CommandResult:
         """Return only recent ERROR/CRITICAL records and complete tracebacks.
 
         Filtering happens on Odoo.sh before output is transferred. INFO and
@@ -787,7 +787,7 @@ class OdooShService:
         summary = "\n\n".join(blocks[-20:]) if blocks else "No recent traceback/error blocks found in tailed Odoo.sh logs."
         return result.model_copy(update={"stdout": summary[-20000:]})
 
-    def recent_build_failure(self, since_epoch: int, tail_lines: int = 800) -> CommandResult:
+    def recent_build_failure(self, since_epoch: int, tail_lines: int = 150) -> CommandResult:
         """Detect Odoo.sh build/runtime failures in logs modified after ``since_epoch``.
 
         Odoo.sh can update ``~/src/user`` to a pushed SHA even when the build test
@@ -803,8 +803,18 @@ class OdooShService:
             "  [ -f \"$f\" ] || continue; "
             "  m=$(stat -c %Y \"$f\" 2>/dev/null || stat -f %m \"$f\" 2>/dev/null || echo 0); "
             "  [ \"$m\" -ge \"$since\" ] || continue; "
-            "  echo __ODOO_MCP_LOG_FILE__:$f; "
-            f"  tail -n {safe_lines} \"$f\"; "
+            f"  tail -n {safe_lines} \"$f\" | awk -v file=\"$f\" '"
+            "function emit(line) { "
+            "  if (!emitted) { print \"__ODOO_MCP_LOG_FILE__:\" file; emitted=1 } "
+            "  print line "
+            "} "
+            "/Traceback \\(most recent call last\\)/ { in_trace=1; emit($0); next } "
+            "in_trace && /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][[:space:]]/ { in_trace=0 } "
+            "in_trace { emit($0); next } "
+            "/(^|[[:space:]])(ERROR|CRITICAL)([[:space:]:]|$)/ { emit($0); next } "
+            "/Test:[[:space:]]*Failed|Build[[:space:]]+failed|Failed to load registry|"
+            "ParseError|ValidationError|ModuleNotFoundError|ImportError/ { emit($0) }"
+            "'; "
             "done; exit 0"
         )
         result = self.run_shell(script, timeout_seconds=45)
@@ -919,7 +929,7 @@ class OdooShService:
         return unique
 
 
-    def error_pack(self, tail_lines: int = 800) -> CommandResult:
+    def error_pack(self, tail_lines: int = 150) -> CommandResult:
         """Return traceback blocks plus lightweight root-cause hints."""
         base = self.grep_errors(tail_lines)
         text = f"{base.stdout}\n{base.stderr}"

@@ -4,10 +4,13 @@ from pathlib import Path
 import pytest
 
 from odoo_agent_server.routers import tools as tools_router
+from odoo_agent_server.services import live_assertion_service
 from odoo_agent_server.routers.tools import (
     _build_safe_generic_autopatch,
     _analysis_index_target_paths,
     _contract_candidate_paths,
+    _complete_code_batch,
+    _code_batch_fingerprint,
     _debug_requires_runtime_loop,
     _detect_debug_surface,
     _redact_debug_text,
@@ -16,6 +19,7 @@ from odoo_agent_server.routers.tools import (
     _infer_code_change_search_patterns,
     _rank_core_directory_files,
     _rank_core_required_paths,
+    _prepare_code_batch,
     _task_description_search_clues,
 )
 from odoo_agent_server.schemas import (
@@ -103,6 +107,78 @@ def test_debug_router_keeps_small_deterministic_changes_on_fast_path(monkeypatch
 
     assert result["status"] == "routed_to_code_change_fast_path"
     assert result["next_call"]["tool"] == "workflow.odoo_code_change"
+
+
+def test_large_code_batches_are_ordered_and_idempotent():
+    store = _DebugStore()
+    first = _payload(
+        "Implement a large module in two local batches",
+        operation_id="large-module-001",
+        batch_index=0,
+        total_batches=2,
+        writes=[OdooCodeFileChange(relative_path="custom_sale/models/a.py", content="VALUE = 1\n")],
+    )
+    record, fingerprint, replay = _prepare_code_batch(
+        store,
+        client_name="Test 18",
+        project_path="C:/repo",
+        module_name="custom_sale",
+        payload=first,
+    )
+
+    assert replay is False
+    completed = _complete_code_batch(
+        store,
+        client_name="Test 18",
+        record=record,
+        batch_index=0,
+        fingerprint=fingerprint,
+        written_paths=["custom_sale/models/a.py"],
+    )
+    assert completed["completed"] == {"0": fingerprint}
+
+    _record, _fingerprint, replay = _prepare_code_batch(
+        store,
+        client_name="Test 18",
+        project_path="C:/repo",
+        module_name="custom_sale",
+        payload=first,
+    )
+    assert replay is True
+
+    second = first.model_copy(update={
+        "batch_index": 1,
+        "writes": [OdooCodeFileChange(relative_path="custom_sale/views/a.xml", content="<odoo/>\n")],
+    })
+    _record, second_fingerprint, replay = _prepare_code_batch(
+        store,
+        client_name="Test 18",
+        project_path="C:/repo",
+        module_name="custom_sale",
+        payload=second,
+    )
+    assert replay is False
+    assert second_fingerprint == _code_batch_fingerprint(second.writes)
+
+
+def test_large_code_batches_reject_out_of_order_writes():
+    store = _DebugStore()
+    out_of_order = _payload(
+        "Implement a large module in three local batches",
+        operation_id="large-module-002",
+        batch_index=1,
+        total_batches=3,
+        writes=[OdooCodeFileChange(relative_path="custom_sale/models/b.py", content="VALUE = 2\n")],
+    )
+
+    with pytest.raises(Exception, match="Out-of-order batch"):
+        _prepare_code_batch(
+            store,
+            client_name="Test 18",
+            project_path="C:/repo",
+            module_name="custom_sale",
+            payload=out_of_order,
+        )
 
 
 def test_debug_workflow_uses_compact_default_error_pack():
@@ -371,7 +447,7 @@ def test_debug_recovers_owned_deploy_job_after_interrupted_response(monkeypatch)
     assert result["debug_session"]["job_id"] == "recovered-job"
 
 
-def test_debug_surgical_budget_rejects_broad_multi_file_patch(monkeypatch):
+def test_debug_surgical_budget_cannot_be_shrunk_below_server_floor(monkeypatch):
     _prepare_debug_workflow(monkeypatch)
 
     async def fake_code_change(payload):
@@ -382,7 +458,9 @@ def test_debug_surgical_budget_rejects_broad_multi_file_patch(monkeypatch):
         _debug_payload("Backend fails with a traceback", max_surgical_files=2)
     ))
 
-    with pytest.raises(Exception, match="at most 2 files"):
+    assert start["debug_session"]["max_surgical_files"] == 12
+
+    with pytest.raises(Exception, match="at most 12 files"):
         asyncio.run(tools_router._workflow_odoo_debug_and_fix(
             _debug_payload(
                 "Backend fails with a traceback",
@@ -390,7 +468,7 @@ def test_debug_surgical_budget_rejects_broad_multi_file_patch(monkeypatch):
                 debug_session_id=start["debug_session"]["id"],
                 writes=[
                     OdooCodeFileChange(relative_path=f"custom_sale/models/f{index}.py", content="x = 1\n")
-                    for index in range(3)
+                    for index in range(13)
                 ],
             )
         ))
@@ -440,7 +518,12 @@ def test_debug_live_assertion_is_evaluated_from_server_read(monkeypatch):
         "resolve_client",
         lambda self, **kwargs: None,
     )
-    monkeypatch.setattr(tools_router, "OdooService", lambda client=None: FakeOdoo())
+    monkeypatch.setattr(
+        live_assertion_service.ClientResolverService,
+        "resolve_client",
+        lambda self, **kwargs: None,
+    )
+    monkeypatch.setattr(live_assertion_service, "OdooService", lambda client=None: FakeOdoo())
     session = {
         "correlation_id": "dbg-assertion",
         "client_name": "Test 18",

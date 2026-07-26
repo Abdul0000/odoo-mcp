@@ -10,7 +10,7 @@ import pytest
 from fastapi import HTTPException
 
 from odoo_agent_server.config import settings
-from odoo_agent_server.schemas import ApprovalRecord, ApprovalStatus, CommandResult, DeployedModuleVerifyRequest, JobRecord, JobStatus, JobStep, OdooResult, SafeDeployModuleRequest, ResumeJobRequest
+from odoo_agent_server.schemas import ApprovalRecord, ApprovalStatus, CommandResult, DeployedModuleVerifyRequest, JobRecord, JobStatus, JobStep, OdooDebugRecordAssertion, OdooResult, SafeDeployModuleRequest, ResumeJobRequest
 from odoo_agent_server.services.approval_service import ApprovalService
 from odoo_agent_server.services.git_service import GitService
 from odoo_agent_server.services.odoosh_service import OdooShService
@@ -2010,7 +2010,7 @@ def test_safe_deploy_upgrade_fails_all_5_cycles_with_real_error(tmp_path, monkey
     assert finished.result["attempts"] == 5
     assert "real upgrade failure 5" in finished.result["last_real_error"]
     assert "RuntimeError: real upgrade failure" in finished.result["last_real_error"]
-    assert finished.result["next_call"] == {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
+    assert finished.result["next_call"] == {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}}
     assert "pushed & upgrade triggered" not in finished.result["message"].lower()
     assert "deployed successfully" not in finished.result["message"].lower()
     assert calls["deploy"] == 5
@@ -2071,6 +2071,40 @@ def test_safe_deploy_upgrade_succeeds_first_try_without_wasted_retries(tmp_path,
     step_names = [step.name for step in finished.steps]
     assert "upgrade_attempt_1" in step_names
     assert not any(name.startswith("fix_cycle_") for name in step_names)
+    assert all(step.duration_ms is not None for step in finished.steps)
+    assert finished.result["timing_summary"]["measured_stage_count"] > 0
+
+
+def test_safe_deploy_runs_one_combined_live_assertion_after_upgrade(tmp_path, monkeypatch):
+    store, job, payload, _calls = _retry_project(tmp_path, monkeypatch, success_on=1)
+    payload = payload.model_copy(update={
+        "verification_assertion": OdooDebugRecordAssertion(
+            model="ir.cron",
+            fields=["active", "interval_number"],
+            expected_values={"active": True, "interval_number": 1},
+            expected_count_min=1,
+        ),
+    })
+    monkeypatch.setattr(
+        workflow.LiveAssertionService,
+        "evaluate",
+        lambda self, assertion, **kwargs: {
+            "phase": "post_deploy",
+            "query_status": "ok",
+            "passed": True,
+            "model": "ir.cron",
+            "count": 1,
+            "matched_rows": 1,
+        },
+    )
+
+    workflow._run_safe_deploy(payload, job.id)
+
+    finished = store.get_job(job.id)
+    assert finished.status == JobStatus.passed
+    assert finished.result["live_verification"]["passed"] is True
+    steps = {step.name: step.status for step in finished.steps}
+    assert steps["combined_live_verification"] == "passed"
 
 
 def test_safe_deploy_job_stays_running_until_upgrade_loop_exits(tmp_path, monkeypatch):
@@ -2151,7 +2185,7 @@ def test_safe_deploy_wait_for_result_fail_all_retries_returns_real_last_error(tm
     assert "Upgrade failed after 5 attempts, last error:" in result.summary["message"]
     assert "real upgrade failure 5" in result.summary["message"]
     assert "RuntimeError: real upgrade failure" in result.summary["last_real_error"]
-    assert result.summary["next_call"] == {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}}
+    assert result.summary["next_call"] == {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}}
     assert "check back" not in str(result.summary).lower()
     assert "may take a few minutes" not in str(result.summary).lower()
     assert "in progress" not in str(result.summary).lower()

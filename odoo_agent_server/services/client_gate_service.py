@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -164,6 +165,112 @@ class ClientGateService:
                 ),
                 "validation": validation,
             },
+        )
+
+    def issue_job_validation_lease(
+        self,
+        client_name: str | None,
+        *,
+        action: str,
+        project_path: str | None,
+    ) -> dict[str, Any]:
+        """Pin a fresh validated client identity to a server-owned long-running job."""
+        self.require_validated_client(client_name, action)
+        resolved = self.resolver.resolve_client(
+            client_name=client_name,
+            project_path=project_path,
+            require_complete=False,
+        )
+        resolved_name = resolved.name if resolved else client_name
+        validation = self.validation_state(resolved_name)
+        validated_project = self._validated_project_path(resolved_name, validation)
+        effective_project = str(Path(project_path or validated_project or "").expanduser().resolve())
+        if validated_project and Path(validated_project).expanduser().resolve() != Path(effective_project):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Cannot lease validation for a project_path different from the validated client checkout.",
+            )
+        capability = self._requirement_for_action(action)
+        identity = {
+            "version": 1,
+            "client_name": resolved_name,
+            "project_path": effective_project,
+            "repo_fingerprint": hashlib.sha256(
+                str(resolved.repo if resolved else validation.get("repo_url") or "").encode("utf-8")
+            ).hexdigest(),
+            "branch": resolved.branch if resolved else validation.get("branch"),
+            "capability": capability,
+            "validated_at": validation.get("validated_at"),
+            "issued_at": datetime.now(timezone.utc).isoformat(),
+        }
+        identity["fingerprint"] = self._job_lease_fingerprint(identity)
+        return identity
+
+    def require_validated_client_or_job_lease(
+        self,
+        client_name: str | None,
+        action: str,
+        *,
+        project_path: str | None,
+        lease: dict[str, Any] | None,
+    ) -> None:
+        """Accept current validation or an immutable lease from the owning stored job."""
+        try:
+            self.require_validated_client(client_name, action)
+            return
+        except HTTPException as current_error:
+            if not self._job_validation_lease_matches(
+                lease,
+                client_name=client_name,
+                project_path=project_path,
+                required_capability=self._requirement_for_action(action),
+            ):
+                raise current_error
+
+    @staticmethod
+    def _job_lease_fingerprint(identity: dict[str, Any]) -> str:
+        values = [
+            str(identity.get(key) or "")
+            for key in ("version", "client_name", "project_path", "repo_fingerprint", "branch", "capability", "validated_at", "issued_at")
+        ]
+        return hashlib.sha256("\x1f".join(values).encode("utf-8")).hexdigest()
+
+    def _job_validation_lease_matches(
+        self,
+        lease: dict[str, Any] | None,
+        *,
+        client_name: str | None,
+        project_path: str | None,
+        required_capability: str,
+    ) -> bool:
+        if not isinstance(lease, dict) or lease.get("version") != 1:
+            return False
+        expected_fingerprint = self._job_lease_fingerprint(lease)
+        if lease.get("fingerprint") != expected_fingerprint:
+            return False
+        if client_name and lease.get("client_name") != client_name:
+            return False
+        leased_project = Path(str(lease.get("project_path") or "")).expanduser()
+        if not leased_project.is_dir():
+            return False
+        if project_path and leased_project.resolve() != Path(project_path).expanduser().resolve():
+            return False
+        capability = str(lease.get("capability") or "")
+        if required_capability == "deploy_ready" and capability != "deploy_ready":
+            return False
+        resolved = self.resolver.resolve_client(
+            client_name=str(lease.get("client_name") or "") or None,
+            project_path=str(leased_project),
+            require_complete=False,
+        )
+        if resolved is None:
+            return not get_odoo_clients()
+        return (
+            resolved.path is not None
+            and Path(resolved.path).expanduser().resolve() == leased_project.resolve()
+            and hashlib.sha256(str(resolved.repo or "").encode("utf-8")).hexdigest()
+            == str(lease.get("repo_fingerprint") or "")
+            and str(resolved.branch or "") == str(lease.get("branch") or "")
         )
 
     def _require_legacy_checkout_exists(self, action: str) -> None:

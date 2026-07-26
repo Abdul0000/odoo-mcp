@@ -128,6 +128,37 @@ def test_provider_workflow_accepts_up_to_fifty_atomic_writes():
         OdooCodeChangeRequest(module_name="x_module", task_description="Update module XML", writes=[*writes, writes[0]])
 
 
+def test_provider_workflow_exposes_safe_large_module_batches():
+    tools = _mcp_tools_list()
+    workflow = next(tool for tool in tools if tool["name"] == "workflow_odoo_code_change")
+    properties = workflow["inputSchema"]["properties"]
+
+    assert {"operation_id", "batch_index", "total_batches"} <= set(properties)
+    assert properties["total_batches"]["maximum"] == 20
+    request = OdooCodeChangeRequest(
+        module_name="x_module",
+        task_description="Implement the first dependency-ordered module batch",
+        operation_id="large-module-001",
+        batch_index=0,
+        total_batches=2,
+        writes=[OdooCodeFileChange(relative_path="x_module/models/a.py", content="VALUE = 1\n")],
+    )
+    assert request.total_batches == 2
+    with pytest.raises(ValidationError, match="operation_id"):
+        request.model_copy(update={"operation_id": None}).model_validate(
+            request.model_copy(update={"operation_id": None}).model_dump()
+        )
+    with pytest.raises(ValidationError, match="batch_index"):
+        OdooCodeChangeRequest(
+            module_name="x_module",
+            task_description="Invalid final index",
+            operation_id="large-module-002",
+            batch_index=2,
+            total_batches=2,
+            writes=[OdooCodeFileChange(relative_path="x_module/models/a.py", content="VALUE = 1\n")],
+        )
+
+
 def test_provider_install_fast_path_dispatches_without_planning(monkeypatch):
     captured = {}
 

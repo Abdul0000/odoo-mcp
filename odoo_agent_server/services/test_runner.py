@@ -46,5 +46,12 @@ class TestRunner:
     def git_status(self, cwd: Path, timeout_seconds: int = 20) -> CommandResult:
         return self.run(["git", "status", "--short", "--branch"], cwd, timeout_seconds)
 
-    def pytest(self, cwd: Path, timeout_seconds: int = 90) -> CommandResult:
-        return self.run(["python", "-m", "pytest", "-q"], cwd, timeout_seconds)
+    def pytest(
+        self,
+        cwd: Path,
+        timeout_seconds: int = 90,
+        targets: list[str] | None = None,
+    ) -> CommandResult:
+        command = ["python", "-m", "pytest", "-q"]
+        command.extend(targets or [])
+        return self.run(command, cwd, timeout_seconds)

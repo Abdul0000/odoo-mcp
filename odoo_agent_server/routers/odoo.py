@@ -91,7 +91,7 @@ def _direct_module_deploy_guard(payload: OdooModuleRequest, store: JsonStore) ->
                 "status": "deploy_failed",
                 "sha": pushed_sha,
                 "guard": failure.model_dump(mode="json"),
-                "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+                "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}},
             },
         )
 
@@ -111,7 +111,7 @@ def _direct_module_deploy_guard(payload: OdooModuleRequest, store: JsonStore) ->
                     "sha": pushed_sha,
                     "verified_files": sorted(expected_hashes),
                     "guard": hash_result.model_dump(mode="json"),
-                    "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+                    "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}},
                 },
             )
 
@@ -345,8 +345,12 @@ def start_odoo_module_deploy_job(
     approval: ApprovalService | None = None,
     enforce_deploy_guard: bool = False,
     run_inline: bool = False,
+    validated_client=None,
 ) -> OdooResult:
-    client = _prepare_validated_client(payload, "odoo.module_deploy")
+    # A server-owned safe-deploy job already validated and pinned this client
+    # before commit/push. Reuse that resolved identity so a long Odoo.sh wait
+    # cannot expire the session between source deployment and module upgrade.
+    client = validated_client or _prepare_validated_client(payload, "odoo.module_deploy")
     """Start smart deploy in the existing background-job path.
 
     Public router calls pass an ApprovalService after approval succeeds. Internal

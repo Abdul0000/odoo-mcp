@@ -80,6 +80,7 @@ from ..services.prewrite_gate_service import PreWriteGateService
 from ..services.syntax_verifier_service import SyntaxVerifierService  # V14+
 from ..services.frontend_pattern_service import FrontendPatternService  # V15
 from ..services.repo_index_service import RepoIndexService  # V16
+from ..services.live_assertion_service import LiveAssertionService
 from ..services.workflow_guard_service import (
     _RESUMABLE_SAFE_DEPLOY_RESULTS,
     find_blocking_safe_deploy,
@@ -638,7 +639,12 @@ def _wait_workflow_job_until_terminal(store: JsonStore, job_id: str, poll_interv
 
 @router.post("/safe-deploy-module", response_model=WorkflowReport)
 async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport:
-    ClientGateService().require_validated_client(payload.client_name, "workflow.safe_deploy_module")
+    client_gate = ClientGateService()
+    validation_lease = client_gate.issue_job_validation_lease(
+        payload.client_name,
+        action="workflow.safe_deploy_module",
+        project_path=payload.project_path,
+    )
 
     """Start the single owner deploy pipeline for one project/module.
 
@@ -739,10 +745,12 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                 return _existing_job_report(existing_job)
 
             store = JsonStore()
+            job_request = payload.model_dump(mode="json")
+            job_request["validation_lease"] = validation_lease
             job = store.create_job(JobRecord(
                 job_type="safe_deploy_module",
                 status=JobStatus.running,
-                request=payload.model_dump(mode="json"),
+                request=job_request,
             ))
             store.save_session_state({
                 "last_safe_deploy_job_id": job.id,
@@ -1259,8 +1267,17 @@ def _start_and_wait_module_deploy(payload: SafeDeployModuleRequest) -> OdooResul
         wait_timeout_seconds=min(max(int(payload.odoo_module_deploy_timeout_seconds or 1), 1), 25),
         poll_interval_seconds=max(min(float(payload.odoo_module_deploy_poll_interval_seconds or 10.0), 10.0), 0.25),
     )
+    pinned_client = ClientResolverService().resolve_client(
+        client_name=payload.client_name,
+        project_path=payload.project_path,
+        require_complete=False,
+    )
     try:
-        started = start_odoo_module_deploy_job(module_request, run_inline=True)
+        started = start_odoo_module_deploy_job(
+            module_request,
+            run_inline=True,
+            validated_client=pinned_client,
+        )
     except TypeError:
         # Compatibility with existing test doubles and external overrides.
         started = start_odoo_module_deploy_job(module_request)
@@ -1530,8 +1547,13 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         "passed": None if payload.upgrade_module else True,
     }
     rollback_attempted = False
+    last_step_mark = time.monotonic()
 
     def _step(name: str, status_: str, result=None, error: str | None = None) -> None:
+        nonlocal last_step_mark
+        now = time.monotonic()
+        duration_ms = max(0, int((now - last_step_mark) * 1000))
+        last_step_mark = now
         job = store.get_job(job_id)
         store.add_step(
             job,
@@ -1539,6 +1561,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 name=name,
                 status=status_,
                 finished_at=datetime.now(timezone.utc).isoformat(),
+                duration_ms=duration_ms,
                 result=result.model_dump(mode="json") if hasattr(result, "model_dump") else result,
                 error=error,
             ),
@@ -1718,7 +1741,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             deploy_passed = _module_upgrade_success(deploy_result)
             _step("odoo_module_deploy", "passed" if deploy_passed else "failed", deploy_result)
             if not deploy_passed:
-                error_pack = odoosh.error_pack(1200)
+                error_pack = odoosh.error_pack(150)
                 _step("upgrade_error_pack_1", "passed" if error_pack.exit_code == 0 else "warning", error_pack)
                 result = {
                     "status": "upgrade_failed_after_source_resume",
@@ -1733,7 +1756,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                     "visible_change_confirmed": False,
                     "deploy_confirmed": False,
                     "success_allowed": False,
-                    "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+                    "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}},
                 }
                 job = store.get_job(job_id)
                 store.finish_job(job, JobStatus.failed, result)
@@ -1980,7 +2003,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                     "message": "Odoo.sh reported failure evidence after this push. Module upgrade was not attempted.",
                     "module_name": payload.module_name,
                     "sha": pushed_sha,
-                    "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+                    "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}},
                 }
                 store.finish_job(job, JobStatus.failed, result)
                 _save_state("deploy_failed")
@@ -2008,7 +2031,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 "module_name": payload.module_name,
                 "sha": pushed_sha,
                 "verified_files": sorted(expected_user_hashes),
-                "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+                "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}},
             }
             store.finish_job(job, JobStatus.failed, result)
             _save_state("deploy_code_mismatch")
@@ -2018,10 +2041,10 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
 
     def _fetch_upgrade_error_pack(attempt: int, deploy_result) -> CommandResult:
         try:
-            error_pack = odoosh.error_pack(1200)
+            error_pack = odoosh.error_pack(150)
         except Exception as exc:  # noqa: BLE001
             error_pack = CommandResult(
-                command=["odoosh.error_pack", "1200"],
+                command=["odoosh.error_pack", "150"],
                 cwd="odoosh:ssh",
                 exit_code=1,
                 stderr=f"odoosh.error_pack failed: {exc}",
@@ -2228,7 +2251,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                     "attempts": attempts_made,
                 },
                 "odoosh_check_commit": odoosh_deploy_confirmation,
-                "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+                "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}},
             }
             store.finish_job(job, JobStatus.failed, result)
             _save_state("upgrade_failed_after_retries", {"last_upgrade_error": result["last_real_error"]})
@@ -2247,7 +2270,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
                 "sha": pushed_sha,
                 "expected_registry_fields": expected_registry_fields,
                 "registry_field_verify": field_verify.model_dump(mode="json"),
-                "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 1200}},
+                "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}},
             }
             store.finish_job(job, JobStatus.failed, result)
             _save_state("registry_field_missing")
@@ -2255,9 +2278,50 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     else:
         _step("registry_field_verify", "skipped", {"message": "No expected Python field additions were inferred or provided."})
 
-    _step("post_upgrade_smoke", "skipped", {
-        "message": "Skipped redundant post-upgrade shell sessions; the successful module upgrade is the terminal confirmation."
-    })
+    live_verification = None
+    if payload.verification_assertion is not None:
+        try:
+            live_verification = LiveAssertionService().evaluate(
+                payload.verification_assertion,
+                client_name=client.name if client else payload.client_name,
+                project_path=str(project_path),
+                phase="post_deploy",
+            )
+        except Exception as exc:  # noqa: BLE001
+            live_verification = {
+                "phase": "post_deploy",
+                "query_status": "failed",
+                "passed": False,
+                "error": str(exc)[:2000],
+            }
+        _step(
+            "combined_live_verification",
+            "passed" if live_verification.get("passed") else "failed",
+            live_verification,
+        )
+        if not live_verification.get("passed"):
+            job = store.get_job(job_id)
+            result = {
+                "status": "live_verification_failed",
+                "message": "Source and module upgrade completed, but the task-specific live assertion did not pass.",
+                "module_name": payload.module_name,
+                "sha": pushed_sha,
+                "live_verification": live_verification,
+                "odoosh_check_commit": odoosh_deploy_confirmation,
+                "module_upgrade": module_upgrade_confirmation,
+                "source_deployed": True,
+                "module_upgraded": bool(payload.upgrade_module and module_upgrade_confirmation.get("passed")),
+                "deploy_confirmed": False,
+                "success_allowed": False,
+            }
+            store.finish_job(job, JobStatus.failed, result)
+            _save_state("live_verification_failed")
+            approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module live assertion failed")
+            return
+    else:
+        _step("combined_live_verification", "skipped", {
+            "message": "No task-specific live record/count assertion was supplied; source, upgrade, and inferred registry checks remain authoritative."
+        })
 
     fresh_job = store.get_job(job_id)
     final_result = {
@@ -2268,6 +2332,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         "expected_registry_fields": expected_registry_fields,
         "odoosh_check_commit": odoosh_deploy_confirmation,
         "module_upgrade": module_upgrade_confirmation,
+        "live_verification": live_verification,
         "source_pushed": True,
         "source_on_odoosh": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")),
         "source_deployed": bool(odoosh_deploy_confirmation and odoosh_deploy_confirmation.get("deployed")),
@@ -2281,6 +2346,14 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         "tool_exit_allowed": True,
         "next_call": None,
         "terminal_action": "stop_and_summarize",
+        "timing_summary": {
+            "measured_stage_count": len(fresh_job.steps),
+            "measured_total_ms": sum(int(step.duration_ms or 0) for step in fresh_job.steps),
+            "slowest_stages": [
+                {"name": step.name, "duration_ms": int(step.duration_ms or 0)}
+                for step in sorted(fresh_job.steps, key=lambda item: int(item.duration_ms or 0), reverse=True)[:5]
+            ],
+        },
     }
     store.finish_job(fresh_job, JobStatus.passed, final_result)
     approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module succeeded")

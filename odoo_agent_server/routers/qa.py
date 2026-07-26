@@ -11,6 +11,39 @@ from ..services.validator_service import OdooModuleValidator
 router = APIRouter(prefix="/qa", tags=["qa"], dependencies=[AuthDependency])
 
 
+def _module_test_strategy(module_path, project_path, requested: str) -> tuple[str, list[str]]:
+    module_tests = sorted((module_path / "tests").glob("test_*.py")) if (module_path / "tests").is_dir() else []
+    project_tests = sorted((project_path / "tests").glob("test_*.py")) if (project_path / "tests").is_dir() else []
+    if requested == "none":
+        return "none", []
+    if requested == "odoo_native":
+        return "odoo_native", [str(path) for path in module_tests]
+    if requested == "pytest":
+        targets = module_tests or project_tests
+        return "pytest", [path.relative_to(project_path).as_posix() for path in targets]
+    if module_tests:
+        odoo_markers = (
+            "from odoo",
+            "import odoo",
+            "odoo.tests",
+            "transactioncase",
+            "savepointcase",
+            "httptestcase",
+            "tagged(",
+        )
+        for path in module_tests:
+            try:
+                source = path.read_text(encoding="utf-8").lower()
+            except (OSError, UnicodeDecodeError):
+                continue
+            if any(marker in source for marker in odoo_markers):
+                return "odoo_native", [str(item) for item in module_tests]
+        return "pytest", [path.relative_to(project_path).as_posix() for path in module_tests]
+    if project_tests:
+        return "pytest", [path.relative_to(project_path).as_posix() for path in project_tests]
+    return "none", []
+
+
 @router.post("/self-run", response_model=SelfRunReport)
 def self_run(payload: SelfRunRequest) -> SelfRunReport:
     project_path = resolve_allowed_path(payload.project_path)
@@ -54,10 +87,20 @@ def self_run(payload: SelfRunRequest) -> SelfRunReport:
                 )
             )
 
+    selected_test_strategy = "none"
+    selected_test_targets: list[str] = []
     if project_path_valid and payload.run_pytest:
-        has_tests = (module_path / "tests").exists() or (project_path / "tests").exists()
-        if has_tests:
-            pytest_result = runner.pytest(project_path, timeout_seconds=payload.timeout_seconds)
+        selected_test_strategy, selected_test_targets = _module_test_strategy(
+            module_path,
+            project_path,
+            payload.test_strategy,
+        )
+        if selected_test_strategy == "pytest":
+            pytest_result = runner.pytest(
+                project_path,
+                timeout_seconds=payload.timeout_seconds,
+                targets=selected_test_targets,
+            )
             commands.append(pytest_result)
             if pytest_result.exit_code != 0:
                 findings.append(
@@ -68,6 +111,18 @@ def self_run(payload: SelfRunRequest) -> SelfRunReport:
                         hint=(pytest_result.stderr or pytest_result.stdout)[-4000:],
                     )
                 )
+        elif selected_test_strategy == "odoo_native":
+            findings.append(
+                Finding(
+                    severity=Severity.info,
+                    code="ODOO_NATIVE_TESTS_DEFERRED",
+                    message="Odoo-native addon tests were not collected with plain pytest.",
+                    hint=(
+                        "Static validation continues now; execute these tests in an Odoo test-enabled environment. "
+                        "A successful module upgrade proves registry/load compatibility but is not a claim that native tests ran."
+                    ),
+                )
+            )
         else:
             findings.append(
                 Finding(
@@ -95,5 +150,7 @@ def self_run(payload: SelfRunRequest) -> SelfRunReport:
             "commands_run": len(commands),
             "project_path_valid": project_path_valid,
             "module_structure_complete": error_count == 0,
+            "test_strategy": selected_test_strategy,
+            "test_targets": selected_test_targets[:20],
         },
     )
