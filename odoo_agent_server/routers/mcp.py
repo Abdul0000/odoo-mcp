@@ -253,6 +253,7 @@ _PROVIDER_TOOL_NAMES = {
     "client.check",
     "workflow.agent_instructions",
     "workflow.odoo_code_change",
+    "workflow.odoo_debug_and_fix",
     "workflow.module_analyze",
     "workflow.module_install_and_check",
     "workflow.frontend_visual_implement",

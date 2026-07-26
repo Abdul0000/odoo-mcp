@@ -269,6 +269,66 @@ class OdooCodeChangeRequest(BaseModel):
         return value
 
 
+class OdooDebugAndFixRequest(BaseModel):
+    """Bounded runtime-debug orchestrator layered over the normal code workflow."""
+
+    client_name: str | None = Field(default=None, description="Validated ODOO_CLIENTS entry.")
+    project_path: str | None = Field(default=None, description="Existing checkout; client path is used when omitted.")
+    module_name: str = Field(..., description="Custom addon technical name or safe human hint.")
+    issue_description: str = Field(..., min_length=3, max_length=10000, description="Observed runtime error or incorrect behavior.")
+    expected_result: str = Field(..., min_length=3, max_length=5000, description="Concrete behavior that proves the issue is fixed.")
+    reproduction_steps: list[str] = Field(default_factory=list, max_length=20, description="Bounded steps used to reproduce the issue.")
+    surface: Literal[
+        "auto", "backend", "controller", "cron", "integration", "frontend",
+        "security", "install_upgrade", "performance",
+    ] = Field(default="auto", description="Debug surface; auto selects from the issue.")
+    action: Literal["auto", "start", "continue", "poll", "verify"] = Field(default="auto", description="Start or continue one persisted debug session.")
+    debug_session_id: str | None = Field(default=None, max_length=64, description="Session ID returned by an earlier debug call.")
+    correlation_id: str | None = Field(default=None, max_length=80, description="Safe request/record correlation identifier.")
+    runtime_evidence: list[str] = Field(default_factory=list, max_length=50, description="New sanitized logs, traceback, console, or network evidence.")
+    verification_evidence: list[str] = Field(default_factory=list, max_length=20, description="Evidence from replaying the same scenario after deploy.")
+    writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=50, description="Exact writes generated from returned debug/code context.")
+    job_id: str | None = Field(default=None, max_length=64, description="Safe-deploy job currently owned by this debug session.")
+    reproduction_passed: bool | None = Field(default=None, description="True only when the same scenario passes after deploy.")
+    expected_result_verified: bool | None = Field(default=None, description="True only when the expected DB/API/UI result is proven.")
+    max_fix_cycles: int = Field(default=3, ge=1, le=5, description="Maximum evidence-based write/deploy cycles.")
+    tail_lines: int = Field(default=800, ge=50, le=2000, description="Odoo.sh log lines inspected per diagnosis.")
+    wait_for_result: bool = Field(default=True, description="Wait briefly when polling the owned deploy job.")
+    wait_timeout_seconds: int = Field(default=600, ge=1, le=600, description="Bounded server-side deploy poll window.")
+    poll_interval_seconds: float = Field(default=1.0, ge=0.25, le=10.0, description="Delay between deploy-job status checks.")
+    auto_deploy: bool = Field(default=True, description="Use the existing safe-deploy pipeline after verified writes.")
+
+    @field_validator("module_name")
+    @classmethod
+    def debug_module_name_must_be_safe(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or "\x00" in value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
+
+    @field_validator("debug_session_id")
+    @classmethod
+    def debug_session_id_must_be_safe(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not re.fullmatch(r"[a-f0-9]{32}", value):
+            raise ValueError("debug_session_id must be the exact 32-character ID returned by the tool")
+        return value
+
+    @field_validator("correlation_id")
+    @classmethod
+    def correlation_id_must_be_safe(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value or not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+            raise ValueError("correlation_id contains unsafe characters")
+        return value
+
+
 class ModuleAnalyzeRequest(BaseModel):
     """Fast read-only custom-addon architecture analysis."""
     client_name: str | None = Field(default=None, description="Validated ODOO_CLIENTS entry")

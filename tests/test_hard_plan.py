@@ -161,6 +161,7 @@ def test_mcp_initialize_list_and_call(tmp_path, monkeypatch):
         "client_check",
         "workflow_agent_instructions",
         "workflow_odoo_code_change",
+        "workflow_odoo_debug_and_fix",
         "workflow_module_analyze",
         "workflow_module_install_and_check",
         "workflow_frontend_visual_implement",

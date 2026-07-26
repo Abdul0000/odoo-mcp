@@ -14,6 +14,7 @@ _PROVIDER_TOOLS = {
     "client_check",
     "workflow_agent_instructions",
     "workflow_odoo_code_change",
+    "workflow_odoo_debug_and_fix",
     "workflow_module_analyze",
     "workflow_module_install_and_check",
     "workflow_frontend_visual_implement",
@@ -73,6 +74,35 @@ def test_provider_mcp_workflow_schema_contains_autopatch_fields():
         if isinstance(value, dict)
     ]
     assert all(len(description) <= 80 for description in descriptions)
+
+
+def test_provider_debug_workflow_exposes_persisted_replay_contract():
+    tools = _mcp_tools_list()
+    workflow = next(tool for tool in tools if tool["name"] == "workflow_odoo_debug_and_fix")
+    properties = workflow["inputSchema"]["properties"]
+
+    for field in (
+        "issue_description",
+        "expected_result",
+        "debug_session_id",
+        "correlation_id",
+        "runtime_evidence",
+        "verification_evidence",
+        "writes",
+        "job_id",
+        "reproduction_passed",
+        "expected_result_verified",
+        "max_fix_cycles",
+    ):
+        assert field in properties
+    assert properties["max_fix_cycles"]["maximum"] == 5
+    assert properties["writes"]["maxItems"] == 50
+
+    output = workflow["outputSchema"]["properties"]
+    assert "debug_session" in output
+    assert "deploy_confirmed" in output
+    assert "reproduction_passed" in output
+    assert "expected_result_verified" in output
 
 
 def test_provider_workflow_accepts_up_to_fifty_atomic_writes():

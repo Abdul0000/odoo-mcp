@@ -4,6 +4,7 @@ import asyncio
 import ast
 from copy import deepcopy
 import difflib
+import hashlib
 import inspect
 import json
 import re
@@ -13,6 +14,7 @@ import typing
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ValidationError
@@ -35,6 +37,7 @@ from ..schemas import (
     MenuCrawlerRequest,
     CodingTaskPlanRequest,
     OdooCodeChangeRequest,
+    OdooDebugAndFixRequest,
     ModuleAnalyzeRequest,
     FrontendVisualImplementRequest,
     EmptyRequest,
@@ -269,6 +272,18 @@ _TOOL_DESCRIPTORS = [
             "Task descriptions automatically supply quoted identifiers/selectors/XML IDs/methods for focused inspection. "
             "An exact quoted replacement that occurs once can complete in one call; ambiguous or complex work returns exact editable source units in write_generation.contexts for a second call with non-empty writes. "
             "Existing-addon surgical changes use baseline-delta QA: unchanged unrelated legacy findings are reported but do not block commit/deploy; new, task-required, manifest/version, and changed-scope errors still block."
+        ),
+        requires_approval=True,
+    ),
+    ToolDescriptor(
+        name="workflow.odoo_debug_and_fix",
+        title="Diagnose, fix, deploy, and replay an Odoo runtime issue",
+        description=(
+            "Additive bounded debug orchestrator for runtime errors and unclear behavior. "
+            "It detects the Odoo surface, collects and redacts Odoo.sh evidence, persists a correlation-scoped session, "
+            "hands exact writes to workflow.odoo_code_change, reuses the existing QA/safe-deploy/jobs pipeline, "
+            "and requires same-scenario replay evidence before success. Deterministic small edits are routed directly "
+            "to workflow.odoo_code_change. It never runs arbitrary console commands or duplicates Git/deploy logic."
         ),
         requires_approval=True,
     ),
@@ -726,6 +741,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.capability_check": EmptyRequest,
     "workflow.coding_task_plan": CodingTaskPlanRequest,
     "workflow.odoo_code_change": OdooCodeChangeRequest,
+    "workflow.odoo_debug_and_fix": OdooDebugAndFixRequest,
     "workflow.module_analyze": ModuleAnalyzeRequest,
     "workflow.module_install_and_check": OdooModuleRequest,
     "workflow.frontend_visual_implement": FrontendVisualImplementRequest,
@@ -3088,6 +3104,542 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     }
 
 
+_DEBUG_RUNTIME_MARKERS = (
+    "error", "exception", "traceback", "failed", "failure", "broken", "runtime",
+    "controller", "cron", "scheduled", "browser", "console", "network", "api",
+    "webhook", "timeout", "intermittent", "access denied", "permission", "slow",
+    "performance", "install", "upgrade", "registry", "500", "rpc_error",
+)
+
+
+def _detect_debug_surface(payload: OdooDebugAndFixRequest) -> str:
+    if payload.surface != "auto":
+        return payload.surface
+    text = " ".join([
+        payload.issue_description,
+        payload.expected_result,
+        *payload.reproduction_steps,
+    ]).lower()
+    routes = (
+        ("frontend", ("owl", "javascript", " js ", "browser", "console", "network", "pos", "website", "asset")),
+        ("install_upgrade", ("install", "upgrade", "registry", "parseerror", "module load")),
+        ("security", ("access denied", "accesserror", "permission", "record rule", "acl")),
+        ("performance", ("slow", "performance", "timeout", "query count", "n+1")),
+        ("cron", ("cron", "scheduled", "batch", "queue")),
+        ("controller", ("controller", "route", "http", "endpoint")),
+        ("integration", ("api", "webhook", "integration", "external", "request", "response")),
+    )
+    for surface, markers in routes:
+        if any(marker in text for marker in markers):
+            return surface
+    return "backend"
+
+
+def _debug_requires_runtime_loop(payload: OdooDebugAndFixRequest) -> bool:
+    if payload.surface != "auto" or payload.action == "start" or payload.runtime_evidence:
+        return True
+    text = " ".join([payload.issue_description, *payload.reproduction_steps]).lower()
+    for marker in _DEBUG_RUNTIME_MARKERS:
+        if marker.isalnum() and len(marker) <= 4:
+            if re.search(rf"\b{re.escape(marker)}\b", text):
+                return True
+        elif marker in text:
+            return True
+    return False
+
+
+def _redact_debug_text(value: str, max_chars: int = 12_000) -> str:
+    """Redact common credentials/PII before persistence or model output."""
+    text = str(value or "")
+    patterns = (
+        (r"(?i)\b(authorization\s*:\s*bearer)\s+\S+", r"\1 <redacted>"),
+        (r"(?i)\b(password|passwd|token|api[_-]?key|secret)\b(\s*[:=]\s*)[^\s,;]+", r"\1\2<redacted>"),
+        (r"(?i)(https?://[^/\s:@]+:)[^@\s/]+@", r"\1<redacted>@"),
+        (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", "<redacted-email>"),
+    )
+    for pattern, replacement in patterns:
+        text = re.sub(pattern, replacement, text)
+    if len(text) <= max_chars:
+        return text
+    half = max_chars // 2
+    return text[:half] + f"\n...[{len(text) - max_chars} redacted chars omitted]...\n" + text[-half:]
+
+
+def _debug_evidence_fingerprint(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", _redact_debug_text(value).lower()).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _debug_session_store(
+    store: JsonStore,
+    session: dict[str, Any],
+    *,
+    client_name: str | None,
+) -> dict[str, Any]:
+    state = store.load_session_state(client_name=client_name)
+    sessions = dict(state.get("debug_sessions") or {}) if isinstance(state, dict) else {}
+    sessions[str(session["id"])] = session
+    if len(sessions) > 20:
+        sessions = dict(list(sessions.items())[-20:])
+    store.save_session_state({"debug_sessions": sessions}, client_name=client_name)
+    return session
+
+
+def _debug_session_load(
+    store: JsonStore,
+    session_id: str,
+    *,
+    client_name: str | None,
+) -> dict[str, Any]:
+    state = store.load_session_state(client_name=client_name)
+    sessions = state.get("debug_sessions") if isinstance(state, dict) else None
+    session = sessions.get(session_id) if isinstance(sessions, dict) else None
+    if not isinstance(session, dict):
+        raise HTTPException(status_code=404, detail="Debug session not found for the selected client.")
+    return dict(session)
+
+
+def _debug_public_session(session: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": session.get("id"),
+        "correlation_id": session.get("correlation_id"),
+        "client_name": session.get("client_name"),
+        "project_path": session.get("project_path"),
+        "module_name": session.get("module_name"),
+        "surface": session.get("surface"),
+        "phase": session.get("phase"),
+        "fix_cycles": session.get("fix_cycles", 0),
+        "max_fix_cycles": session.get("max_fix_cycles", 3),
+        "job_id": session.get("job_id"),
+        "deploy_confirmed": session.get("deploy_confirmed", False),
+        "already_deployed_confirmed": session.get("already_deployed_confirmed", False),
+        "evidence_count": len(session.get("evidence") or []),
+    }
+
+
+def _append_debug_evidence(session: dict[str, Any], values: list[str]) -> int:
+    evidence = list(session.get("evidence") or [])
+    fingerprints = list(session.get("evidence_fingerprints") or [])
+    known = set(fingerprints)
+    added = 0
+    for raw in values:
+        value = _redact_debug_text(raw, 8_000)
+        if not value.strip():
+            continue
+        fingerprint = _debug_evidence_fingerprint(value)
+        if fingerprint in known:
+            continue
+        evidence.append(value)
+        fingerprints.append(fingerprint)
+        known.add(fingerprint)
+        added += 1
+    session["evidence"] = evidence[-20:]
+    session["evidence_fingerprints"] = fingerprints[-40:]
+    return added
+
+
+def _debug_task_description(session: dict[str, Any]) -> str:
+    evidence = "\n\n".join(session.get("evidence") or [])[-12_000:]
+    reproduction = "\n".join(f"- {step}" for step in session.get("reproduction_steps") or []) or "- Reproduce the reported entry point with the correlation ID."
+    return (
+        "Diagnose and completely fix this persisted Odoo runtime issue.\n\n"
+        f"Issue: {session['issue_description']}\n"
+        f"Expected result: {session['expected_result']}\n"
+        f"Detected surface: {session['surface']}\n"
+        f"Correlation ID: {session['correlation_id']}\n"
+        f"Reproduction steps:\n{reproduction}\n\n"
+        f"Sanitized runtime evidence:\n{evidence or 'No traceback captured yet; inspect the exact entry point and add bounded instrumentation only when needed.'}\n\n"
+        "Implementation contract: identify the evidence-backed root cause; make the smallest complete multi-file fix; "
+        "preserve unrelated behavior; use structured correlation-scoped logging only where runtime visibility is missing; "
+        "never log credentials or sensitive record values; add or update focused mocked/regression tests for the failing flow. "
+        "Do not submit scaffold/import/security-only writes while functional behavior remains missing. "
+        "The existing code-change and safe-deploy workflows remain the sole owners of writes, Git, Odoo.sh deployment, and module upgrade."
+    )[:20_000]
+
+
+def _debug_code_task_type(surface: str) -> str:
+    return {
+        "frontend": "js_owl",
+        "controller": "controller",
+        "install_upgrade": "python_model",
+        "security": "security_csv",
+    }.get(surface, "python_model")
+
+
+def _debug_collect_error_pack(client_name: str | None, tail_lines: int) -> str:
+    try:
+        client = ClientResolverService().resolve_client(client_name=client_name, require_complete=False)
+        result = OdooShService(client).error_pack(tail_lines)
+        return _redact_debug_text(
+            f"exit_code={result.exit_code}\n{result.stdout}\n{result.stderr}",
+            12_000,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return _redact_debug_text(f"Error-pack collection failed: {type(exc).__name__}: {exc}", 4_000)
+
+
+def _debug_next_call(
+    session: dict[str, Any],
+    *,
+    action: str,
+    required_generated_arguments: list[str] | None = None,
+) -> dict[str, Any]:
+    call = {
+        "tool": "workflow.odoo_debug_and_fix",
+        "arguments": {
+            "client_name": session.get("client_name"),
+            "project_path": session.get("project_path"),
+            "module_name": session.get("module_name"),
+            "issue_description": session.get("issue_description"),
+            "expected_result": session.get("expected_result"),
+            "reproduction_steps": session.get("reproduction_steps") or [],
+            "surface": session.get("surface"),
+            "action": action,
+            "debug_session_id": session.get("id"),
+            "correlation_id": session.get("correlation_id"),
+            "max_fix_cycles": session.get("max_fix_cycles", 3),
+            "job_id": session.get("job_id"),
+        },
+    }
+    if required_generated_arguments:
+        call["required_generated_arguments"] = required_generated_arguments
+    return call
+
+
+async def _debug_begin_code_inspection(
+    payload: OdooDebugAndFixRequest,
+    session: dict[str, Any],
+    store: JsonStore,
+) -> dict[str, Any]:
+    code_result = await _workflow_odoo_code_change(OdooCodeChangeRequest(
+        client_name=session.get("client_name"),
+        project_path=session.get("project_path"),
+        module_name=session["module_name"],
+        task_description=_debug_task_description(session),
+        task_type=_debug_code_task_type(str(session["surface"])),
+        intent="fix_bug",
+        target_hint=session.get("correlation_id"),
+        patch_strategy="explicit_writes" if payload.writes else "auto",
+        target_files=[],
+        writes=payload.writes,
+        commit_message=f"Fix {session['module_name']}: {session['issue_description'][:180]}",
+        auto_deploy=payload.auto_deploy,
+        deploy_mode="auto",
+        investigation_evidence=list(session.get("evidence") or [])[-20:],
+    ))
+    code_status = str(code_result.get("status") or "")
+    job_id = code_result.get("job_id")
+    if job_id:
+        session["job_id"] = job_id
+        session["phase"] = "deploying"
+        _debug_session_store(store, session, client_name=session.get("client_name"))
+        return {
+            "status": "debug_deploying",
+            "message": "The existing code-change workflow verified the fix and started its owned safe-deploy job. Continue through this debug session; do not start another deploy.",
+            "debug_session": _debug_public_session(session),
+            "code_change": code_result,
+            "job_id": job_id,
+            "success_allowed": False,
+            "completion_required": True,
+            "next_call": _debug_next_call(session, action="poll"),
+        }
+
+    if code_status in {"needs_writes", "internal_repair_required"}:
+        session["phase"] = "awaiting_writes"
+        _debug_session_store(store, session, client_name=session.get("client_name"))
+        return {
+            "status": "debug_needs_writes",
+            "message": "Generate one complete evidence-backed write set from the embedded code context, then continue the same debug session.",
+            "debug_session": _debug_public_session(session),
+            "diagnosis_evidence": list(session.get("evidence") or [])[-3:],
+            "code_change": code_result,
+            "write_generation": code_result.get("write_generation"),
+            "structure_findings": code_result.get("structure_findings") or [],
+            "success_allowed": False,
+            "completion_required": True,
+            "next_call": _debug_next_call(session, action="continue", required_generated_arguments=["writes"]),
+        }
+
+    session["phase"] = "blocked"
+    session["last_code_change_status"] = code_status
+    _debug_session_store(store, session, client_name=session.get("client_name"))
+    return {
+        "status": "debug_blocked",
+        "message": "The existing code-change workflow returned a non-deployable terminal blocker.",
+        "debug_session": _debug_public_session(session),
+        "code_change": code_result,
+        "success_allowed": False,
+        "completion_required": False,
+        "next_call": None,
+    }
+
+
+async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[str, Any]:
+    """Evidence-first runtime debugger that never duplicates mutation/deploy logic."""
+    store = JsonStore()
+    if payload.action in {"continue", "poll", "verify"} and not payload.debug_session_id:
+        raise HTTPException(status_code=400, detail=f"action={payload.action} requires debug_session_id.")
+    if payload.action == "start" and payload.debug_session_id:
+        raise HTTPException(status_code=400, detail="action=start cannot reuse an existing debug_session_id.")
+    seed = OdooCodeChangeRequest(
+        client_name=payload.client_name,
+        project_path=payload.project_path,
+        module_name=payload.module_name,
+        task_description=payload.issue_description,
+        auto_deploy=False,
+    )
+    resolved_client_name, resolved_project_path = _resolve_code_change_project(seed)
+    client_name = resolved_client_name or payload.client_name
+
+    if not payload.debug_session_id:
+        if not _debug_requires_runtime_loop(payload):
+            ClientGateService().require_validated_client(client_name, "workflow.odoo_debug_and_fix")
+            return {
+                "status": "routed_to_code_change_fast_path",
+                "message": "No runtime-debug signal was detected. Use the existing focused code-change workflow without log collection or debug cycles.",
+                "surface": _detect_debug_surface(payload),
+                "success_allowed": False,
+                "completion_required": True,
+                "next_call": {
+                    "tool": "workflow.odoo_code_change",
+                    "arguments": {
+                        "client_name": client_name,
+                        "project_path": resolved_project_path,
+                        "module_name": payload.module_name,
+                        "task_description": f"{payload.issue_description}\nExpected result: {payload.expected_result}",
+                    },
+                },
+            }
+
+        ClientGateService().require_validated_client(client_name, "odoosh.error_pack")
+        session = {
+            "id": uuid4().hex,
+            "correlation_id": payload.correlation_id or f"dbg-{uuid4().hex[:12]}",
+            "client_name": client_name,
+            "project_path": resolved_project_path,
+            "module_name": payload.module_name,
+            "issue_description": payload.issue_description,
+            "expected_result": payload.expected_result,
+            "reproduction_steps": payload.reproduction_steps,
+            "surface": _detect_debug_surface(payload),
+            "phase": "diagnosing",
+            "fix_cycles": 0,
+            "max_fix_cycles": payload.max_fix_cycles,
+            "job_id": None,
+            "deploy_confirmed": False,
+            "evidence": [],
+            "evidence_fingerprints": [],
+        }
+        _append_debug_evidence(session, payload.runtime_evidence)
+        _append_debug_evidence(session, [_debug_collect_error_pack(client_name, payload.tail_lines)])
+        _debug_session_store(store, session, client_name=client_name)
+        return await _debug_begin_code_inspection(payload, session, store)
+
+    session = _debug_session_load(store, payload.debug_session_id, client_name=client_name)
+    if session.get("module_name") != payload.module_name:
+        raise HTTPException(status_code=409, detail="Debug session module does not match this request.")
+    if session.get("phase") == "completed":
+        return {
+            "status": "debug_verified",
+            "message": "This debug session already completed with deploy and replay proof.",
+            "debug_session": _debug_public_session(session),
+            "deploy_confirmed": bool(session.get("deploy_confirmed")),
+            "already_deployed_confirmed": bool(session.get("already_deployed_confirmed")),
+            "reproduction_passed": True,
+            "expected_result_verified": True,
+            "success_allowed": True,
+            "completion_required": False,
+            "next_call": None,
+        }
+
+    added_evidence = _append_debug_evidence(session, payload.runtime_evidence)
+    if payload.writes:
+        if session.get("phase") != "awaiting_writes":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Debug writes are only accepted in awaiting_writes phase, not {session.get('phase')}.",
+            )
+        if int(session.get("fix_cycles") or 0) >= int(session.get("max_fix_cycles") or 3):
+            session["phase"] = "blocked"
+            _debug_session_store(store, session, client_name=client_name)
+            return {
+                "status": "debug_max_cycles_reached",
+                "message": "Maximum evidence-based fix cycles reached. No further writes are allowed without a new debug session and revised scope.",
+                "debug_session": _debug_public_session(session),
+                "success_allowed": False,
+                "completion_required": False,
+                "next_call": None,
+            }
+        session["fix_cycles"] = int(session.get("fix_cycles") or 0) + 1
+        session["phase"] = "applying_fix"
+        _debug_session_store(store, session, client_name=client_name)
+        return await _debug_begin_code_inspection(payload, session, store)
+
+    job_id = payload.job_id or session.get("job_id")
+    owned_job_id = session.get("job_id")
+    if payload.job_id and payload.job_id != owned_job_id:
+        raise HTTPException(status_code=409, detail="job_id is not owned by this debug session.")
+    if job_id and (payload.action in {"auto", "poll", "continue", "verify"} or session.get("phase") == "deploying"):
+        if payload.wait_for_result:
+            job = await asyncio.to_thread(
+                store.wait_job,
+                job_id,
+                payload.wait_timeout_seconds,
+                payload.poll_interval_seconds,
+            )
+        else:
+            job = store.get_job(job_id)
+        job_data = job.model_dump(mode="json")
+        if job.status in {JobStatus.queued, JobStatus.running}:
+            session["phase"] = "deploying"
+            session["job_id"] = job_id
+            _debug_session_store(store, session, client_name=client_name)
+            return {
+                "status": "debug_deploying",
+                "message": "The existing safe-deploy job is still running; continue the same debug session.",
+                "debug_session": _debug_public_session(session),
+                "job": job_data,
+                "success_allowed": False,
+                "completion_required": True,
+                "next_call": _debug_next_call(session, action="poll"),
+            }
+
+        if job.deploy_confirmed or job.already_deployed_confirmed:
+            session["deploy_confirmed"] = bool(job.deploy_confirmed)
+            session["already_deployed_confirmed"] = bool(job.already_deployed_confirmed)
+            session["phase"] = "awaiting_replay"
+            session["job_id"] = job_id
+            verification_added = _append_debug_evidence(session, payload.verification_evidence)
+            has_replay_proof = any(str(item or "").strip() for item in payload.verification_evidence)
+            if payload.reproduction_passed is True and payload.expected_result_verified is True and has_replay_proof:
+                session["phase"] = "completed"
+                session["verification_evidence"] = [
+                    _redact_debug_text(item, 4_000) for item in payload.verification_evidence
+                ][-10:]
+                _debug_session_store(store, session, client_name=client_name)
+                issue_fingerprint = code_change_issue_fingerprint(
+                    project_path=str(session.get("project_path") or ""),
+                    module_name=str(session.get("module_name") or ""),
+                    task_description=str(session.get("issue_description") or ""),
+                    task_type=_debug_code_task_type(str(session.get("surface") or "backend")),
+                    intent="fix_bug",
+                    target_hint=str(session.get("correlation_id") or ""),
+                )
+                repeated_failure_guard_status(
+                    client_name=client_name,
+                    fingerprint=issue_fingerprint,
+                    task_description=str(session.get("issue_description") or ""),
+                    investigation_evidence=list(session.get("evidence") or []),
+                    functional_verification_passed=True,
+                )
+                return {
+                    "status": "debug_verified",
+                    "message": "Deployment, module upgrade, same-scenario replay, and expected-result verification all passed.",
+                    "debug_session": _debug_public_session(session),
+                    "job": job_data,
+                    "deploy_confirmed": bool(job.deploy_confirmed),
+                    "already_deployed_confirmed": bool(job.already_deployed_confirmed),
+                    "reproduction_passed": True,
+                    "expected_result_verified": True,
+                    "success_allowed": True,
+                    "completion_required": False,
+                    "next_call": None,
+                }
+
+            if payload.reproduction_passed is False or payload.expected_result_verified is False:
+                if verification_added <= 0:
+                    _debug_session_store(store, session, client_name=client_name)
+                    return {
+                        "status": "debug_needs_verification_evidence",
+                        "message": "Replay failed, but no new console/log/DB/API evidence was supplied. Provide fresh evidence before another fix cycle.",
+                        "debug_session": _debug_public_session(session),
+                        "success_allowed": False,
+                        "completion_required": True,
+                        "next_call": _debug_next_call(session, action="verify", required_generated_arguments=["verification_evidence"]),
+                    }
+                _append_debug_evidence(session, [_debug_collect_error_pack(client_name, payload.tail_lines)])
+                if int(session.get("fix_cycles") or 0) >= int(session.get("max_fix_cycles") or 3):
+                    session["phase"] = "blocked"
+                    _debug_session_store(store, session, client_name=client_name)
+                    return {
+                        "status": "debug_max_cycles_reached",
+                        "message": "Replay still fails after the maximum diagnosed fix cycles. The exact latest evidence is preserved in the debug session.",
+                        "debug_session": _debug_public_session(session),
+                        "success_allowed": False,
+                        "completion_required": False,
+                        "next_call": None,
+                    }
+                session["phase"] = "diagnosing"
+                session["job_id"] = None
+                _debug_session_store(store, session, client_name=client_name)
+                return await _debug_begin_code_inspection(payload.model_copy(update={"writes": [], "auto_deploy": True}), session, store)
+
+            _debug_session_store(store, session, client_name=client_name)
+            return {
+                "status": "debug_awaiting_replay",
+                "message": "Deploy is confirmed. Replay the same scenario and provide concrete verification evidence; deploy proof alone is not debug success.",
+                "debug_session": _debug_public_session(session),
+                "job": job_data,
+                "deploy_confirmed": bool(job.deploy_confirmed),
+                "already_deployed_confirmed": bool(job.already_deployed_confirmed),
+                "success_allowed": False,
+                "completion_required": True,
+                "next_call": _debug_next_call(
+                    session,
+                    action="verify",
+                    required_generated_arguments=["reproduction_passed", "expected_result_verified", "verification_evidence"],
+                ),
+            }
+
+        failure_evidence = _redact_debug_text(json.dumps(job_data, ensure_ascii=False, default=str), 8_000)
+        new_failure_evidence = _append_debug_evidence(session, [failure_evidence, _debug_collect_error_pack(client_name, payload.tail_lines)])
+        session["job_id"] = None
+        if int(session.get("fix_cycles") or 0) >= int(session.get("max_fix_cycles") or 3):
+            session["phase"] = "blocked"
+            _debug_session_store(store, session, client_name=client_name)
+            return {
+                "status": "debug_max_cycles_reached",
+                "message": "Safe deploy or module upgrade failed at the maximum cycle limit; exact terminal evidence is preserved.",
+                "debug_session": _debug_public_session(session),
+                "job": job_data,
+                "success_allowed": False,
+                "completion_required": False,
+                "next_call": None,
+            }
+        if new_failure_evidence <= 0 and added_evidence <= 0:
+            session["phase"] = "awaiting_evidence"
+            _debug_session_store(store, session, client_name=client_name)
+            return {
+                "status": "debug_needs_new_evidence",
+                "message": "The deploy failure fingerprint is unchanged. Supply new evidence instead of repeating the same patch.",
+                "debug_session": _debug_public_session(session),
+                "success_allowed": False,
+                "completion_required": True,
+                "next_call": _debug_next_call(session, action="continue", required_generated_arguments=["runtime_evidence"]),
+            }
+        session["phase"] = "diagnosing"
+        _debug_session_store(store, session, client_name=client_name)
+        return await _debug_begin_code_inspection(payload.model_copy(update={"writes": [], "auto_deploy": True}), session, store)
+
+    if added_evidence > 0:
+        session["phase"] = "diagnosing"
+        _debug_session_store(store, session, client_name=client_name)
+        return await _debug_begin_code_inspection(payload, session, store)
+
+    return {
+        "status": f"debug_{session.get('phase') or 'awaiting_evidence'}",
+        "message": "Continue this debug session with the generated writes, owned job poll, or fresh runtime/replay evidence requested by the current phase.",
+        "debug_session": _debug_public_session(session),
+        "success_allowed": False,
+        "completion_required": True,
+        "next_call": _debug_next_call(
+            session,
+            action="continue",
+            required_generated_arguments=["writes"] if session.get("phase") == "awaiting_writes" else ["runtime_evidence"],
+        ),
+    }
+
+
 async def _workflow_frontend_visual_implement(payload: FrontendVisualImplementRequest) -> dict[str, Any]:
     """Generate deterministic frontend visual assets, then run the normal Odoo workflow.
 
@@ -3184,6 +3736,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return coding_task_plan(CodingTaskPlanRequest.model_validate(args))
     if name == "workflow.odoo_code_change":
         return await _workflow_odoo_code_change(OdooCodeChangeRequest.model_validate(args))
+    if name == "workflow.odoo_debug_and_fix":
+        return await _workflow_odoo_debug_and_fix(OdooDebugAndFixRequest.model_validate(args))
     if name == "workflow.module_analyze":
         return _workflow_module_analyze(ModuleAnalyzeRequest.model_validate(args))
     if name == "workflow.module_install_and_check":
@@ -3567,6 +4121,10 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             "repair_attempts": {"type": "integer"}, "structure_findings": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
             "terminal": {"type": "boolean"}, "must_continue": {"type": "boolean"},
             "summary_allowed": {"type": "boolean"}, "blocking_scope": {"type": "string"},
+            "debug_session": {"type": "object", "additionalProperties": True},
+            "diagnosis_evidence": {"type": "array", "items": {"type": "string"}},
+            "reproduction_passed": {"type": "boolean"},
+            "expected_result_verified": {"type": "boolean"},
         })
     elif internal.startswith("repo."):
         properties.update({

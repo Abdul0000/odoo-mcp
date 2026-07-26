@@ -20,6 +20,7 @@ _PROVIDER_TOOLS = {
     "client_check",
     "workflow_agent_instructions",
     "workflow_odoo_code_change",
+    "workflow_odoo_debug_and_fix",
     "workflow_module_analyze",
     "workflow_module_install_and_check",
     "workflow_frontend_visual_implement",
@@ -105,4 +106,3 @@ def test_root_provider_tools_metadata_matches_mcp_surface():
     root = client.get("/")
     assert root.status_code == 200
     assert set(root.json()["provider_tools"]) == _PROVIDER_TOOLS
-
