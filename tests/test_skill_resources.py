@@ -125,6 +125,27 @@ def test_accounting_report_aliases_load_dedicated_accounting_report_skill():
         assert result["source"] == "skills/12-SKILL-accounting-reports.md"
 
 
+def test_interactive_account_report_contract_routes_to_accounting_skill():
+    service = SkillService()
+
+    for task in (
+        "Add an AccountReportFilters Top N filter",
+        "Fix account_reports updateOption behavior",
+        "Persist account report options correctly",
+    ):
+        assert service.list(task)["recommendation"]["name"] == "odoo-accounting-reports"
+
+    content = service.read("accounting-report")["content"]
+    for marker in (
+        "ir.actions.client.params",
+        'options` as a mutable mapping',
+        'updateOption("top_x", topX, true)',
+        "explicit current request override",
+        "browser asset URL/hash",
+    ):
+        assert marker in content
+
+
 def test_view_aliases_and_surface_routing_load_dedicated_view_skill():
     service = SkillService()
 
@@ -139,5 +160,19 @@ def test_view_aliases_and_surface_routing_load_dedicated_view_skill():
     for marker in (
         "owning addon", "priority", "representative users", "noupdate",
         "Studio", "t-call", "final compiled architecture",
+        "t-on-keydown.enter", "duplicate component registration",
+    ):
+        assert marker in content
+
+
+def test_planning_skill_rejects_diagnostic_scope_invention():
+    content = SkillService().read("planning")["content"]
+
+    for marker in (
+        "evidence, not automatic requirements",
+        "Never bypass a false-positive contract",
+        "connector_pipeline",
+        "unterminated quoted string",
+        "nonblocking baseline debt",
     ):
         assert marker in content

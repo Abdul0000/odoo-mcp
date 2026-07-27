@@ -112,12 +112,35 @@ Prefer stable semantic selectors:
   audited boundary.
 - Keep component names, OWL templates, registries, services, JS imports, and
   asset bundles synchronized.
+- Inspect supported OWL event syntax in the exact version. Do not invent event
+  modifiers such as `t-on-keydown.enter`; bind `t-on-keydown` and test
+  `event.key` in the handler when that is the native pattern.
+- When Enter and change/blur can apply the same value, design one execution
+  path; do not trigger two report reloads or RPCs for one user action.
 - Preserve `oe_structure`, website editor compatibility, multi-website scope,
   portal/public access, report pagination, and print-safe layout.
 
 ---
 
-## 8. TERMINAL VIEW PROOF
+## 8. ASSET IDENTITY AND REGISTRATION
+
+- Verify the active manifest bundle, module upgrade, generated attachment,
+  browser asset URL/hash, and loaded bundle content. Source deployment alone
+  does not prove the browser executed new JS/XML.
+- Register a component/patch/template exactly once. When revising asset
+  filenames to escape a proven stale generated bundle, only the latest asset
+  may perform registration; never leave two active implementations.
+- Prefer fixing bundle registration/cache invalidation over accumulating
+  version-suffixed files. Use a fresh filename only when stale attachment
+  identity is proven and include a cleanup/migration plan; do not use
+  comment-only or dead revision-marker assets to satisfy validation.
+- A root XPath such as `<xpath expr="." position="inside">` is valid only after
+  the exact inherited template root and intended insertion semantics are read
+  from installed source.
+
+---
+
+## 9. TERMINAL VIEW PROOF
 
 Do not claim the view fixed or deployable until applicable checks pass:
 
@@ -129,4 +152,5 @@ Do not claim the view fixed or deployable until applicable checks pass:
 - `noupdate` behavior matches install/upgrade intent.
 - Final compiled architecture contains the intended result.
 - Representative-user verification passes when visibility/access is involved.
-
+- The browser-loaded asset hash/content contains the new implementation and no
+  duplicate component registration occurs.

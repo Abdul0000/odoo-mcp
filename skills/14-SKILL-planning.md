@@ -82,6 +82,35 @@ Stop and ask the user before planning further if:
 
 ---
 
+## 7. EVIDENCE-BOUND SCOPE AND RECOVERY
+
+- Derive required files/symbols only from the user's contract, exact installed
+  source, manifest/load dependencies, and changed-code call graph. Words inside
+  an exception or task narrative are evidence, not automatic requirements.
+- Do not infer a `controllers/` or `tests/` package, a custom `optionPath`
+  symbol, or new JavaScript/Python implementation merely because those tokens
+  appear in an error. Add them only when the requested behavior or source
+  contract requires them.
+- Never bypass a false-positive contract with neutral wording, a fresh
+  operation ID, fake comments, empty files, or unrelated edits. Report the
+  mismatched inferred requirement and preserve the real task scope.
+- After the first focused inspection, ask one concise question only when a
+  material product/scope choice remains. Resolve technical choices from
+  installed source and existing project conventions.
+- Classify failures by evidence:
+  `custom_code` (trace points into changed module),
+  `preexisting_baseline` (unchanged before/after),
+  or `connector_pipeline` (generated command/checkpoint failed independently of
+  module code). Never modify module code to repair a connector quoting error.
+- For a connector command failure such as an unterminated quoted string,
+  preserve the successful commit/push/deploy checkpoints, resume the same job
+  at the failed verification step, and require exact deployed SHA/file plus
+  module-upgrade evidence before claiming success.
+- Keep unchanged Studio/view/deprecation/cache warnings as nonblocking baseline debt.
+  Escalate only newly introduced or changed-scope failures.
+
+---
+
 ## CRITICAL RULES
 - Classify scope (§1) before touching any file — it determines whether you
   do a pinpoint edit or a full complete-file-set write.
@@ -93,3 +122,5 @@ Stop and ask the user before planning further if:
   reason about.
 - Implement via `workflow.odoo_code_change` (server-owned read/write/verify/deploy)
   once planning is done. Never call hidden repo/git/odoosh tools directly.
+- Do not convert diagnostics into requirements or connector failures into code
+  patches; keep scope and completion claims tied to concrete evidence.

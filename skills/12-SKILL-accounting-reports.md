@@ -10,6 +10,86 @@ assets, company/language context, and final rendered proof.
 
 ---
 
+## NATIVE `account_reports` CLIENT CONTRACT
+
+Interactive financial reports are OWL client actions, not ordinary QWeb/PDF
+reports. Before changing a filter, read the exact installed-version
+`AccountReport`, `AccountReportFilters`, action loader, option initializer, and
+one native filter implementation. Treat their signatures as the contract.
+
+For Odoo 18, verify the installed source still matches this action shape:
+
+```xml
+<field name="tag">account_report</field>
+<field name="params"
+       eval="{
+           'report_id': ref('module_name.report_xmlid'),
+           'options': {},
+           'ignore_session': True
+       }"/>
+```
+
+- Put report startup data in `ir.actions.client.params`, not `context`, when
+  the installed action loader reads `params`.
+- Pass `options` as a mutable mapping (`{}`), never JSON text (`"{}"`).
+  Native code mutates the object during startup.
+- Directly depend on every addon whose models/XML IDs/templates are referenced;
+  an `account_reports` dependency does not replace a direct `account`
+  dependency.
+- Do not call `controller.reload()` from a filter unless the installed method
+  contract supplies its required action. In the Odoo 18 contract, apply an
+  option through the native path:
+
+```javascript
+await this.controller.updateOption("top_x", topX, true);
+```
+
+The first argument is an option-path string, not a replacement options object;
+the apply flag uses the native refresh path while preserving report/action
+state. Reconfirm this signature for the selected version instead of copying it
+across releases.
+
+## OPTION LIFECYCLE AND CONSISTENCY
+
+- Define one canonical option key and trace it end to end: action defaults →
+  session/current options → backend initializer → query/domain → displayed
+  rows → total label.
+- Let an explicit current request override persisted/previous options:
+  `options.get(key, previous_options.get(key, default))`, unless installed core
+  proves another precedence.
+- Parse and normalize once. For Top N, reject booleans/non-numeric values,
+  default deterministically, clamp to at least 1, and use the normalized value
+  for slicing, totals, labels, and persisted options.
+- Count business rows only; do not include a synthetic total row in Top N.
+- Generate date labels from normalized report date options with locale/company
+  context. Verify single-month and multi-month ranges, previous/current column
+  labels, and the date-button label from the same boundaries.
+- Avoid duplicate apply events. A safe Enter pattern is to prevent default and
+  blur the input; let the single `change` handler apply the option once:
+
+```javascript
+onTopXKeydown(event) {
+    if (event.key === "Enter") {
+        event.preventDefault();
+        event.target.blur();
+    }
+}
+```
+
+## INTERACTIVE REPORT TERMINAL PROOF
+
+Do not stop at “no console error.” Prove all of the following on the deployed
+bundle and representative accounting user:
+
+- action opens without `sessionOptions`/JSON startup errors;
+- changing the filter issues one native refresh;
+- backend receives the normalized current option;
+- row count, total-row label, date labels, and exported/printed result agree;
+- reopening the report follows the intended session persistence policy;
+- browser asset URL/hash and loaded module contain the deployed implementation.
+
+---
+
 ## 1. INVOICE REPORT (multi-tax safe)
 ```xml
 <record id="action_report_invoice_custom" model="ir.actions.report">

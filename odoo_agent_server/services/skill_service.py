@@ -95,7 +95,12 @@ _ROUTING_TERMS = {
         "field placement", "add field to form", "button in view",
         "attrs states", "view priority",
     ),
-    "odoo-accounting-reports": ("accounting report", "financial report", "invoice report", "ar aging", "aged receivable", "profit loss", "balance sheet", "tax report", "partner statement"),
+    "odoo-accounting-reports": (
+        "accounting report", "financial report", "invoice report", "ar aging",
+        "aged receivable", "profit loss", "balance sheet", "tax report",
+        "partner statement", "account report filter", "account_reports",
+        "accountreportfilters", "updateoption", "report options",
+    ),
     "odoo-qweb-reports-development": ("qweb", "pdf report", "print report", "report template", "paperformat", "wkhtmltopdf", "ir.actions.report"),
     "odoo-sql-query-development": ("sql", "query", "search_read", "read_group", "domain", "group by", "aggregate", "record count", "analytics"),
     "odoo-pos-development": ("point of sale", "pos ", "pos_", "receipt", "payment screen", "restaurant pos"),
