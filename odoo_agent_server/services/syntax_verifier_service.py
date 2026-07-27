@@ -641,6 +641,13 @@ class SyntaxVerifierService:
         if not isinstance(assets, dict):
             return findings
         module_root = Path(file_path).parent
+        # Bundle ownership cannot be inferred from addon, directory, or file
+        # names. Names such as ``pos_*``, ``website_*``, and ``*_editor`` are
+        # valid in multiple Odoo applications and bundles. Keep this syntax
+        # verifier evidence-based: validate that declared assets resolve.
+        # Bundle suitability belongs to the source-backed frontend preflight,
+        # where the owning app's real manifest and runtime entry point are
+        # available.
         for bundle, entries in assets.items():
             for asset in _flatten_asset_entries(entries):
                 if not _asset_path_exists(module_root, asset):
@@ -650,23 +657,6 @@ class SyntaxVerifierService:
                         check="manifest_asset_exists",
                         message=f"Asset '{asset}' in bundle '{bundle}' does not resolve to a file/glob from this module.",
                         fix_hint="Fix the asset path or remove it from __manifest__.py before pushing.",
-                    ))
-                lower_asset = asset.lower()
-                if ("point_of_sale" in lower_asset or "/pos" in lower_asset or "pos_" in lower_asset) and bundle != "point_of_sale._assets_pos":
-                    findings.append(VerifyFinding(
-                        file=file_path,
-                        severity=VerifySeverity.CRITICAL,
-                        check="manifest_pos_asset_bundle",
-                        message=f"POS-looking asset '{asset}' is in '{bundle}', not point_of_sale._assets_pos.",
-                        fix_hint="Move POS JS/XML/SCSS assets to point_of_sale._assets_pos unless real Odoo source proves another bundle.",
-                    ))
-                if ("website" in lower_asset or "snippet" in lower_asset or "editor" in lower_asset) and bundle == "web.assets_backend":
-                    findings.append(VerifyFinding(
-                        file=file_path,
-                        severity=VerifySeverity.WARNING,
-                        check="manifest_website_asset_bundle",
-                        message=f"Website/editor-looking asset '{asset}' is in backend bundle '{bundle}'.",
-                        fix_hint="Verify from website source whether this belongs in web.assets_frontend or website.assets_editor.",
                     ))
         return findings
 
