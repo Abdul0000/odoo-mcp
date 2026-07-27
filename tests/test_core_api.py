@@ -81,6 +81,7 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
         "odoo-helpdesk-development",
         "odoo-pos-development",
         "odoo-website-development",
+        "odoo-view-development",
     }.issubset(skills["available"])
 
     forbidden_sections = {

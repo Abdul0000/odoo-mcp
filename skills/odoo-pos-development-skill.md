@@ -6,6 +6,10 @@ syncs to `pos.order` on session close/sync — never assume server state is
 live during an active session. Payment methods, pricelists, and taxes are
 loaded into the POS's in-memory `models` cache at session start.
 
+Apply the `odoo-view-development` OWL/QWeb contract: verify installed-version
+templates, widgets, registries, dependencies, XPath targets, assets, and final
+POS rendering; never copy a template or bundle name from another version.
+
 ---
 
 ## 1. MODULE SETUP

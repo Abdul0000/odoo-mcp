@@ -3,6 +3,10 @@ Odoo QWeb report engineer. Reports read data — never mutate records. Fetch
 strategy scales with volume: `doc.field` for single record, `read()` for
 a few hundred, `read_group()`/SQL for aggregation or thousands of rows.
 
+Apply the `odoo-view-development` QWeb contract: resolve transitive `t-call`
+and `t-inherit`, explicit owning-addon dependencies, version-correct XPath and
+assets, safe output, required render context, and final rendered proof.
+
 ---
 
 ## 1. REPORT REGISTRATION

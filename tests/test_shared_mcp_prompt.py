@@ -91,6 +91,7 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "odoo-hr-payroll-development",
         "odoo-crm-pipeline-development",
         "odoo-helpdesk-development",
+        "odoo-view-development",
         "workflow.odoo_code_change",
         "workflow.module_analyze",
         "workflow.module_install_and_check",
@@ -108,6 +109,9 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "dependency-ordered local batches",
         "Odoo-native addon tests",
         "pinned validated client identity",
+        "## VIEW AND XML GATE",
+        "unexpected multiple matches",
+        "Studio/database overlays",
     ]
     for marker in required_markers:
         assert marker in text

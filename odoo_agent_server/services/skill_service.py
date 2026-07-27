@@ -22,6 +22,7 @@ _SKILLS = {
     "odoo-website-development": ("odoo-website-development.md", "Website themes, QWeb, snippets, eCommerce, controllers, multi-site, SEO, and performance."),
     "odoo-custom-module-development": ("13-SKILL-custom-module.md", "Standalone custom modules with their own models/tables, manifest, security, views, and menus — not inherited/mixed into native Odoo models."),
     "odoo-task-planning": ("14-SKILL-planning.md", "Pre-implementation planning: scope classification (surgical vs new feature vs new module), file inventory checklist, impact/dependency check, and risk flags before writing code."),
+    "odoo-view-development": ("15-SKILL-views.md", "Version-aware backend views, XML/QWeb, XPath, dependencies, inheritance priorities, widgets, security visibility, noupdate, Studio overlays, actions, and menus."),
 }
 
 _ALIASES = {
@@ -79,9 +80,21 @@ _ALIASES = {
     "task-plan": "odoo-task-planning",
     "scope": "odoo-task-planning",
     "checklist": "odoo-task-planning",
+    "view": "odoo-view-development",
+    "views": "odoo-view-development",
+    "xpath": "odoo-view-development",
+    "xml-view": "odoo-view-development",
+    "backend-view": "odoo-view-development",
+    "view-xml": "odoo-view-development",
 }
 
 _ROUTING_TERMS = {
+    "odoo-view-development": (
+        "xpath", "inherited view", "inherit_id", "form view", "list view",
+        "tree view", "backend view", "xml view", "ir.ui.view", "studio view",
+        "field placement", "add field to form", "button in view",
+        "attrs states", "view priority",
+    ),
     "odoo-accounting-reports": ("accounting report", "financial report", "invoice report", "ar aging", "aged receivable", "profit loss", "balance sheet", "tax report", "partner statement"),
     "odoo-qweb-reports-development": ("qweb", "pdf report", "print report", "report template", "paperformat", "wkhtmltopdf", "ir.actions.report"),
     "odoo-sql-query-development": ("sql", "query", "search_read", "read_group", "domain", "group by", "aggregate", "record count", "analytics"),

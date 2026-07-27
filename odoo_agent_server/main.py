@@ -125,6 +125,7 @@ def agent_instructions() -> dict:
                     "odoo-website-development",
                     "odoo-custom-module-development",
                     "odoo-task-planning",
+                    "odoo-view-development",
                 ],
             },
             "multi_client": {

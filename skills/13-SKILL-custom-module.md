@@ -5,6 +5,10 @@ models/tables** — not `_inherit` on native models (`sale.order`,
 security, own views, own menu. Only touch native models via explicit
 `Many2one` reference, never by inheriting them.
 
+For every view/action/menu, follow the `odoo-view-development` contract:
+version-correct syntax, explicit owning-addon dependencies, resolved XML IDs,
+stable XPath, security visibility, manifest load order, and final view proof.
+
 ---
 
 ## 1. MODULE SKELETON (minimum required files)

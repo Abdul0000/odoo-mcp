@@ -8,10 +8,13 @@ browser test; it blocks the most common framework-pattern mistakes before push.
 from __future__ import annotations
 
 import ast
+import copy
 import glob
 import re
 from pathlib import Path
 from typing import Any
+
+from lxml import etree
 
 from . import core_sync_service
 from .client_resolver_service import ClientResolverService
@@ -48,6 +51,10 @@ _T_INHERIT_RE      = re.compile(r't-inherit=["\']([^"\']+)["\']')
 _T_CALL_RE         = re.compile(r't-call=["\']([^"\']+)["\']')
 _T_XPATH_RE        = re.compile(r'<xpath\b[^>]*expr=["\']([^"\']+)["\']', re.DOTALL)
 _CLASS_IN_EXPR_RE  = re.compile(r'contains\(@class,\s*["\']([^"\']+)["\']\)|hasclass\(["\']([^"\']+)["\']\)')
+_REF_CALL_RE       = re.compile(r'\bref\(\s*["\']([A-Za-z0-9_]+\.[A-Za-z0-9_.-]+)["\']\s*\)')
+_INTERPOLATED_REF_RE = re.compile(r'%\(([A-Za-z0-9_]+\.[A-Za-z0-9_.-]+)\)[ds]')
+_POSITIONAL_XPATH_RE = re.compile(r'\[\s*(?:\d+|last\(\))\s*\]')
+_BROAD_XPATH_RE    = re.compile(r'^//(?:div|span|group|field|button|page|sheet|notebook|tree|list|form)$')
 
 # Search roots for installed-source reads: enterprise, community, then user fallback.
 _SRC_ROOTS = [
@@ -260,6 +267,206 @@ def _flatten_asset_entries(entries: Any) -> list[str]:
     return assets
 
 
+def _addon_root(file_path: str) -> Path | None:
+    path = Path(file_path).resolve()
+    for candidate in (path.parent, *path.parents):
+        if (candidate / "__manifest__.py").is_file():
+            return candidate
+    return None
+
+
+def _manifest_context(file_path: str) -> tuple[str | None, set[str], int | None]:
+    root = _addon_root(file_path)
+    if not root:
+        return None, set(), None
+    try:
+        manifest = ast.literal_eval((root / "__manifest__.py").read_text(encoding="utf-8"))
+    except Exception:
+        return root.name, set(), None
+    if not isinstance(manifest, dict):
+        return root.name, set(), None
+    depends = {
+        str(item) for item in (manifest.get("depends") or [])
+        if isinstance(item, str)
+    }
+    version = str(manifest.get("version") or "")
+    major_match = re.match(r"^(1[4-9])(?:\.|$)", version)
+    return root.name, depends, int(major_match.group(1)) if major_match else None
+
+
+def _safe_xml_root(content: str) -> etree._Element | None:
+    try:
+        parser = etree.XMLParser(resolve_entities=False, no_network=True, recover=False)
+        return etree.fromstring(content.encode("utf-8"), parser=parser)
+    except (etree.XMLSyntaxError, ValueError):
+        return None
+
+
+def _external_reference_modules(content: str) -> set[str]:
+    modules: set[str] = set()
+    root = _safe_xml_root(content)
+    if root is not None:
+        for element in root.iter():
+            for attribute in ("ref", "inherit_id", "parent", "action", "t-call", "t-inherit"):
+                value = str(element.get(attribute) or "").strip()
+                if re.fullmatch(r"[A-Za-z0-9_]+\.[A-Za-z0-9_.-]+", value):
+                    modules.add(value.split(".", 1)[0])
+            for value in str(element.get("groups") or "").split(","):
+                clean = value.strip().lstrip("!")
+                if re.fullmatch(r"[A-Za-z0-9_]+\.[A-Za-z0-9_.-]+", clean):
+                    modules.add(clean.split(".", 1)[0])
+    for pattern in (_REF_CALL_RE, _INTERPOLATED_REF_RE):
+        modules.update(match.group(1).split(".", 1)[0] for match in pattern.finditer(content))
+    return modules
+
+
+def _xmlid_definition(
+    reference: str,
+    *,
+    local_root: Path | None,
+    client_name: str | None,
+) -> etree._Element | None:
+    if "." not in reference:
+        return None
+    module_name, xmlid = reference.split(".", 1)
+    module_dirs: list[Path] = []
+    if local_root:
+        if local_root.name == module_name:
+            module_dirs.append(local_root)
+        sibling = local_root.parent / module_name
+        if sibling.is_dir():
+            module_dirs.append(sibling)
+    module_dirs.extend(_iter_module_dirs(module_name, client_name=client_name))
+    seen: set[Path] = set()
+    for module_dir in module_dirs:
+        resolved = module_dir.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        for xml_file in resolved.rglob("*.xml"):
+            root = _safe_xml_root(_read_file(str(xml_file), max_bytes=1048576))
+            if root is None:
+                continue
+            matches = root.xpath("//*[@id=$xmlid]", xmlid=xmlid)
+            if matches:
+                return copy.deepcopy(matches[0])
+    return None
+
+
+def _definition_parent_ref(definition: etree._Element) -> str | None:
+    if definition.tag == "template":
+        return str(definition.get("inherit_id") or "").strip() or None
+    if definition.tag != "record":
+        return None
+    matches = definition.xpath("./field[@name='inherit_id'][@ref]")
+    return str(matches[0].get("ref") or "").strip() if matches else None
+
+
+def _definition_arch(definition: etree._Element) -> etree._Element | None:
+    wrapper = etree.Element("view-root")
+    if definition.tag == "record":
+        fields = definition.xpath("./field[@name='arch']")
+        if not fields:
+            return None
+        for child in fields[0]:
+            wrapper.append(copy.deepcopy(child))
+    elif definition.tag == "template":
+        for child in definition:
+            wrapper.append(copy.deepcopy(child))
+    else:
+        return None
+    return wrapper
+
+
+def _translate_odoo_xpath(expr: str) -> str:
+    return re.sub(
+        r"hasclass\(\s*(['\"])([^'\"]+)\1\s*\)",
+        lambda match: (
+            "contains(concat(' ', normalize-space(@class), ' '), "
+            f"' {match.group(2)} ')"
+        ),
+        expr,
+    )
+
+
+def _xpath_matches(arch: etree._Element, expr: str) -> list[etree._Element]:
+    try:
+        result = arch.xpath(_translate_odoo_xpath(expr))
+    except etree.XPathError:
+        return []
+    return [item for item in result if isinstance(item, etree._Element)]
+
+
+def _apply_inheritance_spec(arch: etree._Element, spec: etree._Element) -> None:
+    if spec.tag == "xpath":
+        expr = str(spec.get("expr") or "")
+    else:
+        name = str(spec.get("name") or "")
+        if not name:
+            return
+        expr = f".//{spec.tag}[@name={repr(name)}]"
+    matches = _xpath_matches(arch, expr)
+    position = str(spec.get("position") or "inside")
+    for target in matches:
+        parent = target.getparent()
+        if position == "attributes":
+            for attribute in spec.xpath("./attribute[@name]"):
+                name = str(attribute.get("name"))
+                if attribute.get("add") is not None:
+                    separator = str(attribute.get("separator") or " ")
+                    current = str(target.get(name) or "")
+                    target.set(name, separator.join(filter(None, (current, str(attribute.get("add"))))))
+                elif attribute.get("remove") is not None:
+                    current = str(target.get(name) or "")
+                    remove = str(attribute.get("remove"))
+                    target.set(name, current.replace(remove, "").strip())
+                else:
+                    target.set(name, "".join(attribute.itertext()).strip())
+        elif position == "inside":
+            for child in spec:
+                target.append(copy.deepcopy(child))
+        elif parent is not None and position in {"before", "after", "replace"}:
+            index = parent.index(target)
+            if position == "replace":
+                parent.remove(target)
+            elif position == "after":
+                index += 1
+            for child in spec:
+                parent.insert(index, copy.deepcopy(child))
+                index += 1
+
+
+def _resolved_xmlid_arch(
+    reference: str,
+    *,
+    local_root: Path | None,
+    client_name: str | None,
+    visited: set[str] | None = None,
+) -> etree._Element | None:
+    trail = set(visited or set())
+    if reference in trail:
+        return None
+    trail.add(reference)
+    definition = _xmlid_definition(reference, local_root=local_root, client_name=client_name)
+    if definition is None:
+        return None
+    parent_ref = _definition_parent_ref(definition)
+    own_arch = _definition_arch(definition)
+    if not parent_ref:
+        return own_arch
+    parent_arch = _resolved_xmlid_arch(
+        parent_ref,
+        local_root=local_root,
+        client_name=client_name,
+        visited=trail,
+    )
+    if parent_arch is None or own_arch is None:
+        return parent_arch
+    for spec in own_arch:
+        _apply_inheritance_spec(parent_arch, spec)
+    return parent_arch
+
+
 class SyntaxVerifierService:
     """Pre-push cross-checker for Odoo Python/XML/manifest/JS asset files."""
 
@@ -268,6 +475,7 @@ class SyntaxVerifierService:
         files_checked: list[str] = []
         xml_contents: dict[str, str] = {}
         js_contents: dict[str, str] = {}
+        direct_files = {str(Path(file_path).resolve()) for file_path in request.written_files}
 
         if not _core_source_available(request.client_name):
             findings.append(VerifyFinding(
@@ -318,6 +526,12 @@ class SyntaxVerifierService:
                 findings.extend(self._verify_python_model(file_path, content, request.client_name))
             elif path.suffix == ".xml":
                 findings.extend(self._verify_xml_view(file_path, content, request.client_name))
+                findings.extend(self._verify_xml_contract(
+                    file_path,
+                    content,
+                    request.client_name,
+                    strict=str(path.resolve()) in direct_files,
+                ))
                 findings.extend(self._verify_qweb_template(file_path, content, xml_contents, request.client_name))
             elif path.suffix == ".js":
                 findings.extend(self._verify_js_syntax_real(file_path, content))
@@ -556,73 +770,337 @@ class SyntaxVerifierService:
     # ------------------------------------------------------------------
 
     def _verify_xml_view(self, file_path: str, content: str, client_name: str | None = None) -> list[VerifyFinding]:
+        """Retain the lightweight custom-field hint.
+
+        Parent resolution and XPath matching belong to _verify_xml_contract,
+        which resolves external IDs and the complete source inheritance chain
+        instead of guessing a model name from an XML ID.
+        """
         findings: list[VerifyFinding] = []
-        inherit_refs = [m.group(1) for m in _INHERIT_ID_RE.finditer(content)]
+        root = _safe_xml_root(content)
+        if root is not None and root.xpath("//record[@model='ir.ui.view']//field[@name='arch']//field[@name]"):
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.INFO,
+                check="xml_fields_require_model_proof",
+                message="View fields detected; custom fields must exist on the view model and be readable by representative users.",
+                fix_hint="Verify the model field definition, ACLs, record rules, groups, and the final compiled view.",
+            ))
+        return findings
 
-        model_name: str | None = None
-        for ref in inherit_refs:
-            parts = ref.split(".")
-            if len(parts) >= 2:
-                candidate = f"{parts[0]}.{parts[1]}"
-                core_content_test = _find_core_view_content(candidate, client_name=client_name)
-                if core_content_test:
-                    model_name = candidate
-                    break
+    @staticmethod
+    def _severity_for_scope(strict: bool) -> VerifySeverity:
+        return VerifySeverity.CRITICAL if strict else VerifySeverity.WARNING
 
-        core_view_content = _find_core_view_content(model_name, client_name=client_name) if model_name else ""
-        for xpath_m in _XPATH_EXPR_RE.finditer(content):
-            expr = xpath_m.group(1)
-            # QWeb template xpaths are verified by _verify_qweb_template.
-            if "t-inherit" in content and not inherit_refs:
+    def _verify_xml_contract(
+        self,
+        file_path: str,
+        content: str,
+        client_name: str | None = None,
+        *,
+        strict: bool = True,
+    ) -> list[VerifyFinding]:
+        """Validate version, dependency, inheritance, and visibility contracts.
+
+        Directly written files can block push. Impact-aware companion files are
+        advisory so pre-existing legacy code cannot unexpectedly block a small
+        unrelated task.
+        """
+        findings: list[VerifyFinding] = []
+        root = _safe_xml_root(content)
+        if root is None:
+            return findings
+
+        blocking_severity = self._severity_for_scope(strict)
+        addon_root = _addon_root(file_path)
+        module_name, depends, major = _manifest_context(file_path)
+
+        referenced_modules = _external_reference_modules(content)
+        missing_dependencies = sorted(referenced_modules - depends - ({module_name} if module_name else set()))
+        for dependency in missing_dependencies:
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=blocking_severity if module_name else VerifySeverity.WARNING,
+                check="xml_owner_dependency",
+                message=(
+                    f"XML references '{dependency}.*' but addon '{module_name or '(unknown)'}' "
+                    f"does not declare '{dependency}' in depends[]."
+                ),
+                fix_hint=(
+                    f"Add '{dependency}' to __manifest__.py depends[] after confirming the referenced "
+                    "record/template belongs to that addon."
+                ),
+            ))
+
+        if major is not None and major >= 17 and root.xpath("//*[@attrs or @states]"):
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=blocking_severity,
+                check="view_modifiers_version",
+                message=f"Odoo {major} view uses legacy attrs/states modifiers.",
+                fix_hint="Use version-correct direct invisible/readonly/required expressions verified from installed source.",
+            ))
+        if major is not None and major >= 18:
+            legacy_trees = root.xpath("//tree")
+            tree_modes = [
+                node for node in root.xpath("//field[@name='view_mode']")
+                if "tree" in "".join(node.itertext()).split(",")
+            ]
+            if legacy_trees or tree_modes:
+                findings.append(VerifyFinding(
+                    file=file_path,
+                    severity=blocking_severity,
+                    check="view_type_version",
+                    message=f"Odoo {major} XML uses legacy 'tree' view syntax/view_mode.",
+                    fix_hint="Use 'list' only after confirming the target Odoo version and installed source conventions.",
+                ))
+
+        xpath_nodes = root.xpath("//xpath[@expr]")
+        for xpath_node in xpath_nodes:
+            expr = str(xpath_node.get("expr") or "").strip()
+            if _BROAD_XPATH_RE.fullmatch(expr) or _POSITIONAL_XPATH_RE.search(expr):
+                findings.append(VerifyFinding(
+                    file=file_path,
+                    severity=blocking_severity,
+                    check="xpath_stability",
+                    message=f"Fragile XPath '{expr}' is broad or positional.",
+                    fix_hint="Anchor to a stable semantic attribute confirmed in the exact parent view.",
+                ))
+
+        definitions: list[etree._Element] = list(root.xpath("//record[@model='ir.ui.view']"))
+        definitions.extend(root.xpath("//template[@inherit_id]"))
+        for definition in definitions:
+            parent_ref = _definition_parent_ref(definition)
+            if not parent_ref:
                 continue
-            if not core_view_content:
+            parent_arch = _resolved_xmlid_arch(
+                parent_ref,
+                local_root=addon_root,
+                client_name=client_name,
+            )
+            for chain_ref, chain_parent, expr, match_count in self._inheritance_chain_mismatches(
+                parent_ref,
+                local_root=addon_root,
+                client_name=client_name,
+            ):
                 findings.append(VerifyFinding(
                     file=file_path,
                     severity=VerifySeverity.WARNING,
-                    check="xpath_core_view_found",
-                    message=f"xpath expr='{expr}' — cannot cross-check: core view not found for model '{model_name}'.",
-                    fix_hint=f"Run workflow.find_similar_view('{model_name}', 'form') and repo.read the result before using this xpath.",
+                    check="view_inheritance_chain",
+                    message=(
+                        f"Intermediate view '{chain_ref}' locator '{expr}' matched {match_count} "
+                        f"nodes in '{chain_parent}', not exactly one."
+                    ),
+                    fix_hint="Inspect the complete installed inheritance chain, priorities, and active database overlays.",
+                ))
+            specs = self._inheritance_specs(definition)
+            if parent_arch is None:
+                findings.append(VerifyFinding(
+                    file=file_path,
+                    severity=(
+                        blocking_severity
+                        if _core_source_available(client_name) and strict
+                        else VerifySeverity.WARNING
+                    ),
+                    check="view_parent_resolves",
+                    message=f"Could not resolve inherited view/template '{parent_ref}' from available source.",
+                    fix_hint="Sync/read the exact installed source and confirm the XML ID plus every inheritance level before writing.",
                 ))
                 continue
-
-            name_in_expr = re.search(r'@name\s*=\s*["\']([^"\']+)["\']', expr)
-            if name_in_expr:
-                node_name = name_in_expr.group(1)
-                if node_name not in core_view_content:
+            for spec in specs:
+                expr = self._inheritance_expr(spec)
+                if not expr:
+                    continue
+                matches = _xpath_matches(parent_arch, expr)
+                if len(matches) != 1:
                     findings.append(VerifyFinding(
                         file=file_path,
-                        severity=VerifySeverity.CRITICAL,
-                        check="xpath_node_exists",
-                        message=f"xpath expr='{expr}' — node with name='{node_name}' not found in core view source.",
-                        fix_hint="Re-read the core view with workflow.find_similar_view + repo.read to find the correct node name.",
+                        severity=blocking_severity,
+                        check="xpath_match_count",
+                        message=(
+                            f"Locator '{expr}' matched {len(matches)} nodes in the resolved parent "
+                            f"'{parent_ref}'; exactly one is required."
+                        ),
+                        fix_hint="Inspect the resolved parent chain and use a stable locator with exactly one match.",
                     ))
                 else:
                     findings.append(VerifyFinding(
                         file=file_path,
                         severity=VerifySeverity.INFO,
-                        check="xpath_node_exists",
-                        message=f"xpath node name='{node_name}' — confirmed in core view.",
+                        check="xpath_match_count",
+                        message=f"Locator '{expr}' matched exactly one node in resolved parent '{parent_ref}'.",
                         fix_hint="",
                     ))
 
-        if model_name and core_view_content:
-            field_names_in_xml = {m.group(1) for m in _FIELD_NAME_XML_RE.finditer(content)}
-            core_model_content = _find_core_model_content(model_name, client_name=client_name)
-            if core_model_content:
-                core_fields = _extract_core_field_names(core_model_content)
-                for field_name in field_names_in_xml:
-                    if field_name not in core_fields:
-                        findings.append(VerifyFinding(
-                            file=file_path,
-                            severity=VerifySeverity.WARNING,
-                            check="xml_field_in_core",
-                            message=(
-                                f"<field name='{field_name}'> not found in core model '{model_name}'. "
-                                "If this is a custom field added by your module, this is expected."
-                            ),
-                            fix_hint=f"Verify '{field_name}' is defined in your custom module's model file.",
-                        ))
+        if self._has_noupdate_records(root):
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.WARNING,
+                check="view_noupdate_upgrade",
+                message="View/menu/action data is inside noupdate='1'; an ordinary module upgrade may not update an existing database record.",
+                fix_hint="Prefer a new inheriting record or an explicit migration, then verify the existing database record after upgrade.",
+            ))
+
+        if root.xpath("//*[@groups or @invisible or @readonly or @required]"):
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.INFO,
+                check="view_security_live_proof",
+                message="View visibility/modifier security requires compiled-view proof with representative non-admin users.",
+                fix_hint="Verify fields_get/get_views plus ACLs, record rules, groups, and visible/clickable behavior for each target role.",
+            ))
+
+        if definitions:
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.INFO,
+                check="studio_overlay_unverified",
+                message="Static source checks cannot prove database-only Odoo Studio overlays or the final compiled architecture.",
+                fix_hint="Inspect active ir.ui.view records and verify the final compiled view in the target database.",
+            ))
+            findings.extend(self._verify_view_priority_collisions(
+                file_path,
+                root,
+                addon_root,
+            ))
         return findings
+
+    @staticmethod
+    def _inheritance_specs(definition: etree._Element) -> list[etree._Element]:
+        arch = _definition_arch(definition)
+        if arch is None:
+            return []
+        return [
+            child for child in arch
+            if child.tag == "xpath" or child.get("position") is not None
+        ]
+
+    @staticmethod
+    def _inheritance_expr(spec: etree._Element) -> str | None:
+        if spec.tag == "xpath":
+            return str(spec.get("expr") or "").strip() or None
+        name = str(spec.get("name") or "").strip()
+        if not name:
+            return None
+        tag = str(spec.tag).split("}")[-1]
+        return f".//{tag}[@name={repr(name)}]"
+
+    @staticmethod
+    def _has_noupdate_records(root: etree._Element) -> bool:
+        tracked = {"ir.ui.view", "ir.actions.act_window", "ir.ui.menu"}
+        for record in root.xpath("//record[@model] | //menuitem"):
+            if record.tag != "menuitem" and str(record.get("model") or "") not in tracked:
+                continue
+            if any(str(parent.get("noupdate") or "").lower() in {"1", "true"} for parent in record.iterancestors()):
+                return True
+        return False
+
+    def _verify_view_priority_collisions(
+        self,
+        file_path: str,
+        root: etree._Element,
+        addon_root: Path | None,
+    ) -> list[VerifyFinding]:
+        if addon_root is None:
+            return []
+        current = self._view_targets(root)
+        if not current:
+            return []
+        findings: list[VerifyFinding] = []
+        current_path = Path(file_path).resolve()
+        for other_path in addon_root.rglob("*.xml"):
+            if other_path.resolve() == current_path:
+                continue
+            other_root = _safe_xml_root(_read_file(str(other_path), max_bytes=1048576))
+            if other_root is None:
+                continue
+            other_targets = self._view_targets(other_root)
+            collisions = sorted(
+                (parent_ref, expr, priority, other_priority)
+                for parent_ref, expr, priority in current
+                for other_parent, other_expr, other_priority in other_targets
+                if (parent_ref, expr) == (other_parent, other_expr)
+            )
+            for parent_ref, expr, priority, other_priority in collisions:
+                findings.append(VerifyFinding(
+                    file=file_path,
+                    severity=VerifySeverity.WARNING,
+                    check="view_priority_collision",
+                    message=(
+                        f"'{expr}' also targets '{parent_ref}' in {other_path.relative_to(addon_root)}; "
+                        f"priorities are {priority} and {other_priority}."
+                    ),
+                    fix_hint="Inspect all inheriting views and set an intentional deterministic priority/apply order.",
+                ))
+        return findings
+
+    def _inheritance_chain_mismatches(
+        self,
+        reference: str,
+        *,
+        local_root: Path | None,
+        client_name: str | None,
+        visited: set[str] | None = None,
+    ) -> list[tuple[str, str, str, int]]:
+        trail = set(visited or set())
+        if reference in trail:
+            return []
+        trail.add(reference)
+        definition = _xmlid_definition(reference, local_root=local_root, client_name=client_name)
+        if definition is None:
+            return []
+        parent_ref = _definition_parent_ref(definition)
+        if not parent_ref:
+            return []
+        mismatches = self._inheritance_chain_mismatches(
+            parent_ref,
+            local_root=local_root,
+            client_name=client_name,
+            visited=trail,
+        )
+        parent_arch = _resolved_xmlid_arch(
+            parent_ref,
+            local_root=local_root,
+            client_name=client_name,
+        )
+        if parent_arch is None:
+            return mismatches
+        for spec in self._inheritance_specs(definition):
+            expr = self._inheritance_expr(spec)
+            if not expr:
+                continue
+            count = len(_xpath_matches(parent_arch, expr))
+            if count != 1:
+                mismatches.append((reference, parent_ref, expr, count))
+        return mismatches
+
+    @classmethod
+    def _view_targets(cls, root: etree._Element) -> set[tuple[str, str, int]]:
+        targets: set[tuple[str, str, int]] = set()
+        definitions: list[etree._Element] = list(root.xpath("//record[@model='ir.ui.view']"))
+        definitions.extend(root.xpath("//template[@inherit_id]"))
+        for definition in definitions:
+            parent_ref = _definition_parent_ref(definition)
+            if not parent_ref:
+                continue
+            priority = 16
+            if definition.tag == "record":
+                values = definition.xpath("./field[@name='priority']")
+                if values:
+                    try:
+                        priority = int("".join(values[0].itertext()).strip())
+                    except ValueError:
+                        pass
+            else:
+                try:
+                    priority = int(str(definition.get("priority") or "16"))
+                except ValueError:
+                    pass
+            for spec in cls._inheritance_specs(definition):
+                expr = cls._inheritance_expr(spec)
+                if expr:
+                    targets.add((parent_ref, expr, priority))
+        return targets
 
     def _verify_qweb_template(self, file_path: str, content: str, xml_contents: dict[str, str], client_name: str | None = None) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []

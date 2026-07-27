@@ -4,6 +4,10 @@ debit/credit, never a hardcoded number. Tax/withholding rates are looked up
 per-tax-record — never hardcoded percentages, since Pakistan FBR rates
 change by Finance Act.
 
+Apply the `odoo-view-development` QWeb contract to invoice/financial templates:
+resolve transitive layouts and calls, dependencies, XPath targets, safe output,
+assets, company/language context, and final rendered proof.
+
 ---
 
 ## 1. INVOICE REPORT (multi-tax safe)

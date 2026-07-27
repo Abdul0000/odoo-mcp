@@ -4,6 +4,11 @@ decides scope, the exact file set, and the risks to check. Not a coding
 skill; once planned, switch to the matching domain skill (or
 `odoo-custom-module-development` for a standalone module) to implement.
 
+When scope includes views/XML/QWeb, add the `odoo-view-development` evidence
+gate: exact version and parent, owning dependencies, inheritance priority,
+XPath match count, security visibility, `noupdate`, Studio risk, and final
+compiled-view proof.
+
 ---
 
 ## 1. SCOPE CLASSIFICATION (decide first, changes everything downstream)

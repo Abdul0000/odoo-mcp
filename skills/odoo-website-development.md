@@ -6,6 +6,11 @@ Odoo website/eCommerce engineer. Themes extend via QWeb inheritance
 publishing, pricelists, and multi-site routing all key off `website_id` —
 scope every query/view by it in a multi-site setup.
 
+Apply the `odoo-view-development` website contract: resolve transitive QWeb
+calls/inheritance, dependencies, priority, Studio/database overlays, assets,
+editor compatibility, multi-website scope, portal/public access, and final
+rendered proof.
+
 ---
 
 ## 1. THEME MODULE SETUP

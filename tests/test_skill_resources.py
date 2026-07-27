@@ -24,6 +24,7 @@ EXPECTED = {
     "odoo-website-development": "odoo-website-development.md",
     "odoo-custom-module-development": "13-SKILL-custom-module.md",
     "odoo-task-planning": "14-SKILL-planning.md",
+    "odoo-view-development": "15-SKILL-views.md",
 }
 
 
@@ -122,3 +123,21 @@ def test_accounting_report_aliases_load_dedicated_accounting_report_skill():
         result = service.read(alias)
         assert result["name"] == "odoo-accounting-reports"
         assert result["source"] == "skills/12-SKILL-accounting-reports.md"
+
+
+def test_view_aliases_and_surface_routing_load_dedicated_view_skill():
+    service = SkillService()
+
+    for alias in ("view", "views", "xpath", "xml-view", "backend-view"):
+        result = service.read(alias)
+        assert result["name"] == "odoo-view-development"
+        assert result["source"] == "skills/15-SKILL-views.md"
+
+    recommended = service.list("Add a field to the sale order form view with a stable xpath")
+    assert recommended["recommendation"]["name"] == "odoo-view-development"
+    content = service.read("view")["content"]
+    for marker in (
+        "owning addon", "priority", "representative users", "noupdate",
+        "Studio", "t-call", "final compiled architecture",
+    ):
+        assert marker in content

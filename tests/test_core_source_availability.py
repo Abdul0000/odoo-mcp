@@ -24,6 +24,41 @@ from odoo_agent_server.schemas import SyntaxVerifyRequest, VerifySeverity
 from odoo_agent_server.services import syntax_verifier_service as svs
 
 
+def _write_addon(tmp_path, name, *, version="18.0.1.0.0", depends=None):
+    addon = tmp_path / name
+    addon.mkdir(parents=True)
+    (addon / "__manifest__.py").write_text(
+        repr({
+            "name": name,
+            "version": version,
+            "depends": depends or ["base"],
+        }),
+        encoding="utf-8",
+    )
+    views = addon / "views"
+    views.mkdir()
+    return addon, views
+
+
+def _write_parent_view(source_root, *, duplicate_partner=False):
+    sale = source_root / "sale"
+    views = sale / "views"
+    views.mkdir(parents=True)
+    second = '<field name="partner_id"/>' if duplicate_partner else ""
+    (views / "sale_order_views.xml").write_text(
+        "<odoo>"
+        '<record id="view_order_form" model="ir.ui.view">'
+        '<field name="name">sale.order.form</field>'
+        '<field name="model">sale.order</field>'
+        '<field name="arch" type="xml">'
+        f'<form><sheet><field name="partner_id"/>{second}</sheet></form>'
+        "</field>"
+        "</record>"
+        "</odoo>",
+        encoding="utf-8",
+    )
+
+
 @pytest.fixture
 def core_source_unreachable(monkeypatch):
     """Simulate the Render-without-Odoo.sh-SSH scenario: no local source
@@ -139,3 +174,207 @@ def test_still_critical_when_source_available_and_dep_genuinely_missing(tmp_path
         "When a source root DOES exist locally (even if empty), that counts as "
         "'source available' — a genuinely missing module must still be CRITICAL."
     )
+
+
+def test_view_contract_blocks_missing_dependency_and_legacy_v18_syntax(tmp_path, monkeypatch):
+    source_root = tmp_path / "src"
+    _write_parent_view(source_root)
+    monkeypatch.setattr(svs, "_SRC_ROOTS", [source_root])
+    addon, views = _write_addon(tmp_path, "x_view", depends=["base"])
+    view_file = views / "sale_order_views.xml"
+    view_file.write_text(
+        "<odoo>"
+        '<record id="sale_order_form_inherit" model="ir.ui.view">'
+        '<field name="inherit_id" ref="sale.view_order_form"/>'
+        '<field name="arch" type="xml">'
+        '<xpath expr="//field[@name=&quot;partner_id&quot;]" position="after">'
+        '<field name="x_note" attrs="{&quot;invisible&quot;: []}"/>'
+        "</xpath>"
+        "</field>"
+        "</record>"
+        '<record id="x_action" model="ir.actions.act_window">'
+        '<field name="view_mode">tree,form</field>'
+        "</record>"
+        "</odoo>",
+        encoding="utf-8",
+    )
+
+    result = svs.SyntaxVerifierService().verify(
+        SyntaxVerifyRequest(written_files=[str(view_file)], project_path=str(addon))
+    )
+    critical_checks = {finding.check for finding in result.findings if finding.severity == VerifySeverity.CRITICAL}
+    assert {"xml_owner_dependency", "view_modifiers_version", "view_type_version"} <= critical_checks
+    assert result.push_blocked is True
+
+
+@pytest.mark.parametrize(
+    ("duplicate_partner", "expected_severity"),
+    [(False, VerifySeverity.INFO), (True, VerifySeverity.CRITICAL)],
+)
+def test_view_contract_requires_exactly_one_parent_match(
+    tmp_path,
+    monkeypatch,
+    duplicate_partner,
+    expected_severity,
+):
+    source_root = tmp_path / "src"
+    _write_parent_view(source_root, duplicate_partner=duplicate_partner)
+    monkeypatch.setattr(svs, "_SRC_ROOTS", [source_root])
+    addon, views = _write_addon(tmp_path, "x_view", depends=["base", "sale"])
+    view_file = views / "sale_order_views.xml"
+    view_file.write_text(
+        "<odoo>"
+        '<record id="sale_order_form_inherit" model="ir.ui.view">'
+        '<field name="inherit_id" ref="sale.view_order_form"/>'
+        '<field name="arch" type="xml">'
+        '<xpath expr="//field[@name=&quot;partner_id&quot;]" position="after">'
+        '<field name="x_note"/>'
+        "</xpath>"
+        "</field>"
+        "</record>"
+        "</odoo>",
+        encoding="utf-8",
+    )
+
+    result = svs.SyntaxVerifierService().verify(
+        SyntaxVerifyRequest(written_files=[str(view_file)], project_path=str(addon))
+    )
+    match_findings = [finding for finding in result.findings if finding.check == "xpath_match_count"]
+    assert match_findings
+    assert match_findings[0].severity == expected_severity
+    assert ("matched exactly one" in match_findings[0].message) is (not duplicate_partner)
+
+
+def test_view_contract_flags_fragile_xpath_and_noupdate_security_proof(tmp_path, monkeypatch):
+    source_root = tmp_path / "src"
+    _write_parent_view(source_root)
+    monkeypatch.setattr(svs, "_SRC_ROOTS", [source_root])
+    addon, views = _write_addon(tmp_path, "x_view", depends=["base", "sale"])
+    view_file = views / "sale_order_views.xml"
+    view_file.write_text(
+        '<odoo><data noupdate="1">'
+        '<record id="sale_order_form_inherit" model="ir.ui.view">'
+        '<field name="inherit_id" ref="sale.view_order_form"/>'
+        '<field name="arch" type="xml">'
+        '<xpath expr="//field[1]" position="after">'
+        '<field name="x_note" groups="base.group_user" invisible="not x_enabled"/>'
+        "</xpath>"
+        "</field>"
+        "</record>"
+        "</data></odoo>",
+        encoding="utf-8",
+    )
+
+    result = svs.SyntaxVerifierService().verify(
+        SyntaxVerifyRequest(written_files=[str(view_file)], project_path=str(addon))
+    )
+    findings = {finding.check: finding for finding in result.findings}
+    assert findings["xpath_stability"].severity == VerifySeverity.CRITICAL
+    assert findings["view_noupdate_upgrade"].severity == VerifySeverity.WARNING
+    assert findings["view_security_live_proof"].severity == VerifySeverity.INFO
+
+
+def test_unresolved_view_parent_is_warning_when_source_unreachable(
+    tmp_path,
+    core_source_unreachable,
+):
+    addon, views = _write_addon(tmp_path, "x_view", depends=["base", "sale"])
+    view_file = views / "sale_order_views.xml"
+    view_file.write_text(
+        "<odoo>"
+        '<record id="sale_order_form_inherit" model="ir.ui.view">'
+        '<field name="inherit_id" ref="sale.view_order_form"/>'
+        '<field name="arch" type="xml">'
+        '<xpath expr="//field[@name=&quot;partner_id&quot;]" position="after">'
+        '<field name="x_note"/>'
+        "</xpath>"
+        "</field>"
+        "</record>"
+        "</odoo>",
+        encoding="utf-8",
+    )
+
+    result = svs.SyntaxVerifierService().verify(
+        SyntaxVerifyRequest(written_files=[str(view_file)], project_path=str(addon))
+    )
+    parent_findings = [finding for finding in result.findings if finding.check == "view_parent_resolves"]
+    assert parent_findings
+    assert parent_findings[0].severity == VerifySeverity.WARNING
+    assert result.push_blocked is False
+
+
+def test_view_contract_checks_intermediate_inheritance_level(tmp_path, monkeypatch):
+    source_root = tmp_path / "src"
+    _write_parent_view(source_root)
+    sale_extra = source_root / "sale" / "views" / "sale_order_intermediate.xml"
+    sale_extra.write_text(
+        "<odoo>"
+        '<record id="view_order_form_intermediate" model="ir.ui.view">'
+        '<field name="inherit_id" ref="sale.view_order_form"/>'
+        '<field name="arch" type="xml">'
+        '<xpath expr="//field[@name=&quot;missing_field&quot;]" position="after">'
+        '<field name="note"/>'
+        "</xpath>"
+        "</field>"
+        "</record>"
+        "</odoo>",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(svs, "_SRC_ROOTS", [source_root])
+    addon, views = _write_addon(tmp_path, "x_view", depends=["base", "sale"])
+    view_file = views / "sale_order_views.xml"
+    view_file.write_text(
+        "<odoo>"
+        '<record id="sale_order_form_inherit" model="ir.ui.view">'
+        '<field name="inherit_id" ref="sale.view_order_form_intermediate"/>'
+        '<field name="arch" type="xml">'
+        '<xpath expr="//field[@name=&quot;partner_id&quot;]" position="after">'
+        '<field name="x_note"/>'
+        "</xpath>"
+        "</field>"
+        "</record>"
+        "</odoo>",
+        encoding="utf-8",
+    )
+
+    result = svs.SyntaxVerifierService().verify(
+        SyntaxVerifyRequest(written_files=[str(view_file)], project_path=str(addon))
+    )
+    chain_findings = [finding for finding in result.findings if finding.check == "view_inheritance_chain"]
+    assert chain_findings
+    assert "sale.view_order_form_intermediate" in chain_findings[0].message
+    assert chain_findings[0].severity == VerifySeverity.WARNING
+
+
+def test_view_contract_reports_same_target_priority_interaction(tmp_path, monkeypatch):
+    source_root = tmp_path / "src"
+    _write_parent_view(source_root)
+    monkeypatch.setattr(svs, "_SRC_ROOTS", [source_root])
+    addon, views = _write_addon(tmp_path, "x_view", depends=["base", "sale"])
+    first_view = views / "first.xml"
+    second_view = views / "second.xml"
+    for path, xmlid, priority in (
+        (first_view, "first_inherit", 10),
+        (second_view, "second_inherit", 30),
+    ):
+        path.write_text(
+            "<odoo>"
+            f'<record id="{xmlid}" model="ir.ui.view">'
+            '<field name="inherit_id" ref="sale.view_order_form"/>'
+            f'<field name="priority">{priority}</field>'
+            '<field name="arch" type="xml">'
+            '<xpath expr="//field[@name=&quot;partner_id&quot;]" position="after">'
+            '<field name="x_note"/>'
+            "</xpath>"
+            "</field>"
+            "</record>"
+            "</odoo>",
+            encoding="utf-8",
+        )
+
+    result = svs.SyntaxVerifierService().verify(
+        SyntaxVerifyRequest(written_files=[str(first_view)], project_path=str(addon))
+    )
+    collisions = [finding for finding in result.findings if finding.check == "view_priority_collision"]
+    assert collisions
+    assert "10 and 30" in collisions[0].message
