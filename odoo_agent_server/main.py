@@ -34,7 +34,7 @@ if os.getenv("RENDER", "").lower() in {"1", "true", "yes"} and settings.api_toke
 
 app = FastAPI(
     title="Odoo MCP Agent Connector",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "Provider-safe Odoo 16-19 development connector with server-owned source discovery, "
         "verification, Git, Odoo.sh deployment, recovery jobs, OAuth, and on-demand skills."
@@ -88,7 +88,7 @@ def agent_instructions() -> dict:
                 "Do not call hidden repo, Git, source-discovery, verification, or deploy tools; the composite workflow owns those steps.",
                 "Follow workflow_profile for adaptive small/medium/large scope. After focused inspection, ask the returned single question only for status=needs_clarification; otherwise resolve technical details from source. For status=needs_writes, generate one contract-complete writes set, never deploy partial local batches, and use jobs.get or workflow.resume_job until terminal.",
                 "When repair_required=true, must_continue=true, or contract_status=pending, treat it as non-terminal: generate only the blocking repairs from structure_findings and execute next_call immediately without summarizing or asking the user; allow at most three diagnosed repair cycles.",
-                "When deploy_confirmed or already_deployed_confirmed is true, stop and summarize for normal workflows; for debug work manual text/booleans remain untrusted, continue through replay, and say fixed only when truth_gate.verified_fixed=true—otherwise preserve claim_status such as implemented_unverified or blocked_with_evidence.",
+                "When deploy_confirmed or already_deployed_confirmed is true, stop and summarize for normal workflows; for debug work manual text/booleans remain untrusted, continue through replay, and say fixed only when truth_gate.verified_fixed=true—otherwise preserve claim_status such as implemented_unverified or blocked_with_evidence. Honor watchdog metadata: never interrupt protected coding/write/Git/deploy/upgrade/database phases; stop repeating non-mutating inspection on watchdog_redirect, ask one precise clarification only when the contract is genuinely unclear, and use poll_after_seconds without treating backoff as success.",
                 "Produce production-ready, task-scoped code: clean, minimal, secure, batch-safe, and compatible with the installed Odoo version. Preserve architecture, prevent N+1 queries, use environment-aware tests, prefer ORM/framework built-ins, use parameterized SQL only when justified, scope sudo/security correctly, and avoid unrelated refactoring. Never expose credentials, create normal module schema through Studio/ORM shortcuts, or put Pydantic code inside Odoo addons.",
             ],
             "provider_flow": {

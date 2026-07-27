@@ -128,6 +128,7 @@ from ..services.workflow_guard_service import (
     record_code_change_deploy_attempt,
     repeated_failure_guard_status,
 )
+from ..services.workflow_watchdog_service import WorkflowWatchdogService
 from .qa import self_run
 from .repo import repo_delete, repo_write, repo_write_many_atomic, repo_write_many_fast_safe, repo_write_many_smart, repo_apply_patch, repo_apply_patch_atomic, repo_clean_pyc, repo_prepare, repo_custom_modules
 from .git import git_commit, git_push
@@ -4832,7 +4833,8 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "workflow.odoo_debug_and_fix":
         return await _workflow_odoo_debug_and_fix(OdooDebugAndFixRequest.model_validate(args))
     if name == "workflow.module_analyze":
-        return _workflow_module_analyze(ModuleAnalyzeRequest.model_validate(args))
+        request = ModuleAnalyzeRequest.model_validate(args)
+        return await asyncio.to_thread(_workflow_module_analyze, request)
     if name == "workflow.module_install_and_check":
         return odoo_module_deploy(OdooModuleRequest.model_validate(_force_mcp_async_deploy_args(args)))
     if name == "workflow.frontend_visual_implement":
@@ -4949,7 +4951,7 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "odoosh.error_pack":
         req = OdooShCommandRequest.model_validate(args)
         client = _resolve_query_client(req.client_name)
-        return OdooShService(client).error_pack(req.tail_lines)
+        return await asyncio.to_thread(OdooShService(client).error_pack, req.tail_lines)
     if name == "odoosh.module_deploy_ssh":
         return odoosh_module_deploy_ssh(OdooShModuleUpdateRequest.model_validate(_force_mcp_async_deploy_args(args)))
     if name == "odoosh.module_update":
@@ -4962,7 +4964,8 @@ async def _dispatch(name: str, args: dict) -> object:
         req = ClientOnlyRequest.model_validate(args)
         return _odoo_service_for_client(_resolve_query_client(req.client_name)).health()
     if name == "odoo.query":
-        return _odoo_functional_query(OdooFunctionalQueryRequest.model_validate(args))
+        request = OdooFunctionalQueryRequest.model_validate(args)
+        return await asyncio.to_thread(_odoo_functional_query, request)
     if name == "odoo.module_deploy":
         return odoo_module_deploy(OdooModuleRequest.model_validate(_force_mcp_async_deploy_args(args)))
     if name == "odoo.module_status":
@@ -4974,7 +4977,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return odoo_module_update(OdooModuleRequest.model_validate(_force_mcp_async_deploy_args(args)))
     if name == "odoo.search_read":
         req = OdooSearchReadRequest.model_validate(args)
-        data = _search_read_via_shell(
+        data = await asyncio.to_thread(
+            _search_read_via_shell,
             model=req.model,
             domain=req.domain,
             fields=req.fields,
@@ -4987,7 +4991,7 @@ async def _dispatch(name: str, args: dict) -> object:
         return data.get("odoo") if data.get("status") == "ok" else OdooResult(status="failed", result=data, error=data.get("message") or "Odoo search_read failed")
     if name == "odoo.read_group":
         req = OdooReadGroupRequest.model_validate(args)
-        data = _read_group_via_shell(req)
+        data = await asyncio.to_thread(_read_group_via_shell, req)
         return data.get("odoo") if data.get("status") == "ok" else OdooResult(status="failed", result=data, error=data.get("message"))
     if name == "browser.pos_flow":
         req = PosFlowCheckRequest.model_validate(args)
@@ -5014,14 +5018,16 @@ async def _dispatch(name: str, args: dict) -> object:
         return JsonStore().list_jobs(limit=req.limit)
     if name == "jobs.get":
         req = JobGetRequest.model_validate(args)
+        watchdog = WorkflowWatchdogService()
         if req.wait_for_result:
-            return await asyncio.to_thread(
+            job = await asyncio.to_thread(
                 JsonStore().wait_job,
                 req.job_id,
                 req.wait_timeout_seconds,
                 req.poll_interval_seconds,
             )
-        return JsonStore().get_job(req.job_id)
+            return watchdog.annotate_job(job)
+        return watchdog.annotate_job(JsonStore().get_job(req.job_id))
     if name == "audit.list":
         req = AuditListRequest.model_validate(args)
         return JsonStore().list_audit(limit=req.limit)
@@ -5254,6 +5260,29 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             "completion_required": {"type": "boolean"}, "deploy_confirmed": {"type": "boolean"},
             "terminal_action": {"type": "string"},
         })
+        if internal == "jobs.get":
+            properties["watchdog"] = {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["active", "stalled", "terminal"]},
+                    "phase": {"type": "string"},
+                    "protected": {"type": "boolean"},
+                    "stalled": {"type": "boolean"},
+                    "idle_seconds": {"type": "number", "minimum": 0},
+                    "unchanged_observations": {"type": "integer", "minimum": 0},
+                    "action": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "poll_after_seconds": {"type": ["integer", "null"]},
+                    "cancellation_supported": {"type": "boolean"},
+                    "force_cancelled": {"type": "boolean"},
+                },
+                "required": [
+                    "status", "phase", "protected", "stalled", "idle_seconds",
+                    "unchanged_observations", "action", "reason",
+                    "cancellation_supported", "force_cancelled",
+                ],
+                "additionalProperties": False,
+            }
     elif internal == "artifacts.read":
         properties.update({
             "artifact_id": {"type": "string"}, "content": {"type": "string"},

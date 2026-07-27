@@ -4,7 +4,7 @@ import base64
 import hashlib
 import os
 from pathlib import Path
-from typing import List
+from typing import List, Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -82,6 +82,32 @@ class Settings(BaseSettings):
     # module-deploy job submitted to the same bounded executor.
     background_max_workers: int = Field(default=2, ge=1, le=4, alias="ODOO_AGENT_BACKGROUND_MAX_WORKERS")
     mcp_operation_guard_enabled: bool = Field(default=False, alias="ODOO_AGENT_OPERATION_GUARD_ENABLED")
+    # Phase-aware watchdog. It never force-cancels write/deploy/database work.
+    # In safe_redirect mode it can time-bound an allowlisted read-only MCP call
+    # and return a concrete next action; shadow mode preserves current behavior.
+    workflow_watchdog_enabled: bool = Field(default=True, alias="ODOO_AGENT_WATCHDOG_ENABLED")
+    workflow_watchdog_mode: Literal["shadow", "safe_redirect"] = Field(
+        default="shadow",
+        alias="ODOO_AGENT_WATCHDOG_MODE",
+    )
+    workflow_watchdog_observation_budget_seconds: int = Field(
+        default=120,
+        ge=15,
+        le=3600,
+        alias="ODOO_AGENT_WATCHDOG_OBSERVATION_BUDGET_SECONDS",
+    )
+    workflow_watchdog_stall_confirmations: int = Field(
+        default=2,
+        ge=2,
+        le=10,
+        alias="ODOO_AGENT_WATCHDOG_STALL_CONFIRMATIONS",
+    )
+    workflow_watchdog_wait_cap_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=120,
+        alias="ODOO_AGENT_WATCHDOG_WAIT_CAP_SECONDS",
+    )
 
     # Qwen URL-token fallback hardening. Qwen app may not pass headers, so the
     # server can mint a short-lived URL token that maps to the real API/OAuth token.

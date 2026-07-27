@@ -505,6 +505,8 @@ Recommended environment:
 WORKSPACE_ROOT=/workspace/repos
 ODOO_AGENT_API_TOKEN=<strong-random-secret>
 ODOO_AGENT_BACKGROUND_MAX_WORKERS=2
+ODOO_AGENT_WATCHDOG_ENABLED=true
+ODOO_AGENT_WATCHDOG_MODE=shadow
 TARGET_GIT_REPO=git@github.com:Abdul0000/test_18.git
 TARGET_GIT_BRANCH=feature_branch
 TARGET_PROJECT_PATH=/workspace/repos/odoo_project
@@ -512,6 +514,8 @@ GIT_SSH_KEY_PATH=/tmp/keys/github_key
 ```
 
 `ODOO_AGENT_OPERATION_GUARD_ENABLED=false` preserves the current MCP flow. Enable it only after validating the stricter duplicate/phase guard with your clients.
+
+The phase-aware watchdog is independent of the optional operation guard. It defaults to `shadow`, which preserves existing behavior. In `safe_redirect` mode only explicitly allowlisted read-only provider calls receive a runtime budget, and provider `jobs.get` arguments expose their effective bounded wait. REST/internal wait values remain unchanged. Coding, file writes, Git, deployment, module upgrades, migrations, database work, and unknown job types are never timed out.
 
 Legacy `ODOO_AGENT_BACKGROUND_MAX_WORKERS=1` values are accepted and safely clamped to two workers internally.
 

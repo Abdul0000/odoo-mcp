@@ -14,6 +14,7 @@ from ..services.prompt_service import load_mcp_system_prompt, load_client_check_
 from ..services.qwen_token_service import QwenTokenService
 from ..services.store_service import JsonStore
 from ..services.mcp_operation_guard_service import McpOperationGuardService
+from ..services.workflow_watchdog_service import WorkflowWatchdogService
 from .tools import _dispatch, format_tool_validation_error, internal_tool_name, list_tools, strict_safe_tool_name, tool_input_schema, tool_output_schema
 
 router = APIRouter(prefix="/mcp", tags=["mcp"], dependencies=[AuthDependency])
@@ -117,6 +118,11 @@ def _provider_safe_next_calls(value: Any) -> Any:
                 out[key] = child
             continue
         out[key] = _provider_safe_next_calls(child)
+    if internal_tool_name(str(out.get("tool") or "")) == "jobs.get" and isinstance(out.get("arguments"), dict):
+        arguments = dict(out["arguments"])
+        requested = int(arguments.get("wait_timeout_seconds", 600) or 600)
+        arguments["wait_timeout_seconds"] = WorkflowWatchdogService().provider_wait_timeout(requested)
+        out["arguments"] = arguments
     return out
 
 
@@ -211,7 +217,8 @@ def _arguments_for_profile(tool_name: str, arguments: dict[str, Any], profile: s
         if "wait_for_result" not in adjusted:
             adjusted["wait_for_result"] = True
         if adjusted.get("wait_for_result") is True:
-            adjusted["wait_timeout_seconds"] = min(max(int(adjusted.get("wait_timeout_seconds", 600) or 600), 1), 600)
+            requested_wait = min(max(int(adjusted.get("wait_timeout_seconds", 600) or 600), 1), 600)
+            adjusted["wait_timeout_seconds"] = WorkflowWatchdogService().provider_wait_timeout(requested_wait)
             adjusted["poll_interval_seconds"] = min(max(float(adjusted.get("poll_interval_seconds", 1.0) or 1.0), 0.25), 10.0)
             return adjusted
         if profile not in {"provider", "claude", "chatgpt", "grok", "qwen"} or "wait_for_result" not in adjusted:
@@ -503,7 +510,7 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                     "tools": {"listChanged": False},
                     "prompts": {"listChanged": False},
                 },
-                "serverInfo": {"name": "odoo-mcp-agent-connector", "version": "1.7.0"},
+                "serverInfo": {"name": "odoo-mcp-agent-connector", "version": "1.8.0"},
                 "instructions": load_client_check_system_prompt(),
                 "prompt_source": "CLIENT_CHECK_SYSTEM_PROMPT.md",
                 "next_prompt_source_after_client_validation": "MCP_SYSTEM_PROMPT.md",
@@ -598,7 +605,13 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                             "isError": False,
                         },
                     )
-            result = await _dispatch(internal_name, arguments)
+            if settings.workflow_watchdog_enabled and profile in {"provider", "claude", "chatgpt", "grok", "qwen"}:
+                result = await WorkflowWatchdogService().run_tool_call(
+                    internal_name,
+                    lambda: _dispatch(internal_name, arguments),
+                )
+            else:
+                result = await _dispatch(internal_name, arguments)
             structured = _to_structured_content(result, tool_name=internal_name)
             if profile in {"provider", "claude", "chatgpt", "grok", "qwen"}:
                 structured = _provider_safe_next_calls(structured)
