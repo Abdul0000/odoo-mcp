@@ -25,6 +25,15 @@ EXPECTED = {
     "odoo-custom-module-development": "13-SKILL-custom-module.md",
     "odoo-task-planning": "14-SKILL-planning.md",
     "odoo-view-development": "15-SKILL-views.md",
+    "odoo-backend-development": "16-SKILL-backend.md",
+    "odoo-frontend-owl-development": "17-SKILL-frontend-owl.md",
+    "odoo-integration-development": "18-SKILL-integration.md",
+    "odoo-security-development": "19-SKILL-security.md",
+    "odoo-runtime-debugging": "20-SKILL-runtime-debugging.md",
+    "odoo-test-development": "21-SKILL-tests.md",
+    "odoo-code-review": "22-SKILL-code-review.md",
+    "odoo-upgrade-migration": "23-SKILL-upgrade-migration.md",
+    "odoo-ai-mcp-development": "24-SKILL-ai-mcp.md",
 }
 
 
@@ -34,6 +43,7 @@ def test_exact_skill_files_are_loaded_only_on_demand():
     listed = service.list()
 
     assert listed["loading"] == "on_demand"
+    assert listed["selection_policy"] == "single_primary_owner"
     assert listed["count"] == len(EXPECTED)
     assert {item["name"] for item in listed["skills"]} == set(EXPECTED)
 
@@ -176,3 +186,58 @@ def test_planning_skill_rejects_diagnostic_scope_invention():
         "nonblocking baseline debt",
     ):
         assert marker in content
+
+
+def test_unique_technical_skill_owners_route_on_demand():
+    service = SkillService()
+    cases = {
+        "Add a computed field with an _inherit model and batch method": "odoo-backend-development",
+        "Build an OWL component client action with a registry category": "odoo-frontend-owl-development",
+        "Implement an external API webhook with rate limit handling": "odoo-integration-development",
+        "Fix an ir.rule record rule cross company access leak": "odoo-security-development",
+        "The cron failed with a runtime error traceback": "odoo-runtime-debugging",
+        "Add a SavepointCase regression test": "odoo-test-development",
+        "Perform a production readiness code review": "odoo-code-review",
+        "Migrate from Odoo 17 to Odoo 19 with deprecated API changes": "odoo-upgrade-migration",
+        "Create an Odoo MCP tool for a RAG pipeline": "odoo-ai-mcp-development",
+    }
+
+    for task, expected in cases.items():
+        result = service.list(task)
+        assert result["recommendation"]["name"] == expected
+        assert result["recommendation"]["selection_policy"] == "single_primary_owner"
+        assert "content" not in result["recommendation"]
+
+
+def test_specific_existing_owner_beats_cross_layer_generic_terms():
+    service = SkillService()
+
+    accounting = service.list("Add an OWL Top N account report filter in account_reports")
+    view = service.list("Add a field to a form view with an inherited view and xpath")
+
+    assert accounting["recommendation"]["name"] == "odoo-accounting-reports"
+    assert view["recommendation"]["name"] == "odoo-view-development"
+
+
+def test_skill_registry_has_one_file_per_authoritative_owner():
+    service = SkillService()
+    rows = [service.read(name) for name in service.names()]
+
+    assert len({row["name"] for row in rows}) == len(rows)
+    assert len({row["source"] for row in rows}) == len(rows)
+    assert service.read("orm")["name"] == "odoo-sql-query-development"
+    assert service.read("backend")["name"] == "odoo-backend-development"
+    assert service.read("debug")["name"] == "odoo-runtime-debugging"
+
+
+def test_new_skills_preserve_existing_composite_workflow_ownership():
+    service = SkillService()
+
+    debug = service.read("debug")["content"]
+    ai_mcp = service.read("mcp")["content"]
+    planning = service.read("planning")["content"]
+
+    assert "workflow.odoo_debug_and_fix" in debug
+    assert "existing code-change, QA, safe-deploy, resume, and replay flow" in debug
+    assert "never create a parallel deployment pipeline" in ai_mcp
+    assert "normally 3–8 relevant files" in planning

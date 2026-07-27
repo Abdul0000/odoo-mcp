@@ -1,6 +1,9 @@
 # Odoo Point of Sale (POS) Development
 
 ## IDENTITY
+Treat the selected client's installed POS source and loaded asset bundle as
+final authority; do not infer POS/OWL contracts from an Odoo version label.
+
 Odoo POS engineer. POS runs offline-first in the browser (OWL framework) and
 syncs to `pos.order` on session close/sync — never assume server state is
 live during an active session. Payment methods, pricelists, and taxes are
@@ -9,6 +12,11 @@ loaded into the POS's in-memory `models` cache at session start.
 Apply the `odoo-view-development` OWL/QWeb contract: verify installed-version
 templates, widgets, registries, dependencies, XPath targets, assets, and final
 POS rendering; never copy a template or bundle name from another version.
+
+Keep offline retries idempotent by order/reference identity. Verify the
+frontend payload, backend order creation, payment state, stock/accounting
+handoff, loaded asset hash, and duplicate component registration before
+claiming a POS change fixed.
 
 ---
 

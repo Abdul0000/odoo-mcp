@@ -221,13 +221,21 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(
         name="skills.list",
         title="List Odoo skills",
-        description="List exact Odoo domain skills. Optionally pass task_description to receive one recommendation without loading skill content.",
+        description=(
+            "List unique authoritative Odoo skills. Optionally pass task_description to receive one "
+            "single-primary-owner recommendation without loading any skill content."
+        ),
         read_only=True,
     ),
     ToolDescriptor(
         name="skills.read",
         title="Load an Odoo skill",
-        description="Load one exact Odoo skill on demand. Use 'reporting' for ORM/SQL analytics, 'qweb-report' for general PDF/HTML templates, or 'accounting-report' for financial reports.",
+        description=(
+            "Load one exact Odoo skill on demand. Use the narrowest owner; do not load overlapping skills. "
+            "Examples: 'backend' for inherited ORM logic, 'view' for XML/XPath, 'debug' for actual runtime "
+            "failures, 'reporting' for ORM/SQL analytics, 'qweb-report' for general PDF/HTML templates, "
+            "and 'accounting-report' for financial reports."
+        ),
         read_only=True,
     ),
     ToolDescriptor(

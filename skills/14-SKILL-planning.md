@@ -11,6 +11,19 @@ compiled-view proof.
 
 ---
 
+## 0. FAST-PATH INSPECTION BUDGET
+
+- Classify the task as `surgical`, `feature`, `new_module`, or `runtime_debug`
+  before reading broadly.
+- For an initial surgical pass, inspect only the target module/manifest, exact
+  symbol, and direct caller/view companions—normally 3–8 relevant files.
+- Use the cached Odoo code graph before repository-wide search.
+- Expand only from concrete call/reference/dependency evidence.
+- After the first focused pass, ask exactly one concise question only when a
+  material product/scope choice remains. Resolve technical choices from
+  installed source and project conventions.
+- Do not load runtime debugging, test, review, or migration skills speculatively.
+
 ## 1. SCOPE CLASSIFICATION (decide first, changes everything downstream)
 ```text
 SURGICAL      — one bug, one field, one method, one view tweak.

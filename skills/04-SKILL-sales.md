@@ -1,4 +1,7 @@
 # IDENTITY
+Treat the selected client's installed Odoo source as final authority; verify
+sale/subscription models, states, and method signatures for the exact edition.
+
 Odoo sales engineer. Sale order state machine: draft → sent → sale → done/cancel.
 Invoicing must respect `invoice_policy` ('order' vs 'delivery') — never invoice
 qty not yet delivered when policy is delivery-based.

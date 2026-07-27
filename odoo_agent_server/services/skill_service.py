@@ -23,6 +23,15 @@ _SKILLS = {
     "odoo-custom-module-development": ("13-SKILL-custom-module.md", "Standalone custom modules with their own models/tables, manifest, security, views, and menus — not inherited/mixed into native Odoo models."),
     "odoo-task-planning": ("14-SKILL-planning.md", "Pre-implementation planning: scope classification (surgical vs new feature vs new module), file inventory checklist, impact/dependency check, and risk flags before writing code."),
     "odoo-view-development": ("15-SKILL-views.md", "Version-aware backend views, XML/QWeb, XPath, dependencies, inheritance priorities, widgets, security visibility, noupdate, Studio overlays, actions, and menus."),
+    "odoo-backend-development": ("16-SKILL-backend.md", "Inherited Odoo Python models, ORM methods, fields, computes, constraints, workflows, cron logic, batching, and chatter behavior."),
+    "odoo-frontend-owl-development": ("17-SKILL-frontend-owl.md", "Odoo web-client JavaScript, OWL components, services, hooks, registries, patches, client actions, widgets, templates, and assets."),
+    "odoo-integration-development": ("18-SKILL-integration.md", "External APIs, webhooks, provider clients, mappings, queues, retries, idempotency, rate limits, and integration audit state."),
+    "odoo-security-development": ("19-SKILL-security.md", "ACLs, groups, record rules, multi-company isolation, controller authorization, portal tokens, field visibility, and scoped sudo."),
+    "odoo-runtime-debugging": ("20-SKILL-runtime-debugging.md", "Evidence-bounded Odoo runtime diagnosis for tracebacks, repeated failures, controller/cron/queue/API errors, browser defects, access issues, and performance failures."),
+    "odoo-test-development": ("21-SKILL-tests.md", "Focused Odoo regression tests for models, security, controllers, integrations, reports, migrations, queues, OWL, and browser flows."),
+    "odoo-code-review": ("22-SKILL-code-review.md", "Odoo module/PR/diff review for concrete bugs, security leaks, regressions, performance, upgrade risk, missing tests, and evidence-backed completion."),
+    "odoo-upgrade-migration": ("23-SKILL-upgrade-migration.md", "Odoo source-to-target compatibility, deprecated APIs, view/OWL/assets changes, manifest changes, noupdate behavior, and data migrations."),
+    "odoo-ai-mcp-development": ("24-SKILL-ai-mcp.md", "Odoo-connected MCP tools, AI assistants, LLM providers, RAG, permission-aware actions, structured outputs, audit, and truthful completion."),
 }
 
 _ALIASES = {
@@ -86,6 +95,32 @@ _ALIASES = {
     "xml-view": "odoo-view-development",
     "backend-view": "odoo-view-development",
     "view-xml": "odoo-view-development",
+    "backend": "odoo-backend-development",
+    "python-model": "odoo-backend-development",
+    "orm-model": "odoo-backend-development",
+    "model-inheritance": "odoo-backend-development",
+    "owl": "odoo-frontend-owl-development",
+    "frontend": "odoo-frontend-owl-development",
+    "javascript": "odoo-frontend-owl-development",
+    "integration": "odoo-integration-development",
+    "api-integration": "odoo-integration-development",
+    "webhook": "odoo-integration-development",
+    "security": "odoo-security-development",
+    "access-rights": "odoo-security-development",
+    "record-rules": "odoo-security-development",
+    "debug": "odoo-runtime-debugging",
+    "debugging": "odoo-runtime-debugging",
+    "runtime-error": "odoo-runtime-debugging",
+    "tests": "odoo-test-development",
+    "testing": "odoo-test-development",
+    "regression-test": "odoo-test-development",
+    "review": "odoo-code-review",
+    "code-review": "odoo-code-review",
+    "migration": "odoo-upgrade-migration",
+    "version-upgrade": "odoo-upgrade-migration",
+    "ai": "odoo-ai-mcp-development",
+    "mcp": "odoo-ai-mcp-development",
+    "rag": "odoo-ai-mcp-development",
 }
 
 _ROUTING_TERMS = {
@@ -101,8 +136,46 @@ _ROUTING_TERMS = {
         "partner statement", "account report filter", "account_reports",
         "accountreportfilters", "updateoption", "report options",
     ),
+    "odoo-runtime-debugging": (
+        "traceback", "runtime error", "server error", "javascript error",
+        "console error", "cron failed", "queue failed", "webhook failed",
+        "same issue persists", "still not fixed", "repeated failure",
+    ),
+    "odoo-test-development": (
+        "regression test", "savepointcase", "transactioncase", "httptest",
+        "httpcase", "mocked test", "test case", "test coverage",
+    ),
+    "odoo-code-review": (
+        "code review", "review this diff", "review this module", "audit this module",
+        "security review", "production readiness", "pull request review",
+    ),
+    "odoo-upgrade-migration": (
+        "version migration", "migrate from", "migrate to", "upgrade compatibility",
+        "deprecated api", "migration script", "pre-migrate", "post-migrate",
+    ),
+    "odoo-ai-mcp-development": (
+        "mcp tool", "mcp server", "model context protocol", "rag pipeline",
+        "llm provider", "openai integration", "ai assistant", "embedding",
+    ),
     "odoo-qweb-reports-development": ("qweb", "pdf report", "print report", "report template", "paperformat", "wkhtmltopdf", "ir.actions.report"),
     "odoo-sql-query-development": ("sql", "query", "search_read", "read_group", "domain", "group by", "aggregate", "record count", "analytics"),
+    "odoo-frontend-owl-development": (
+        "owl component", "client action", "field widget", "use service",
+        "useservice", "registry category", "javascript patch", "web.assets_backend",
+    ),
+    "odoo-integration-development": (
+        "external api", "api integration", "webhook", "provider client",
+        "rate limit", "external id", "sync queue", "third party",
+    ),
+    "odoo-security-development": (
+        "access control", "access rights", "ir.model.access", "record rule",
+        "ir.rule", "cross company", "portal token", "permission denied",
+    ),
+    "odoo-backend-development": (
+        "computed field", "onchange", "python constraint", "model constraint",
+        "override create", "override write", "model inheritance", "_inherit",
+        "message_post", "mail.thread", "batch method",
+    ),
     "odoo-pos-development": ("point of sale", "pos ", "pos_", "receipt", "payment screen", "restaurant pos"),
     "odoo-website-development": ("website", "web page", "landing page", "snippet", "ecommerce", "portal page", "seo"),
     "odoo-manufacturing-development": ("manufacturing", "mrp", "bill of materials", "bom", "work order"),
@@ -119,11 +192,30 @@ _ROUTING_TERMS = {
 }
 
 
+def _validate_registry() -> None:
+    filenames = [filename for filename, _description in _SKILLS.values()]
+    if len(filenames) != len(set(filenames)):
+        raise RuntimeError("Each authoritative Odoo skill must own one unique source file.")
+    unknown_aliases = sorted(set(_ALIASES.values()) - set(_SKILLS))
+    unknown_routes = sorted(set(_ROUTING_TERMS) - set(_SKILLS))
+    if unknown_aliases or unknown_routes:
+        raise RuntimeError(
+            f"Invalid skill registry references: aliases={unknown_aliases}, routes={unknown_routes}"
+        )
+
+
+_validate_registry()
+
+
 def _skills_root() -> Path:
     return Path(__file__).resolve().parents[2] / "skills"
 
 
 class SkillService:
+    @staticmethod
+    def names() -> list[str]:
+        return list(_SKILLS)
+
     def list(self, task_description: str | None = None) -> dict:
         result = {
             "skills": [
@@ -132,6 +224,7 @@ class SkillService:
             ],
             "count": len(_SKILLS),
             "loading": "on_demand",
+            "selection_policy": "single_primary_owner",
         }
         if str(task_description or "").strip():
             result["recommendation"] = self.recommend(task_description or "")
@@ -149,7 +242,12 @@ class SkillService:
         if not ranked:
             return None
         score, _, name, matched = max(ranked)
-        return {"name": name, "matched_terms": matched[:5], "confidence": "high" if score >= 3 else "medium"}
+        return {
+            "name": name,
+            "matched_terms": matched[:5],
+            "confidence": "high" if score >= 3 else "medium",
+            "selection_policy": "single_primary_owner",
+        }
 
     def read(self, name: str) -> dict:
         requested = str(name or "").strip().lower()

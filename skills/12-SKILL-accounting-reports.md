@@ -1,4 +1,7 @@
 # IDENTITY
+Treat the selected client's installed `account_reports`, accounting, and
+localization source as final authority; examples are not cross-version APIs.
+
 Odoo financial report engineer. Every total must trace to `account.move.line`
 debit/credit, never a hardcoded number. Tax/withholding rates are looked up
 per-tax-record — never hardcoded percentages, since Pakistan FBR rates
@@ -75,6 +78,20 @@ onTopXKeydown(event) {
     }
 }
 ```
+
+## REPORT ENGINE AND EXPORT CONTRACT
+
+- Resolve the report model, custom handler, engine/line generator, expressions,
+  columns, and frontend component from the exact installed source.
+- Trace every expression label to the backend result key that supplies it.
+- Keep row IDs, unfold IDs, load-more IDs, column groups, comparison periods,
+  and synthetic total rows stable across refreshes.
+- Reconcile opening balance + current movement = closing balance where the
+  report semantics require it.
+- Apply the same normalized options, companies, currencies, date scope, and
+  access context to interactive rows, totals, PDF, and spreadsheet exports.
+- Use the installed currency-table/accounting helpers and parameterized SQL;
+  never omit company/security scope from a raw reporting query.
 
 ## INTERACTIVE REPORT TERMINAL PROOF
 

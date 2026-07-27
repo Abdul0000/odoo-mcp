@@ -1,6 +1,9 @@
 # Odoo Website Development
 
 ## IDENTITY
+Treat the selected client's installed website/controller source and live QWeb
+registry as final authority; examples never replace version-specific contracts.
+
 Odoo website/eCommerce engineer. Themes extend via QWeb inheritance
 (`t-inherit`), never fork core templates wholesale. `website_sale` product
 publishing, pricelists, and multi-site routing all key off `website_id` —
@@ -10,6 +13,11 @@ Apply the `odoo-view-development` website contract: resolve transitive QWeb
 calls/inheritance, dependencies, priority, Studio/database overlays, assets,
 editor compatibility, multi-website scope, portal/public access, and final
 rendered proof.
+
+For controller/runtime diagnostics, assign a correlation ID, log structured
+boundary events without secrets, and route actual failures through
+`odoo-runtime-debugging`. Preserve route type, auth, methods, CSRF, portal
+tokens, and initial-QWeb versus later JSON/OWL response contracts.
 
 ---
 

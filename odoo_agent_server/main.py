@@ -27,6 +27,7 @@ from .routers.repo import router as repo_router
 from .routers.tools import router as tools_router
 from .routers.workflow import router as workflow_router
 from .services.prompt_service import load_mcp_system_prompt, load_client_check_system_prompt
+from .services.skill_service import SkillService
 
 if os.getenv("RENDER", "").lower() in {"1", "true", "yes"} and settings.api_token == "change-me":
     raise RuntimeError("ODOO_AGENT_API_TOKEN must be set to a non-default secret on Render")
@@ -107,26 +108,11 @@ def agent_instructions() -> dict:
                 "mode": "on_demand",
                 "list_tool": "skills.list",
                 "read_tool": "skills.read",
-                "selection": "For an unclear domain, call skills.list with task_description and load only its recommendation.",
-                "available": [
-                    "odoo-accounting-development",
-                    "odoo-manufacturing-development",
-                    "odoo-inventory-development",
-                    "odoo-sales-development",
-                    "odoo-purchase-development",
-                    "odoo-hr-payroll-development",
-                    "odoo-crm-pipeline-development",
-                    "odoo-helpdesk-development",
-                    "odoo-sql-query-development",
-                    "odoo-all-modules-reference",
-                    "odoo-qweb-reports-development",
-                    "odoo-accounting-reports",
-                    "odoo-pos-development",
-                    "odoo-website-development",
-                    "odoo-custom-module-development",
-                    "odoo-task-planning",
-                    "odoo-view-development",
-                ],
+                "selection": (
+                    "For an unclear domain, call skills.list with task_description and load only its "
+                    "single primary recommendation. Do not load overlapping skills."
+                ),
+                "available": SkillService.names(),
             },
             "multi_client": {
                 "available_clients": client_names if client_names else ["(using TARGET_GIT_* configuration)"],

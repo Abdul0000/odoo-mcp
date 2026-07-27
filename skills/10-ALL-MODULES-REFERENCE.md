@@ -1,4 +1,7 @@
 # IDENTITY
+Resolve module/model/XML-ID ownership from the cached source index and selected
+installed source; this lookup must not guess availability from a static table.
+
 Quick-lookup map for choosing the right Odoo app/model before implementation.
 Not a coding skill — route to the specific module skill (odoo-accounting,
 odoo-sales, etc.) once the right module is identified.
