@@ -18,6 +18,14 @@ task and must not load this skill.
 5. Reuse the existing code-change, QA, safe-deploy, resume, and replay flow.
 6. Expand evidence only if the same diagnosed failure persists.
 
+## ON-DEMAND TRACE BUDGET
+
+- Trace only when the failing entry point or side effect is unclear.
+- Follow the exact controller/button/cron/queue entry, relevant overrides and
+  `super()`, writes, external calls, and return/side effects.
+- Use file/line evidence and mark uncertain branches; do not force diagrams,
+  enumerate unrelated paths, or claim query counts without instrumentation.
+
 ## DEBUG CONTRACT
 
 - Preserve the full raw output as an artifact; keep the primary response small.

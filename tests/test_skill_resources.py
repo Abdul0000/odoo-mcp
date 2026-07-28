@@ -241,3 +241,21 @@ def test_new_skills_preserve_existing_composite_workflow_ownership():
     assert "existing code-change, QA, safe-deploy, resume, and replay flow" in debug
     assert "never create a parallel deployment pipeline" in ai_mcp
     assert "normally 3–8 relevant files" in planning
+
+
+def test_vetted_expert_deltas_stay_compact_and_in_existing_owners():
+    service = SkillService()
+    backend = service.read("backend")["content"]
+    integration = service.read("integration")["content"]
+    query = service.read("sql")["content"]
+    debug = service.read("debug")["content"]
+
+    assert "@api.readonly" in backend
+    assert "models.Constraint" in backend
+    assert "_commit_progress()" in integration
+    assert "small deterministic" in integration
+    assert "search_fetch()" in query
+    assert "version label alone" in query
+    assert "ON-DEMAND TRACE BUDGET" in debug
+    assert "do not force diagrams" in debug
+    assert service.list()["count"] == len(EXPECTED)

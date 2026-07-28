@@ -16,6 +16,13 @@ scaffolding, frontend/OWL, or external-provider transport.
 ## BACKEND CONTRACT
 
 - Treat installed Odoo source as final authority; examples are illustrative.
+- Inspect version-specific APIs only when the changed code needs them. Where
+  installed source supports them, use `@api.readonly` for RPC-safe read-only
+  methods, `@api.private` to block RPC exposure, and the native
+  `check_access`/`has_access`/`_filtered_access` helpers.
+- On Odoo 19, prefer native `models.Constraint`/`Index` declarations when
+  confirmed in source. Keep `_name` explicit even if class-name inference is
+  supported, because implicit names are warned and make inheritance less clear.
 - Use modern recordset APIs only. Never introduce deprecated `@api.multi`.
 - Use `@api.model_create_multi` when overriding `create()` for batch input;
   do not apply it indiscriminately to unrelated methods.

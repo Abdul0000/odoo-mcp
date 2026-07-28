@@ -17,6 +17,11 @@ integration audit state. Odoo controllers/portal pages remain with
 ## INTEGRATION CONTRACT
 
 - Keep credentials server-side and mask secrets in logs/artifacts.
+- For a long Odoo 19 cron only when installed source exposes the APIs, process
+  bounded batches, report progress with `ir.cron._commit_progress()`, honor its
+  remaining-time result, and use `try_lock_for_update()` when concurrent workers
+  can claim the same record. Do not add this machinery to a small deterministic
+  cron.
 - Validate webhook signatures, timestamps, replay windows, and payload schema.
 - Use stable external/event/request IDs for idempotency.
 - Apply timeouts, bounded retries with backoff, pagination, and rate-limit

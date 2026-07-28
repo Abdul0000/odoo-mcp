@@ -13,6 +13,10 @@ access manually.
 ## QUERY SELECTION GATE
 
 - Use ORM for ordinary reads/writes and security-sensitive user-facing data.
+- When installed source supports them and the task benefits, use
+  `search_fetch()`/`fetch()` to warm an exact field set with fewer queries and
+  `execute_query()` with the native SQL wrapper for safe composed SQL. Never
+  require these APIs from a version label alone.
 - Use `read_group`/batched ORM before raw SQL for standard aggregation.
 - Use parameterized raw SQL only for proven bulk/aggregate/reporting needs.
 - For diagnostics, default to read-only queries with explicit limit, company
