@@ -308,9 +308,34 @@ class OdooModuleValidator:
         return findings
 
     @staticmethod
+    def tests_explicitly_requested(task_description: str) -> bool:
+        """Distinguish requested test files from a test-pass verification gate."""
+        lowered = str(task_description or "").lower()
+        without_pass_gates = re.sub(
+            r"\b(?:existing\s+)?(?:mocked\s+|unit\s+|regression\s+|focused\s+)?"
+            r"tests?\s+(?:that\s+)?(?:(?:must|should|need(?:s)?\s+to)\s+)?pass(?:ing|ed)?\b",
+            "",
+            lowered,
+        )
+        return bool(
+            re.search(
+                r"\b(?:add|create|write|implement|include|provide|require)\b"
+                r"(?:(?![.!?]).){0,160}\b"
+                r"(?:mocked\s+|unit\s+|regression\s+|focused\s+)?tests?\b|"
+                r"\btests?\s+(?:covering|to\s+cover|for\s+coverage)\b|"
+                r"\b(?:mocked\s+|unit\s+|regression\s+|focused\s+)?tests?\s+"
+                r"(?:are\s+)?required\b|"
+                r"\btest\s+coverage\b",
+                without_pass_gates,
+                flags=re.DOTALL,
+            )
+        )
+
+    @staticmethod
     def requested_contract(task_description: str, create_module: bool = False) -> dict:
         text = str(task_description or "")
         lowered = text.lower()
+        tests_explicitly_requested = OdooModuleValidator.tests_explicitly_requested(text)
         full_module = bool(
             create_module and re.search(r"\b(?:complete|full|comprehensive|fully functional|installable)\b|\ball necessary files\b|\bdeliverables\b|\bmvp\b", lowered)
         ) or bool(re.search(r"\b(?:complete|full|comprehensive)\s+(?:odoo\s+)?(?:module|addon)\b|\bmvp\b", lowered))
@@ -320,7 +345,6 @@ class OdooModuleValidator:
             ("controllers", ("controller", "endpoint", "route")),
             ("iot_handlers", ("iot_handlers",)),
             ("wizard", ("wizard",)),
-            ("tests", ("unit test", "tests covering", "test coverage", "mocked test", "mock test", "regression test")),
         )
         for package, terms in package_rules:
             if any(term in lowered for term in terms):
@@ -363,14 +387,9 @@ class OdooModuleValidator:
                 ("controllers", ("controller", "endpoint", "route")),
                 ("handlers", ("iot_handlers", "interface", "driver")),
                 ("wizard", ("wizard",)),
-                ("tests", ("unit test", "tests covering", "test coverage", "mocked test", "mock test", "regression test")),
             ) if any(term in lowered for term in terms)
         ]
-        if re.search(
-            r"\btests?\b.{0,40}\b(?:pass|cover|mock|implement|add|create|write|required)\b|"
-            r"\b(?:pass|cover|mock|implement|add|create|write|required)\b.{0,40}\btests?\b",
-            lowered,
-        ):
+        if tests_explicitly_requested:
             if "tests" not in packages:
                 packages.append("tests")
             if "tests" not in layers:
@@ -415,6 +434,7 @@ class OdooModuleValidator:
             "required_methods": methods,
             "required_symbols": required_symbols,
             "required_test_symbols": required_test_symbols,
+            "tests_explicitly_requested": tests_explicitly_requested,
         }
 
     @staticmethod
@@ -430,13 +450,17 @@ class OdooModuleValidator:
             "required_methods": [],
             "required_symbols": [],
             "required_test_symbols": [],
+            "tests_explicitly_requested": False,
         }
         for contract in contracts:
             if not isinstance(contract, dict):
                 continue
             merged["full_module_requested"] = bool(merged["full_module_requested"] or contract.get("full_module_requested"))
+            merged["tests_explicitly_requested"] = bool(
+                merged["tests_explicitly_requested"] or contract.get("tests_explicitly_requested")
+            )
             for key in merged:
-                if key == "full_module_requested":
+                if key in {"full_module_requested", "tests_explicitly_requested"}:
                     continue
                 for value in contract.get(key) or []:
                     item = str(value).strip()

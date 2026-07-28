@@ -121,3 +121,75 @@ def test_pending_contract_does_not_contaminate_unrelated_surgical_task(tmp_path)
     assert surgical["required_layers"] == ["models"]
     assert surgical["required_view_types"] == []
     assert record["requirement_sources"] == ["Swap Hours and Units labels and calculate Value from units."]
+
+
+def test_legacy_pass_gate_drops_stale_tests_package_on_continuation(tmp_path):
+    store = MemoryStore()
+    store.state = {
+        "module_contracts": {
+            "rethink": {
+                "project_path": str(tmp_path.resolve()),
+                "module_name": "rethink",
+                "contract": {
+                    "required_packages": ["tests"],
+                    "required_layers": ["tests"],
+                    "required_test_symbols": ["GetAppointmentsByIdAsync"],
+                },
+                "requirement_sources": [
+                    "Implement GetAppointmentsByIdAsync; existing mocked tests must pass."
+                ],
+                "task_description": "Implement GetAppointmentsByIdAsync; existing mocked tests must pass.",
+                "status": "pending",
+            }
+        }
+    }
+
+    merged, _record = _persist_module_contract(
+        store,
+        client_name="odoo 18",
+        project_path=str(tmp_path),
+        module_name="rethink",
+        current_contract={},
+        task_description="deploy",
+    )
+
+    assert "tests" not in merged["required_packages"]
+    assert "tests" not in merged["required_layers"]
+    assert merged["required_test_symbols"] == []
+    assert merged["tests_explicitly_requested"] is False
+
+
+def test_legacy_explicit_test_request_remains_blocking_on_continuation(tmp_path):
+    store = MemoryStore()
+    store.state = {
+        "module_contracts": {
+            "rethink": {
+                "project_path": str(tmp_path.resolve()),
+                "module_name": "rethink",
+                "contract": {
+                    "required_packages": ["tests"],
+                    "required_layers": ["tests"],
+                    "required_test_symbols": ["GetAppointmentsByIdAsync"],
+                },
+                "requirement_sources": [
+                    "Add mocked tests covering GetAppointmentsByIdAsync."
+                ],
+                "task_description": "Add mocked tests covering GetAppointmentsByIdAsync.",
+                "status": "pending",
+            }
+        }
+    }
+
+    merged, _record = _persist_module_contract(
+        store,
+        client_name="odoo 18",
+        project_path=str(tmp_path),
+        module_name="rethink",
+        current_contract={},
+        task_description="continue",
+    )
+
+    assert "tests" in merged["required_packages"]
+    assert "tests" in merged["required_layers"]
+    assert merged["required_test_symbols"] == ["GetAppointmentsByIdAsync"]
+    assert merged["tests_explicitly_requested"] is True

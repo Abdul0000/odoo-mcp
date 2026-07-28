@@ -326,7 +326,7 @@ def test_detailed_iot_prompt_builds_enforceable_module_contract():
     assert set(contract["required_routes"]) == {"/iot/v1/heartbeat", "/iot/v1/data/<token>"}
 
 
-def test_session_note_prompt_captures_api_identifiers_and_mocked_tests():
+def test_session_note_pass_gate_does_not_require_a_new_tests_package():
     prompt = """
     Complete the Session Note flow:
     Appointment ID → GetAppointmentsByIdAsync → sessionNoteResponseId
@@ -343,9 +343,10 @@ def test_session_note_prompt_captures_api_identifiers_and_mocked_tests():
         "isDraft",
         "GetFormResponsesAsync",
     } <= set(contract["required_symbols"])
-    assert "tests" in contract["required_layers"]
-    assert "tests" in contract["required_packages"]
-    assert set(contract["required_test_symbols"]) == set(contract["required_symbols"])
+    assert "tests" not in contract["required_layers"]
+    assert "tests" not in contract["required_packages"]
+    assert contract["required_test_symbols"] == []
+    assert contract["tests_explicitly_requested"] is False
 
 
 def test_session_note_contract_blocks_structural_only_implementation(tmp_path):
@@ -364,7 +365,7 @@ def test_session_note_contract_blocks_structural_only_implementation(tmp_path):
     )
     prompt = (
         "Implement GetAppointmentsByIdAsync, sessionNoteResponseId, clientId, isDraft, "
-        "GetFormResponsesAsync, and mocked tests that pass."
+        "GetFormResponsesAsync, and add mocked tests covering those identifiers."
     )
 
     findings = OdooModuleValidator().validate(module, task_description=prompt)
@@ -410,7 +411,7 @@ def test_session_note_contract_accepts_named_flow_and_focused_tests(tmp_path):
     )
     prompt = (
         "Implement GetAppointmentsByIdAsync, sessionNoteResponseId, clientId, isDraft, "
-        "GetFormResponsesAsync, and mocked tests that pass."
+        "GetFormResponsesAsync, and add mocked tests covering those identifiers."
     )
 
     findings = OdooModuleValidator().validate(module, task_description=prompt)

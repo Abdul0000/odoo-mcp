@@ -2289,6 +2289,28 @@ def _persist_module_contract(
     )
     continue_previous = bool(same_project and previous and explicit_continuation)
     previous_contract = previous.get("contract") if continue_previous else None
+    if isinstance(previous_contract, dict) and "tests_explicitly_requested" not in previous_contract:
+        legacy_sources = [
+            *list(previous.get("requirement_sources") or []),
+            previous_task,
+        ]
+        legacy_tests_explicit = any(
+            OdooModuleValidator.tests_explicitly_requested(source)
+            for source in legacy_sources
+            if str(source or "").strip()
+        )
+        previous_contract = dict(previous_contract)
+        previous_contract["tests_explicitly_requested"] = legacy_tests_explicit
+        if not legacy_tests_explicit:
+            previous_contract["required_packages"] = [
+                item for item in previous_contract.get("required_packages") or []
+                if item != "tests"
+            ]
+            previous_contract["required_layers"] = [
+                item for item in previous_contract.get("required_layers") or []
+                if item != "tests"
+            ]
+            previous_contract["required_test_symbols"] = []
     merged = OdooModuleValidator.merge_contracts(previous_contract, current_contract)
     unchanged = continue_previous and previous_contract == merged
     requirement_sources = list(previous.get("requirement_sources") or []) if continue_previous else []
