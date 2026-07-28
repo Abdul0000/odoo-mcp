@@ -1,0 +1,577 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import datetime, timezone
+from typing import Any
+
+from fastapi import HTTPException, status
+
+from ..config import settings
+from ..schemas import (
+    OdooFlowTestRequest,
+    OdooMutationAuditRequest,
+    OdooRecordActionRequest,
+    OdooRecordCreateRequest,
+    OdooRecordWriteRequest,
+    OdooResult,
+)
+from .approval_service import ApprovalService
+from .client_resolver_service import ClientResolverService, ResolvedClient
+from .odoo_jsonrpc_service import OdooJsonRpcService
+from .store_service import JsonStore
+
+
+_FORBIDDEN_WRITE_FIELDS = {
+    "id", "state", "create_uid", "create_date", "write_uid", "write_date", "__last_update",
+}
+_SAFE_CONTEXT_KEYS = {
+    "lang", "tz", "company_id", "allowed_company_ids", "active_id", "active_ids",
+    "active_model", "tracking_disable", "mail_notrack", "mail_create_nosubscribe",
+    "mail_auto_subscribe_no_notify",
+}
+_ACTION_POLICY: dict[str, dict[str, bool]] = {
+    "sale.order": {"action_confirm": False, "action_cancel": True},
+    "purchase.order": {"button_confirm": False, "button_cancel": True},
+    "stock.picking": {"action_confirm": False, "action_assign": False, "button_validate": True},
+    "mrp.production": {"action_confirm": False, "action_assign": False, "button_mark_done": True},
+    "account.move": {"action_post": True, "button_cancel": True},
+}
+_ACTION_EXPECTED_STATES: dict[tuple[str, str], set[str]] = {
+    ("sale.order", "action_confirm"): {"sale", "done"},
+    ("sale.order", "action_cancel"): {"cancel"},
+    ("purchase.order", "button_confirm"): {"purchase", "done"},
+    ("purchase.order", "button_cancel"): {"cancel"},
+    ("stock.picking", "action_confirm"): {"confirmed", "waiting", "assigned"},
+    ("stock.picking", "action_assign"): {"assigned"},
+    ("stock.picking", "button_validate"): {"done"},
+    ("mrp.production", "action_confirm"): {"confirmed", "progress", "to_close"},
+    ("mrp.production", "action_assign"): {"confirmed", "progress", "to_close"},
+    ("mrp.production", "button_mark_done"): {"done"},
+    ("account.move", "action_post"): {"posted"},
+    ("account.move", "button_cancel"): {"cancel"},
+}
+_FLOW_RECIPES = {
+    "sale_order": {
+        "model": "sale.order",
+        "marker": "client_order_ref",
+        "actions": {"confirm": "action_confirm", "cancel": "action_cancel"},
+        "verify": ["id", "name", "state", "partner_id", "amount_total"],
+    },
+    "purchase_order": {
+        "model": "purchase.order",
+        "marker": "partner_ref",
+        "actions": {"confirm": "button_confirm", "cancel": "button_cancel"},
+        "verify": ["id", "name", "state", "partner_id", "amount_total"],
+    },
+    "inventory_transfer": {
+        "model": "stock.picking",
+        "marker": "origin",
+        "actions": {"confirm": "action_confirm", "reserve": "action_assign", "validate": "button_validate"},
+        "verify": ["id", "name", "state", "picking_type_id", "origin"],
+    },
+    "manufacturing_order": {
+        "model": "mrp.production",
+        "marker": "origin",
+        "actions": {"confirm": "action_confirm", "reserve": "action_assign", "complete": "button_mark_done"},
+        "verify": ["id", "name", "state", "product_id", "product_qty"],
+    },
+    "customer_invoice": {
+        "model": "account.move",
+        "marker": "ref",
+        "defaults": {"move_type": "out_invoice"},
+        "actions": {"post": "action_post", "cancel": "button_cancel"},
+        "verify": ["id", "name", "state", "move_type", "partner_id", "amount_total", "payment_state"],
+    },
+    "vendor_bill": {
+        "model": "account.move",
+        "marker": "ref",
+        "defaults": {"move_type": "in_invoice"},
+        "actions": {"post": "action_post", "cancel": "button_cancel"},
+        "verify": ["id", "name", "state", "move_type", "partner_id", "amount_total", "payment_state"],
+    },
+}
+
+
+class FunctionalOperationService:
+    """Execute permission-aware live Odoo mutations outside the code pipeline."""
+
+    def __init__(self) -> None:
+        self.store = JsonStore()
+        self.approvals = ApprovalService()
+
+    def create(self, request: OdooRecordCreateRequest) -> dict[str, Any]:
+        client, rpc = self._runtime(request.client_name)
+        payload = request.model_dump(mode="json", exclude={"approval_id"})
+        replay = self._replay(request.request_id, self._client_key(client), "record_create", payload)
+        if replay:
+            return replay
+        self._ensure_model(request.model)
+        self._ensure_batch(len(request.records))
+        fields = self._metadata(rpc, request.model)
+        self._ensure_access(rpc, request.model, "create")
+        for values in request.records:
+            self._validate_values(fields, values, creating=True)
+        context = self._safe_context(request.context)
+        result = rpc.create_records(request.model, request.records, context)
+        ids = self._created_ids(result)
+        if not ids:
+            return self._failed(request, client, "record_create", payload, result.error or "Odoo create returned no record IDs.")
+        verify_fields = self._verify_fields(fields, request.verify_fields, request.records)
+        verified_records = self._read_ok(rpc, request.model, ids, verify_fields, context)
+        response = {
+            "status": "ok",
+            "operation": "record_create",
+            "request_id": request.request_id,
+            "client_name": self._client_key(client),
+            "model": request.model,
+            "record_ids": ids,
+            "records": verified_records,
+            "verified": len(verified_records) == len(ids),
+            "success_allowed": len(verified_records) == len(ids),
+        }
+        return self._save(request, client, "record_create", payload, response)
+
+    def write(self, request: OdooRecordWriteRequest) -> dict[str, Any]:
+        client, rpc = self._runtime(request.client_name)
+        payload = request.model_dump(mode="json", exclude={"approval_id"})
+        replay = self._replay(request.request_id, self._client_key(client), "record_write", payload)
+        if replay:
+            return replay
+        self._ensure_model(request.model)
+        self._ensure_batch(len(request.ids))
+        fields = self._metadata(rpc, request.model)
+        self._ensure_access(rpc, request.model, "write")
+        self._validate_values(fields, request.values, creating=False)
+        context = self._safe_context(request.context)
+        tracked = sorted(set(request.values) | set(request.expected_values) | set(request.verify_fields) | {"id", "display_name"})
+        tracked = self._verify_fields(fields, tracked, [request.values])
+        before = self._read_ok(rpc, request.model, request.ids, tracked, context)
+        if len(before) != len(request.ids):
+            raise HTTPException(status_code=404, detail="One or more records are missing or blocked by record rules.")
+        mismatches = [
+            {"id": row.get("id"), "field": key, "expected": expected, "actual": row.get(key)}
+            for row in before
+            for key, expected in request.expected_values.items()
+            if row.get(key) != expected
+        ]
+        if mismatches:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"message": "Record changed since inspection; write was not executed.", "mismatches": mismatches[:20]},
+            )
+        result = rpc.write_records(request.model, request.ids, request.values, context)
+        if result.status != "ok" or result.result is not True:
+            return self._failed(request, client, "record_write", payload, result.error or "Odoo write failed.")
+        after = self._read_ok(rpc, request.model, request.ids, tracked, context)
+        verified = len(after) == len(request.ids) and all(
+            self._value_matches(row.get(key), value)
+            for row in after
+            for key, value in request.values.items()
+            if not isinstance(value, (dict, list))
+        )
+        unverifiable_fields = sorted(
+            key for key, value in request.values.items() if isinstance(value, (dict, list))
+        )
+        response = {
+            "status": "ok",
+            "operation": "record_write",
+            "request_id": request.request_id,
+            "client_name": self._client_key(client),
+            "model": request.model,
+            "record_ids": request.ids,
+            "before": self._redact(before),
+            "records": self._redact(after),
+            "verified": verified,
+            "unverifiable_fields": unverifiable_fields,
+        }
+        response["success_allowed"] = verified and not unverifiable_fields
+        return self._save(request, client, "record_write", payload, response)
+
+    def action(self, request: OdooRecordActionRequest) -> dict[str, Any]:
+        client, rpc = self._runtime(request.client_name)
+        payload = request.model_dump(mode="json", exclude={"approval_id"})
+        replay = self._replay(request.request_id, self._client_key(client), "record_action", payload)
+        if replay:
+            return replay
+        self._ensure_model(request.model)
+        self._ensure_batch(len(request.ids))
+        sensitive = self._action_sensitive(request.model, request.action)
+        fields = self._metadata(rpc, request.model)
+        self._ensure_access(rpc, request.model, "write")
+        context = self._safe_context(request.context)
+        verify_fields = self._verify_fields(
+            fields,
+            request.verify_fields or ["id", "display_name", "name", "state"],
+            [],
+        )
+        before = self._read_ok(rpc, request.model, request.ids, verify_fields, context)
+        if len(before) != len(request.ids):
+            raise HTTPException(status_code=404, detail="One or more action records are missing or blocked by record rules.")
+        approval_payload = self._redact(payload)
+        self.approvals.ensure_allowed(
+            f"odoo.record_action.{request.model}.{request.action}",
+            request.approval_id,
+            approval_payload,
+            force=sensitive,
+            bind_payload=sensitive,
+        )
+        result = rpc.run_action(
+            request.model,
+            request.ids,
+            request.action,
+            request.arguments,
+            request.keyword_arguments,
+            context,
+        )
+        if result.status != "ok":
+            self.approvals.mark_failed(request.approval_id, result.error)
+            return self._failed(request, client, "record_action", payload, result.error or "Odoo action failed.")
+        after = self._read_ok(rpc, request.model, request.ids, verify_fields, context)
+        self.approvals.mark_consumed(request.approval_id)
+        expected_states = _ACTION_EXPECTED_STATES[(request.model, request.action)]
+        states = [str(row.get("state") or "") for row in after]
+        verified = len(after) == len(request.ids) and all(state in expected_states for state in states)
+        response = {
+            "status": "ok",
+            "operation": "record_action",
+            "request_id": request.request_id,
+            "client_name": self._client_key(client),
+            "model": request.model,
+            "action": request.action,
+            "record_ids": request.ids,
+            "before": self._redact(before),
+            "records": self._redact(after),
+            "action_result": self._redact(result.result),
+            "expected_states": sorted(expected_states),
+            "verified": verified,
+            "success_allowed": verified,
+        }
+        return self._save(request, client, "record_action", payload, response)
+
+    def flow_test(self, request: OdooFlowTestRequest) -> dict[str, Any]:
+        client, rpc = self._runtime(request.client_name)
+        recipe = _FLOW_RECIPES[request.flow]
+        model = str(recipe["model"])
+        fields = self._metadata(rpc, model)
+        self._ensure_model(model)
+        self._ensure_access(rpc, model, "create")
+        stages = request.stages or []
+        unknown = [stage for stage in stages if stage not in recipe["actions"]]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported stages for {request.flow}: {unknown}. Allowed: {sorted(recipe['actions'])}",
+            )
+        values = {**recipe.get("defaults", {}), **request.values}
+        marker = str(recipe.get("marker") or "")
+        if request.mode == "persistent_test" and marker in fields and marker not in values:
+            values[marker] = f"MCP-TEST-{request.request_id}"
+        self._validate_values(fields, values, creating=True)
+        plan = {
+            "flow": request.flow,
+            "model": model,
+            "mode": request.mode,
+            "stages": stages,
+            "actions": [recipe["actions"][stage] for stage in stages],
+            "sensitive_stages": [
+                stage for stage in stages if self._action_sensitive(model, recipe["actions"][stage])
+            ],
+            "notifications_suppressed": True,
+        }
+        if request.mode == "preview":
+            return {
+                "status": "preview",
+                "request_id": request.request_id,
+                "client_name": self._client_key(client),
+                "plan": plan,
+                "write_executed": False,
+                "success_allowed": False,
+                "next_action": "Review the plan, then retry with persistent_test or live mode.",
+            }
+        create_request = OdooRecordCreateRequest(
+            client_name=request.client_name,
+            request_id=f"{request.request_id}:create",
+            context=request.context,
+            model=model,
+            records=[values],
+            verify_fields=request.verify_fields or recipe["verify"],
+        )
+        created = self.create(create_request)
+        if created.get("status") != "ok" or not created.get("record_ids"):
+            return {
+                "status": "failed",
+                "request_id": request.request_id,
+                "plan": plan,
+                "created": created,
+                "success_allowed": False,
+            }
+        record_ids = list(created["record_ids"])
+        stage_results: list[dict[str, Any]] = []
+        for index, stage in enumerate(stages):
+            action = str(recipe["actions"][stage])
+            action_request = OdooRecordActionRequest(
+                client_name=request.client_name,
+                request_id=f"{request.request_id}:stage:{index}:{stage}",
+                context=request.context,
+                approval_id=request.approval_id,
+                model=model,
+                ids=record_ids,
+                action=action,
+                verify_fields=request.verify_fields or recipe["verify"],
+            )
+            result = self.action(action_request)
+            stage_results.append({"stage": stage, **result})
+            if result.get("status") != "ok" or result.get("verified") is not True:
+                break
+        complete = len(stage_results) == len(stages) and all(item.get("status") == "ok" for item in stage_results)
+        response = {
+            "status": "ok" if complete else "failed",
+            "operation": "flow_test",
+            "request_id": request.request_id,
+            "client_name": self._client_key(client),
+            "plan": plan,
+            "record_ids": record_ids,
+            "created": created,
+            "stage_results": stage_results,
+            "verified": complete,
+            "success_allowed": complete,
+            "cleanup": "Only draft/cancelled test records may be removed manually; no automatic unlink is exposed.",
+        }
+        payload = request.model_dump(mode="json", exclude={"approval_id"})
+        return self._save(request, client, "flow_test", payload, response)
+
+    def audit(self, request: OdooMutationAuditRequest) -> dict[str, Any]:
+        client = ClientResolverService().resolve_client(request.client_name, require_complete=False)
+        client_name = self._client_key(client)
+        return {
+            "status": "ok",
+            "client_name": client_name,
+            "items": self.store.list_mutations(request.limit, request.request_id, client_name),
+        }
+
+    def _runtime(self, client_name: str | None) -> tuple[ResolvedClient | None, OdooJsonRpcService]:
+        if not settings.functional_operations_enabled:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "Functional record operations are disabled. Set "
+                    "ODOO_AGENT_FUNCTIONAL_OPERATIONS_ENABLED=true after test-database validation."
+                ),
+            )
+        client = ClientResolverService().resolve_client(client_name, require_complete=False)
+        rpc = OdooJsonRpcService(client)
+        if not rpc.configured():
+            raise HTTPException(
+                status_code=400,
+                detail="Authenticated Odoo URL, database, login, and password are required; SSH superuser fallback is prohibited.",
+            )
+        return client, rpc
+
+    def _ensure_model(self, model: str) -> None:
+        if model not in settings.functional_allowed_models:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Model {model!r} is not in ODOO_AGENT_FUNCTIONAL_ALLOWED_MODELS.",
+            )
+
+    def _ensure_batch(self, count: int) -> None:
+        if count > settings.functional_max_batch_records:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Batch has {count} records; configured maximum is {settings.functional_max_batch_records}.",
+            )
+
+    @staticmethod
+    def _safe_context(context: dict[str, Any] | None) -> dict[str, Any]:
+        supplied = context or {}
+        unknown = sorted(set(supplied) - _SAFE_CONTEXT_KEYS)
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Unsupported Odoo context keys: {unknown}")
+        return {
+            **supplied,
+            "tracking_disable": True,
+            "mail_notrack": True,
+            "mail_create_nosubscribe": True,
+            "mail_auto_subscribe_no_notify": True,
+        }
+
+    @staticmethod
+    def _metadata(rpc: OdooJsonRpcService, model: str) -> dict[str, dict[str, Any]]:
+        result = rpc.fields_get(model)
+        if result.status != "ok" or not isinstance(result.result, dict):
+            raise HTTPException(status_code=400, detail=result.error or f"Cannot inspect fields for {model}.")
+        return result.result
+
+    @staticmethod
+    def _ensure_access(rpc: OdooJsonRpcService, model: str, operation: str) -> None:
+        result = rpc.check_access_rights(model, operation)
+        if result.status != "ok" or result.result is not True:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=result.error or f"Configured Odoo user lacks {operation} access on {model}.",
+            )
+
+    @staticmethod
+    def _validate_values(fields: dict[str, dict[str, Any]], values: dict[str, Any], *, creating: bool) -> None:
+        unknown = sorted(set(values) - set(fields))
+        if unknown:
+            raise HTTPException(status_code=400, detail=f"Unknown or inaccessible fields: {unknown}")
+        forbidden = sorted(set(values) & _FORBIDDEN_WRITE_FIELDS)
+        if forbidden:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Direct writes to workflow/system fields are prohibited: {forbidden}",
+            )
+        readonly = sorted(
+            name for name in values if fields.get(name, {}).get("readonly") and not creating
+        )
+        if readonly:
+            raise HTTPException(status_code=400, detail=f"Readonly fields cannot be updated: {readonly}")
+
+    @staticmethod
+    def _verify_fields(
+        fields: dict[str, dict[str, Any]],
+        requested: list[str],
+        values: list[dict[str, Any]],
+    ) -> list[str]:
+        candidates = ["id", "display_name", *requested]
+        for row in values:
+            candidates.extend(row)
+        result: list[str] = []
+        for name in candidates:
+            if name in fields and name not in result:
+                result.append(name)
+        return result[:30]
+
+    @staticmethod
+    def _read_ok(
+        rpc: OdooJsonRpcService,
+        model: str,
+        ids: list[int],
+        fields: list[str],
+        context: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        result = rpc.read_records(model, ids, fields, context)
+        if result.status != "ok" or not isinstance(result.result, list):
+            raise HTTPException(status_code=400, detail=result.error or f"Read-back verification failed for {model}.")
+        return result.result
+
+    @staticmethod
+    def _created_ids(result: OdooResult) -> list[int]:
+        if result.status != "ok":
+            return []
+        raw = result.result
+        if isinstance(raw, int):
+            return [raw]
+        if isinstance(raw, list) and all(isinstance(item, int) for item in raw):
+            return raw
+        return []
+
+    @staticmethod
+    def _value_matches(actual: Any, expected: Any) -> bool:
+        if isinstance(expected, int) and isinstance(actual, (list, tuple)) and actual:
+            return actual[0] == expected
+        return actual == expected
+
+    @staticmethod
+    def _action_sensitive(model: str, action: str) -> bool:
+        allowed = _ACTION_POLICY.get(model, {})
+        if action not in allowed:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Action {model}.{action} is not allowlisted.",
+            )
+        return allowed[action]
+
+    @staticmethod
+    def _client_key(client: ResolvedClient | None) -> str:
+        return client.name if client else "default"
+
+    @staticmethod
+    def _payload_hash(payload: dict[str, Any]) -> str:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _replay(
+        self,
+        request_id: str,
+        client_name: str,
+        operation: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        existing = self.store.get_mutation(request_id, client_name)
+        if not existing:
+            return None
+        if existing.get("operation") != operation or existing.get("payload_hash") != self._payload_hash(payload):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="request_id was already used for a different mutation payload.",
+            )
+        response = dict(existing.get("response") or {})
+        response["idempotent_replay"] = True
+        return response
+
+    def _save(
+        self,
+        request: Any,
+        client: ResolvedClient | None,
+        operation: str,
+        payload: dict[str, Any],
+        response: dict[str, Any],
+    ) -> dict[str, Any]:
+        record = {
+            "request_id": request.request_id,
+            "client_name": self._client_key(client),
+            "operation": operation,
+            "payload_hash": self._payload_hash(payload),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "response": self._redact(response),
+        }
+        self.store.save_mutation(record)
+        self.store.log_audit(
+            f"odoo.{operation}",
+            str(response.get("status") or "unknown"),
+            f"{operation} {response.get('model') or response.get('plan', {}).get('model') or ''}".strip(),
+            {
+                "request_id": request.request_id,
+                "client_name": self._client_key(client),
+                "record_ids": response.get("record_ids") or [],
+                "verified": response.get("verified"),
+            },
+        )
+        return response
+
+    def _failed(
+        self,
+        request: Any,
+        client: ResolvedClient | None,
+        operation: str,
+        payload: dict[str, Any],
+        error: str,
+    ) -> dict[str, Any]:
+        response = {
+            "status": "failed",
+            "operation": operation,
+            "request_id": request.request_id,
+            "client_name": self._client_key(client),
+            "error": error,
+            "verified": False,
+            "success_allowed": False,
+        }
+        return self._save(request, client, operation, payload, response)
+
+    @classmethod
+    def _redact(cls, value: Any) -> Any:
+        if isinstance(value, list):
+            return [cls._redact(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        return {
+            key: (
+                "[REDACTED]"
+                if any(token in str(key).lower() for token in ("password", "secret", "token", "api_key"))
+                else cls._redact(item)
+            )
+            for key, item in value.items()
+        }

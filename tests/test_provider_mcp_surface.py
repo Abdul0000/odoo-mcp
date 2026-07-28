@@ -21,6 +21,11 @@ _PROVIDER_TOOLS = {
     "odoo_query",
     "odoo_search_read",
     "odoo_read_group",
+    "odoo_record_create",
+    "odoo_record_write",
+    "odoo_record_action",
+    "odoo_flow_test",
+    "odoo_mutation_audit",
     "artifacts_read",
     "workflow_resume_job",
     "jobs_list",
@@ -49,6 +54,19 @@ def test_provider_mcp_tools_list_exposes_core_read_tools_on_single_mcp_endpoint(
     assert _PROVIDER_TOOLS <= names
     assert len(names) == len(_PROVIDER_TOOLS)
     assert set(provider_tool_names_safe()) == names
+
+
+def test_functional_mutation_tools_advertise_side_effects_and_idempotency():
+    tools = {tool["name"]: tool for tool in _mcp_tools_list()}
+
+    for name in ("odoo_record_create", "odoo_record_write", "odoo_record_action", "odoo_flow_test"):
+        annotations = tools[name]["annotations"]
+        assert annotations["readOnlyHint"] is False
+        assert annotations["destructiveHint"] is True
+        assert annotations["idempotentHint"] is True
+        assert annotations["openWorldHint"] is True
+
+    assert tools["odoo_mutation_audit"]["annotations"]["readOnlyHint"] is True
 
 
 def test_provider_mcp_workflow_schema_contains_autopatch_fields():

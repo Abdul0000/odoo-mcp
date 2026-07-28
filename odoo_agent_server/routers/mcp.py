@@ -269,6 +269,11 @@ _PROVIDER_TOOL_NAMES = {
     "odoo.query",
     "odoo.search_read",
     "odoo.read_group",
+    "odoo.record_create",
+    "odoo.record_write",
+    "odoo.record_action",
+    "odoo.flow_test",
+    "odoo.mutation_audit",
     # Source discovery and verification are server-owned steps inside the
     # composite workflows. Keeping them off the provider surface avoids extra
     # planning loops and repeated input-schema payloads.
@@ -448,8 +453,9 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
             "inputSchema": _remote_compatible_schema(tool_input_schema(tool.name)),
             "annotations": {
                 "readOnlyHint": bool(tool.read_only),
-                "destructiveHint": bool(tool.requires_approval),
-                "openWorldHint": not bool(tool.read_only),
+                "destructiveHint": bool(tool.destructive or tool.requires_approval),
+                "idempotentHint": bool(tool.idempotent),
+                "openWorldHint": bool(tool.open_world),
             },
         }
         if output_schema:
@@ -466,7 +472,9 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
         "annotations": {
             "title": title,
             "readOnlyHint": bool(tool.read_only),
-            "destructiveHint": bool(tool.requires_approval),
+            "destructiveHint": bool(tool.destructive or tool.requires_approval),
+            "idempotentHint": bool(tool.idempotent),
+            "openWorldHint": bool(tool.open_world),
         },
     }
     if output_schema:

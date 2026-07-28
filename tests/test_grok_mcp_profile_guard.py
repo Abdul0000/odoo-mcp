@@ -104,3 +104,13 @@ def test_grok_operation_guard_blocks_tools_after_terminal_pass(tmp_path, monkeyp
     assert blocked is not None
     assert blocked["status"] == "final_guard"
     assert blocked["next_call"]["tool"] == "final_answer"
+
+
+def test_functional_operations_bypass_code_phase_guard(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path))
+    service = McpOperationGuardService()
+    arguments = {"client_name": "ClientA", "request_id": "sale-flow-001", "flow": "sale_order"}
+
+    assert service.before_tool_call("odoo.flow_test", arguments) is None
+    service.after_tool_call("odoo.flow_test", arguments, {"status": "preview"})
+    assert service.before_tool_call("odoo.flow_test", arguments) is None

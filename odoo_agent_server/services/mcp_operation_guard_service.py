@@ -36,6 +36,13 @@ _VERIFY_TOOLS = {"git.diff", "qa.self_run", "workflow.verify_against_core"}
 _DEPLOY_TOOLS = {"workflow.safe_deploy_module"}
 _POLL_TOOLS = {"jobs.get", "jobs.list", "workflow.resume_job"}
 _ALLOWED_REPEAT_TOOLS = {"jobs.get", "jobs.list", "artifacts.read"}
+_FUNCTIONAL_OPERATION_TOOLS = {
+    "odoo.record_create",
+    "odoo.record_write",
+    "odoo.record_action",
+    "odoo.flow_test",
+    "odoo.mutation_audit",
+}
 _UNIQUE_ONCE_TOOLS = {"repo.list_custom_modules", "workflow.list_module_files", "workflow.scope_advice", "workflow.find_similar_view"}
 _MAX_SEARCH_CALLS = 2
 _FRONTEND_SUFFIXES = (".xml", ".css", ".scss", ".js", ".qweb")
@@ -95,6 +102,8 @@ class McpOperationGuardService:
         return data
 
     def before_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
+        if tool_name in _FUNCTIONAL_OPERATION_TOOLS:
+            return None
         client_name = self._client_name(arguments)
         state = self._load(client_name)
         guard = state.setdefault("mcp_operation_guard", {})
@@ -199,6 +208,8 @@ class McpOperationGuardService:
         return None
 
     def after_tool_call(self, tool_name: str, arguments: dict[str, Any], structured: dict[str, Any]) -> None:
+        if tool_name in _FUNCTIONAL_OPERATION_TOOLS:
+            return
         client_name = self._client_name(arguments)
         state = self._load(client_name)
         guard = state.setdefault("mcp_operation_guard", {})
@@ -256,6 +267,8 @@ class McpOperationGuardService:
         turning source deployment into an unverified visual/UI claim.
         """
         if not isinstance(structured, dict):
+            return structured
+        if tool_name in _FUNCTIONAL_OPERATION_TOOLS:
             return structured
         op = self._load(self._client_name(arguments)).get("mcp_operation_guard", {}).get("current", {})
         out = dict(structured)

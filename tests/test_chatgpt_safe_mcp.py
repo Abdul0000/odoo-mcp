@@ -27,6 +27,11 @@ _PROVIDER_TOOLS = {
     "odoo_query",
     "odoo_search_read",
     "odoo_read_group",
+    "odoo_record_create",
+    "odoo_record_write",
+    "odoo_record_action",
+    "odoo_flow_test",
+    "odoo_mutation_audit",
     "artifacts_read",
     "workflow_resume_job",
     "jobs_list",
@@ -79,7 +84,7 @@ def test_hidden_direct_tool_call_is_blocked_with_next_action():
     assert structured["next_call"]["tool"] == "workflow.odoo_code_change"
 
 
-def test_jobs_get_uses_single_bounded_ten_minute_poll(monkeypatch):
+def test_jobs_get_uses_watchdog_bounded_provider_poll(monkeypatch):
     captured = {}
 
     async def fake_dispatch(name, arguments):
@@ -97,7 +102,7 @@ def test_jobs_get_uses_single_bounded_ten_minute_poll(monkeypatch):
     assert response.status_code == 200
     assert captured["name"] == "jobs.get"
     assert captured["arguments"]["wait_for_result"] is True
-    assert captured["arguments"]["wait_timeout_seconds"] == 600
+    assert captured["arguments"]["wait_timeout_seconds"] == settings.workflow_watchdog_wait_cap_seconds
     assert captured["arguments"]["poll_interval_seconds"] == 1.0
 
 

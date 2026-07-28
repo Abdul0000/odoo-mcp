@@ -56,6 +56,7 @@ class JsonStore:
         self.approvals_file = self.root / "approvals.json"
         self.jobs_file = self.root / "jobs.json"
         self.audit_file = self.root / "audit.json"
+        self.mutations_file = self.root / "functional_mutations.json"
         self.artifacts_dir = self.root / "artifacts"
 
     def _read_list(self, path: Path) -> list[dict[str, Any]]:
@@ -220,6 +221,46 @@ class JsonStore:
     def list_audit(self, limit: int = 200) -> list[AuditEvent]:
         rows = self._read_list(self.audit_file)
         return [AuditEvent.model_validate(row) for row in rows[-limit:]][::-1]
+
+    def save_mutation(self, record: dict[str, Any]) -> dict[str, Any]:
+        request_id = str(record.get("request_id") or "")
+        client_name = str(record.get("client_name") or "")
+
+        def update(rows):
+            for index, row in enumerate(rows):
+                if row.get("request_id") == request_id and str(row.get("client_name") or "") == client_name:
+                    rows[index] = dict(record)
+                    return dict(record)
+            rows.append(dict(record))
+            if len(rows) > 2000:
+                del rows[:-2000]
+            return dict(record)
+
+        return self._update_list(self.mutations_file, update)
+
+    def get_mutation(self, request_id: str, client_name: str | None = None) -> dict[str, Any] | None:
+        for row in reversed(self._read_list(self.mutations_file)):
+            if row.get("request_id") != request_id:
+                continue
+            if client_name is not None and str(row.get("client_name") or "") != client_name:
+                continue
+            return dict(row)
+        return None
+
+    def list_mutations(
+        self,
+        limit: int = 20,
+        request_id: str | None = None,
+        client_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        rows = self._read_list(self.mutations_file)
+        filtered = [
+            row
+            for row in rows
+            if (request_id is None or row.get("request_id") == request_id)
+            and (client_name is None or str(row.get("client_name") or "") == client_name)
+        ]
+        return [dict(row) for row in filtered[-limit:]][::-1]
 
     def create_artifact(self, kind: str, source_tool: str, payload: Any) -> dict[str, Any]:
         artifact_id = f"art_{uuid4().hex}"

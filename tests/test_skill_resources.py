@@ -34,6 +34,7 @@ EXPECTED = {
     "odoo-code-review": "22-SKILL-code-review.md",
     "odoo-upgrade-migration": "23-SKILL-upgrade-migration.md",
     "odoo-ai-mcp-development": "24-SKILL-ai-mcp.md",
+    "odoo-functional-flow-testing": "25-SKILL-functional-flow-testing.md",
 }
 
 

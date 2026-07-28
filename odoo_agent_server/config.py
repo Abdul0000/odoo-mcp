@@ -84,10 +84,10 @@ class Settings(BaseSettings):
     mcp_operation_guard_enabled: bool = Field(default=False, alias="ODOO_AGENT_OPERATION_GUARD_ENABLED")
     # Phase-aware watchdog. It never force-cancels write/deploy/database work.
     # In safe_redirect mode it can time-bound an allowlisted read-only MCP call
-    # and return a concrete next action; shadow mode preserves current behavior.
+    # and return a concrete next action; shadow remains available for diagnostics.
     workflow_watchdog_enabled: bool = Field(default=True, alias="ODOO_AGENT_WATCHDOG_ENABLED")
     workflow_watchdog_mode: Literal["shadow", "safe_redirect"] = Field(
-        default="shadow",
+        default="safe_redirect",
         alias="ODOO_AGENT_WATCHDOG_MODE",
     )
     workflow_watchdog_observation_budget_seconds: int = Field(
@@ -119,6 +119,24 @@ class Settings(BaseSettings):
     odoo_login: str | None = Field(default=None, alias="ODOO_LOGIN")
     odoo_password: str | None = Field(default=None, alias="ODOO_PASSWORD")
     odoo_https_verify_ssl: bool = Field(default=True, alias="ODOO_HTTPS_VERIFY_SSL")
+    functional_operations_enabled: bool = Field(
+        default=False,
+        alias="ODOO_AGENT_FUNCTIONAL_OPERATIONS_ENABLED",
+    )
+    functional_max_batch_records: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        alias="ODOO_AGENT_FUNCTIONAL_MAX_BATCH_RECORDS",
+    )
+    functional_allowed_models_raw: str = Field(
+        default=(
+            "res.partner,product.product,product.template,crm.lead,"
+            "sale.order,purchase.order,stock.picking,mrp.production,"
+            "account.move,project.task,helpdesk.ticket"
+        ),
+        alias="ODOO_AGENT_FUNCTIONAL_ALLOWED_MODELS",
+    )
 
 
     # Odoo.sh SSH connector settings. Use a development/staging build host.
@@ -153,6 +171,14 @@ class Settings(BaseSettings):
     @property
     def protected_branches(self) -> set[str]:
         return {item.strip() for item in self.protected_branches_raw.split(",") if item.strip()}
+
+    @property
+    def functional_allowed_models(self) -> set[str]:
+        return {
+            item.strip()
+            for item in self.functional_allowed_models_raw.split(",")
+            if item.strip()
+        }
 
     @property
     def workspace_path(self) -> Path:

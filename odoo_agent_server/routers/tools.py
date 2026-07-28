@@ -55,6 +55,11 @@ from ..schemas import (
     LimitRequest,
     OdooModuleRequest,
     OdooReadGroupRequest,
+    OdooFlowTestRequest,
+    OdooMutationAuditRequest,
+    OdooRecordActionRequest,
+    OdooRecordCreateRequest,
+    OdooRecordWriteRequest,
     OdooCodeFileChange,
     OdooResult,
     OdooSearchReadRequest,
@@ -143,6 +148,7 @@ from ..services.skill_service import SkillService
 from ..services.validator_service import OdooModuleValidator
 from ..services.module_analysis_service import ModuleAnalysisService
 from ..services.live_assertion_service import LiveAssertionService
+from ..services.functional_operation_service import FunctionalOperationService
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
@@ -596,6 +602,52 @@ _TOOL_DESCRIPTORS = [
         title="Query Odoo records", description="Run Odoo search_read safely. Uses Odoo.sh SSH first, then HTTPS JSON-RPC read-only fallback when SSH is refused/unavailable for a client.", read_only=True),
     ToolDescriptor(name="odoo.read_group",
         title="Aggregate Odoo records", description="Return live grouped counts, sums, averages, minima, or maxima with safe read_group. Example: account.move customer invoices grouped by state.", read_only=True),
+    ToolDescriptor(
+        name="odoo.record_create",
+        title="Create Odoo records",
+        description=(
+            "Create an allowlisted single or bounded batch of live Odoo records as the configured "
+            "Odoo user. Requires an explicit request_id and verifies created records by reading them back."
+        ),
+        destructive=True,
+        idempotent=True,
+    ),
+    ToolDescriptor(
+        name="odoo.record_write",
+        title="Update Odoo records",
+        description=(
+            "Update allowlisted live records with optional expected_values concurrency protection, "
+            "then return before/after read-back evidence. Direct state writes are prohibited."
+        ),
+        destructive=True,
+        idempotent=True,
+    ),
+    ToolDescriptor(
+        name="odoo.record_action",
+        title="Run approved Odoo business action",
+        description=(
+            "Execute only an allowlisted Odoo workflow action on bounded record IDs. Posting, stock "
+            "validation, production completion, cancellation, and other sensitive actions require human approval."
+        ),
+        destructive=True,
+        idempotent=True,
+    ),
+    ToolDescriptor(
+        name="odoo.flow_test",
+        title="Run Odoo functional flow",
+        description=(
+            "Preview or execute a verified Sales, Purchase, Inventory, Manufacturing, customer-invoice, "
+            "or vendor-bill flow without entering the code/deploy pipeline."
+        ),
+        destructive=True,
+        idempotent=True,
+    ),
+    ToolDescriptor(
+        name="odoo.mutation_audit",
+        title="Read Odoo mutation audit",
+        description="Read functional-operation evidence by request_id and client without changing Odoo.",
+        read_only=True,
+    ),
     ToolDescriptor(name="browser.screenshot",
         title="Check browser page", description="Navigate an Odoo page through external CDP browser and capture console/network errors; screenshot_path is optional", read_only=True),
     ToolDescriptor(name="browser.pos_flow",
@@ -813,6 +865,11 @@ _TOOL_INPUT_MODELS = {
     "odoo.module_update": OdooModuleRequest,
     "odoo.search_read": OdooSearchReadRequest,
     "odoo.read_group": OdooReadGroupRequest,
+    "odoo.record_create": OdooRecordCreateRequest,
+    "odoo.record_write": OdooRecordWriteRequest,
+    "odoo.record_action": OdooRecordActionRequest,
+    "odoo.flow_test": OdooFlowTestRequest,
+    "odoo.mutation_audit": OdooMutationAuditRequest,
     "browser.screenshot": BrowserCheckRequest,
     "browser.pos_flow": PosFlowCheckRequest,
     "approvals.list": LimitRequest,
@@ -5015,6 +5072,21 @@ async def _dispatch(name: str, args: dict) -> object:
         req = OdooReadGroupRequest.model_validate(args)
         data = await asyncio.to_thread(_read_group_via_shell, req)
         return data.get("odoo") if data.get("status") == "ok" else OdooResult(status="failed", result=data, error=data.get("message"))
+    if name == "odoo.record_create":
+        req = OdooRecordCreateRequest.model_validate(args)
+        return await asyncio.to_thread(FunctionalOperationService().create, req)
+    if name == "odoo.record_write":
+        req = OdooRecordWriteRequest.model_validate(args)
+        return await asyncio.to_thread(FunctionalOperationService().write, req)
+    if name == "odoo.record_action":
+        req = OdooRecordActionRequest.model_validate(args)
+        return await asyncio.to_thread(FunctionalOperationService().action, req)
+    if name == "odoo.flow_test":
+        req = OdooFlowTestRequest.model_validate(args)
+        return await asyncio.to_thread(FunctionalOperationService().flow_test, req)
+    if name == "odoo.mutation_audit":
+        req = OdooMutationAuditRequest.model_validate(args)
+        return FunctionalOperationService().audit(req)
     if name == "browser.pos_flow":
         req = PosFlowCheckRequest.model_validate(args)
         return await CdpBrowserService().run_pos_flow(req)
@@ -5274,6 +5346,12 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             "groups": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
             "count": {"type": "integer"}, "job_id": {"type": "string"},
             "stdout": {"type": "string"}, "stderr": {"type": "string"},
+            "operation": {"type": "string"}, "request_id": {"type": "string"},
+            "model": {"type": "string"}, "record_ids": {"type": "array", "items": {"type": "integer"}},
+            "verified": {"type": "boolean"}, "success_allowed": {"type": "boolean"},
+            "plan": {"type": "object", "additionalProperties": True},
+            "stage_results": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+            "items": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
         })
     elif internal.startswith("jobs.") or internal.startswith("approvals.") or internal.startswith("audit."):
         properties.update({

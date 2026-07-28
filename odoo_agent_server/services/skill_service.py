@@ -32,6 +32,7 @@ _SKILLS = {
     "odoo-code-review": ("22-SKILL-code-review.md", "Odoo module/PR/diff review for concrete bugs, security leaks, regressions, performance, upgrade risk, missing tests, and evidence-backed completion."),
     "odoo-upgrade-migration": ("23-SKILL-upgrade-migration.md", "Odoo source-to-target compatibility, deprecated APIs, view/OWL/assets changes, manifest changes, noupdate behavior, and data migrations."),
     "odoo-ai-mcp-development": ("24-SKILL-ai-mcp.md", "Odoo-connected MCP tools, AI assistants, LLM providers, RAG, permission-aware actions, structured outputs, audit, and truthful completion."),
+    "odoo-functional-flow-testing": ("25-SKILL-functional-flow-testing.md", "Live permission-aware Odoo record mutations and verified Sales, Purchase, Inventory, MRP, and Accounting flow tests."),
 }
 
 _ALIASES = {
@@ -121,6 +122,9 @@ _ALIASES = {
     "ai": "odoo-ai-mcp-development",
     "mcp": "odoo-ai-mcp-development",
     "rag": "odoo-ai-mcp-development",
+    "functional-flow": "odoo-functional-flow-testing",
+    "flow-test": "odoo-functional-flow-testing",
+    "live-records": "odoo-functional-flow-testing",
 }
 
 _ROUTING_TERMS = {
@@ -156,6 +160,11 @@ _ROUTING_TERMS = {
     "odoo-ai-mcp-development": (
         "mcp tool", "mcp server", "model context protocol", "rag pipeline",
         "llm provider", "openai integration", "ai assistant", "embedding",
+    ),
+    "odoo-functional-flow-testing": (
+        "flow test", "functional flow", "run sale order", "run purchase order",
+        "create live record", "update live record", "record action",
+        "record_create", "record_write", "persistent_test",
     ),
     "odoo-qweb-reports-development": ("qweb", "pdf report", "print report", "report template", "paperformat", "wkhtmltopdf", "ir.actions.report"),
     "odoo-sql-query-development": ("sql", "query", "search_read", "read_group", "domain", "group by", "aggregate", "record count", "analytics"),

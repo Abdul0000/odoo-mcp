@@ -7,12 +7,18 @@ import pytest
 from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
+from odoo_agent_server.config import Settings
 from odoo_agent_server.main import app
 from odoo_agent_server.routers.jobs import get_job
 from odoo_agent_server.routers.mcp import _arguments_for_profile, _provider_safe_next_calls
 from odoo_agent_server.routers.tools import tool_output_schema
 from odoo_agent_server.schemas import JobRecord, JobStatus, JobStep
 from odoo_agent_server.services.workflow_watchdog_service import WorkflowWatchdogService
+
+
+def test_watchdog_defaults_to_active_safe_redirect(monkeypatch):
+    monkeypatch.delenv("ODOO_AGENT_WATCHDOG_MODE", raising=False)
+    assert Settings(_env_file=None).workflow_watchdog_mode == "safe_redirect"
 
 
 @pytest.mark.asyncio

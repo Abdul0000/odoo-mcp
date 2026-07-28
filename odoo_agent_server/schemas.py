@@ -911,6 +911,60 @@ class OdooReadGroupRequest(BaseModel):
     timeout_seconds: int = Field(default=120, ge=15, le=300)
 
 
+class OdooMutationBaseRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Selected ODOO_CLIENTS entry.")
+    request_id: str = Field(..., min_length=8, max_length=100, pattern=r"^[A-Za-z0-9_.:-]+$")
+    context: dict[str, Any] | None = Field(default=None, description="Bounded safe Odoo context.")
+    approval_id: str | None = Field(default=None, description="Human approval for sensitive actions.")
+
+
+class OdooRecordCreateRequest(OdooMutationBaseRequest):
+    model: str = Field(..., pattern=r"^[a-zA-Z0-9_.]+$")
+    records: list[dict[str, Any]] = Field(..., min_length=1, max_length=100)
+    verify_fields: list[str] = Field(default_factory=list, max_length=30)
+
+
+class OdooRecordWriteRequest(OdooMutationBaseRequest):
+    model: str = Field(..., pattern=r"^[a-zA-Z0-9_.]+$")
+    ids: list[int] = Field(..., min_length=1, max_length=100)
+    values: dict[str, Any] = Field(..., min_length=1)
+    expected_values: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Optimistic concurrency values that every selected record must currently match.",
+    )
+    verify_fields: list[str] = Field(default_factory=list, max_length=30)
+
+
+class OdooRecordActionRequest(OdooMutationBaseRequest):
+    model: str = Field(..., pattern=r"^[a-zA-Z0-9_.]+$")
+    ids: list[int] = Field(..., min_length=1, max_length=100)
+    action: str = Field(..., pattern=r"^[a-zA-Z0-9_]+$")
+    arguments: list[Any] = Field(default_factory=list, max_length=10)
+    keyword_arguments: dict[str, Any] = Field(default_factory=dict)
+    verify_fields: list[str] = Field(default_factory=list, max_length=30)
+
+
+class OdooMutationAuditRequest(BaseModel):
+    client_name: str | None = Field(default=None)
+    request_id: str | None = Field(default=None, min_length=8, max_length=100)
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class OdooFlowTestRequest(OdooMutationBaseRequest):
+    flow: Literal[
+        "sale_order",
+        "purchase_order",
+        "inventory_transfer",
+        "manufacturing_order",
+        "customer_invoice",
+        "vendor_bill",
+    ]
+    mode: Literal["preview", "persistent_test", "live"] = "preview"
+    values: dict[str, Any] = Field(default_factory=dict)
+    stages: list[str] = Field(default_factory=list, max_length=10)
+    verify_fields: list[str] = Field(default_factory=list, max_length=30)
+
+
 class OdooShQueryRequest(BaseModel):
     client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when multiple clients are configured.")
     model: str = Field(..., description="Odoo model to query with read-only ORM search_read, e.g. account.move")
@@ -1250,6 +1304,9 @@ class ToolDescriptor(BaseModel):
     description: str
     read_only: bool = False
     requires_approval: bool = False
+    destructive: bool = False
+    idempotent: bool = False
+    open_world: bool = True
     deprecated: bool = Field(
         default=False,
         description=(

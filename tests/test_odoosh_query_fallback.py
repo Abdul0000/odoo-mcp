@@ -1,8 +1,20 @@
 import asyncio
 import json
 
+import pytest
+from fastapi import HTTPException
+
+from odoo_agent_server.config import settings
 from odoo_agent_server.routers import tools
-from odoo_agent_server.schemas import OdooFunctionalQueryRequest, OdooResult
+from odoo_agent_server.schemas import (
+    OdooFlowTestRequest,
+    OdooFunctionalQueryRequest,
+    OdooRecordActionRequest,
+    OdooRecordCreateRequest,
+    OdooRecordWriteRequest,
+    OdooResult,
+)
+from odoo_agent_server.services.functional_operation_service import FunctionalOperationService
 
 
 def _client_env():
@@ -180,3 +192,166 @@ def test_provider_read_group_dispatches_safe_customer_invoice_aggregation(monkey
 
     assert result["status"] == "ok"
     assert result["result"] == [{"state": "posted", "state_count": 21}]
+
+
+class _FakeMutationRpc:
+    def __init__(self):
+        self.rows = {
+            7: {"id": 7, "display_name": "SO007", "name": "SO007", "state": "draft", "partner_id": [3, "Customer"], "amount_total": 10.0}
+        }
+        self.created_calls = 0
+
+    def configured(self):
+        return True
+
+    def fields_get(self, model):
+        names = {
+            "id", "display_name", "name", "state", "partner_id", "amount_total",
+            "order_line", "client_order_ref", "ref", "move_type", "invoice_line_ids",
+            "payment_state",
+        }
+        return OdooResult(status="ok", result={name: {"readonly": name in {"id", "display_name"}} for name in names})
+
+    def check_access_rights(self, model, operation):
+        return OdooResult(status="ok", result=True)
+
+    def create_records(self, model, records, context):
+        self.created_calls += 1
+        record_id = 8
+        self.rows[record_id] = {
+            "id": record_id,
+            "display_name": "SO008",
+            "name": "SO008",
+            "state": "draft",
+            "amount_total": 25.0,
+            **records[0],
+        }
+        return OdooResult(status="ok", result=record_id)
+
+    def read_records(self, model, ids, fields, context):
+        return OdooResult(
+            status="ok",
+            result=[{field: self.rows[item].get(field) for field in fields} for item in ids if item in self.rows],
+        )
+
+    def write_records(self, model, ids, values, context):
+        for item in ids:
+            self.rows[item].update(values)
+        return OdooResult(status="ok", result=True)
+
+    def run_action(self, model, ids, action, arguments, keyword_arguments, context):
+        for item in ids:
+            self.rows[item]["state"] = "posted" if action == "action_post" else "sale"
+        return OdooResult(status="ok", result=True)
+
+
+def _functional_service(tmp_path, monkeypatch):
+    fake = _FakeMutationRpc()
+    monkeypatch.setattr(settings, "functional_operations_enabled", True)
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path))
+    monkeypatch.setattr(
+        "odoo_agent_server.services.functional_operation_service.ClientResolverService.resolve_client",
+        lambda self, client_name=None, require_complete=False: None,
+    )
+    monkeypatch.setattr(
+        "odoo_agent_server.services.functional_operation_service.OdooJsonRpcService",
+        lambda client=None: fake,
+    )
+    return FunctionalOperationService(), fake
+
+
+def test_functional_operations_are_default_off(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "functional_operations_enabled", False)
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path))
+    request = OdooRecordCreateRequest(
+        request_id="disabled-create-001",
+        model="sale.order",
+        records=[{"partner_id": 3}],
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        FunctionalOperationService().create(request)
+    assert exc.value.status_code == 403
+
+
+def test_functional_create_is_verified_and_idempotent(tmp_path, monkeypatch):
+    service, fake = _functional_service(tmp_path, monkeypatch)
+    request = OdooRecordCreateRequest(
+        request_id="sale-create-001",
+        model="sale.order",
+        records=[{"partner_id": 3, "order_line": [[0, 0, {"product_id": 4, "product_uom_qty": 1}]]}],
+        verify_fields=["state", "amount_total"],
+    )
+
+    first = service.create(request)
+    second = service.create(request)
+
+    assert first["status"] == "ok"
+    assert first["verified"] is True
+    assert second["idempotent_replay"] is True
+    assert fake.created_calls == 1
+
+
+def test_functional_write_blocks_stale_expected_values(tmp_path, monkeypatch):
+    service, _fake = _functional_service(tmp_path, monkeypatch)
+    request = OdooRecordWriteRequest(
+        request_id="sale-write-001",
+        model="sale.order",
+        ids=[7],
+        values={"client_order_ref": "new-ref"},
+        expected_values={"state": "sale"},
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        service.write(request)
+    assert exc.value.status_code == 409
+
+
+def test_flow_preview_performs_zero_writes(tmp_path, monkeypatch):
+    service, fake = _functional_service(tmp_path, monkeypatch)
+    result = service.flow_test(
+        OdooFlowTestRequest(
+            request_id="sale-flow-preview-001",
+            flow="sale_order",
+            mode="preview",
+            values={"partner_id": 3},
+            stages=["confirm"],
+        )
+    )
+
+    assert result["status"] == "preview"
+    assert result["write_executed"] is False
+    assert fake.created_calls == 0
+
+
+def test_sensitive_action_requires_payload_bound_human_approval(tmp_path, monkeypatch):
+    service, fake = _functional_service(tmp_path, monkeypatch)
+    fake.rows[7].update({"move_type": "out_invoice", "payment_state": "not_paid"})
+    request = OdooRecordActionRequest(
+        request_id="invoice-post-001",
+        model="account.move",
+        ids=[7],
+        action="action_post",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        service.action(request)
+    assert exc.value.status_code == 409
+    assert exc.value.detail["approval_required"] is True
+
+
+def test_action_is_not_verified_when_expected_state_transition_did_not_happen(tmp_path, monkeypatch):
+    service, fake = _functional_service(tmp_path, monkeypatch)
+    fake.run_action = lambda *args, **kwargs: OdooResult(status="ok", result={"type": "ir.actions.act_window"})
+    result = service.action(
+        OdooRecordActionRequest(
+            request_id="sale-confirm-no-transition-001",
+            model="sale.order",
+            ids=[7],
+            action="action_confirm",
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert result["verified"] is False
+    assert result["success_allowed"] is False

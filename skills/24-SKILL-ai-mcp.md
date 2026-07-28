@@ -12,6 +12,9 @@ language actions, and agent audit/completion contracts.
    gates; never create a parallel deployment pipeline.
 5. Evaluate with realistic read-only scenarios and focused mocked tests.
 
+Live business-record mutations and functional scenario execution are routed to
+`odoo-functional-flow-testing`; they must not enter the code/deploy pipeline.
+
 ## AI/MCP CONTRACT
 
 - Keep Odoo records, permissions, companies, workflows, and audit trails as

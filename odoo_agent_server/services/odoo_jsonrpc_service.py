@@ -12,11 +12,11 @@ from .client_resolver_service import ResolvedClient
 
 
 class OdooJsonRpcService:
-    """Read-only Odoo HTTPS JSON-RPC fallback.
+    """Authenticated Odoo HTTPS transport.
 
-    This is intentionally limited to safe query operations such as
-    ``search_read``. Deploy/install/upgrade still go through the safe
-    Odoo.sh SSH pipeline so deployment verification remains strict.
+    Reads and explicitly enabled functional mutations execute as the configured
+    Odoo user, so normal ACLs, field groups, company rules, and record rules
+    remain authoritative. Deployment operations still use the Odoo.sh pipeline.
     """
 
     def __init__(self, client: ResolvedClient | None = None) -> None:
@@ -178,3 +178,118 @@ class OdooJsonRpcService:
             return OdooResult(status="ok", base_url=self._base_url(), database=self._db(), result=records or [])
         except Exception as exc:
             return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error=self._format_exception(exc))
+
+    def execute_model_method(
+        self,
+        model: str,
+        method: str,
+        args: list[Any] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        timeout_seconds: int = 60,
+    ) -> OdooResult:
+        if not self.configured():
+            return OdooResult(
+                status="failed",
+                base_url=self._base_url(),
+                database=self._db(),
+                error="Authenticated Odoo HTTPS credentials are not configured for this client.",
+            )
+        if not re.fullmatch(r"[a-zA-Z0-9_.]+", model or ""):
+            return OdooResult(status="failed", error="Invalid Odoo model name.")
+        if not re.fullmatch(r"[a-zA-Z0-9_]+", method or ""):
+            return OdooResult(status="failed", error="Invalid Odoo method name.")
+        try:
+            uid = self._login_uid(timeout_seconds)
+            result = self._call(
+                "object",
+                "execute_kw",
+                [self._db(), uid, self._password(), model, method, args or [], kwargs or {}],
+                timeout_seconds,
+            )
+            return OdooResult(
+                status="ok",
+                base_url=self._base_url(),
+                database=self._db(),
+                result=result,
+            )
+        except Exception as exc:
+            return OdooResult(
+                status="failed",
+                base_url=self._base_url(),
+                database=self._db(),
+                error=self._format_exception(exc),
+            )
+
+    def fields_get(self, model: str, timeout_seconds: int = 60) -> OdooResult:
+        return self.execute_model_method(
+            model,
+            "fields_get",
+            [],
+            {"attributes": ["type", "readonly", "required", "string", "relation"]},
+            timeout_seconds,
+        )
+
+    def check_access_rights(self, model: str, operation: str, timeout_seconds: int = 60) -> OdooResult:
+        return self.execute_model_method(
+            model,
+            "check_access_rights",
+            [operation],
+            {"raise_exception": False},
+            timeout_seconds,
+        )
+
+    def read_records(
+        self,
+        model: str,
+        ids: list[int],
+        fields: list[str],
+        context: dict[str, Any] | None = None,
+        timeout_seconds: int = 60,
+    ) -> OdooResult:
+        kwargs: dict[str, Any] = {"fields": fields}
+        if context:
+            kwargs["context"] = context
+        return self.execute_model_method(model, "read", [ids], kwargs, timeout_seconds)
+
+    def create_records(
+        self,
+        model: str,
+        records: list[dict[str, Any]],
+        context: dict[str, Any] | None = None,
+        timeout_seconds: int = 60,
+    ) -> OdooResult:
+        kwargs = {"context": context} if context else {}
+        values: dict[str, Any] | list[dict[str, Any]] = records[0] if len(records) == 1 else records
+        return self.execute_model_method(model, "create", [values], kwargs, timeout_seconds)
+
+    def write_records(
+        self,
+        model: str,
+        ids: list[int],
+        values: dict[str, Any],
+        context: dict[str, Any] | None = None,
+        timeout_seconds: int = 60,
+    ) -> OdooResult:
+        kwargs = {"context": context} if context else {}
+        return self.execute_model_method(model, "write", [ids, values], kwargs, timeout_seconds)
+
+    def run_action(
+        self,
+        model: str,
+        ids: list[int],
+        action: str,
+        arguments: list[Any] | None = None,
+        keyword_arguments: dict[str, Any] | None = None,
+        context: dict[str, Any] | None = None,
+        timeout_seconds: int = 60,
+    ) -> OdooResult:
+        kwargs = dict(keyword_arguments or {})
+        if context:
+            kwargs["context"] = context
+        return self.execute_model_method(
+            model,
+            action,
+            [ids, *(arguments or [])],
+            kwargs,
+            timeout_seconds,
+        )
