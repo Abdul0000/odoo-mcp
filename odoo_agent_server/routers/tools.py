@@ -2104,6 +2104,73 @@ def _target_edit_policy_rule(strategy: str) -> str:
     return "Do not guess target ownership; resolve the exact source owner before generating writes."
 
 
+def _safe_unique_python_function_rebase(
+    current: str,
+    search: str,
+    replace: str,
+    *,
+    minimum_similarity: float = 0.72,
+) -> tuple[str | None, str]:
+    """Rebase a stale complete-function replacement only when its target is unique."""
+    try:
+        search_tree = ast.parse(textwrap.dedent(search))
+        replace_tree = ast.parse(textwrap.dedent(replace))
+        current_tree = ast.parse(current)
+    except SyntaxError:
+        return None, "search, replacement, or current Python source is not syntactically complete"
+
+    function_types = (ast.FunctionDef, ast.AsyncFunctionDef)
+    if (
+        len(search_tree.body) != 1
+        or len(replace_tree.body) != 1
+        or not isinstance(search_tree.body[0], function_types)
+        or not isinstance(replace_tree.body[0], function_types)
+    ):
+        return None, "search and replacement must each contain exactly one complete Python function"
+
+    search_node = search_tree.body[0]
+    replace_node = replace_tree.body[0]
+    if type(search_node) is not type(replace_node) or search_node.name != replace_node.name:
+        return None, "search and replacement function identities differ"
+
+    candidates = [
+        node for node in ast.walk(current_tree)
+        if isinstance(node, function_types) and node.name == search_node.name
+    ]
+    if len(candidates) != 1:
+        return None, f"function {search_node.name!r} has {len(candidates)} matches in the current file"
+    current_node = candidates[0]
+    if type(current_node) is not type(search_node):
+        return None, "current function sync/async type differs from the supplied search"
+    if ast.dump(current_node.args, include_attributes=False) != ast.dump(search_node.args, include_attributes=False):
+        return None, "current function signature differs from the supplied search"
+
+    current_lines = current.splitlines(keepends=True)
+    start = int(current_node.lineno) - 1
+    end = int(current_node.end_lineno or current_node.lineno)
+    current_unit = "".join(current_lines[start:end])
+    normalized_current = " ".join(textwrap.dedent(current_unit).split())
+    normalized_search = " ".join(textwrap.dedent(search).split())
+    similarity = difflib.SequenceMatcher(None, normalized_search, normalized_current).ratio()
+    if similarity < minimum_similarity:
+        return None, (
+            f"current function similarity {similarity:.2f} is below the safe "
+            f"{minimum_similarity:.2f} threshold"
+        )
+
+    indentation = re.match(r"[ \t]*", current_lines[start]).group(0)
+    replacement_lines = textwrap.dedent(replace).strip("\r\n").splitlines()
+    replacement_unit = "\n".join(
+        f"{indentation}{line}" if line else ""
+        for line in replacement_lines
+    )
+    if current_unit.endswith(("\n", "\r")):
+        replacement_unit += "\n"
+    return "".join([*current_lines[:start], replacement_unit, *current_lines[end:]]), (
+        f"rebased unique function {search_node.name!r} at similarity {similarity:.2f}"
+    )
+
+
 def _code_batch_fingerprint(writes: list[OdooCodeFileChange]) -> str:
     payload = [item.model_dump(mode="json") for item in writes]
     return hashlib.sha256(
@@ -3441,6 +3508,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     writes_for_this_call = [] if final_batch_replay else writes_to_apply
     for write_index, change in enumerate(writes_for_this_call, start=1):
         rel = _safe_module_relative(effective_module_name, change.relative_path)
+        application_mode = "full_content"
         if change.content is not None and (change.search is not None or change.replace is not None):
             raise HTTPException(status_code=400, detail=f"Provide either content or search/replace, not both, for {rel}")
         if change.content is not None:
@@ -3452,16 +3520,37 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             old = target.read_text(encoding="utf-8")
             if change.regex:
                 new_content, replaced = re.subn(change.search, change.replace, old, count=change.count or 0)
+                application_mode = "regex"
             else:
                 replaced = old.count(change.search) if change.count == 0 else min(old.count(change.search), change.count)
                 new_content = old.replace(change.search, change.replace, change.count or -1)
+                application_mode = "literal"
+                if replaced <= 0 and target.suffix.lower() == ".py" and change.count in {0, 1}:
+                    rebased, rebase_reason = _safe_unique_python_function_rebase(
+                        old,
+                        change.search,
+                        change.replace,
+                    )
+                    if rebased is not None:
+                        new_content = rebased
+                        replaced = 1
+                        application_mode = "rebased_unique_python_function"
             if replaced <= 0:
-                raise HTTPException(status_code=409, detail=f"Search text not found in {rel}")
+                detail = f"Search text not found in {rel}"
+                if not change.regex and target.suffix.lower() == ".py" and change.count in {0, 1}:
+                    detail += f"; safe function refresh was not applicable: {rebase_reason}"
+                raise HTTPException(status_code=409, detail=detail)
         result = repo_write(RepoWriteRequest(project_path=project_path, client_name=client_name, relative_path=rel, content=new_content))
         written_abs = str((project / rel).resolve())
         if written_abs not in written_files_abs:
             written_files_abs.append(written_abs)
-        write_results.append({"relative_path": rel, "status": "written", "size": result.size, "extra": result.extra})
+        write_results.append({
+            "relative_path": rel,
+            "status": "written",
+            "size": result.size,
+            "application_mode": application_mode,
+            "extra": result.extra,
+        })
         for auto_rel in result.extra.get("auto_wired_init_files", []) if isinstance(result.extra, dict) else []:
             auto_abs = str((project / str(auto_rel)).resolve())
             if auto_abs not in written_files_abs:

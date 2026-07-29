@@ -22,6 +22,7 @@ from odoo_agent_server.routers.tools import (
     _prepare_code_batch,
     _task_description_search_clues,
     _target_edit_policy_rule,
+    _safe_unique_python_function_rebase,
 )
 from odoo_agent_server.schemas import (
     JobRecord,
@@ -566,6 +567,75 @@ def test_write_generation_rule_matches_target_ownership_strategy():
     assert "duplicate _inherit" in _target_edit_policy_rule("direct_edit")
     assert "Do not modify protected source" in _target_edit_policy_rule("inherit_extension")
     assert "Do not guess target ownership" in _target_edit_policy_rule("clarify")
+
+
+def test_stale_search_rebases_unique_matching_python_function():
+    current = (
+        "class Attendance:\n"
+        "    def action_download_attendance(self):\n"
+        "        # deployed implementation differs slightly\n"
+        "        punch_type = stored_attendance.punch_type\n"
+        "        return punch_type\n"
+    )
+    stale_search = (
+        "    def action_download_attendance(self):\n"
+        "        punch_type = attendance.punch_type\n"
+        "        return punch_type\n"
+    )
+    replacement = (
+        "    def action_download_attendance(self):\n"
+        "        punch_type = raw_attendance.punch\n"
+        "        duplicate_atten_ids.write({'punch_type': punch_type})\n"
+        "        return punch_type\n"
+    )
+
+    rebased, reason = _safe_unique_python_function_rebase(current, stale_search, replacement)
+
+    assert rebased is not None
+    assert "raw_attendance.punch" in rebased
+    assert "duplicate_atten_ids.write" in rebased
+    assert "stored_attendance.punch_type" not in rebased
+    assert "rebased unique function" in reason
+
+
+def test_stale_search_does_not_rebase_ambiguous_python_function():
+    current = (
+        "class First:\n"
+        "    def action_download_attendance(self):\n"
+        "        return 0\n"
+        "class Second:\n"
+        "    def action_download_attendance(self):\n"
+        "        return 1\n"
+    )
+    search = "def action_download_attendance(self):\n    return 2\n"
+    replacement = "def action_download_attendance(self):\n    return 3\n"
+
+    rebased, reason = _safe_unique_python_function_rebase(current, search, replacement)
+
+    assert rebased is None
+    assert "2 matches" in reason
+
+
+def test_stale_search_does_not_rebase_low_similarity_function():
+    current = (
+        "def action_download_attendance(self):\n"
+        "    values = self._download_all_devices()\n"
+        "    return self._reconcile(values, strict=True)\n"
+    )
+    search = (
+        "def action_download_attendance(self):\n"
+        "    punch_type = attendance.punch_type\n"
+        "    return punch_type\n"
+    )
+    replacement = (
+        "def action_download_attendance(self):\n"
+        "    return raw_attendance.punch\n"
+    )
+
+    rebased, reason = _safe_unique_python_function_rebase(current, search, replacement)
+
+    assert rebased is None
+    assert "below the safe" in reason
 
 
 def test_debug_live_assertion_is_evaluated_from_server_read(monkeypatch):
