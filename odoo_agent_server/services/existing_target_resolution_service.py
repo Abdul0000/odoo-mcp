@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from ..schemas import (
+    OdooTargetEditPolicy,
     OdooTargetMatch,
     OdooTargetResolutionHint,
     OdooTargetResolutionResult,
@@ -89,6 +90,7 @@ class ExistingTargetResolutionService:
                 identifier=None,
                 model=model,
                 source_verified=bool(paths),
+                edit_policy=self._edit_policy(module_path, [], module_scope=True),
                 reason=(
                     "No exact technical identifier was asserted. The focused task/file scope remains authoritative; "
                     "existing source alone is not a new-target collision."
@@ -111,6 +113,7 @@ class ExistingTargetResolutionService:
                 identifier=module_name,
                 model=None,
                 source_verified=bool(paths),
+                edit_policy=self._edit_policy(module_path, [], module_scope=True),
                 reason=(
                     "The request targets the addon as a whole. Multiple definitions and references "
                     "inside that addon are expected and are governed by the module contract, not a single-object ambiguity gate."
@@ -136,11 +139,17 @@ class ExistingTargetResolutionService:
                 matches = planned_matches
         definitions = [match for match in matches if match.role == "definition"]
         relevant = definitions or [match for match in matches if match.role == "reference"] or matches
+        custom_relevant = [match for match in relevant if match.source == "custom"]
+        if custom_relevant:
+            # An exact implementation in the selected client addon is the edit
+            # target. Its upstream Core/OCA definition is context, not ambiguity.
+            relevant = custom_relevant
 
         if mode == "new" and relevant:
             result = self._result(
                 status="collision", mode=mode, kind=kind, identifier=identifier, model=model,
                 matches=relevant, source_verified=True, writes_blocked=True,
+                edit_policy=self._edit_policy(module_path, relevant),
                 question=f"Target {identifier!r} already exists. Confirm whether to modify it or provide a new technical identifier.",
                 reason="A new target would collide with focused source.",
             )
@@ -150,6 +159,7 @@ class ExistingTargetResolutionService:
             result = self._result(
                 status="not_found", mode=mode, kind=kind, identifier=identifier, model=model,
                 writes_blocked=True,
+                edit_policy=self._edit_policy(module_path, []),
                 question=f"Could not resolve existing target {identifier!r}. Confirm its exact technical identifier, model, XML ID, or file.",
                 reason="The asserted existing target was not found in focused custom or installed source.",
             )
@@ -161,6 +171,7 @@ class ExistingTargetResolutionService:
             result = self._result(
                 status="ambiguous", mode=mode, kind=kind, identifier=identifier, model=model,
                 matches=relevant, source_verified=True, writes_blocked=True,
+                edit_policy=self._edit_policy(module_path, relevant),
                 question=f"Multiple targets match {identifier!r} ({choices}). Confirm the exact model, XML ID, or file.",
                 reason="Focused source contains multiple plausible existing targets.",
             )
@@ -204,6 +215,7 @@ class ExistingTargetResolutionService:
             status=status, mode=mode, kind=kind, identifier=identifier, model=model,
             matches=relevant, source_verified=source_verified, live_required=live_required,
             live_checked=live_checked, live_status=live_status, writes_blocked=writes_blocked,
+            edit_policy=self._edit_policy(module_path, relevant, new_target=mode == "new" and not relevant),
             question=question,
             reason=self._reason(status, mode),
         )
@@ -491,6 +503,77 @@ class ExistingTargetResolutionService:
                 index = len(parts) - 1 - list(reversed(parts)).index(marker)
                 return parts[index + 1] if index + 1 < len(parts) else None
         return path.parent.name
+
+    @classmethod
+    def _edit_policy(
+        cls,
+        module_path: Path,
+        matches: list[OdooTargetMatch],
+        *,
+        module_scope: bool = False,
+        new_target: bool = False,
+    ) -> OdooTargetEditPolicy:
+        """Choose where a change belongs without changing target-resolution flow."""
+        if module_scope or new_target:
+            return OdooTargetEditPolicy(
+                ownership="client_custom",
+                strategy="direct_edit",
+                direct_edit_paths=[str(module_path.resolve())],
+                reason="The requested work belongs to the selected client-owned custom addon.",
+            )
+        if not matches:
+            return OdooTargetEditPolicy(
+                ownership="unknown",
+                strategy="clarify",
+                reason="No exact source owner was established.",
+            )
+
+        ownerships = {cls._match_ownership(match, module_path) for match in matches}
+        paths = list(dict.fromkeys(match.path for match in matches))
+        if len(ownerships) != 1:
+            return OdooTargetEditPolicy(
+                ownership="mixed",
+                strategy="clarify",
+                protected_source_paths=[
+                    match.path for match in matches
+                    if cls._match_ownership(match, module_path) != "client_custom"
+                ],
+                reason="Focused matches span client-owned and protected source trees; select the exact owner before writing.",
+            )
+
+        ownership = ownerships.pop()
+        if ownership == "client_custom":
+            return OdooTargetEditPolicy(
+                ownership=ownership,
+                strategy="direct_edit",
+                direct_edit_paths=paths,
+                reason="The existing implementation is owned by the selected custom addon; edit that source directly.",
+            )
+        return OdooTargetEditPolicy(
+            ownership=ownership,
+            strategy="inherit_extension",
+            protected_source_paths=paths,
+            reason=(
+                "The target is Odoo Core/Enterprise source and must be extended from the selected custom addon."
+                if ownership == "odoo_core"
+                else "The target is owned by another addon; extend it from the selected custom addon by default."
+            ),
+        )
+
+    @classmethod
+    def _match_ownership(cls, match: OdooTargetMatch, module_path: Path) -> str:
+        path = Path(match.path)
+        if match.source == "custom" or cls._is_relative_to(path, module_path):
+            return "client_custom"
+        normalized = path.as_posix().lower()
+        if (
+            "/home/odoo/src/odoo/" in normalized
+            or "/home/odoo/src/enterprise/" in normalized
+            or "/odoo/addons/" in normalized
+            or "/enterprise/" in normalized
+        ):
+            return "odoo_core"
+        return "third_party"
 
     @staticmethod
     def _live_lookup(

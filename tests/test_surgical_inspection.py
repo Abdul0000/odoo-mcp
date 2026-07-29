@@ -21,6 +21,7 @@ from odoo_agent_server.routers.tools import (
     _rank_core_required_paths,
     _prepare_code_batch,
     _task_description_search_clues,
+    _target_edit_policy_rule,
 )
 from odoo_agent_server.schemas import (
     JobRecord,
@@ -558,6 +559,13 @@ def test_debug_surgical_scope_rejects_undiagnosed_source_file(monkeypatch):
                 )],
             )
         ))
+
+
+def test_write_generation_rule_matches_target_ownership_strategy():
+    assert "directly" in _target_edit_policy_rule("direct_edit")
+    assert "duplicate _inherit" in _target_edit_policy_rule("direct_edit")
+    assert "Do not modify protected source" in _target_edit_policy_rule("inherit_extension")
+    assert "Do not guess target ownership" in _target_edit_policy_rule("clarify")
 
 
 def test_debug_live_assertion_is_evaluated_from_server_read(monkeypatch):

@@ -255,6 +255,14 @@ class OdooTargetMatch(BaseModel):
     source: Literal["custom", "installed"]
 
 
+class OdooTargetEditPolicy(BaseModel):
+    ownership: Literal["client_custom", "odoo_core", "third_party", "mixed", "unknown"] = "unknown"
+    strategy: Literal["direct_edit", "inherit_extension", "clarify"] = "clarify"
+    direct_edit_paths: list[str] = Field(default_factory=list, max_length=20)
+    protected_source_paths: list[str] = Field(default_factory=list, max_length=20)
+    reason: str
+
+
 class OdooTargetResolutionResult(BaseModel):
     status: Literal[
         "not_required", "scope_verified", "verified",
@@ -275,6 +283,11 @@ class OdooTargetResolutionResult(BaseModel):
     writes_blocked: bool = False
     question: str | None = None
     reason: str
+    edit_policy: OdooTargetEditPolicy = Field(
+        default_factory=lambda: OdooTargetEditPolicy(
+            reason="Target ownership was not established from focused source."
+        )
+    )
 
 
 class OdooCodeChangeRequest(BaseModel):

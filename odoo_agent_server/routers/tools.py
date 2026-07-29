@@ -2090,6 +2090,20 @@ def _material_clarification(payload: OdooCodeChangeRequest) -> dict[str, Any] | 
     }
 
 
+def _target_edit_policy_rule(strategy: str) -> str:
+    if strategy == "direct_edit":
+        return (
+            "Edit the existing client-owned custom source directly; do not add a duplicate "
+            "_inherit, inherited view, or patch layer."
+        )
+    if strategy == "inherit_extension":
+        return (
+            "Do not modify protected source. Implement the change in the selected custom addon "
+            "using the version-appropriate Odoo extension mechanism."
+        )
+    return "Do not guess target ownership; resolve the exact source owner before generating writes."
+
+
 def _code_batch_fingerprint(writes: list[OdooCodeFileChange]) -> str:
     payload = [item.model_dump(mode="json") for item in writes]
     return hashlib.sha256(
@@ -3302,6 +3316,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "writes_required": True,
             "write_generation": {
                 "required": True,
+                "edit_policy": target_resolution_data["edit_policy"],
                 "contexts": write_context,
                 "required_contract": module_contract,
                 "identifier_coverage": {
@@ -3322,6 +3337,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 }],
                 "rules": [
                     "Generate one complete write set for every required contract item before making next_call.",
+                    _target_edit_policy_rule(target_resolution.edit_policy.strategy),
                     "Do not submit import, manifest, security, or scaffold-only writes when functional identifiers or tests remain missing.",
                     "Prefer literal search/replace with count=1 from a complete source unit.",
                     "Preserve unrelated code and do not rewrite omitted source.",

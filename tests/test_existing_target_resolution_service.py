@@ -85,6 +85,90 @@ def test_existing_field_is_source_verified_without_forcing_live_odoo(tmp_path):
     assert result.live_status == "unavailable"
     assert result.writes_blocked is False
     assert result.matches[0].role == "definition"
+    assert result.edit_policy.ownership == "client_custom"
+    assert result.edit_policy.strategy == "direct_edit"
+    assert result.edit_policy.direct_edit_paths == [str(paths[0])]
+
+
+def test_odoo_core_target_requires_custom_inheritance(tmp_path):
+    project, module, _ = _module(tmp_path, {
+        "models/__init__.py": "",
+    })
+    core_path = tmp_path / "home" / "odoo" / "src" / "odoo" / "addons" / "sale" / "models" / "sale_order.py"
+    core_path.parent.mkdir(parents=True)
+    core_path.write_text(
+        "from odoo import models\n"
+        "class SaleOrder(models.Model):\n"
+        "    _name = 'sale.order'\n"
+        "    def action_confirm(self):\n"
+        "        return True\n",
+        encoding="utf-8",
+    )
+
+    result = _resolve(
+        project, module, [core_path],
+        mode="existing", kind="method", identifier="action_confirm", model="sale.order",
+    )
+
+    assert result.edit_policy.ownership == "odoo_core"
+    assert result.edit_policy.strategy == "inherit_extension"
+    assert result.edit_policy.protected_source_paths == [str(core_path)]
+
+
+def test_other_addon_target_defaults_to_extension(tmp_path):
+    project, module, _ = _module(tmp_path, {
+        "models/__init__.py": "",
+    })
+    vendor_path = project / "vendor_addons" / "oca_sale" / "models" / "sale_order.py"
+    vendor_path.parent.mkdir(parents=True)
+    vendor_path.write_text(
+        "from odoo import models\n"
+        "class SaleOrder(models.Model):\n"
+        "    _inherit = 'sale.order'\n"
+        "    def action_confirm(self):\n"
+        "        return super().action_confirm()\n",
+        encoding="utf-8",
+    )
+
+    result = _resolve(
+        project, module, [vendor_path],
+        mode="existing", kind="method", identifier="action_confirm", model="sale.order",
+    )
+
+    assert result.edit_policy.ownership == "third_party"
+    assert result.edit_policy.strategy == "inherit_extension"
+    assert result.edit_policy.protected_source_paths == [str(vendor_path)]
+
+
+def test_selected_custom_implementation_wins_over_upstream_definition(tmp_path):
+    project, module, custom_paths = _module(tmp_path, {
+        "models/sale_order.py": (
+            "from odoo import models\n"
+            "class SaleOrder(models.Model):\n"
+            "    _inherit = 'sale.order'\n"
+            "    def action_confirm(self):\n"
+            "        return super().action_confirm()\n"
+        ),
+    })
+    core_path = tmp_path / "home" / "odoo" / "src" / "odoo" / "addons" / "sale" / "models" / "sale_order.py"
+    core_path.parent.mkdir(parents=True)
+    core_path.write_text(
+        "from odoo import models\n"
+        "class SaleOrder(models.Model):\n"
+        "    _name = 'sale.order'\n"
+        "    def action_confirm(self):\n"
+        "        return True\n",
+        encoding="utf-8",
+    )
+
+    result = _resolve(
+        project, module, [*custom_paths, core_path],
+        mode="existing", kind="method", identifier="action_confirm", model="sale.order",
+    )
+
+    assert result.status != "ambiguous"
+    assert result.edit_policy.strategy == "direct_edit"
+    assert result.edit_policy.direct_edit_paths == [str(custom_paths[0])]
 
 
 def test_ambiguous_existing_field_blocks_writes(tmp_path):
