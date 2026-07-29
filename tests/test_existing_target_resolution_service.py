@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from odoo_agent_server.schemas import OdooResult, OdooTargetResolutionHint
+from odoo_agent_server.schemas import OdooCodeChangeRequest
+from odoo_agent_server.routers import tools
 from odoo_agent_server.services.existing_target_resolution_service import ExistingTargetResolutionService
 from odoo_agent_server.services.odoo_jsonrpc_service import OdooJsonRpcService
 
@@ -146,6 +148,61 @@ def test_broad_free_text_does_not_invent_a_technical_identifier(tmp_path):
     assert result.status == "scope_verified"
     assert result.identifier is None
     assert result.writes_blocked is False
+
+
+def test_qa_acronym_does_not_become_an_odoo_target(tmp_path):
+    project, module, paths = _module(tmp_path, {
+        "models/job.py": "from odoo import models\nclass Job(models.Model):\n    _name = 'sample.job'\n",
+    })
+
+    result = ExistingTargetResolutionService().resolve(
+        project=project,
+        module_path=module,
+        module_name="sample",
+        task_description="Apply the approved multi-file implementation and run QA before deployment.",
+        target_hint=None,
+        intent="implement",
+        task_type="auto",
+        change_request={},
+        hint=OdooTargetResolutionHint(),
+        candidate_paths=paths,
+        planned_paths=["sample/models/job.py", "sample/views/job_views.xml"],
+        client=None,
+        create_module=False,
+    )
+
+    assert result.identifier is None
+    assert result.writes_blocked is False
+
+
+def test_target_clarification_continuation_preserves_supplied_writes():
+    payload = OdooCodeChangeRequest(
+        client_name="Anchor",
+        project_path="/workspace/repos/anchor",
+        module_name="tebra_integration",
+        task_description="Apply approved module-wide implementation and QA.",
+        operation_id="tebra-redesign-01",
+        batch_index=0,
+        total_batches=2,
+        writes=[
+            {"relative_path": "tebra_integration/models/job.py", "content": "first"},
+            {"relative_path": "tebra_integration/views/job_views.xml", "content": "second"},
+        ],
+    )
+
+    arguments = tools._target_resolution_continuation_arguments(
+        payload,
+        client_name="Anchor",
+        project_path="/workspace/repos/anchor",
+        module_name="tebra_integration",
+        target_files=["tebra_integration/models/job.py", "tebra_integration/views/job_views.xml"],
+    )
+
+    assert arguments["writes"] == payload.model_dump(mode="json", exclude_none=True)["writes"]
+    assert arguments["operation_id"] == "tebra-redesign-01"
+    assert arguments["batch_index"] == 0
+    assert arguments["total_batches"] == 2
+    assert "clarification_answer" not in arguments
 
 
 def test_module_wide_redesign_does_not_treat_module_name_as_single_field(tmp_path):

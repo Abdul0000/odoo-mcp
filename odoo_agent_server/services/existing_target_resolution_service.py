@@ -80,10 +80,19 @@ class ExistingTargetResolutionService:
             cached.duration_ms = max(0, int((time.monotonic() - started) * 1000))
             return cached
 
-        if mode == "auto" and not identifier:
+        if not identifier:
+            status = "not_required" if mode == "auto" else "scope_verified"
             result = self._result(
-                status="not_required", mode=mode, kind=kind, identifier=None, model=model,
-                reason="No existing or new technical target was asserted; focused workflow inspection remains authoritative.",
+                status=status,
+                mode=mode,
+                kind=kind,
+                identifier=None,
+                model=model,
+                source_verified=bool(paths),
+                reason=(
+                    "No exact technical identifier was asserted. The focused task/file scope remains authoritative; "
+                    "existing source alone is not a new-target collision."
+                ),
             )
             return self._finish(key, result, started)
 
@@ -154,14 +163,6 @@ class ExistingTargetResolutionService:
                 matches=relevant, source_verified=True, writes_blocked=True,
                 question=f"Multiple targets match {identifier!r} ({choices}). Confirm the exact model, XML ID, or file.",
                 reason="Focused source contains multiple plausible existing targets.",
-            )
-            return self._finish(key, result, started)
-
-        if not identifier:
-            result = self._result(
-                status="scope_verified", mode=mode, kind=kind, identifier=None, model=model,
-                matches=relevant, source_verified=bool(paths),
-                reason="The bounded focused file scope was verified; no exact technical identifier was required.",
             )
             return self._finish(key, result, started)
 
@@ -277,8 +278,7 @@ class ExistingTargetResolutionService:
             r"(?<![\w])(?:"
             r"/[A-Za-z0-9_./{}:-]+|"
             r"[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+|"
-            r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+|"
-            r"[A-Z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*"
+            r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+"
             r")",
             task,
         ))

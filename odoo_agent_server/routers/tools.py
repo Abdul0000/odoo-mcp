@@ -2441,6 +2441,27 @@ def _contract_continuation_task(task_description: str, module_name: str) -> str:
     )
 
 
+def _target_resolution_continuation_arguments(
+    payload: OdooCodeChangeRequest,
+    *,
+    client_name: str | None,
+    project_path: str,
+    module_name: str,
+    target_files: list[str],
+) -> dict[str, Any]:
+    """Preserve the exact approved change while requesting target clarification."""
+    arguments = payload.model_dump(mode="json", exclude_none=True)
+    arguments.pop("clarification_answer", None)
+    arguments.update({
+        "client_name": client_name,
+        "project_path": project_path,
+        "module_name": module_name,
+        "task_description": _contract_continuation_task(payload.task_description, module_name),
+        "target_files": target_files,
+    })
+    return arguments
+
+
 def _workflow_module_analyze(payload: ModuleAnalyzeRequest) -> dict[str, Any]:
     """Analyze one custom addon locally without entering the coding pipeline."""
     client = ClientResolverService().resolve_client(
@@ -3085,17 +3106,17 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "completion_required": True,
             "next_call": {
                 "tool": "workflow.odoo_code_change",
-                "arguments": {
-                    "client_name": client_name,
-                    "project_path": project_path,
-                    "module_name": effective_module_name,
-                    "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
-                    "task_type": _normalized_task_type(payload),
-                    "intent": payload.intent,
-                    "target_hint": _target_hint(payload),
-                    "target_files": [item.get("relative_path") for item in custom_reads if item.get("status") == "read"],
-                    "target_resolution": payload.target_resolution.model_dump(mode="json"),
-                },
+                "arguments": _target_resolution_continuation_arguments(
+                    payload,
+                    client_name=client_name,
+                    project_path=project_path,
+                    module_name=effective_module_name,
+                    target_files=[
+                        str(item.get("relative_path"))
+                        for item in custom_reads
+                        if item.get("status") == "read" and item.get("relative_path")
+                    ],
+                ),
                 "required_generated_arguments": ["clarification_answer"],
             },
         }
