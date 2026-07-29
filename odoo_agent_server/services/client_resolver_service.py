@@ -24,6 +24,7 @@ class ResolvedClient:
     branch: str
     path: str
     token: str | None = None
+    environment: str | None = None
     odoo_url: str | None = None
     odoo_db: str | None = None
     odoo_login: str | None = None
@@ -50,6 +51,7 @@ class ResolvedClient:
                 "repo": self.repo,
                 "branch": self.branch,
                 "path": self.path,
+                "environment": self.environment,
                 "odoo_url": self.odoo_url,
                 "odoo_db": self.odoo_db,
                 "odoo_verify_ssl": self.odoo_verify_ssl,
@@ -219,6 +221,7 @@ class ClientResolverService:
             branch=client["branch"],
             path=client["path"],
             token=client.get("token") or None,
+            environment=self._parse_environment(client.get("environment")),
             odoo_url=client.get("odoo_url") or None,
             odoo_db=client.get("odoo_db") or None,
             odoo_login=client.get("odoo_login") or None,
@@ -260,6 +263,21 @@ class ClientResolverService:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid odoosh_ssh_port in ODOO_CLIENTS: {value!r}",
             )
+
+    @staticmethod
+    def _parse_environment(value: str | None) -> str | None:
+        if value in (None, ""):
+            return None
+        environment = str(value).strip().lower()
+        if environment not in {"test", "development", "staging", "production"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Invalid ODOO_CLIENTS environment. Use test, development, "
+                    "staging, or production."
+                ),
+            )
+        return environment
 
     def _is_complete(self, client: dict) -> bool:
         return all(client.get(key) for key in self._required)

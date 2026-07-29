@@ -519,6 +519,8 @@ The phase-aware watchdog is independent of the optional operation guard. It defa
 
 Live functional operations are a separate, default-off lane. Set `ODOO_AGENT_FUNCTIONAL_OPERATIONS_ENABLED=true` only after validating the configured Odoo user's ACLs on a test database. `odoo.flow_test`, `odoo.record_create`, `odoo.record_write`, and `odoo.record_action` use authenticated HTTPS RPC with field/action policy checks, idempotent request IDs, read-back verification, and mutation audit; they never fall back to SSH superuser writes or enter the code/deploy workflow. Standard recipes are optional fast paths: arbitrary business/custom models can use ordered dynamic create/write/action/verify steps with prior-step `$ref` outputs, while security/system models and private/CRUD methods remain blocked.
 
+For complete addon verification, `workflow.module_test` starts one background job that can combine local static QA, Odoo-native tests, same-origin controller/API contracts, and bounded functional flows. Native/API/functional layers require the selected `ODOO_CLIENTS` entry to include `"environment": "test"`; static-only testing remains local. Poll `jobs.get` and accept success only from a terminal result with `verified=true` and `success_allowed=true`. This workflow never edits, commits, pushes, upgrades, or deploys code.
+
 Legacy `ODOO_AGENT_BACKGROUND_MAX_WORKERS=1` values are accepted and safely clamped to two workers internally.
 
 For SSH GitHub repos, either set `GIT_SSH_COMMAND` yourself or set `GIT_SSH_KEY_PATH`; `repo.prepare` will build a safe `GIT_SSH_COMMAND` using that key.

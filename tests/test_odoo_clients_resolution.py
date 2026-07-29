@@ -62,6 +62,24 @@ def test_resolver_selects_explicit_name(monkeypatch, tmp_path):
     assert resolved.branch == "beta"
 
 
+def test_resolver_exposes_validated_environment(monkeypatch, tmp_path):
+    _set_clients(monkeypatch, [
+        _client(
+            "Test",
+            "git@example.com:test.git",
+            "test",
+            str(tmp_path / "test"),
+            environment="TEST",
+        )
+    ])
+
+    resolved = ClientResolverService().resolve_client()
+
+    assert resolved is not None
+    assert resolved.environment == "test"
+    assert resolved.public["environment"] == "test"
+
+
 def test_resolver_rejects_global_odoo_url_and_db_when_multiple_clients(monkeypatch, tmp_path):
     clients = [
         _client("Alpha", "git@example.com:a.git", "alpha", str(tmp_path / "a"), odoo_url="https://a.example.com", odoo_db="a"),

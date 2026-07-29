@@ -995,6 +995,140 @@ class OdooFlowTestRequest(OdooMutationBaseRequest):
     )
 
 
+class OdooModuleFunctionalCase(BaseModel):
+    """One bounded functional scenario executed through the existing safe engine."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_.-]+$")
+    flow: str = Field(..., min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
+    values: dict[str, Any] = Field(default_factory=dict)
+    stages: list[str] = Field(default_factory=list, max_length=10)
+    verify_fields: list[str] = Field(default_factory=list, max_length=30)
+    steps: list[OdooDynamicFlowStep] = Field(default_factory=list, max_length=30)
+    approval_id: str | None = Field(
+        default=None,
+        description="Payload-bound human approval for sensitive business actions in this scenario.",
+    )
+
+
+class OdooEndpointTestCase(BaseModel):
+    """One same-origin Odoo controller/API contract test."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(..., min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_.-]+$")
+    method: Literal["GET", "POST", "PUT", "PATCH", "DELETE"] = "GET"
+    path: str = Field(..., min_length=1, max_length=500)
+    protocol: Literal["http", "odoo_jsonrpc"] = "http"
+    auth: Literal["public", "session"] = "session"
+    query: dict[str, Any] = Field(default_factory=dict)
+    headers: dict[str, str] = Field(default_factory=dict)
+    body: Any = Field(default_factory=dict)
+    expected_status: int = Field(default=200, ge=100, le=599)
+    expected_json_subset: Any | None = None
+    expected_body_contains: list[str] = Field(default_factory=list, max_length=20)
+    record_assertions: list[OdooDebugRecordAssertion] = Field(default_factory=list, max_length=10)
+    timeout_seconds: int = Field(default=20, ge=1, le=60)
+
+    @field_validator("path")
+    @classmethod
+    def endpoint_path_must_be_same_origin_relative(cls, value: str) -> str:
+        path = str(value or "").strip()
+        if (
+            not path.startswith("/")
+            or path.startswith("//")
+            or "\\" in path
+            or "://" in path
+            or any(ord(char) < 32 for char in path)
+        ):
+            raise ValueError("path must be a same-origin relative Odoo path beginning with one slash")
+        return path
+
+    @field_validator("headers")
+    @classmethod
+    def endpoint_headers_must_be_safe(cls, value: dict[str, str]) -> dict[str, str]:
+        blocked = {"authorization", "cookie", "host", "proxy-authorization", "x-forwarded-host"}
+        if len(value) > 20:
+            raise ValueError("headers supports at most 20 entries")
+        clean: dict[str, str] = {}
+        for key, item in value.items():
+            name = str(key or "").strip()
+            text = str(item or "")
+            if not re.fullmatch(r"[A-Za-z0-9-]{1,80}", name):
+                raise ValueError(f"invalid HTTP header name: {key!r}")
+            if name.lower() in blocked:
+                raise ValueError(f"header {name!r} is connector-owned and cannot be supplied")
+            if len(text) > 2000 or "\r" in text or "\n" in text:
+                raise ValueError(f"invalid HTTP header value for {name!r}")
+            clean[name] = text
+        return clean
+
+    @model_validator(mode="after")
+    def endpoint_payload_must_be_bounded(self):
+        payload = {
+            "query": self.query,
+            "body": self.body,
+            "expected_json_subset": self.expected_json_subset,
+        }
+        if len(str(payload)) > 100_000:
+            raise ValueError("endpoint test payload is too large")
+        if self.method == "GET" and self.body not in ({}, None):
+            raise ValueError("GET endpoint tests must use query parameters instead of a request body")
+        return self
+
+
+class OdooModuleTestRequest(BaseProjectRequest):
+    """Run bounded evidence-producing tests without entering the deploy pipeline."""
+
+    module_name: str = Field(..., min_length=1, max_length=120)
+    layers: list[Literal["auto", "all", "static", "native", "api", "functional"]] = Field(
+        default_factory=lambda: ["auto"],
+        min_length=1,
+        max_length=4,
+        description="auto runs static plus configured/discovered layers; all requires every layer.",
+    )
+    native_test_tags: list[str] = Field(default_factory=list, max_length=20)
+    api_cases: list[OdooEndpointTestCase] = Field(default_factory=list, max_length=20)
+    functional_cases: list[OdooModuleFunctionalCase] = Field(default_factory=list, max_length=20)
+    allow_endpoint_mutations: bool = Field(
+        default=False,
+        description="Explicitly allow POST/PUT/PATCH/DELETE cases on a client marked environment=test.",
+    )
+    timeout_seconds: int = Field(default=600, ge=30, le=1800)
+
+    @field_validator("module_name")
+    @classmethod
+    def module_test_name_must_be_safe(cls, value: str) -> str:
+        name = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            raise ValueError("module_name must be a safe Odoo technical name")
+        return name
+
+    @field_validator("native_test_tags")
+    @classmethod
+    def native_test_tags_must_be_safe(cls, values: list[str]) -> list[str]:
+        clean: list[str] = []
+        for value in values:
+            tag = str(value or "").strip()
+            if not re.fullmatch(r"[-+*A-Za-z0-9_./:]+", tag):
+                raise ValueError(f"unsafe Odoo test tag selector: {value!r}")
+            if tag not in clean:
+                clean.append(tag)
+        return clean
+
+    @model_validator(mode="after")
+    def module_test_layers_must_be_unambiguous(self):
+        unique = list(dict.fromkeys(self.layers))
+        if len(unique) != len(self.layers):
+            raise ValueError("layers must not contain duplicates")
+        if ("auto" in unique or "all" in unique) and len(unique) != 1:
+            raise ValueError("auto/all cannot be combined with another test layer")
+        if any(case.method != "GET" for case in self.api_cases) and not self.allow_endpoint_mutations:
+            raise ValueError("mutating API cases require allow_endpoint_mutations=true")
+        return self
+
+
 class OdooShQueryRequest(BaseModel):
     client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when multiple clients are configured.")
     model: str = Field(..., description="Odoo model to query with read-only ORM search_read, e.g. account.move")
@@ -1263,8 +1397,11 @@ class JobRecord(BaseModel):
     @computed_field  # type: ignore[misc]
     @property
     def completion_required(self) -> bool:
-        """True while safe deploy still requires follow-up polling."""
-        return self.job_type == "safe_deploy_module" and self.status in {JobStatus.queued, JobStatus.running}
+        """True while a connector-owned long-running workflow needs polling."""
+        return self.job_type in {"safe_deploy_module", "workflow.module_test"} and self.status in {
+            JobStatus.queued,
+            JobStatus.running,
+        }
 
     @computed_field  # type: ignore[misc]
     @property

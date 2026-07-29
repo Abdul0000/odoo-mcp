@@ -25,3 +25,16 @@ or browser flows. Do not create broad placeholder suites.
 - Do not run Odoo-native addon tests as ordinary repository-root pytest.
 - Report skipped/deferred native tests honestly; never convert “not run” into
   “passed.”
+
+## CONNECTOR EXECUTION
+
+- For an explicit complete-module test, call `workflow.module_test` once and
+  poll its returned `jobs.get` instruction to a terminal result.
+- `auto` runs static QA plus only configured/discovered native, API, and
+  functional layers. `all` requires every layer and fails honestly when cases
+  or native tests are absent.
+- Native tests must produce a parsed Odoo test summary; exit code zero alone is
+  not proof. Controller cases use same-origin relative paths and optional
+  configured-user record assertions.
+- Native, API, and functional execution is allowed only on an `ODOO_CLIENTS`
+  entry marked `environment=test`. The workflow does not edit or deploy code.

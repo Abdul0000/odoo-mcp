@@ -1137,6 +1137,60 @@ class OdooShService:
             )
         return self._run_module_cli(module_name, "-u", timeout_seconds)
 
+    def run_module_tests(
+        self,
+        module_name: str,
+        test_tags: list[str] | None = None,
+        timeout_seconds: int = 600,
+    ) -> CommandResult:
+        """Run one addon's Odoo-native tests through a fixed, non-shell-extensible command."""
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", module_name or ""):
+            return CommandResult(
+                command=["odoosh.module_tests", module_name],
+                cwd="odoosh:ssh",
+                exit_code=2,
+                stderr="Invalid Odoo module technical name.",
+            )
+        if self._active_client() and self._active_client().environment != "test":
+            return CommandResult(
+                command=["odoosh.module_tests", module_name],
+                cwd="odoosh:ssh",
+                exit_code=2,
+                stderr="Odoo-native tests require an ODOO_CLIENTS entry with environment=test.",
+            )
+        tags = list(dict.fromkeys(test_tags or [f"/{module_name}"]))
+        if any(not re.fullmatch(r"[-+*A-Za-z0-9_./:]+", tag or "") for tag in tags):
+            return CommandResult(
+                command=["odoosh.module_tests", module_name],
+                cwd="odoosh:ssh",
+                exit_code=2,
+                stderr="Unsafe Odoo test tag selector.",
+            )
+        if not self._db_name():
+            return CommandResult(
+                command=["odoosh.module_tests", module_name],
+                cwd="odoosh:ssh",
+                exit_code=2,
+                stderr="ODOOSH_DB_NAME is not configured for the selected test client.",
+            )
+        safe_db = shlex.quote(self._db_name())
+        safe_module = shlex.quote(module_name)
+        safe_tags = shlex.quote(",".join(tags))
+        odoo_path = shlex.quote(self._odoo_path())
+        script = (
+            "set -e; "
+            f"{self._addons_path_shell_setup()}"
+            f"cd {odoo_path}; "
+            f"./odoo-bin -d {safe_db} --addons-path=\"$MCP_ADDONS_PATH\" "
+            f"-u {safe_module} --test-tags {safe_tags} --stop-after-init --log-level=test"
+        )
+        result = self._classify_module_update_result(
+            self.run_shell(script, timeout_seconds=timeout_seconds)
+        )
+        return result.model_copy(
+            update={"command": ["odoosh.module_tests", module_name, ",".join(tags)]}
+        )
+
     def module_deploy_ssh(self, module_name: str, timeout_seconds: int = 600) -> CommandResult:
         """Fast hybrid deploy: cheap SQL state probe, one Odoo process.
 

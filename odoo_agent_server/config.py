@@ -226,6 +226,7 @@ def get_odoo_clients() -> list[dict]:
 
     Each client dict should have:
       name, repo, branch, path, token,
+      environment (optional: test, development, staging, production),
       odoo_url, odoo_db, odoo_login, odoo_password, odoo_verify_ssl,
       optional per-client Odoo.sh keys:
       odoosh_db_name, odoosh_ssh_host, odoosh_ssh_port,
@@ -277,6 +278,7 @@ def normalise_client(client: dict) -> dict:
         "branch",
         "path",
         "token",
+        "environment",
         "odoo_url",
         "odoo_db",
         "odoo_login",
@@ -305,6 +307,7 @@ def safe_client_public(client: dict) -> dict:
         "repo": mask_repo_url(normalized.get("repo", "")) if normalized.get("repo") else None,
         "branch": normalized.get("branch"),
         "path": normalized.get("path"),
+        "environment": normalized.get("environment"),
         "odoo_url": normalized.get("odoo_url"),
         "odoo_db": normalized.get("odoo_db"),
         "odoo_verify_ssl": normalized.get("odoo_verify_ssl"),

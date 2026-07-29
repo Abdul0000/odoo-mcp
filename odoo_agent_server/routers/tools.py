@@ -54,6 +54,7 @@ from ..schemas import (
     JobGetRequest,
     LimitRequest,
     OdooModuleRequest,
+    OdooModuleTestRequest,
     OdooReadGroupRequest,
     OdooFlowTestRequest,
     OdooMutationAuditRequest,
@@ -149,6 +150,7 @@ from ..services.validator_service import OdooModuleValidator
 from ..services.module_analysis_service import ModuleAnalysisService
 from ..services.live_assertion_service import LiveAssertionService
 from ..services.functional_operation_service import FunctionalOperationService
+from ..services.module_test_service import ModuleTestService
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
@@ -317,6 +319,19 @@ _TOOL_DESCRIPTORS = [
             "Never prepares/pulls the repo, reads Odoo core/Odoo.sh, runs QA, deploys, or retries broad inspection."
         ),
         read_only=True,
+    ),
+    ToolDescriptor(
+        name="workflow.module_test",
+        title="Test complete Odoo module",
+        description=(
+            "Run one connector-owned background verification job for an existing addon: local static QA, "
+            "real Odoo-native addon tests, same-origin controller/API contracts, and bounded functional "
+            "create/action/read-back scenarios. Live layers run only on a selected client explicitly marked "
+            "environment=test. This workflow never edits, commits, pushes, upgrades, or deploys code; poll jobs.get "
+            "and claim success only when the terminal result has verified=true and success_allowed=true."
+        ),
+        destructive=True,
+        idempotent=True,
     ),
     ToolDescriptor(
         name="workflow.module_install_and_check",
@@ -809,6 +824,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.odoo_code_change": OdooCodeChangeRequest,
     "workflow.odoo_debug_and_fix": OdooDebugAndFixRequest,
     "workflow.module_analyze": ModuleAnalyzeRequest,
+    "workflow.module_test": OdooModuleTestRequest,
     "workflow.module_install_and_check": OdooModuleRequest,
     "workflow.frontend_visual_implement": FrontendVisualImplementRequest,
     "workflow.smart_tool_router": SmartToolRouteRequest,
@@ -4914,6 +4930,9 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "workflow.module_analyze":
         request = ModuleAnalyzeRequest.model_validate(args)
         return await asyncio.to_thread(_workflow_module_analyze, request)
+    if name == "workflow.module_test":
+        request = OdooModuleTestRequest.model_validate(args)
+        return ModuleTestService().start(request, self_run)
     if name == "workflow.module_install_and_check":
         return odoo_module_deploy(OdooModuleRequest.model_validate(_force_mcp_async_deploy_args(args)))
     if name == "workflow.frontend_visual_implement":
