@@ -228,6 +228,55 @@ class OdooCodeFileChange(BaseModel):
     count: int = Field(default=0, ge=0, le=1000, description="Maximum replacements. 0 means replace all occurrences.")
 
 
+class OdooTargetResolutionHint(BaseModel):
+    """Optional exact target contract for an existing-object change."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["auto", "existing", "new"] = "auto"
+    kind: Literal[
+        "auto", "model", "field", "method", "view", "xml_id", "template",
+        "route", "component", "asset", "cron", "action", "menu", "security",
+        "config", "record", "other",
+    ] = "auto"
+    identifier: str | None = Field(default=None, max_length=500)
+    model: str | None = Field(default=None, max_length=200, pattern=r"^[A-Za-z0-9_.]+$")
+    require_live: bool | None = None
+
+
+class OdooTargetMatch(BaseModel):
+    path: str
+    line: int = Field(ge=1)
+    kind: str
+    identifier: str
+    role: Literal["definition", "reference", "text"]
+    model: str | None = None
+    owner: str | None = None
+    source: Literal["custom", "installed"]
+
+
+class OdooTargetResolutionResult(BaseModel):
+    status: Literal[
+        "not_required", "scope_verified", "verified",
+        "source_verified_live_unverified", "source_verified_live_missing",
+        "not_found", "ambiguous", "collision",
+    ]
+    mode: Literal["existing", "new", "auto"]
+    kind: str
+    identifier: str | None = None
+    model: str | None = None
+    source_verified: bool = False
+    live_required: bool = False
+    live_checked: bool = False
+    live_status: str = "not_applicable"
+    matches: list[OdooTargetMatch] = Field(default_factory=list, max_length=20)
+    cache_hit: bool = False
+    duration_ms: int = Field(default=0, ge=0)
+    writes_blocked: bool = False
+    question: str | None = None
+    reason: str
+
+
 class OdooCodeChangeRequest(BaseModel):
     """Provider-safe high-level Odoo code-change workflow.
 
@@ -250,6 +299,10 @@ class OdooCodeChangeRequest(BaseModel):
     intent: str | None = Field(default=None, max_length=160, description="Optional generic intent such as add_field, fix_bug, add_button, change_style, refactor, optimize, add_security, update_report, or modify_existing_feature.")
     target_hint: str | None = Field(default=None, max_length=500, description="Optional generic target hint for search/autopatch, such as a visible label, method, class, XML id, field, route, or file clue.")
     change_request: dict[str, Any] = Field(default_factory=dict, description="Optional structured generic change request. Safe autopatch currently supports style/text replacement shortcuts; all other task types fall back to inspection + writes.")
+    target_resolution: OdooTargetResolutionHint = Field(
+        default_factory=OdooTargetResolutionHint,
+        description="Optional exact target contract. Auto mode stays source-first and only performs one bounded live lookup when useful.",
+    )
     patch_strategy: str = Field(default="auto", max_length=80, description="Patch strategy hint: auto, inspect_only, explicit_writes, safe_autopatch, text_replace, style_rule, inline_style, etc.")
     # Backward-compatible convenience fields for simple style/text tasks. They are
     # normalized into target_hint/change_request internally and do not limit the workflow.

@@ -61,6 +61,7 @@ Claims require server provenance, never narrative: use `claim_status`, `truth_ga
 ## CHANGE SCOPE
 
 - Surgical requests touch only necessary files/lines; no unrelated restructuring.
+- Before changing an existing Odoo object or behavior, let `workflow.odoo_code_change` resolve the exact technical target, owner, installed-version definition, inheritance/dependency context, and relevant live registry/database identity. New targets receive the same bounded collision check. This gate is source-first, reuses focused inspection, is cached, performs at most one useful live lookup with no retry, and never starts a repository-wide scan. If it returns `not_found`, `ambiguous`, or `collision`, apply no write and ask only its returned precise clarification; `source_verified_live_unverified` is honest non-live evidence, not deployment proof.
 - For new features/modules, prepare and submit the complete model, security (ACL/groups/rules), views, actions, menus, and data set in the same write call; never write/push one layer and return later for the rest.
 - Commit/push once only after the full logical scope is complete and verified.
 - Follow `workflow_profile`: small tasks use one complete write set; medium/large tasks may use dependency-ordered local batches but never commit, push, or deploy a partial contract.

@@ -130,6 +130,9 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "## VIEW AND XML GATE",
         "unexpected multiple matches",
         "Studio/database overlays",
+        "exact technical target",
+        "at most one useful live lookup",
+        "source_verified_live_unverified",
     ]
     for marker in required_markers:
         assert marker in text

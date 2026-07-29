@@ -151,6 +151,7 @@ from ..services.module_analysis_service import ModuleAnalysisService
 from ..services.live_assertion_service import LiveAssertionService
 from ..services.functional_operation_service import FunctionalOperationService
 from ..services.module_test_service import ModuleTestService
+from ..services.existing_target_resolution_service import ExistingTargetResolutionService
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
@@ -3028,6 +3029,71 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         cache = dict(list(cache.items())[-20:])
     JsonStore().save_session_state({"code_change_evidence": cache}, client_name=client_name)
 
+    resolution_client = ClientResolverService().resolve_client(
+        client_name=client_name,
+        project_path=project_path,
+        require_complete=False,
+    )
+    target_resolution = ExistingTargetResolutionService().resolve(
+        project=project,
+        module_path=module_dir,
+        module_name=effective_module_name,
+        task_description=effective_task_description,
+        target_hint=_target_hint(payload),
+        intent=payload.intent,
+        task_type=_normalized_task_type(payload),
+        change_request=payload.change_request,
+        hint=payload.target_resolution,
+        candidate_paths=[
+            *[project / str(item.get("relative_path")) for item in custom_reads if item.get("status") == "read"],
+            *[Path(str(item.get("path"))) for item in core_reads if item.get("status") == "read"],
+        ],
+        planned_paths=[write.relative_path for write in (payload.writes or generated_writes)],
+        client=resolution_client,
+        create_module=payload.create_module,
+    )
+    target_resolution_data = target_resolution.model_dump(mode="json")
+    steps.append({
+        "step": "workflow.resolve_existing_target",
+        "status": target_resolution.status,
+        "duration_ms": target_resolution.duration_ms,
+        "cache_hit": target_resolution.cache_hit,
+        "live_checked": target_resolution.live_checked,
+    })
+    if target_resolution.writes_blocked:
+        return {
+            "status": "needs_clarification",
+            "message": "Focused inspection could not safely resolve the exact Odoo target. No write was applied.",
+            "client_name": client_name,
+            "project_path": project_path,
+            "module_name": effective_module_name,
+            "steps": steps,
+            "target_resolution": target_resolution_data,
+            "clarification_gate": {
+                "required": True,
+                "question": target_resolution.question,
+                "reason": target_resolution.reason,
+            },
+            "writes_blocked": True,
+            "success_allowed": False,
+            "completion_required": True,
+            "next_call": {
+                "tool": "workflow.odoo_code_change",
+                "arguments": {
+                    "client_name": client_name,
+                    "project_path": project_path,
+                    "module_name": effective_module_name,
+                    "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
+                    "task_type": _normalized_task_type(payload),
+                    "intent": payload.intent,
+                    "target_hint": _target_hint(payload),
+                    "target_files": [item.get("relative_path") for item in custom_reads if item.get("status") == "read"],
+                    "target_resolution": payload.target_resolution.model_dump(mode="json"),
+                },
+                "required_generated_arguments": ["clarification_answer"],
+            },
+        }
+
     failure_guard = repeated_failure_guard_status(
         client_name=client_name,
         fingerprint=issue_fingerprint,
@@ -3046,6 +3112,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "project_path": project_path,
             "module_name": effective_module_name,
             "steps": steps,
+            "target_resolution": target_resolution_data,
             "failure_guard": failure_guard,
             "investigation_read_plan": {
                 "custom_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
@@ -3117,6 +3184,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                         "module_name": effective_module_name,
                         "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
                         "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
+                        "target_resolution": payload.target_resolution.model_dump(mode="json"),
                     },
                     "required_generated_arguments": ["clarification_answer"],
                 },
@@ -3144,6 +3212,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "project_path": project_path,
             "module_name": effective_module_name,
             "steps": steps,
+            "target_resolution": target_resolution_data,
             "custom_reads": custom_read_metadata,
             "search_results": search_results[:10],
             "task_type": _normalized_task_type(payload),
@@ -3398,6 +3467,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "module_name": effective_module_name,
             "workflow_profile": adaptive_profile,
             "steps": steps,
+            "target_resolution": target_resolution_data,
             "write_results": write_results,
             "verify_against_core": batch_verify.model_dump(mode="json"),
             "batch": {
@@ -3517,6 +3587,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "project_path": project_path,
             "module_name": effective_module_name,
             "steps": steps,
+            "target_resolution": target_resolution_data,
             "write_results": write_results,
             "git_diff": {"exit_code": diff.exit_code, "stdout": diff.stdout[-12000:], "stderr": diff.stderr[-4000:]},
             "qa": qa_struct,
@@ -3649,6 +3720,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "project_path": project_path,
         "module_name": effective_module_name,
         "steps": steps,
+        "target_resolution": target_resolution_data,
         "write_results": write_results,
         "generated_autopatch": bool(generated_writes and not payload.writes),
         "generated_autopatch_strategy": generated_autopatch_strategy,
