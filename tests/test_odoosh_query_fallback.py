@@ -8,6 +8,7 @@ from odoo_agent_server.config import settings
 from odoo_agent_server.routers import tools
 from odoo_agent_server.schemas import (
     OdooFlowTestRequest,
+    OdooDynamicFlowStep,
     OdooFunctionalQueryRequest,
     OdooRecordActionRequest,
     OdooRecordCreateRequest,
@@ -208,7 +209,7 @@ class _FakeMutationRpc:
         names = {
             "id", "display_name", "name", "state", "partner_id", "amount_total",
             "order_line", "client_order_ref", "ref", "move_type", "invoice_line_ids",
-            "payment_state",
+            "payment_state", "picking_id", "product_return_moves",
         }
         return OdooResult(status="ok", result={name: {"readonly": name in {"id", "display_name"}} for name in names})
 
@@ -355,3 +356,76 @@ def test_action_is_not_verified_when_expected_state_transition_did_not_happen(tm
     assert result["status"] == "ok"
     assert result["verified"] is False
     assert result["success_allowed"] is False
+
+
+def test_public_custom_action_is_allowed_without_static_allowlist(tmp_path, monkeypatch):
+    service, _fake = _functional_service(tmp_path, monkeypatch)
+    result = service.action(
+        OdooRecordActionRequest(
+            request_id="sale-custom-action-001",
+            model="sale.order",
+            ids=[7],
+            action="action_custom_process",
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert result["verification_mode"] == "rpc_result_and_read_back"
+    assert result["success_allowed"] is True
+
+
+def test_inventory_return_flow_is_supported_in_preview(tmp_path, monkeypatch):
+    service, fake = _functional_service(tmp_path, monkeypatch)
+    result = service.flow_test(
+        OdooFlowTestRequest(
+            request_id="stock-return-preview-001",
+            flow="inventory_return",
+            mode="preview",
+            values={"picking_id": 42, "product_return_moves": [[0, 0, {"product_id": 4, "quantity": 1}]]},
+            stages=["create_return"],
+        )
+    )
+
+    assert result["status"] == "preview"
+    assert result["plan"]["model"] == "stock.return.picking"
+    assert fake.created_calls == 0
+
+
+def test_dynamic_flow_chains_create_action_and_verify_with_safe_references(tmp_path, monkeypatch):
+    service, fake = _functional_service(tmp_path, monkeypatch)
+    result = service.flow_test(
+        OdooFlowTestRequest(
+            request_id="dynamic-sale-flow-001",
+            flow="custom_sale_validation",
+            mode="persistent_test",
+            steps=[
+                OdooDynamicFlowStep(
+                    name="create_order",
+                    operation="create",
+                    model="sale.order",
+                    records=[{"partner_id": 3}],
+                    verify_fields=["state"],
+                ),
+                OdooDynamicFlowStep(
+                    name="confirm_order",
+                    operation="action",
+                    model="sale.order",
+                    ids_from="create_order.record_ids",
+                    action="action_confirm",
+                    verify_fields=["state"],
+                ),
+                OdooDynamicFlowStep(
+                    name="verify_order",
+                    operation="verify",
+                    model="sale.order",
+                    ids_from="create_order.record_ids",
+                    expected_values={"state": "sale"},
+                ),
+            ],
+        )
+    )
+
+    assert result["status"] == "ok"
+    assert result["verified"] is True
+    assert result["outputs"]["verify_order"]["records"][0]["state"] == "sale"
+    assert fake.created_calls == 1

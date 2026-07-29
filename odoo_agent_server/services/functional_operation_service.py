@@ -30,12 +30,20 @@ _SAFE_CONTEXT_KEYS = {
     "active_model", "tracking_disable", "mail_notrack", "mail_create_nosubscribe",
     "mail_auto_subscribe_no_notify",
 }
-_ACTION_POLICY: dict[str, dict[str, bool]] = {
-    "sale.order": {"action_confirm": False, "action_cancel": True},
-    "purchase.order": {"button_confirm": False, "button_cancel": True},
-    "stock.picking": {"action_confirm": False, "action_assign": False, "button_validate": True},
-    "mrp.production": {"action_confirm": False, "action_assign": False, "button_mark_done": True},
-    "account.move": {"action_post": True, "button_cancel": True},
+_BLOCKED_ACTION_METHODS = {
+    "create", "write", "unlink", "read", "search", "search_read", "read_group",
+    "fields_get", "default_get", "check_access_rights", "check_access_rule",
+    "sudo", "with_context", "with_user", "execute_kw",
+}
+_SENSITIVE_ACTION_TOKENS = {
+    "post", "validate", "done", "complete", "cancel", "delete", "unlink",
+    "payment", "pay", "reconcile", "refund", "return", "scrap", "close",
+}
+_NON_SENSITIVE_ACTIONS = {"action_return"}
+_BLOCKED_MODELS = {
+    "ir.config_parameter", "ir.model", "ir.model.fields", "ir.model.access",
+    "ir.rule", "ir.cron", "ir.actions.server", "base.automation",
+    "res.users", "res.groups",
 }
 _ACTION_EXPECTED_STATES: dict[tuple[str, str], set[str]] = {
     ("sale.order", "action_confirm"): {"sale", "done"},
@@ -69,6 +77,11 @@ _FLOW_RECIPES = {
         "marker": "origin",
         "actions": {"confirm": "action_confirm", "reserve": "action_assign", "validate": "button_validate"},
         "verify": ["id", "name", "state", "picking_type_id", "origin"],
+    },
+    "inventory_return": {
+        "model": "stock.return.picking",
+        "actions": {"create_return": "create_returns"},
+        "verify": ["id", "picking_id", "product_return_moves"],
     },
     "manufacturing_order": {
         "model": "mrp.production",
@@ -229,9 +242,14 @@ class FunctionalOperationService:
             return self._failed(request, client, "record_action", payload, result.error or "Odoo action failed.")
         after = self._read_ok(rpc, request.model, request.ids, verify_fields, context)
         self.approvals.mark_consumed(request.approval_id)
-        expected_states = _ACTION_EXPECTED_STATES[(request.model, request.action)]
+        expected_states = _ACTION_EXPECTED_STATES.get((request.model, request.action))
         states = [str(row.get("state") or "") for row in after]
-        verified = len(after) == len(request.ids) and all(state in expected_states for state in states)
+        if expected_states:
+            verified = len(after) == len(request.ids) and all(state in expected_states for state in states)
+            verification_mode = "expected_state"
+        else:
+            verified = len(after) == len(request.ids) and result.result is not False
+            verification_mode = "rpc_result_and_read_back"
         response = {
             "status": "ok",
             "operation": "record_action",
@@ -243,13 +261,24 @@ class FunctionalOperationService:
             "before": self._redact(before),
             "records": self._redact(after),
             "action_result": self._redact(result.result),
-            "expected_states": sorted(expected_states),
+            "expected_states": sorted(expected_states or []),
+            "verification_mode": verification_mode,
             "verified": verified,
             "success_allowed": verified,
         }
         return self._save(request, client, "record_action", payload, response)
 
     def flow_test(self, request: OdooFlowTestRequest) -> dict[str, Any]:
+        if request.steps:
+            return self._dynamic_flow_test(request)
+        if request.flow not in _FLOW_RECIPES:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown recipe {request.flow!r}. Provide ordered steps for a dynamic flow, "
+                    f"or use one of: {sorted(_FLOW_RECIPES)}"
+                ),
+            )
         client, rpc = self._runtime(request.client_name)
         recipe = _FLOW_RECIPES[request.flow]
         model = str(recipe["model"])
@@ -341,6 +370,168 @@ class FunctionalOperationService:
         payload = request.model_dump(mode="json", exclude={"approval_id"})
         return self._save(request, client, "flow_test", payload, response)
 
+    def _dynamic_flow_test(self, request: OdooFlowTestRequest) -> dict[str, Any]:
+        client, rpc = self._runtime(request.client_name)
+        names = [step.name for step in request.steps]
+        if len(names) != len(set(names)):
+            raise HTTPException(status_code=400, detail="Dynamic flow step names must be unique.")
+
+        plan_steps: list[dict[str, Any]] = []
+        for step in request.steps:
+            self._ensure_model(step.model)
+            fields = self._metadata(rpc, step.model)
+            access = "create" if step.operation == "create" else ("read" if step.operation == "verify" else "write")
+            self._ensure_access(rpc, step.model, access)
+            if step.operation == "create":
+                for values in step.records:
+                    self._validate_values(fields, values, creating=True)
+            elif step.operation == "write":
+                self._validate_values(fields, step.values, creating=False)
+            sensitive = bool(step.action and self._action_sensitive(step.model, step.action))
+            plan_steps.append(
+                {
+                    "name": step.name,
+                    "operation": step.operation,
+                    "model": step.model,
+                    "action": step.action,
+                    "ids": step.ids,
+                    "ids_from": step.ids_from,
+                    "sensitive": sensitive,
+                }
+            )
+
+        plan = {
+            "flow": request.flow,
+            "mode": request.mode,
+            "dynamic": True,
+            "steps": plan_steps,
+            "notifications_suppressed": True,
+        }
+        if request.mode == "preview":
+            return {
+                "status": "preview",
+                "request_id": request.request_id,
+                "client_name": self._client_key(client),
+                "plan": plan,
+                "write_executed": False,
+                "success_allowed": False,
+                "next_action": "Review the dynamic plan, then retry with persistent_test or live mode.",
+            }
+
+        outputs: dict[str, dict[str, Any]] = {}
+        stage_results: list[dict[str, Any]] = []
+        for index, step in enumerate(request.steps):
+            records = self._resolve_refs(step.records, outputs)
+            values = self._resolve_refs(step.values, outputs)
+            arguments = self._resolve_refs(step.arguments, outputs)
+            keyword_arguments = self._resolve_refs(step.keyword_arguments, outputs)
+            expected_values = self._resolve_refs(step.expected_values, outputs)
+            ids = [] if step.operation == "create" else self._step_ids(step.ids, step.ids_from, outputs)
+            step_request_id = f"{request.request_id}:step:{index}:{step.name}"
+
+            if step.operation == "create":
+                result = self.create(
+                    OdooRecordCreateRequest(
+                        client_name=request.client_name,
+                        request_id=step_request_id,
+                        context=request.context,
+                        model=step.model,
+                        records=records,
+                        verify_fields=step.verify_fields,
+                    )
+                )
+            elif step.operation == "write":
+                result = self.write(
+                    OdooRecordWriteRequest(
+                        client_name=request.client_name,
+                        request_id=step_request_id,
+                        context=request.context,
+                        model=step.model,
+                        ids=ids,
+                        values=values,
+                        expected_values=expected_values,
+                        verify_fields=step.verify_fields,
+                    )
+                )
+            elif step.operation == "action":
+                result = self.action(
+                    OdooRecordActionRequest(
+                        client_name=request.client_name,
+                        request_id=step_request_id,
+                        context=request.context,
+                        approval_id=step.approval_id or request.approval_id,
+                        model=step.model,
+                        ids=ids,
+                        action=str(step.action),
+                        arguments=arguments,
+                        keyword_arguments=keyword_arguments,
+                        verify_fields=step.verify_fields,
+                    )
+                )
+            else:
+                result = self._verify_dynamic_step(
+                    rpc,
+                    step.model,
+                    ids,
+                    expected_values,
+                    step.verify_fields,
+                    request.context,
+                )
+
+            output = {"step": step.name, **result}
+            outputs[step.name] = output
+            stage_results.append(output)
+            if result.get("status") not in {"ok", "preview"} or result.get("verified") is not True:
+                break
+
+        complete = len(stage_results) == len(request.steps) and all(
+            item.get("status") == "ok" and item.get("verified") is True
+            for item in stage_results
+        )
+        response = {
+            "status": "ok" if complete else "failed",
+            "operation": "flow_test",
+            "request_id": request.request_id,
+            "client_name": self._client_key(client),
+            "plan": plan,
+            "stage_results": stage_results,
+            "outputs": outputs,
+            "verified": complete,
+            "success_allowed": complete,
+        }
+        payload = request.model_dump(mode="json", exclude={"approval_id"})
+        return self._save(request, client, "flow_test", payload, response)
+
+    def _verify_dynamic_step(
+        self,
+        rpc: OdooJsonRpcService,
+        model: str,
+        ids: list[int],
+        expected_values: dict[str, Any],
+        verify_fields: list[str],
+        context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        fields = self._metadata(rpc, model)
+        selected = self._verify_fields(
+            fields,
+            [*verify_fields, *expected_values],
+            [],
+        )
+        records = self._read_ok(rpc, model, ids, selected, self._safe_context(context))
+        verified = len(records) == len(ids) and all(
+            self._value_matches(row.get(key), value)
+            for row in records
+            for key, value in expected_values.items()
+        )
+        return {
+            "status": "ok",
+            "model": model,
+            "record_ids": ids,
+            "records": self._redact(records),
+            "verified": verified,
+            "success_allowed": verified,
+        }
+
     def audit(self, request: OdooMutationAuditRequest) -> dict[str, Any]:
         client = ClientResolverService().resolve_client(request.client_name, require_complete=False)
         client_name = self._client_key(client)
@@ -369,10 +560,10 @@ class FunctionalOperationService:
         return client, rpc
 
     def _ensure_model(self, model: str) -> None:
-        if model not in settings.functional_allowed_models:
+        if model in _BLOCKED_MODELS:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Model {model!r} is not in ODOO_AGENT_FUNCTIONAL_ALLOWED_MODELS.",
+                detail=f"Security/system model {model!r} cannot be mutated through functional operations.",
             )
 
     def _ensure_batch(self, count: int) -> None:
@@ -474,15 +665,60 @@ class FunctionalOperationService:
             return actual[0] == expected
         return actual == expected
 
+    def _step_ids(
+        self,
+        explicit_ids: list[int],
+        ids_from: str | None,
+        outputs: dict[str, dict[str, Any]],
+    ) -> list[int]:
+        raw: Any = explicit_ids
+        if ids_from:
+            raw = self._reference_value(ids_from, outputs)
+        if isinstance(raw, int):
+            raw = [raw]
+        if not isinstance(raw, list) or not raw or any(not isinstance(item, int) or item <= 0 for item in raw):
+            raise HTTPException(status_code=400, detail=f"Dynamic step resolved invalid record IDs from {ids_from!r}.")
+        self._ensure_batch(len(raw))
+        return raw
+
+    def _resolve_refs(self, value: Any, outputs: dict[str, dict[str, Any]]) -> Any:
+        if isinstance(value, list):
+            return [self._resolve_refs(item, outputs) for item in value]
+        if not isinstance(value, dict):
+            return value
+        if set(value) == {"$ref"}:
+            reference = value.get("$ref")
+            if not isinstance(reference, str):
+                raise HTTPException(status_code=400, detail="Dynamic $ref must be a string.")
+            return self._reference_value(reference, outputs)
+        return {key: self._resolve_refs(item, outputs) for key, item in value.items()}
+
+    @staticmethod
+    def _reference_value(reference: str, outputs: dict[str, dict[str, Any]]) -> Any:
+        parts = reference.split(".")
+        if not parts or parts[0] not in outputs:
+            raise HTTPException(status_code=400, detail=f"Dynamic reference {reference!r} does not target a completed step.")
+        value: Any = outputs[parts[0]]
+        for part in parts[1:]:
+            if isinstance(value, dict) and part in value:
+                value = value[part]
+            elif isinstance(value, list) and part.isdigit() and int(part) < len(value):
+                value = value[int(part)]
+            else:
+                raise HTTPException(status_code=400, detail=f"Dynamic reference path {reference!r} was not found.")
+        return value
+
     @staticmethod
     def _action_sensitive(model: str, action: str) -> bool:
-        allowed = _ACTION_POLICY.get(model, {})
-        if action not in allowed:
+        if action.startswith("_") or action in _BLOCKED_ACTION_METHODS:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Action {model}.{action} is not allowlisted.",
+                detail=f"Private/system method {model}.{action} cannot be called through odoo.record_action.",
             )
-        return allowed[action]
+        lowered = action.lower()
+        if lowered in _NON_SENSITIVE_ACTIONS:
+            return False
+        return any(token in lowered for token in _SENSITIVE_ACTION_TOKENS)
 
     @staticmethod
     def _client_key(client: ResolvedClient | None) -> str:

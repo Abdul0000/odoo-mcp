@@ -129,14 +129,6 @@ class Settings(BaseSettings):
         le=100,
         alias="ODOO_AGENT_FUNCTIONAL_MAX_BATCH_RECORDS",
     )
-    functional_allowed_models_raw: str = Field(
-        default=(
-            "res.partner,product.product,product.template,crm.lead,"
-            "sale.order,purchase.order,stock.picking,mrp.production,"
-            "account.move,project.task,helpdesk.ticket"
-        ),
-        alias="ODOO_AGENT_FUNCTIONAL_ALLOWED_MODELS",
-    )
 
 
     # Odoo.sh SSH connector settings. Use a development/staging build host.
@@ -171,14 +163,6 @@ class Settings(BaseSettings):
     @property
     def protected_branches(self) -> set[str]:
         return {item.strip() for item in self.protected_branches_raw.split(",") if item.strip()}
-
-    @property
-    def functional_allowed_models(self) -> set[str]:
-        return {
-            item.strip()
-            for item in self.functional_allowed_models_raw.split(",")
-            if item.strip()
-        }
 
     @property
     def workspace_path(self) -> Path:

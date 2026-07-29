@@ -950,19 +950,49 @@ class OdooMutationAuditRequest(BaseModel):
     limit: int = Field(default=20, ge=1, le=100)
 
 
+class OdooDynamicFlowStep(BaseModel):
+    name: str = Field(..., min_length=1, max_length=60, pattern=r"^[A-Za-z0-9_-]+$")
+    operation: Literal["create", "write", "action", "verify"]
+    model: str = Field(..., pattern=r"^[a-zA-Z0-9_.]+$")
+    records: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    values: dict[str, Any] = Field(default_factory=dict)
+    ids: list[int] = Field(default_factory=list, max_length=100)
+    ids_from: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+|\.\d+)*$",
+        description="Reference to an earlier step result, e.g. create_order.record_ids.",
+    )
+    action: str | None = Field(default=None, pattern=r"^[a-zA-Z0-9_]+$")
+    arguments: list[Any] = Field(default_factory=list, max_length=10)
+    keyword_arguments: dict[str, Any] = Field(default_factory=dict)
+    expected_values: dict[str, Any] = Field(default_factory=dict)
+    verify_fields: list[str] = Field(default_factory=list, max_length=30)
+    approval_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_operation_contract(self):
+        if self.operation == "create" and not self.records:
+            raise ValueError("create step requires records")
+        if self.operation == "write" and not self.values:
+            raise ValueError("write step requires values")
+        if self.operation == "action" and not self.action:
+            raise ValueError("action step requires action")
+        if self.operation != "create" and not self.ids and not self.ids_from:
+            raise ValueError(f"{self.operation} step requires ids or ids_from")
+        return self
+
+
 class OdooFlowTestRequest(OdooMutationBaseRequest):
-    flow: Literal[
-        "sale_order",
-        "purchase_order",
-        "inventory_transfer",
-        "manufacturing_order",
-        "customer_invoice",
-        "vendor_bill",
-    ]
+    flow: str = Field(..., min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_-]+$")
     mode: Literal["preview", "persistent_test", "live"] = "preview"
     values: dict[str, Any] = Field(default_factory=dict)
     stages: list[str] = Field(default_factory=list, max_length=10)
     verify_fields: list[str] = Field(default_factory=list, max_length=30)
+    steps: list[OdooDynamicFlowStep] = Field(
+        default_factory=list,
+        max_length=30,
+        description="Ordered dynamic create/write/action/verify steps. Exact {'$ref': 'step.path'} objects may reference prior outputs.",
+    )
 
 
 class OdooShQueryRequest(BaseModel):

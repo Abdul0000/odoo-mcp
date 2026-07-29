@@ -69,6 +69,16 @@ def test_functional_mutation_tools_advertise_side_effects_and_idempotency():
     assert tools["odoo_mutation_audit"]["annotations"]["readOnlyHint"] is True
 
 
+def test_dynamic_flow_step_contract_is_exposed_to_remote_providers():
+    flow = next(tool for tool in _mcp_tools_list() if tool["name"] == "odoo_flow_test")
+    step = flow["inputSchema"]["properties"]["steps"]["items"]["properties"]
+
+    assert {
+        "name", "operation", "model", "records", "values", "ids", "ids_from",
+        "action", "arguments", "keyword_arguments", "expected_values", "verify_fields",
+    } <= set(step)
+
+
 def test_provider_mcp_workflow_schema_contains_autopatch_fields():
     tools = _mcp_tools_list()
     workflow = next(tool for tool in tools if tool["name"] == "workflow_odoo_code_change")

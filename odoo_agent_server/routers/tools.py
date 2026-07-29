@@ -606,7 +606,7 @@ _TOOL_DESCRIPTORS = [
         name="odoo.record_create",
         title="Create Odoo records",
         description=(
-            "Create an allowlisted single or bounded batch of live Odoo records as the configured "
+            "Create a single or bounded batch of live business records as the configured "
             "Odoo user. Requires an explicit request_id and verifies created records by reading them back."
         ),
         destructive=True,
@@ -616,7 +616,7 @@ _TOOL_DESCRIPTORS = [
         name="odoo.record_write",
         title="Update Odoo records",
         description=(
-            "Update allowlisted live records with optional expected_values concurrency protection, "
+            "Update live business records with optional expected_values concurrency protection, "
             "then return before/after read-back evidence. Direct state writes are prohibited."
         ),
         destructive=True,
@@ -626,8 +626,8 @@ _TOOL_DESCRIPTORS = [
         name="odoo.record_action",
         title="Run approved Odoo business action",
         description=(
-            "Execute only an allowlisted Odoo workflow action on bounded record IDs. Posting, stock "
-            "validation, production completion, cancellation, and other sensitive actions require human approval."
+            "Execute a public Odoo business action on bounded record IDs. Private/system CRUD methods remain "
+            "blocked; posting, stock validation, returns, completion, cancellation, and similar actions require approval."
         ),
         destructive=True,
         idempotent=True,
@@ -636,8 +636,8 @@ _TOOL_DESCRIPTORS = [
         name="odoo.flow_test",
         title="Run Odoo functional flow",
         description=(
-            "Preview or execute a verified Sales, Purchase, Inventory, Manufacturing, customer-invoice, "
-            "or vendor-bill flow without entering the code/deploy pipeline."
+            "Preview or execute a standard recipe or arbitrary ordered dynamic create/write/action/verify "
+            "flow with safe prior-step references, without entering the code/deploy pipeline."
         ),
         destructive=True,
         idempotent=True,

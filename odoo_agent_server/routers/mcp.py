@@ -391,7 +391,7 @@ def _remote_compatible_schema(schema: dict[str, Any]) -> dict[str, Any]:
         if "$ref" in value:
             ref = str(value.get("$ref") or "")
             definition_name = ref.rsplit("/", 1)[-1]
-            if definition_name == "OdooDebugRecordAssertion":
+            if definition_name in {"OdooDebugRecordAssertion", "OdooDynamicFlowStep"}:
                 target = definitions.get(definition_name)
                 if isinstance(target, dict):
                     return clean(target)
