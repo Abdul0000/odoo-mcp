@@ -133,6 +133,7 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "exact technical target",
         "at most one useful live lookup",
         "source_verified_live_unverified",
+        "denotes module scope",
     ]
     for marker in required_markers:
         assert marker in text

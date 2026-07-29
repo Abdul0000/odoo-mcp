@@ -87,6 +87,28 @@ class ExistingTargetResolutionService:
             )
             return self._finish(key, result, started)
 
+        if self._is_module_scope(
+            hint=hint,
+            identifier=identifier,
+            module_name=module_name,
+            task_description=task_description,
+            change_request=change_request,
+            planned_paths=planned_paths,
+        ):
+            result = self._result(
+                status="scope_verified",
+                mode=mode,
+                kind="module_scope",
+                identifier=module_name,
+                model=None,
+                source_verified=bool(paths),
+                reason=(
+                    "The request targets the addon as a whole. Multiple definitions and references "
+                    "inside that addon are expected and are governed by the module contract, not a single-object ambiguity gate."
+                ),
+            )
+            return self._finish(key, result, started)
+
         matches = self._source_matches(
             paths=paths,
             module_path=module_path,
@@ -203,6 +225,36 @@ class ExistingTargetResolutionService:
         if _NEW_WORDS.search(text):
             return "new"
         return "existing" if hint.identifier else "auto"
+
+    @staticmethod
+    def _is_module_scope(
+        *,
+        hint: OdooTargetResolutionHint,
+        identifier: str | None,
+        module_name: str,
+        task_description: str,
+        change_request: dict[str, Any],
+        planned_paths: list[str],
+    ) -> bool:
+        if hint.kind not in {"auto", "other"}:
+            return False
+        identifier_is_module = bool(
+            identifier
+            and identifier.strip().lower().replace("-", "_")
+            == module_name.strip().lower().replace("-", "_")
+        )
+        broad_contract = bool(re.search(
+            r"\b(module[- ]wide|whole module|entire module|full (?:module )?redesign|"
+            r"complete (?:module )?(?:implementation|redesign|rewrite|refactor)|"
+            r"redesign (?:the )?(?:whole|entire|full) module)\b",
+            task_description,
+            re.I,
+        ))
+        structured_scope = str(change_request.get("scope") or "").strip().lower().replace("_", "-") in {
+            "module", "module-wide", "whole-module", "entire-module",
+        }
+        multi_file_module_write = identifier_is_module and len(set(planned_paths)) > 1
+        return structured_scope or broad_contract or identifier_is_module or multi_file_module_write
 
     @staticmethod
     def _clues(

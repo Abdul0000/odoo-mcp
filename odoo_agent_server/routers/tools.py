@@ -9,6 +9,7 @@ import inspect
 import json
 import re
 import textwrap
+import threading
 import time
 import typing
 from datetime import datetime, timezone
@@ -92,6 +93,7 @@ from ..schemas import (
     RepoWriteItem,
     RepoWriteRequest,
     SelfRunRequest,
+    JobRecord,
     JobStatus,
     JobStep,
     deployment_confirmed_from_record,
@@ -152,10 +154,13 @@ from ..services.live_assertion_service import LiveAssertionService
 from ..services.functional_operation_service import FunctionalOperationService
 from ..services.module_test_service import ModuleTestService
 from ..services.existing_target_resolution_service import ExistingTargetResolutionService
+from ..services.background_executor import submit_background
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
 _STRICT_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+_CLIENT_VALIDATION_START_LOCK = threading.Lock()
+_CLIENT_VALIDATION_STALE_SECONDS = 180
 
 
 def strict_safe_tool_name(name: str) -> str:
@@ -261,7 +266,8 @@ _TOOL_DESCRIPTORS = [
             "Mandatory first gate for multi-client ODOO_CLIENTS setups. "
             "Call without client_name to list clients and require user selection when multiple clients exist. "
             "After the user selects a client, call with client_name and validate=true. "
-            "Validation checks repo/token/branch, checkout, Odoo.sh SSH, Odoo shell health, and addons path. "
+            "Slow validation runs in a background job and returns job_id/next_call immediately; poll jobs.get until terminal. "
+            "Validation checks repo/token/branch, local checkout identity, Odoo.sh SSH, Odoo shell health, and addons path. "
             "Write/git/deploy tools are blocked until this passes when multiple clients are configured."
         ),
         read_only=True,
@@ -4967,6 +4973,108 @@ async def _workflow_frontend_visual_implement(payload: FrontendVisualImplementRe
     return result
 
 
+def _start_client_validation(req: ClientCheckRequest) -> dict[str, Any]:
+    gate = ClientGateService()
+    selected = gate.check(req.client_name, validate=False)
+    if selected.get("requires_client_selection"):
+        return selected
+
+    client_name = str(selected.get("client_name") or req.client_name or "").strip()
+    if not client_name:
+        return selected
+    if selected.get("validation", {}).get("validated") and not req.force_refresh:
+        return gate.check(client_name, validate=True, force_refresh=False)
+
+    store = JsonStore()
+    with _CLIENT_VALIDATION_START_LOCK:
+        running = None
+        now = datetime.now(timezone.utc)
+        for candidate in store.list_jobs(limit=100):
+            if (
+                candidate.job_type != "client_validation"
+                or candidate.status not in {JobStatus.queued, JobStatus.running}
+                or candidate.request.get("client_name") != client_name
+            ):
+                continue
+            try:
+                created = datetime.fromisoformat(candidate.created_at.replace("Z", "+00:00"))
+                created = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+                age_seconds = (now - created).total_seconds()
+            except (TypeError, ValueError):
+                age_seconds = _CLIENT_VALIDATION_STALE_SECONDS + 1
+            if age_seconds <= _CLIENT_VALIDATION_STALE_SECONDS:
+                running = candidate
+                break
+            store.finish_job(
+                candidate,
+                JobStatus.failed,
+                {
+                    "ok": False,
+                    "validated": False,
+                    "coding_ready": False,
+                    "client_name": client_name,
+                    "summary": "Stale client-validation job was closed after connector interruption.",
+                    "next_call": None,
+                },
+            )
+        if running is not None:
+            return {
+                "status": "validation_running",
+                "validated": False,
+                "coding_ready": False,
+                "client_name": client_name,
+                "job_id": running.id,
+                "completion_required": True,
+                "success_allowed": False,
+                "poll_after_seconds": 2,
+                "next_call": running.next_call,
+            }
+
+        job = store.create_job(JobRecord(
+            job_type="client_validation",
+            status=JobStatus.running,
+            request={"client_name": client_name, "force_refresh": req.force_refresh},
+        ))
+
+    def _background() -> None:
+        worker_store = JsonStore()
+        try:
+            result = ClientGateService().check(
+                client_name,
+                validate=True,
+                force_refresh=req.force_refresh,
+            )
+            status_ = JobStatus.passed if result.get("validated") else JobStatus.failed
+            worker_store.finish_job(worker_store.get_job(job.id), status_, result)
+        except Exception as exc:  # noqa: BLE001
+            worker_store.finish_job(
+                worker_store.get_job(job.id),
+                JobStatus.failed,
+                {
+                    "ok": False,
+                    "validated": False,
+                    "coding_ready": False,
+                    "client_name": client_name,
+                    "summary": "Client validation failed.",
+                    "error": str(getattr(exc, "detail", exc)),
+                    "next_call": None,
+                },
+            )
+
+    submit_background(_background)
+    return {
+        "status": "validation_started",
+        "validated": False,
+        "coding_ready": False,
+        "client_name": client_name,
+        "job_id": job.id,
+        "completion_required": True,
+        "success_allowed": False,
+        "poll_after_seconds": 2,
+        "next_call": job.next_call,
+    }
+
+
 async def _dispatch(name: str, args: dict) -> object:
     if name == "connector.health":
         EmptyRequest.model_validate(args)
@@ -4982,7 +5090,9 @@ async def _dispatch(name: str, args: dict) -> object:
         return JsonStore().read_artifact(req.artifact_id, req.offset, req.max_chars)
     if name == "client.check":
         req = ClientCheckRequest.model_validate(args)
-        return ClientGateService().check(req.client_name, req.run_validation, req.force_refresh)
+        if req.run_validation:
+            return _start_client_validation(req)
+        return ClientGateService().check(req.client_name, validate=False, force_refresh=req.force_refresh)
     if name == "workflow.agent_instructions":
         try:
             from ..main import agent_instructions
@@ -5375,7 +5485,8 @@ def _dynamic_tool_output_schema(name: str) -> dict:
         properties.update({
             "validated": {"type": "boolean"}, "client_name": {"type": "string"},
             "coding_ready": {"type": "boolean"}, "deploy_ready": {"type": "boolean"},
-            "summary": {"type": "string"},
+            "summary": {"type": "string"}, "job_id": {"type": "string"},
+            "completion_required": {"type": "boolean"}, "success_allowed": {"type": "boolean"},
         })
     elif internal == "workflow.module_analyze":
         properties.update({

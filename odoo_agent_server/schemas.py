@@ -1451,7 +1451,7 @@ class JobRecord(BaseModel):
     @property
     def completion_required(self) -> bool:
         """True while a connector-owned long-running workflow needs polling."""
-        return self.job_type in {"safe_deploy_module", "workflow.module_test"} and self.status in {
+        return self.job_type in {"safe_deploy_module", "workflow.module_test", "client_validation"} and self.status in {
             JobStatus.queued,
             JobStatus.running,
         }
@@ -1473,7 +1473,9 @@ class JobRecord(BaseModel):
     @computed_field  # type: ignore[misc]
     @property
     def poll_after_seconds(self) -> int | None:
-        return 10 if self.completion_required else None
+        if not self.completion_required:
+            return None
+        return 2 if self.job_type == "client_validation" else 10
 
     @computed_field  # type: ignore[misc]
     @property
@@ -1486,7 +1488,7 @@ class JobRecord(BaseModel):
                 "job_id": self.id,
                 "wait_for_result": True,
                 "wait_timeout_seconds": 600,
-                "poll_interval_seconds": 10.0,
+                "poll_interval_seconds": 2.0 if self.job_type == "client_validation" else 10.0,
             },
         }
 

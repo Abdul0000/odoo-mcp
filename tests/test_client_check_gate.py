@@ -9,6 +9,7 @@ from fastapi import HTTPException
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import agent_instructions
+from odoo_agent_server.routers import tools
 from odoo_agent_server.routers.repo import repo_read
 from odoo_agent_server.schemas import ClientCheckRequest, RepoReadRequest
 from odoo_agent_server.services.client_gate_service import ClientGateService
@@ -93,6 +94,60 @@ def test_client_check_validation_saves_active_client_and_allows_guarded_repo_too
 
     content = repo_read(RepoReadRequest(client_name="Alpha", project_path=str(checkout), relative_path="README.md"))
     assert content.content == "ok\n"
+
+
+def test_mcp_client_validation_returns_background_job_before_remote_checks(monkeypatch, tmp_path):
+    state = tmp_path / "state"
+    checkout = tmp_path / "alpha"
+    _make_checkout(checkout)
+    monkeypatch.setattr(settings, "state_dir", str(state))
+    _set_clients(monkeypatch, [
+        _client("Alpha", "https://github.com/acme/a.git", "dev", str(checkout)),
+    ])
+    _patch_successful_validation(monkeypatch)
+    callbacks = []
+    monkeypatch.setattr(tools, "submit_background", callbacks.append)
+
+    started = tools._start_client_validation(
+        ClientCheckRequest(client_name="Alpha", validate=True),
+    )
+
+    assert started["status"] == "validation_started"
+    assert started["completion_required"] is True
+    assert started["validated"] is False
+    assert started["next_call"]["tool"] == "jobs.get"
+    assert len(callbacks) == 1
+    running = JsonStore().get_job(started["job_id"])
+    assert running.status.value == "running"
+
+    callbacks[0]()
+
+    terminal = JsonStore().get_job(started["job_id"])
+    assert terminal.status.value == "passed"
+    assert terminal.result["validated"] is True
+    assert terminal.result["next_call"]["tool"] == "workflow.agent_instructions"
+
+
+def test_client_validation_defers_missing_checkout_to_code_workflow(monkeypatch, tmp_path):
+    state = tmp_path / "state"
+    checkout = tmp_path / "not_cloned"
+    monkeypatch.setattr(settings, "state_dir", str(state))
+    _set_clients(monkeypatch, [
+        _client("Alpha", "https://github.com/acme/a.git", "dev", str(checkout)),
+    ])
+    monkeypatch.setattr(
+        "odoo_agent_server.services.client_gate_service.RepoService.prepare_repo",
+        lambda *args, **kwargs: pytest.fail("client validation must not clone or pull"),
+    )
+    monkeypatch.setattr(ClientGateService, "_check_odoo_shell", lambda self, client: {"status": "ok", "log": ["odoo ok"]})
+    monkeypatch.setattr(ClientGateService, "_check_odoosh", lambda self, client: {"status": "ok", "addons_path_status": "ok", "log": ["ssh ok"]})
+
+    checked = ClientGateService().check(client_name="Alpha", validate=True)
+
+    assert checked["validated"] is True
+    assert checked["checks"]["checkout"] == "deferred"
+    assert any("deferred to the selected coding workflow" in line for line in checked["validation_log"])
+    ClientGateService().require_validated_client("Alpha", "repo.prepare")
 
 
 def test_agent_instructions_returns_client_gate_until_validation_passes(monkeypatch, tmp_path):

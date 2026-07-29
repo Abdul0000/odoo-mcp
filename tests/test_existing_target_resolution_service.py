@@ -148,6 +148,42 @@ def test_broad_free_text_does_not_invent_a_technical_identifier(tmp_path):
     assert result.writes_blocked is False
 
 
+def test_module_wide_redesign_does_not_treat_module_name_as_single_field(tmp_path):
+    project, module, paths = _module(tmp_path, {
+        "models/config.py": (
+            "from odoo import fields, models\n"
+            "class Config(models.Model):\n"
+            "    _name = 'tebra.config'\n"
+            "    tebra_integration = fields.Boolean()\n"
+        ),
+        "views/config_views.xml": (
+            "<odoo><record id=\"tebra_integration\" model=\"ir.ui.view\">"
+            "<field name=\"name\">tebra_integration</field></record></odoo>"
+        ),
+    })
+
+    result = ExistingTargetResolutionService().resolve(
+        project=project,
+        module_path=module,
+        module_name="tebra_integration",
+        task_description="Complete module-wide redesign of tebra_integration with all models, views, sync logic, and tests.",
+        target_hint="tebra_integration",
+        intent="modify_existing_feature",
+        task_type="auto",
+        change_request={"scope": "module-wide"},
+        hint=OdooTargetResolutionHint(),
+        candidate_paths=paths,
+        planned_paths=["sample/models/config.py", "sample/views/config_views.xml"],
+        client=None,
+        create_module=False,
+    )
+
+    assert result.status == "scope_verified"
+    assert result.kind == "module_scope"
+    assert result.writes_blocked is False
+    assert result.live_checked is False
+
+
 def test_new_target_collision_blocks_but_absent_target_proceeds(tmp_path):
     project, module, paths = _module(tmp_path, {
         "models/res_partner.py": (
