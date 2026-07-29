@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -128,16 +129,23 @@ def test_mcp_client_validation_returns_background_job_before_remote_checks(monke
     assert terminal.result["next_call"]["tool"] == "workflow.agent_instructions"
 
 
-def test_client_validation_defers_missing_checkout_to_code_workflow(monkeypatch, tmp_path):
+def test_client_validation_prepares_missing_configured_checkout(monkeypatch, tmp_path):
     state = tmp_path / "state"
     checkout = tmp_path / "not_cloned"
     monkeypatch.setattr(settings, "state_dir", str(state))
     _set_clients(monkeypatch, [
         _client("Alpha", "https://github.com/acme/a.git", "dev", str(checkout)),
     ])
+    prepare_calls = []
+
+    def prepare_repo(self, **kwargs):
+        prepare_calls.append(kwargs)
+        _make_checkout(checkout)
+        return SimpleNamespace(project_path=str(checkout), branch="dev")
+
     monkeypatch.setattr(
         "odoo_agent_server.services.client_gate_service.RepoService.prepare_repo",
-        lambda *args, **kwargs: pytest.fail("client validation must not clone or pull"),
+        prepare_repo,
     )
     monkeypatch.setattr(ClientGateService, "_check_odoo_shell", lambda self, client: {"status": "ok", "log": ["odoo ok"]})
     monkeypatch.setattr(ClientGateService, "_check_odoosh", lambda self, client: {"status": "ok", "addons_path_status": "ok", "log": ["ssh ok"]})
@@ -145,9 +153,10 @@ def test_client_validation_defers_missing_checkout_to_code_workflow(monkeypatch,
     checked = ClientGateService().check(client_name="Alpha", validate=True)
 
     assert checked["validated"] is True
-    assert checked["checks"]["checkout"] == "deferred"
-    assert any("deferred to the selected coding workflow" in line for line in checked["validation_log"])
-    ClientGateService().require_validated_client("Alpha", "repo.prepare")
+    assert checked["checks"]["checkout"] == "ok"
+    assert prepare_calls == [{"client_name": "Alpha", "timeout_seconds": 180}]
+    assert checkout.is_dir()
+    ClientGateService().require_validated_client("Alpha", "workflow.odoo_code_change")
 
 
 def test_agent_instructions_returns_client_gate_until_validation_passes(monkeypatch, tmp_path):

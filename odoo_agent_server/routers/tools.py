@@ -160,7 +160,7 @@ router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency
 
 _STRICT_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _CLIENT_VALIDATION_START_LOCK = threading.Lock()
-_CLIENT_VALIDATION_STALE_SECONDS = 180
+_CLIENT_VALIDATION_STALE_SECONDS = 900
 
 
 def strict_safe_tool_name(name: str) -> str:
@@ -267,7 +267,7 @@ _TOOL_DESCRIPTORS = [
             "Call without client_name to list clients and require user selection when multiple clients exist. "
             "After the user selects a client, call with client_name and validate=true. "
             "Slow validation runs in a background job and returns job_id/next_call immediately; poll jobs.get until terminal. "
-            "Validation checks repo/token/branch, local checkout identity, Odoo.sh SSH, Odoo shell health, and addons path. "
+            "Validation prepares or verifies the configured checkout, then checks repo/token/branch, Odoo.sh SSH, Odoo shell health, and addons path. "
             "Write/git/deploy tools are blocked until this passes when multiple clients are configured."
         ),
         read_only=True,

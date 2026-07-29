@@ -303,8 +303,7 @@ class ClientGateService:
         return resolved.path if resolved else None
 
     def _validation_stale_reason(self, validation: dict[str, Any], project_path: str | None) -> str | None:
-        checkout_was_deferred = (validation.get("checks") or {}).get("checkout") == "deferred"
-        if project_path and not Path(project_path).expanduser().is_dir() and not checkout_was_deferred:
+        if project_path and not Path(project_path).expanduser().is_dir():
             return f"repo checkout no longer exists at {project_path}"
         age_seconds = self._validation_age_seconds(validation)
         if age_seconds is not None and age_seconds > self.VALIDATION_TTL_SECONDS:
@@ -413,7 +412,7 @@ class ClientGateService:
             checks["github"] = checkout_result["status"] if checkout_result.get("network_verified") else "deferred"
             checks["branch"] = checkout_result["status"]
             log.extend(checkout_result["log"])
-            if checkout_result["status"] not in {"ok", "deferred"}:
+            if checkout_result["status"] != "ok":
                 base_ok = False
                 error_type = checkout_result.get("error_type") or "checkout_error"
 
@@ -582,15 +581,14 @@ class ClientGateService:
                     return {"status": "ok", "network_verified": False, "log": [f"Existing checkout validated locally without fetch/pull: {existing} on branch {client.branch}. Remote access will be proven during push."]}
                 return {"status": "failed", "error_type": "checkout_target_error", "log": [self._redact(local_check.stderr or local_check.stdout or "Existing checkout target validation failed.")]}
 
-            # Client selection must return quickly. Cloning/fetching/pulling is
-            # owned by the code workflow's repo.prepare stage, where it already
-            # has background/progress handling and exact task context.
+            # Validation itself runs in a connector-owned background job, so it
+            # can safely materialize the configured checkout without holding an
+            # MCP request open or passing a nonexistent path downstream.
+            result = RepoService().prepare_repo(client_name=client.name, timeout_seconds=180)
             return {
-                "status": "deferred",
-                "network_verified": False,
-                "log": [
-                    f"Checkout preparation deferred to the selected coding workflow: {existing} on branch {client.branch}."
-                ],
+                "status": "ok",
+                "network_verified": True,
+                "log": [f"Local checkout ready: {result.project_path} on branch {result.branch}."],
             }
         except Exception as exc:  # noqa: BLE001
             return {"status": "failed", "error_type": "checkout_error", "log": [f"Repo checkout/prepare failed: {self._redact(str(exc))}"]}
