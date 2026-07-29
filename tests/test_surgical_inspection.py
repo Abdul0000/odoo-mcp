@@ -242,6 +242,61 @@ def test_debug_runtime_session_reuses_code_workflow_and_requests_complete_writes
     assert store.states["Test 18"]["debug_sessions"]
 
 
+def test_debug_clarification_preserves_writes_and_never_uses_correlation_as_target(monkeypatch):
+    _prepare_debug_workflow(monkeypatch)
+    captured = []
+
+    async def fake_code_change(payload):
+        captured.append(payload)
+        if not payload.writes:
+            return {
+                "status": "needs_writes",
+                "write_generation": {"contexts": [{"relative_path": "custom_sale/controllers/main.py"}]},
+            }
+        if not payload.clarification_answer:
+            return {
+                "status": "needs_clarification",
+                "clarification_gate": {"required": True, "question": "Apply to portal users too?"},
+            }
+        return {"status": "deploy_started", "job_id": "deploy-after-clarification"}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change", fake_code_change)
+    start = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload("Controller raises an exception when saving")
+    ))
+    session_id = start["debug_session"]["id"]
+    write = OdooCodeFileChange(
+        relative_path="custom_sale/controllers/main.py",
+        content="def save():\n    return True\n",
+    )
+    clarification = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload(
+            "Controller raises an exception when saving",
+            action="continue",
+            debug_session_id=session_id,
+            writes=[write],
+        )
+    ))
+
+    assert clarification["status"] == "debug_needs_clarification"
+    assert clarification["next_call"]["required_generated_arguments"] == ["clarification_answer"]
+    assert clarification["next_call"]["arguments"]["writes"] == [write.model_dump(mode="json")]
+
+    continued = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload(
+            "Controller raises an exception when saving",
+            action="continue",
+            debug_session_id=session_id,
+            clarification_answer="Yes, include portal users.",
+        )
+    ))
+
+    assert continued["status"] == "debug_deploying"
+    assert captured[-1].writes == [write]
+    assert captured[-1].clarification_answer == "Yes, include portal users."
+    assert all(payload.target_hint is None for payload in captured)
+
+
 def test_debug_session_owns_deploy_then_requires_and_accepts_replay_proof(monkeypatch):
     store = _prepare_debug_workflow(monkeypatch)
     calls = {"count": 0}

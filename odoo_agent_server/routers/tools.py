@@ -2441,24 +2441,31 @@ def _contract_continuation_task(task_description: str, module_name: str) -> str:
     )
 
 
-def _target_resolution_continuation_arguments(
+def _code_change_continuation_arguments(
     payload: OdooCodeChangeRequest,
     *,
     client_name: str | None,
     project_path: str,
     module_name: str,
-    target_files: list[str],
+    target_files: list[str] | None = None,
+    preserve_writes: bool,
+    batch_index: int | None = None,
 ) -> dict[str, Any]:
-    """Preserve the exact approved change while requesting target clarification."""
+    """Preserve the exact request contract across every code-change continuation."""
     arguments = payload.model_dump(mode="json", exclude_none=True)
     arguments.pop("clarification_answer", None)
+    if not preserve_writes:
+        arguments.pop("writes", None)
     arguments.update({
         "client_name": client_name,
         "project_path": project_path,
         "module_name": module_name,
         "task_description": _contract_continuation_task(payload.task_description, module_name),
-        "target_files": target_files,
     })
+    if target_files is not None:
+        arguments["target_files"] = target_files
+    if batch_index is not None:
+        arguments["batch_index"] = batch_index
     return arguments
 
 
@@ -3106,7 +3113,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "completion_required": True,
             "next_call": {
                 "tool": "workflow.odoo_code_change",
-                "arguments": _target_resolution_continuation_arguments(
+                "arguments": _code_change_continuation_arguments(
                     payload,
                     client_name=client_name,
                     project_path=project_path,
@@ -3116,6 +3123,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                         for item in custom_reads
                         if item.get("status") == "read" and item.get("relative_path")
                     ],
+                    preserve_writes=True,
                 ),
                 "required_generated_arguments": ["clarification_answer"],
             },
@@ -3186,6 +3194,18 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                     "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
                     "status": "awaiting_user_clarification",
                     "clarification": clarification,
+                    "request": _code_change_continuation_arguments(
+                        payload,
+                        client_name=client_name,
+                        project_path=project_path,
+                        module_name=effective_module_name,
+                        target_files=[
+                            str(r.get("relative_path"))
+                            for r in custom_reads
+                            if r.get("status") == "read" and r.get("relative_path")
+                        ],
+                        preserve_writes=True,
+                    ),
                 }
             }, client_name=client_name)
             return {
@@ -3205,14 +3225,18 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 "completion_required": True,
                 "next_call": {
                     "tool": "workflow.odoo_code_change",
-                    "arguments": {
-                        "client_name": client_name,
-                        "project_path": project_path,
-                        "module_name": effective_module_name,
-                        "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
-                        "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
-                        "target_resolution": payload.target_resolution.model_dump(mode="json"),
-                    },
+                    "arguments": _code_change_continuation_arguments(
+                        payload,
+                        client_name=client_name,
+                        project_path=project_path,
+                        module_name=effective_module_name,
+                        target_files=[
+                            str(r.get("relative_path"))
+                            for r in custom_reads
+                            if r.get("status") == "read" and r.get("relative_path")
+                        ],
+                        preserve_writes=True,
+                    ),
                     "required_generated_arguments": ["clarification_answer"],
                 },
             }
@@ -3230,6 +3254,18 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 "target_hint": _target_hint(payload),
                 "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
                 "status": "awaiting_internal_writes",
+                "request": _code_change_continuation_arguments(
+                    payload,
+                    client_name=client_name,
+                    project_path=project_path,
+                    module_name=effective_module_name,
+                    target_files=[
+                        str(r.get("relative_path"))
+                        for r in custom_reads
+                        if r.get("status") == "read" and r.get("relative_path")
+                    ],
+                    preserve_writes=False,
+                ),
             }
         }, client_name=client_name)
         return {
@@ -3293,13 +3329,18 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             },
             "next_call": {
                 "tool": "workflow.odoo_code_change",
-                "arguments": {
-                    "client_name": client_name,
-                    "project_path": project_path,
-                    "module_name": effective_module_name,
-                    "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
-                    "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
-                },
+                "arguments": _code_change_continuation_arguments(
+                    payload,
+                    client_name=client_name,
+                    project_path=project_path,
+                    module_name=effective_module_name,
+                    target_files=[
+                        str(r.get("relative_path"))
+                        for r in custom_reads
+                        if r.get("status") == "read" and r.get("relative_path")
+                    ],
+                    preserve_writes=False,
+                ),
                 "required_generated_arguments": ["writes"],
             },
         }
@@ -3334,16 +3375,14 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "completion_required": next_index < payload.total_batches,
             "next_call": {
                 "tool": "workflow.odoo_code_change",
-                "arguments": {
-                    "client_name": client_name,
-                    "project_path": project_path,
-                    "module_name": effective_module_name,
-                    "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
-                    "operation_id": payload.operation_id,
-                    "batch_index": next_index,
-                    "total_batches": payload.total_batches,
-                    "auto_deploy": payload.auto_deploy,
-                },
+                "arguments": _code_change_continuation_arguments(
+                    payload,
+                    client_name=client_name,
+                    project_path=project_path,
+                    module_name=effective_module_name,
+                    preserve_writes=False,
+                    batch_index=next_index,
+                ),
                 "required_generated_arguments": ["writes"],
             } if next_index < payload.total_batches else None,
         }
@@ -3461,16 +3500,14 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 "completion_required": True,
                 "next_call": {
                     "tool": "workflow.odoo_code_change",
-                    "arguments": {
-                        "client_name": client_name,
-                        "project_path": project_path,
-                        "module_name": effective_module_name,
-                        "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
-                        "operation_id": payload.operation_id,
-                        "batch_index": payload.batch_index,
-                        "total_batches": payload.total_batches,
-                        "auto_deploy": payload.auto_deploy,
-                    },
+                    "arguments": _code_change_continuation_arguments(
+                        payload,
+                        client_name=client_name,
+                        project_path=project_path,
+                        module_name=effective_module_name,
+                        preserve_writes=False,
+                        batch_index=payload.batch_index,
+                    ),
                     "required_generated_arguments": ["writes"],
                 },
             }
@@ -3510,16 +3547,14 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "completion_required": True,
             "next_call": {
                 "tool": "workflow.odoo_code_change",
-                "arguments": {
-                    "client_name": client_name,
-                    "project_path": project_path,
-                    "module_name": effective_module_name,
-                    "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
-                    "operation_id": payload.operation_id,
-                    "batch_index": next_index,
-                    "total_batches": payload.total_batches,
-                    "auto_deploy": payload.auto_deploy,
-                },
+                "arguments": _code_change_continuation_arguments(
+                    payload,
+                    client_name=client_name,
+                    project_path=project_path,
+                    module_name=effective_module_name,
+                    preserve_writes=False,
+                    batch_index=next_index,
+                ),
                 "required_generated_arguments": ["writes"],
             },
         }
@@ -3637,19 +3672,15 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "completion_required": True,
             "next_call": {
                 "tool": "workflow.odoo_code_change",
-                "arguments": {
-                    "client_name": client_name,
-                    "project_path": project_path,
-                    "module_name": effective_module_name,
-                    "task_description": _contract_continuation_task(payload.task_description, effective_module_name),
-                    "target_files": repair_targets,
-                    **({
-                        "operation_id": payload.operation_id,
-                        "batch_index": payload.batch_index,
-                        "total_batches": payload.total_batches,
-                        "auto_deploy": payload.auto_deploy,
-                    } if batch_record is not None else {}),
-                },
+                "arguments": _code_change_continuation_arguments(
+                    payload,
+                    client_name=client_name,
+                    project_path=project_path,
+                    module_name=effective_module_name,
+                    target_files=repair_targets,
+                    preserve_writes=False,
+                    batch_index=payload.batch_index if batch_record is not None else None,
+                ),
                 "required_generated_arguments": ["writes"],
             } if repair_attempts <= 3 else None,
         }
@@ -4303,6 +4334,9 @@ def _debug_next_call(
             "wait_timeout_seconds": 30,
             "poll_interval_seconds": 1.0,
         })
+    pending_writes = session.get("pending_clarification_writes")
+    if action == "continue" and isinstance(pending_writes, list) and pending_writes:
+        call["arguments"]["writes"] = pending_writes
     if required_generated_arguments:
         call["required_generated_arguments"] = required_generated_arguments
     return call
@@ -4321,10 +4355,10 @@ async def _debug_begin_code_inspection(
             task_description=_debug_task_description(session),
             task_type=_debug_code_task_type(str(session["surface"])),
             intent="fix_bug",
-            target_hint=session.get("correlation_id"),
             patch_strategy="explicit_writes" if payload.writes else "auto",
             target_files=[],
             writes=payload.writes,
+            clarification_answer=payload.clarification_answer,
             commit_message=f"Fix {session['module_name']}: {session['issue_description'][:180]}",
             auto_deploy=payload.auto_deploy,
             deploy_mode="auto",
@@ -4416,6 +4450,31 @@ async def _debug_begin_code_inspection(
             "next_call": _debug_next_call(session, action="continue", required_generated_arguments=["writes"]),
         }
 
+    if code_status == "needs_clarification":
+        session["phase"] = "awaiting_clarification"
+        session["pending_clarification_writes"] = [
+            write.model_dump(mode="json") for write in payload.writes
+        ]
+        session["clarification_gate"] = code_result.get("clarification_gate") or {
+            "required": True,
+            "question": (code_result.get("target_resolution") or {}).get("question"),
+        }
+        _debug_session_store(store, session, client_name=session.get("client_name"))
+        return {
+            "status": "debug_needs_clarification",
+            "message": "The nested code-change workflow needs one material clarification. Continue this same debug session with clarification_answer; no writes were discarded.",
+            "debug_session": _debug_public_session(session),
+            "clarification_gate": session["clarification_gate"],
+            "code_change": code_result,
+            "success_allowed": False,
+            "completion_required": True,
+            "next_call": _debug_next_call(
+                session,
+                action="continue",
+                required_generated_arguments=["clarification_answer"],
+            ),
+        }
+
     session["phase"] = "blocked"
     session["last_code_change_status"] = code_status
     _debug_session_store(store, session, client_name=session.get("client_name"))
@@ -4450,6 +4509,20 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
     if not payload.debug_session_id:
         if not _debug_requires_runtime_loop(payload):
             ClientGateService().require_validated_client(client_name, "workflow.odoo_debug_and_fix")
+            fast_code_request = OdooCodeChangeRequest(
+                client_name=client_name,
+                project_path=resolved_project_path,
+                module_name=payload.module_name,
+                task_description=f"{payload.issue_description}\nExpected result: {payload.expected_result}",
+                task_type=_debug_code_task_type(_detect_debug_surface(payload)),
+                intent="fix_bug",
+                patch_strategy="explicit_writes" if payload.writes else "auto",
+                writes=payload.writes,
+                clarification_answer=payload.clarification_answer,
+                commit_message=f"Fix {payload.module_name}: {payload.issue_description[:180]}",
+                auto_deploy=payload.auto_deploy,
+                verification_assertion=payload.verification_assertion,
+            )
             return {
                 "status": "routed_to_code_change_fast_path",
                 "message": "No runtime-debug signal was detected. Use the existing focused code-change workflow without log collection or debug cycles.",
@@ -4458,12 +4531,7 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
                 "completion_required": True,
                 "next_call": {
                     "tool": "workflow.odoo_code_change",
-                    "arguments": {
-                        "client_name": client_name,
-                        "project_path": resolved_project_path,
-                        "module_name": payload.module_name,
-                        "task_description": f"{payload.issue_description}\nExpected result: {payload.expected_result}",
-                    },
+                    "arguments": fast_code_request.model_dump(mode="json", exclude_none=True),
                 },
             }
 
@@ -4586,6 +4654,32 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
         source="client",
         trusted=False,
     )
+    if session.get("phase") == "awaiting_clarification":
+        if not str(payload.clarification_answer or "").strip():
+            return {
+                "status": "debug_needs_clarification",
+                "message": "Continue this same debug session with the requested clarification_answer.",
+                "debug_session": _debug_public_session(session),
+                "clarification_gate": session.get("clarification_gate"),
+                "success_allowed": False,
+                "completion_required": True,
+                "next_call": _debug_next_call(
+                    session,
+                    action="continue",
+                    required_generated_arguments=["clarification_answer"],
+                ),
+            }
+        session["phase"] = "diagnosing"
+        session.pop("clarification_gate", None)
+        pending_writes = session.pop("pending_clarification_writes", [])
+        _debug_session_store(store, session, client_name=client_name)
+        continued_payload = payload
+        if not payload.writes and pending_writes:
+            continued_payload = payload.model_copy(update={
+                "writes": [OdooCodeFileChange.model_validate(write) for write in pending_writes],
+            })
+        return await _debug_begin_code_inspection(continued_payload, session, store)
+
     if payload.writes:
         write_fingerprint = _debug_validate_surgical_writes(payload, session)
         retrying_interrupted_write = (
@@ -4923,7 +5017,13 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
         "next_call": _debug_next_call(
             session,
             action="continue",
-            required_generated_arguments=["writes"] if session.get("phase") == "awaiting_writes" else ["runtime_evidence"],
+            required_generated_arguments=(
+                ["writes"]
+                if session.get("phase") == "awaiting_writes"
+                else ["clarification_answer"]
+                if session.get("phase") == "awaiting_clarification"
+                else ["runtime_evidence"]
+            ),
         ),
     }
 

@@ -184,25 +184,53 @@ def test_target_clarification_continuation_preserves_supplied_writes():
         operation_id="tebra-redesign-01",
         batch_index=0,
         total_batches=2,
+        auto_deploy=False,
+        deploy_mode="source_only",
+        commit_message="Apply approved Tebra redesign",
+        change_request={"scope": "module-wide", "qa_required": True},
+        target_resolution={"mode": "existing", "kind": "other", "identifier": "tebra_integration"},
         writes=[
             {"relative_path": "tebra_integration/models/job.py", "content": "first"},
             {"relative_path": "tebra_integration/views/job_views.xml", "content": "second"},
         ],
     )
 
-    arguments = tools._target_resolution_continuation_arguments(
+    arguments = tools._code_change_continuation_arguments(
         payload,
         client_name="Anchor",
         project_path="/workspace/repos/anchor",
         module_name="tebra_integration",
         target_files=["tebra_integration/models/job.py", "tebra_integration/views/job_views.xml"],
+        preserve_writes=True,
     )
 
     assert arguments["writes"] == payload.model_dump(mode="json", exclude_none=True)["writes"]
     assert arguments["operation_id"] == "tebra-redesign-01"
     assert arguments["batch_index"] == 0
     assert arguments["total_batches"] == 2
+    assert arguments["auto_deploy"] is False
+    assert arguments["deploy_mode"] == "source_only"
+    assert arguments["commit_message"] == "Apply approved Tebra redesign"
+    assert arguments["change_request"]["qa_required"] is True
+    assert arguments["target_resolution"]["identifier"] == "tebra_integration"
     assert "clarification_answer" not in arguments
+
+    replacement = tools._code_change_continuation_arguments(
+        payload,
+        client_name="Anchor",
+        project_path="/workspace/repos/anchor",
+        module_name="tebra_integration",
+        target_files=["tebra_integration/models/job.py"],
+        preserve_writes=False,
+        batch_index=1,
+    )
+
+    assert "writes" not in replacement
+    assert replacement["batch_index"] == 1
+    assert replacement["auto_deploy"] is False
+    assert replacement["deploy_mode"] == "source_only"
+    assert replacement["change_request"] == arguments["change_request"]
+    assert replacement["target_resolution"] == arguments["target_resolution"]
 
 
 def test_module_wide_redesign_does_not_treat_module_name_as_single_field(tmp_path):

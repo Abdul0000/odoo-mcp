@@ -459,6 +459,7 @@ class OdooDebugAndFixRequest(BaseModel):
     operation_id: str | None = Field(default=None, max_length=64, description="Stable idempotency key for start/retry.")
     correlation_id: str | None = Field(default=None, max_length=80, description="Safe request/record correlation identifier.")
     runtime_evidence: list[str] = Field(default_factory=list, max_length=50, description="New sanitized logs, traceback, console, or network evidence.")
+    clarification_answer: str | None = Field(default=None, max_length=5000, description="User answer requested by the nested code-change target/material clarification gate.")
     verification_evidence: list[str] = Field(default_factory=list, max_length=20, description="Evidence from replaying the same scenario after deploy.")
     verification_assertion: OdooDebugRecordAssertion | None = Field(default=None, description="Live check: model/domain/fields plus expected_values or expected_count bounds.")
     writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=50, description="Exact writes generated from returned debug/code context.")
