@@ -28,6 +28,7 @@ from odoo_agent_server.routers.tools import (
     _task_description_search_clues,
     _target_edit_policy_rule,
     _safe_unique_python_function_rebase,
+    _write_generation_output_schema,
 )
 from odoo_agent_server.schemas import (
     JobRecord,
@@ -657,6 +658,22 @@ def test_write_generation_rule_matches_target_ownership_strategy():
     assert "duplicate _inherit" in _target_edit_policy_rule("direct_edit")
     assert "Do not modify protected source" in _target_edit_policy_rule("inherit_extension")
     assert "Do not guess target ownership" in _target_edit_policy_rule("clarify")
+
+
+def test_full_module_write_schema_puts_missing_file_content_shape_first():
+    schema = _write_generation_output_schema(has_missing_targets=True)
+
+    assert set(schema[0]) == {"relative_path", "content"}
+    assert "missing/new" in schema[0]["relative_path"]
+    assert "search" in schema[1]
+    assert "existing files only" in schema[1]["search"]
+
+
+def test_existing_file_write_schema_keeps_surgical_shape_first():
+    schema = _write_generation_output_schema(has_missing_targets=False)
+
+    assert "search" in schema[0]
+    assert set(schema[1]) == {"relative_path", "content"}
 
 
 def test_stale_search_rebases_unique_matching_python_function():

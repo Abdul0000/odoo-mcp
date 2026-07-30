@@ -300,6 +300,7 @@ _TOOL_DESCRIPTORS = [
             "read custom module, scope_advice, read /home/odoo/src/odoo/addons related source first with enterprise fallback, "
             "apply provided edits, git.diff, qa.self_run, verify_against_core, then workflow.safe_deploy_module and jobs.get polling. "
             "For a missing addon, set create_module=true with an exact lowercase technical name; it is created only at the checkout root. "
+            "New files must use full content writes, not search/replace; missing parent directories are created automatically. "
             "A cached Odoo-aware index maps functional labels through menus/actions/views/models/fields/QWeb/JS relationships, then reads exact match-centered ranges. "
             "Task descriptions automatically supply quoted identifiers/selectors/XML IDs/methods for focused inspection. "
             "An exact quoted replacement that occurs once can complete in one call; ambiguous or complex work returns exact editable source units in write_generation.contexts for a second call with non-empty writes. "
@@ -1299,6 +1300,22 @@ def _ensure_root_module_scaffold(repo: RepoService, project: Path, payload: Odoo
 def _read_text_safe(path: Path, limit: int = 300_000) -> str:
     data = path.read_text(encoding="utf-8")
     return data[:limit]
+
+
+def _write_generation_output_schema(*, has_missing_targets: bool) -> list[dict[str, Any]]:
+    """Return truthful continuation shapes for existing and missing files."""
+    full_content = {
+        "relative_path": "Exact missing/new path from contexts or suggested_write_targets",
+        "content": "Complete production-ready file content",
+    }
+    search_replace = {
+        "relative_path": "Exact existing path copied from a read context",
+        "search": "Exact source text to replace (existing files only)",
+        "replace": "Complete replacement source text",
+        "regex": False,
+        "count": 1,
+    }
+    return [full_content, search_replace] if has_missing_targets else [search_replace, full_content]
 
 
 def _parse_manifest_depends(manifest_path: Path) -> list[str]:
@@ -3644,16 +3661,17 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                     item.get("relative_path") for item in custom_read_metadata
                     if item.get("status") == "missing"
                 ],
-                "output_schema": [{
-                    "relative_path": "Path copied from the selected context",
-                    "search": "Exact source text to replace",
-                    "replace": "Complete replacement source text",
-                    "regex": False,
-                    "count": 1,
-                }],
+                "output_schema": _write_generation_output_schema(
+                    has_missing_targets=any(
+                        item.get("status") == "missing"
+                        for item in custom_read_metadata
+                    ),
+                ),
                 "rules": [
                     "Generate one complete write set for every required contract item before making next_call.",
                     _target_edit_policy_rule(target_resolution.edit_policy.strategy),
+                    "For every missing/new target, use content with the complete file; search/replace is valid only for an existing file returned with status=read.",
+                    "Parent directories for content writes are created automatically; never ask the user to pre-create models, views, static, or tests directories.",
                     "Do not submit import, manifest, security, or scaffold-only writes when functional identifiers or tests remain missing.",
                     "Prefer literal search/replace with count=1 from a complete source unit.",
                     "Preserve unrelated code and do not rewrite omitted source.",
@@ -3767,6 +3785,23 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             if change.search is None or change.replace is None:
                 raise HTTPException(status_code=400, detail=f"Missing content or search+replace for {rel}")
             target = project / rel
+            if not target.is_file():
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "new_file_requires_content",
+                        "message": (
+                            f"Cannot apply search/replace to missing file {rel}. "
+                            "Resend this write with content containing the complete file. "
+                            "Its parent directories will be created automatically."
+                        ),
+                        "relative_path": rel,
+                        "required_write": {
+                            "relative_path": rel,
+                            "content": "Complete production-ready file content",
+                        },
+                    },
+                )
             old = target.read_text(encoding="utf-8")
             if change.regex:
                 new_content, replaced = re.subn(change.search, change.replace, old, count=change.count or 0)
