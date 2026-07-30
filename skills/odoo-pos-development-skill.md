@@ -171,6 +171,9 @@ ORDER BY sale_date DESC;
   POS UI runs against its own in-browser cache until sync/close.
 - One open session per `pos.config` — always check
   `pos_config.current_session_id` before opening a new one.
+- Never define or override `_load_pos_data_fields` on `pos.config`. Read the
+  installed `point_of_sale` source and use that version's supported POS
+  loader/session mechanism.
 - Use `patch()` on component prototypes (17+) for POS UI customization, not
   the deprecated `odoo.define()` module registry pattern.
 - Hardware calls go through the IoT Box proxy, not the Odoo ORM.

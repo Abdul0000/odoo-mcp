@@ -46,6 +46,7 @@ _MODULE_NAME_RE    = re.compile(r"['\"]([A-Za-z0-9_]+)['\"]")
 _JS_IMPORT_RE      = re.compile(r'(?:from\s+["\']([^"\']+)["\']|import\s*\(\s*["\']([^"\']+)["\']\s*\))')
 _JS_TEMPLATE_RE    = re.compile(r'(?:static\s+template\s*=|\.template\s*=)\s*["\']([^"\']+)["\']')
 _POS_CONFIG_LOAD_FIELDS_RE = re.compile(r'load_fields\s*\(\s*["\']pos\.config["\']', re.IGNORECASE)
+_LOAD_POS_DATA_FIELDS_METHOD_RE = re.compile(r'\bdef\s+_load_pos_data_fields\s*\(')
 _T_NAME_RE         = re.compile(r't-name=["\']([^"\']+)["\']')
 _T_INHERIT_RE      = re.compile(r't-inherit=["\']([^"\']+)["\']')
 _T_CALL_RE         = re.compile(r't-call=["\']([^"\']+)["\']')
@@ -669,6 +670,19 @@ class SyntaxVerifierService:
         inherit_models: list[str] = []
         for m in _INHERIT_RE.finditer(content):
             inherit_models.extend(_extract_model_literals(m.group(1)))
+
+        if "pos.config" in inherit_models and _LOAD_POS_DATA_FIELDS_METHOD_RE.search(content):
+            findings.append(VerifyFinding(
+                file=file_path,
+                severity=VerifySeverity.CRITICAL,
+                check="pos_config_no_load_pos_data_fields",
+                message="pos.config must never define or override _load_pos_data_fields().",
+                fix_hint=(
+                    "Read the installed Odoo point_of_sale source and load pos.config fields through "
+                    "the version's supported POS loader/session mechanism. Do not add "
+                    "_load_pos_data_fields() to pos.config."
+                ),
+            ))
 
         for model_name in inherit_models:
             core_content = _find_core_model_content(model_name, client_name=client_name)

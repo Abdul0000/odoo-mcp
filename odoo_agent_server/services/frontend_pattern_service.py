@@ -97,6 +97,7 @@ _AREA_RULES: dict[str, list[str]] = {
     "pos": [
         "Read point_of_sale/static/src/app before any POS patch; POS service/store names differ by Odoo version.",
         "Use point_of_sale._assets_pos for POS JS/XML/SCSS unless the real manifest proves otherwise.",
+        "Never define or override _load_pos_data_fields on pos.config; use the installed version's supported POS loader/session mechanism.",
         "Inspect existing POS screen/component extension style before patching ProductScreen, PaymentScreen, ReceiptScreen, or store logic.",
         "After deploy, verify exact POS URL/menu and capture console/network/Odoo dialog errors.",
     ],
