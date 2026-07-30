@@ -171,6 +171,79 @@ def test_selected_custom_implementation_wins_over_upstream_definition(tmp_path):
     assert result.edit_policy.direct_edit_paths == [str(custom_paths[0])]
 
 
+def test_locked_method_ignores_incidental_field_references_on_write_continuation(tmp_path):
+    project, module, paths = _module(tmp_path, {
+        "models/tebra_insurance.py": (
+            "from odoo import fields, models\n"
+            "class TebraSyncQueue(models.Model):\n"
+            "    _name = 'tebra.sync.queue'\n"
+            "    next_attempt_at = fields.Datetime()\n"
+            "    started_at = fields.Datetime()\n"
+            "    completed_at = fields.Datetime()\n"
+            "    last_error = fields.Text()\n"
+            "    attempts = fields.Integer()\n"
+            "    state = fields.Selection([])\n"
+            "    def enqueue(self, reset=False):\n"
+            "        self.write({'next_attempt_at': False, 'started_at': False, "
+            "'completed_at': False, 'last_error': False})\n"
+        ),
+    })
+    task = (
+        "Update existing method enqueue on tebra.sync.queue. Fresh pending jobs with "
+        "attempts=0 make next_attempt_at due immediately; clear started_at, completed_at, "
+        "and last_error. Preserve retry backoff and do not requeue done, failed, or skipped "
+        "states unless reset=True."
+    )
+    result = ExistingTargetResolutionService().resolve(
+        project=project,
+        module_path=module,
+        module_name="sample",
+        task_description=task,
+        target_hint="enqueue",
+        intent="fix_bug",
+        task_type="python_model",
+        change_request={"method": "enqueue", "model": "tebra.sync.queue"},
+        hint=OdooTargetResolutionHint(
+            mode="existing",
+            identifier="enqueue",
+            model="tebra.sync.queue",
+        ),
+        candidate_paths=paths,
+        planned_paths=["sample/models/tebra_insurance.py"],
+        client=None,
+        create_module=False,
+    )
+
+    assert result.writes_blocked is False
+    assert result.status == "verified"
+    assert [(match.kind, match.identifier, match.role) for match in result.matches] == [
+        ("method", "enqueue", "definition")
+    ]
+
+    payload = OdooCodeChangeRequest(
+        module_name="sample",
+        project_path=str(project),
+        task_description=task,
+        target_hint="enqueue",
+        intent="fix_bug",
+    )
+    locked = tools._lock_resolved_target(payload, result)
+    continuation = tools._code_change_continuation_arguments(
+        locked,
+        client_name=None,
+        project_path=str(project),
+        module_name="sample",
+        target_files=["sample/models/tebra_insurance.py"],
+        preserve_writes=False,
+    )
+    assert continuation["target_resolution"] == {
+        "mode": "existing",
+        "kind": "method",
+        "identifier": "enqueue",
+        "model": "tebra.sync.queue",
+    }
+
+
 def test_ambiguous_existing_field_blocks_writes(tmp_path):
     source = (
         "from odoo import fields, models\n"

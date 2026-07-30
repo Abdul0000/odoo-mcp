@@ -43,6 +43,8 @@ from ..schemas import (
     OdooDebugEvidenceRecord,
     OdooFailureDiagnosis,
     OdooOperationHandoff,
+    OdooTargetResolutionHint,
+    OdooTargetResolutionResult,
     OdooDebugRecordAssertion,
     ModuleAnalyzeRequest,
     FrontendVisualImplementRequest,
@@ -2707,6 +2709,30 @@ def _code_change_continuation_arguments(
     return arguments
 
 
+def _lock_resolved_target(
+    payload: OdooCodeChangeRequest,
+    target_resolution: OdooTargetResolutionResult,
+) -> OdooCodeChangeRequest:
+    """Carry one verified target unchanged through inspect-then-write calls."""
+    if target_resolution.writes_blocked or not target_resolution.identifier:
+        return payload
+    try:
+        locked_hint = OdooTargetResolutionHint.model_validate({
+            "mode": target_resolution.mode,
+            "kind": target_resolution.kind,
+            "identifier": target_resolution.identifier,
+            "model": target_resolution.model,
+            "require_live": payload.target_resolution.require_live,
+        })
+    except ValidationError:
+        # Aggregate scopes such as module_scope are already preserved by the
+        # task contract and must not be forced into a single-object hint.
+        return payload
+    return payload.model_copy(update={
+        "target_resolution": locked_hint
+    })
+
+
 def _workflow_module_analyze(payload: ModuleAnalyzeRequest) -> dict[str, Any]:
     """Analyze one custom addon locally without entering the coding pipeline."""
     client = ClientResolverService().resolve_client(
@@ -3367,6 +3393,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             },
         }
 
+    payload = _lock_resolved_target(payload, target_resolution)
     diagnosis_session_id = (
         payload.investigation_diagnosis.debug_session_id
         if payload.investigation_diagnosis is not None

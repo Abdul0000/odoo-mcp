@@ -68,7 +68,13 @@ class ExistingTargetResolutionService:
         mode = self._mode(hint, task_description, intent, create_module)
         clues = self._clues(hint, target_hint, task_description, change_request)
         identifier = hint.identifier or (clues[0] if clues else None)
-        kind = self._kind(hint, identifier, task_description, task_type)
+        kind = self._kind(
+            hint,
+            identifier,
+            task_description,
+            task_type,
+            change_request,
+        )
         model = hint.model or self._model_hint(change_request, task_description, kind, identifier)
         paths = self._safe_paths(project, candidate_paths)
         key = self._cache_key(
@@ -121,11 +127,16 @@ class ExistingTargetResolutionService:
             )
             return self._finish(key, result, started)
 
+        # This gate resolves exactly one target. Remaining task identifiers are
+        # inspection context/deliverables, not alternative targets. Treating
+        # them as peers lets incidental field names masquerade as method text
+        # matches and creates false ambiguity on the write continuation.
+        resolution_clues = [identifier] if identifier else clues
         matches = self._source_matches(
             paths=paths,
             module_path=module_path,
             module_name=module_name,
-            clues=clues,
+            clues=resolution_clues,
             requested_kind=kind,
             requested_model=model,
         )
@@ -304,9 +315,25 @@ class ExistingTargetResolutionService:
         return result
 
     @staticmethod
-    def _kind(hint: OdooTargetResolutionHint, identifier: str | None, task: str, task_type: str) -> str:
+    def _kind(
+        hint: OdooTargetResolutionHint,
+        identifier: str | None,
+        task: str,
+        task_type: str,
+        change_request: dict[str, Any],
+    ) -> str:
         if hint.kind != "auto":
             return hint.kind
+        for key, structured_kind in (
+            ("method", "method"), ("field", "field"), ("xml_id", "xml_id"),
+            ("route", "route"), ("template", "template"), ("selector", "component"),
+            ("model", "model"),
+        ):
+            value = change_request.get(key)
+            if isinstance(value, str) and (
+                not identifier or ExistingTargetResolutionService._matches(value, identifier)
+            ):
+                return structured_kind
         text = f"{task_type} {task}".lower()
         for token, kind in (
             ("field", "field"), ("method", "method"), ("cron", "cron"), ("menu", "menu"),
