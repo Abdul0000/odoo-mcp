@@ -7,6 +7,10 @@ tolerance). Never hardcode GL account IDs — resolve via `account.journal` /
 `product.category` / fiscal position. Always respect `state` locks: posted moves
 are immutable except via reversal.
 
+Treat ledger balance, reconciliation, effective tax configuration, and audit
+traceability as invariants; check material downstream effects on statements,
+payments, taxes, and lock dates before accepting a change.
+
 ---
 
 ## 1. INVOICE LIFECYCLE (account.move)

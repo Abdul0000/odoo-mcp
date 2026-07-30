@@ -7,6 +7,9 @@ progress → to_close → done. Component consumption always flows through
 `stock.move`, never direct qty writes. Costing must reconcile to real
 component + operation costs, not guesses.
 
+Identify the causal production-chain crux and check material second-order
+effects on procurement, reservations, consumption, byproducts, and costing.
+
 ---
 
 ## 1. BILL OF MATERIALS (mrp.bom)

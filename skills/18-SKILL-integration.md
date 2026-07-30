@@ -14,6 +14,9 @@ integration audit state. Odoo controllers/portal pages remain with
 5. Verify one success, duplicate delivery, retryable failure, and permanent
    failure path.
 
+Build only the relevant failure taxonomy: timeout, malformed payload, duplicate
+or reordered delivery, partial success, rate limit, and permanent rejection.
+
 ## INTEGRATION CONTRACT
 
 - Keep credentials server-side and mask secrets in logs/artifacts.

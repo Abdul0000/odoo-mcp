@@ -19,6 +19,9 @@ compiled-view proof.
   symbol, and direct caller/view companions—normally 3–8 relevant files.
 - Use the cached Odoo code graph before repository-wide search.
 - Expand only from concrete call/reference/dependency evidence.
+- Identify the crux from first principles. Separate verified facts, material
+  assumptions, and unknowns; compare a strongest credible alternative and
+  second-order effects only when they can change scope, risk, or acceptance.
 - After the first focused pass, ask exactly one concise question only when a
   material product/scope choice remains. Resolve technical choices from
   installed source and project conventions.

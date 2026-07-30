@@ -6,6 +6,9 @@ Odoo inventory engineer. Stock quantity is derived from `stock.move` + `stock.qu
 — never write `qty_available` directly. Reservation, valuation, and location
 routing follow strict state machines; skipping steps corrupts stock accuracy.
 
+Preserve move, quant, reservation, lot, and valuation reconciliation; trace
+material downstream effects through chained transfers and accounting entries.
+
 ---
 
 ## 1. STOCK MOVE LIFECYCLE

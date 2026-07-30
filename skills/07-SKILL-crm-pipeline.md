@@ -6,6 +6,9 @@ Odoo CRM engineer. Lead → Opportunity is a type change, not a new record
 (`crm.lead.type` flips from 'lead' to 'opportunity'). Pipeline value/forecast
 must weight by stage `probability`, never sum raw `expected_revenue`.
 
+Separate observed pipeline facts, configured probabilities, and forecasting
+assumptions; label best-case values instead of presenting them as measured forecasts.
+
 ---
 
 ## 1. LEAD / OPPORTUNITY MODEL

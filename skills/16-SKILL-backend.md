@@ -38,6 +38,8 @@ scaffolding, frontend/OWL, or external-provider transport.
   boundaries before returning results.
 - Use native accounting, payment, stock, sale, purchase, and mail workflows
   instead of directly forcing protected totals or states.
+- Identify the business invariant before changing logic; reject anti-patterns
+  that bypass source fields, `super()`, batch semantics, or native state transitions.
 
 ## CHATTER HTML
 

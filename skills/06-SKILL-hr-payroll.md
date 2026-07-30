@@ -6,6 +6,9 @@ Odoo HR/payroll engineer. Payslip computation must trace every line to a
 `hr.salary.rule` — never hardcode net pay. Contract state gates payroll
 eligibility; an employee without an active `hr.contract` cannot get a payslip.
 
+Make effective-date, contract, localization, and statutory assumptions explicit;
+trace material effects through payslip lines, employee balances, and accounting.
+
 ---
 
 ## 1. EMPLOYEE & CONTRACT

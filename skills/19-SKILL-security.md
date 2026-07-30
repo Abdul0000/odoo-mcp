@@ -8,8 +8,10 @@ multi-company isolation, controller authorization, portal tokens, scoped
 1. Identify users/companies/operations and the intended access matrix.
 2. Resolve model ACLs, global/group rules, field groups, view node groups,
    controller auth, and every `sudo()` boundary.
-3. Test representative users; administrator-only success is insufficient.
-4. Prefer deny-by-design for sensitive data while preserving native flows.
+3. Red-team the strongest credible attacker path through those boundaries,
+   using concrete actors, records, operations, companies, and ownership.
+4. Test representative users; administrator-only success is insufficient.
+5. Prefer deny-by-design for sensitive data while preserving native flows.
 
 ## SECURITY CONTRACT
 

@@ -23,6 +23,8 @@ access manually.
   scope, pagination, and bounded output; preserve large results as artifacts.
 - Measure query count/timing or inspect an execution plan before claiming a
   performance improvement.
+- Quantify material performance claims with comparable query count, elapsed
+  time, row volume, or execution-plan evidence; adjectives alone are not proof.
 - After a justified raw write, restore ORM cache consistency and preserve the
   surrounding transaction; never use SQL to bypass business hooks casually.
 

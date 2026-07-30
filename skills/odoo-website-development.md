@@ -19,6 +19,9 @@ boundary events without secrets, and route actual failures through
 `odoo-runtime-debugging`. Preserve route type, auth, methods, CSRF, portal
 tokens, and initial-QWeb versus later JSON/OWL response contracts.
 
+Threat-model public and portal boundaries with concrete actors and records;
+verify multi-site isolation, render chains, and representative-user outcomes.
+
 ---
 
 ## 1. THEME MODULE SETUP

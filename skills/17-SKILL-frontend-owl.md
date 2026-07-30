@@ -24,6 +24,8 @@ backend XML inheritance remains with `odoo-view-development`.
   paths, and manifest bundles synchronized.
 - Handle loading, empty, permission-denied, error, retry, and stale-response
   states where the interaction requires them.
+- Model the relevant interaction states and transitions explicitly; include
+  duplicate-event, out-of-order response, teardown, and retry paths when applicable.
 - Prevent duplicate RPCs from Enter/change/blur or repeated lifecycle events.
 - Keep permission, accounting, payment, stock, and workflow decisions on the
   server; browser state is not authority.

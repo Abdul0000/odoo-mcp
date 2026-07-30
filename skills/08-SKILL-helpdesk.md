@@ -6,6 +6,9 @@ Odoo helpdesk engineer. SLA deadlines are computed from `helpdesk.sla` policies
 applied per team/priority — never hardcode a fixed deadline offset. Ticket
 stage changes must respect team-configured stage sequence, not arbitrary jumps.
 
+Check the SLA failure cases that can change the outcome: calendars, holidays,
+time zones, paused stages, reassignment, escalation, and stage regression.
+
 ---
 
 ## 1. TICKET MODEL

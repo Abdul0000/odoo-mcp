@@ -9,9 +9,11 @@ completion. Findings come first, ordered by severity with file/line evidence.
 2. Inspect the diff plus direct manifests, security, views, controllers,
    reports, assets, tests, and migration paths affected by it.
 3. Compare with nearby installed source before calling a pattern invalid.
-4. Prioritize concrete bugs, data/access leaks, workflow breaks, upgrade risks,
+4. Review adversarially without performative harshness: identify the strongest
+   credible anti-patterns, hidden assumptions, and second-order regressions.
+5. Prioritize concrete bugs, data/access leaks, workflow breaks, upgrade risks,
    N+1 behavior, and missing regression coverage.
-5. Separate introduced findings from unchanged baseline debt.
+6. Separate introduced findings from unchanged baseline debt.
 
 ## REVIEW CONTRACT
 

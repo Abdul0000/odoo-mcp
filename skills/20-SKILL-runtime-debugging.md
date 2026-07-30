@@ -11,12 +11,15 @@ task and must not load this skill.
 2. Read the server-filtered error pack: at most 150 recent source lines by
    default, ERROR/CRITICAL plus complete traceback context; ignore unrelated
    INFO/WARNING noise.
-3. Map the traceback to changed custom source and classify the failure as
+3. Orient on the earliest evidence-backed causal failure, not its downstream
+   symptoms; separate verified facts, assumptions, and unknowns.
+4. Map the traceback to changed custom source and classify the failure as
    `custom_code`, `preexisting_baseline`, or `connector_pipeline`.
-4. Form one evidence-backed hypothesis and apply the smallest complete repair
+5. Form one falsifiable hypothesis and apply the smallest complete repair
    through `workflow.odoo_debug_and_fix`.
-5. Reuse the existing code-change, QA, safe-deploy, resume, and replay flow.
-6. Expand evidence only if the same diagnosed failure persists.
+6. Reuse the existing code-change, QA, safe-deploy, resume, and replay flow.
+7. Replay the exact failure; refine the hypothesis only when evidence falsifies
+   it, and expand evidence only if the same diagnosed failure persists.
 
 ## ON-DEMAND TRACE BUDGET
 

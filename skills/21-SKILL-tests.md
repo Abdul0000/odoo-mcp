@@ -17,7 +17,10 @@ or browser flows. Do not create broad placeholder suites.
 
 - Reproduce the failure before asserting the fix when feasible.
 - Test public behavior and business invariants, not incidental implementation.
-- Cover the requested success path and the highest-risk edge case.
+- Cover the requested success path and the highest-risk credible negative path
+  derived from the invariant or anti-pattern being guarded.
+- Assert observable, quantifiable outcomes where counts, amounts, states,
+  calls, timing bounds, or persisted values define success.
 - Verify idempotency for buttons, crons, queues, webhooks, and backfills.
 - Avoid real network calls, shared production data, sleeps, and order-dependent
   fixtures.

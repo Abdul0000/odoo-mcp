@@ -11,7 +11,9 @@ migration task.
    `noupdate` records, and Studio/database overlays.
 3. Prefer minimal compatibility patches over broad rewrites.
 4. Add migration scripts only for actual stored-data transformation.
-5. Test install/upgrade on representative data and replay the affected flow.
+5. Expose material assumptions and second-order effects across stored data,
+   `noupdate`, inheritance, assets, integrations, restart, and rollback behavior.
+6. Test install/upgrade on representative data and replay the affected flow.
 
 ## MIGRATION CONTRACT
 

@@ -10,6 +10,9 @@ Apply the `odoo-view-development` QWeb contract: resolve transitive `t-call`
 and `t-inherit`, explicit owning-addon dependencies, version-correct XPath and
 assets, safe output, required render context, and final rendered proof.
 
+Treat high-fidelity as exact installed render contracts and representative
+HTML/PDF output, not extra detail; reconcile displayed values with their source.
+
 ---
 
 ## TRUSTED HTML AND CHATTER BOUNDARY

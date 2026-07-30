@@ -18,10 +18,12 @@ run a functional business flow. Do not load for read-only reporting or code work
    requested real operation.
 5. Continue sensitive stages only with the payload-bound human approval returned
    by the tool. The agent cannot approve its own request.
-6. Treat success as valid only when `verified=true` and `success_allowed=true`.
-7. Use `odoo.mutation_audit` for replay evidence; reuse the same `request_id`
+6. Preserve native state-transition invariants and stop at the first failed or
+   unverified dependent stage.
+7. Treat success as valid only when `verified=true` and `success_allowed=true`.
+8. Use `odoo.mutation_audit` for replay evidence; reuse the same `request_id`
    only for an identical retry.
-8. For an unregistered/custom flow, submit ordered dynamic `steps`. Use exact
+9. For an unregistered/custom flow, submit ordered dynamic `steps`. Use exact
    `{"$ref": "step_name.record_ids.0"}` objects to pass prior outputs into later
    records, IDs, arguments, or expected values.
 

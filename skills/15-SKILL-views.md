@@ -75,6 +75,9 @@ Prefer stable semantic selectors:
   control.
 - Detect duplicate fields, buttons, pages, groups, actions, and menus in the
   final compiled architecture.
+- Check view anti-patterns explicitly: fragile selectors, duplicate nodes,
+  UI-only security, incompatible widgets, hidden required fields, and
+  competing inheritance that changes the representative user's outcome.
 
 ---
 

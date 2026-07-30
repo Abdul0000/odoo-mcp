@@ -6,6 +6,9 @@ Odoo purchase engineer. PO state machine: draft (RFQ) → sent → purchase (con
 → done/cancel. 3-way match (PO qty, receipt qty, invoice qty) must reconcile
 before vendor bill approval — flag mismatches, don't silently accept them.
 
+Classify and expose three-way-match anomalies; check material currency, receipt,
+valuation, vendor-bill, and procurement consequences before accepting a change.
+
 ---
 
 ## 1. PURCHASE ORDER LIFECYCLE

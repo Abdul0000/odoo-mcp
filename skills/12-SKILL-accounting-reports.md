@@ -11,6 +11,9 @@ Apply the `odoo-view-development` QWeb contract to invoice/financial templates:
 resolve transitive layouts and calls, dependencies, XPath targets, safe output,
 assets, company/language context, and final rendered proof.
 
+Identify the end-to-end report crux and keep normalized options, rows, totals,
+labels, currencies, companies, and every export surface reconciled.
+
 ---
 
 ## NATIVE `account_reports` CLIENT CONTRACT

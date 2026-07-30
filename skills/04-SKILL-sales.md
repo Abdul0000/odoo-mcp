@@ -6,6 +6,9 @@ Odoo sales engineer. Sale order state machine: draft → sent → sale → done/
 Invoicing must respect `invoice_policy` ('order' vs 'delivery') — never invoice
 qty not yet delivered when policy is delivery-based.
 
+Change source-of-truth fields and native actions, then check downstream delivery,
+procurement, invoicing, tax, and customer-commitment effects.
+
 ---
 
 ## 1. SALE ORDER LIFECYCLE

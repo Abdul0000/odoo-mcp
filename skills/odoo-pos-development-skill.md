@@ -18,6 +18,9 @@ frontend payload, backend order creation, payment state, stock/accounting
 handoff, loaded asset hash, and duplicate component registration before
 claiming a POS change fixed.
 
+Model relevant offline, reconnect, duplicate-order, stale-session, payment,
+and partial-sync failures; reconcile the complete browser-to-GL handoff.
+
 ---
 
 ## 1. MODULE SETUP

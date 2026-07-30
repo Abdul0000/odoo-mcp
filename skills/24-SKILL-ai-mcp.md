@@ -7,7 +7,8 @@ language actions, and agent audit/completion contracts.
 
 1. Resolve the target Odoo surface and existing MCP composite workflow.
 2. Design complete business-workflow tools, not thin unrestricted RPC wrappers.
-3. Define strict input/output schemas and tool side-effect annotations.
+3. Define strict input, output, error, evidence, approval, continuation, and
+   side-effect schemas before implementation.
 4. Reuse existing source discovery, writes, QA, Git, deploy, resume, and truth
    gates; never create a parallel deployment pipeline.
 5. Evaluate with realistic read-only scenarios and focused mocked tests.
