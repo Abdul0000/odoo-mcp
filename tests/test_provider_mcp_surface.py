@@ -119,6 +119,7 @@ def test_provider_debug_workflow_exposes_persisted_replay_contract():
         "runtime_evidence",
         "verification_evidence",
         "verification_assertion",
+        "runtime_replay",
         "writes",
         "job_id",
         "reproduction_passed",
@@ -135,6 +136,11 @@ def test_provider_debug_workflow_exposes_persisted_replay_contract():
         "model", "domain", "fields", "expected_values",
         "expected_count_min", "expected_count_max", "match_mode",
     } <= set(assertion_properties)
+    replay_properties = properties["runtime_replay"]["properties"]
+    assert {
+        "model", "record_ids", "method", "args", "kwargs", "context",
+        "user_id", "company_id", "commit", "confirm_mutation", "timeout_seconds",
+    } <= set(replay_properties)
 
     output = workflow["outputSchema"]["properties"]
     assert "debug_session" in output

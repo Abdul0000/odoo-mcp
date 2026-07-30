@@ -1082,6 +1082,174 @@ class OdooShService:
             result=parsed.get("result") or [],
         )
 
+    def runtime_replay(
+        self,
+        replay: dict,
+        *,
+        correlation_id: str,
+    ) -> OdooResult:
+        """Invoke one explicitly authorized public record method through Odoo shell."""
+        if not self._db_name():
+            return OdooResult(status="failed", error="ODOOSH_DB_NAME/odoosh_db_name is not configured for runtime replay.")
+        model = str(replay.get("model") or "")
+        method = str(replay.get("method") or "")
+        record_ids = replay.get("record_ids") or []
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]+", model):
+            return OdooResult(status="failed", error="Invalid model name for runtime replay.")
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", method) or method.startswith("_"):
+            return OdooResult(status="failed", error="Runtime replay requires a public Odoo method.")
+        if (
+            not isinstance(record_ids, list)
+            or not record_ids
+            or len(record_ids) > 20
+            or any(not isinstance(value, int) or value <= 0 for value in record_ids)
+        ):
+            return OdooResult(status="failed", error="Runtime replay requires 1-20 positive record IDs.")
+        if replay.get("commit", True) and replay.get("confirm_mutation") is not True:
+            return OdooResult(status="failed", error="Committed runtime replay requires confirm_mutation=true.")
+
+        payload = {
+            "model": model,
+            "record_ids": record_ids,
+            "method": method,
+            "args": replay.get("args") or [],
+            "kwargs": replay.get("kwargs") or {},
+            "context": {
+                **(replay.get("context") or {}),
+                "odoo_mcp_correlation_id": correlation_id,
+            },
+            "user_id": replay.get("user_id"),
+            "company_id": replay.get("company_id"),
+            "commit": bool(replay.get("commit", True)),
+            "correlation_id": correlation_id,
+        }
+        payload_b64 = base64.b64encode(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
+        safe_db = shlex.quote(self._db_name() or "")
+        odoo_path = shlex.quote(self._odoo_path())
+        addons_setup = self._addons_path_shell_setup()
+        result_marker = "MCP_RUNTIME_REPLAY_JSON:"
+        begin_marker = f"MCP_RUNTIME_REPLAY_BEGIN:{correlation_id}"
+        end_marker = f"MCP_RUNTIME_REPLAY_END:{correlation_id}"
+        script = (
+            "set +e; "
+            f"{addons_setup}"
+            f"cd {odoo_path}; "
+            f"./odoo-bin shell -d {safe_db} --addons-path=\"$MCP_ADDONS_PATH\" --no-http --log-level=error <<'PY'\n"
+            "import base64, datetime, json, traceback\n"
+            f"payload = json.loads(base64.b64decode({payload_b64!r}).decode('utf-8'))\n"
+            f"result_marker = {result_marker!r}\n"
+            f"begin_marker = {begin_marker!r}\n"
+            f"end_marker = {end_marker!r}\n"
+            "def norm(value):\n"
+            "    if hasattr(value, '_name') and hasattr(value, 'ids'):\n"
+            "        return {'model': value._name, 'ids': list(value.ids)}\n"
+            "    if isinstance(value, (datetime.date, datetime.datetime)):\n"
+            "        return value.isoformat()\n"
+            "    if isinstance(value, tuple):\n"
+            "        return [norm(v) for v in value]\n"
+            "    if isinstance(value, list):\n"
+            "        return [norm(v) for v in value]\n"
+            "    if isinstance(value, dict):\n"
+            "        return {str(k): norm(v) for k, v in value.items()}\n"
+            "    if isinstance(value, bytes):\n"
+            "        return value.decode('utf-8', 'replace')\n"
+            "    if isinstance(value, (str, int, float, bool)) or value is None:\n"
+            "        return value\n"
+            "    return repr(value)[:2000]\n"
+            "print(begin_marker, flush=True)\n"
+            "try:\n"
+            "    records = env[payload['model']].browse(payload['record_ids']).exists()\n"
+            "    if set(records.ids) != set(payload['record_ids']):\n"
+            "        missing = sorted(set(payload['record_ids']) - set(records.ids))\n"
+            "        raise ValueError('Runtime replay records not found: %s' % missing)\n"
+            "    if payload.get('user_id'):\n"
+            "        user = env['res.users'].browse(int(payload['user_id'])).exists()\n"
+            "        if not user:\n"
+            "            raise ValueError('Runtime replay user not found')\n"
+            "        records = records.with_user(user)\n"
+            "    if payload.get('company_id'):\n"
+            "        company = env['res.company'].browse(int(payload['company_id'])).exists()\n"
+            "        if not company:\n"
+            "            raise ValueError('Runtime replay company not found')\n"
+            "        records = records.with_company(company)\n"
+            "    records = records.with_context(**(payload.get('context') or {}))\n"
+            "    value = getattr(records, payload['method'])(*(payload.get('args') or []), **(payload.get('kwargs') or {}))\n"
+            "    if payload.get('commit'):\n"
+            "        env.cr.commit()\n"
+            "    else:\n"
+            "        env.cr.rollback()\n"
+            "    data = {'status': 'ok', 'action_executed': True, 'committed': bool(payload.get('commit')), 'returned': norm(value)}\n"
+            "except Exception as exc:\n"
+            "    env.cr.rollback()\n"
+            "    data = {'status': 'failed', 'action_executed': True, 'committed': False, 'error': str(exc), 'traceback': traceback.format_exc()[-8000:]}\n"
+            "print(result_marker + json.dumps(data, ensure_ascii=False), flush=True)\n"
+            "print(end_marker, flush=True)\n"
+            "PY\n"
+        )
+        result = self.run_shell(
+            script,
+            timeout_seconds=max(10, min(int(replay.get("timeout_seconds") or 120), 600)),
+        )
+        stdout = result.stdout or ""
+        payload_line = ""
+        for line in reversed(stdout.splitlines()):
+            if line.startswith(result_marker):
+                payload_line = line[len(result_marker):]
+                break
+        if not payload_line:
+            return OdooResult(
+                status="failed",
+                database=self._db_name(),
+                error=(result.stderr or stdout or "Odoo.sh runtime replay returned no parseable result.")[-4000:],
+                result={
+                    "action_executed": False,
+                    "committed": False,
+                    "correlation_id": correlation_id,
+                    "ssh_exit_code": result.exit_code,
+                },
+            )
+        try:
+            parsed = json.loads(payload_line)
+        except Exception as exc:
+            return OdooResult(
+                status="failed",
+                database=self._db_name(),
+                error=f"Could not parse Odoo.sh runtime replay JSON: {exc}",
+                result={"action_executed": False, "committed": False, "correlation_id": correlation_id},
+            )
+
+        begin_at = stdout.find(begin_marker)
+        result_at = stdout.find(result_marker, max(begin_at, 0))
+        action_output = stdout[begin_at + len(begin_marker):result_at] if begin_at >= 0 and result_at >= 0 else ""
+        fresh_source = "\n".join(filter(None, (action_output, result.stderr or "")))
+        fresh_blocks = self._extract_error_blocks(fresh_source)
+        selected_blocks: list[str] = []
+        remaining_lines = 150
+        for block in reversed(fresh_blocks):
+            lines = block.splitlines()
+            if remaining_lines <= 0:
+                break
+            selected_blocks.append("\n".join(lines[-remaining_lines:]))
+            remaining_lines -= min(len(lines), remaining_lines)
+        parsed["fresh_errors"] = list(reversed(selected_blocks))
+        parsed["fresh_error_count"] = len(fresh_blocks)
+        parsed["correlation_id"] = correlation_id
+        parsed["ssh_exit_code"] = result.exit_code
+        parsed["passed"] = bool(
+            parsed.get("status") == "ok"
+            and parsed.get("action_executed") is True
+            and result.exit_code == 0
+            and not fresh_blocks
+        )
+        return OdooResult(
+            status="ok" if parsed["passed"] else "failed",
+            database=self._db_name(),
+            result=parsed,
+            error=None if parsed["passed"] else str(parsed.get("error") or "Runtime replay emitted fresh errors.")[:4000],
+        )
+
     def read_group(
         self,
         model: str,

@@ -366,6 +366,76 @@ class OdooCodeChangeRequest(BaseModel):
         return self
 
 
+class OdooDebugRuntimeReplay(BaseModel):
+    """Explicitly authorized Odoo-shell replay of one public record method."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str = Field(..., description="Odoo model containing the button/action method.")
+    record_ids: list[int] = Field(..., min_length=1, max_length=20, description="Exact records used for replay.")
+    method: str = Field(..., description="Public method invoked on the selected recordset.")
+    args: list[Any] = Field(default_factory=list, max_length=20, description="JSON arguments passed after the recordset.")
+    kwargs: dict[str, Any] = Field(default_factory=dict, description="JSON keyword arguments passed to the method.")
+    context: dict[str, Any] = Field(default_factory=dict, description="Bounded Odoo context for matching the UI action.")
+    user_id: int | None = Field(default=None, ge=1, description="Optional Odoo user used for access-rule parity.")
+    company_id: int | None = Field(default=None, ge=1, description="Optional active company used for replay.")
+    commit: bool = Field(default=True, description="Commit successful action changes; failures always roll back.")
+    confirm_mutation: bool = Field(
+        default=False,
+        description="Explicit authorization required when commit=true because action methods may mutate records.",
+    )
+    timeout_seconds: int = Field(default=120, ge=10, le=600, description="Bounded SSH/Odoo-shell execution timeout.")
+
+    @field_validator("model")
+    @classmethod
+    def runtime_replay_model_must_be_safe(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]+", value):
+            raise ValueError("model must be a safe Odoo technical model name")
+        return value
+
+    @field_validator("method")
+    @classmethod
+    def runtime_replay_method_must_be_public(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", value) or value.startswith("_"):
+            raise ValueError("method must be a public Odoo method name")
+        return value
+
+    @field_validator("record_ids")
+    @classmethod
+    def runtime_replay_ids_must_be_unique(cls, values: list[int]) -> list[int]:
+        if any(int(value) <= 0 for value in values):
+            raise ValueError("record_ids must contain positive IDs")
+        if len(set(values)) != len(values):
+            raise ValueError("record_ids must be unique")
+        return values
+
+    @model_validator(mode="after")
+    def runtime_replay_contract_must_be_bounded(self):
+        if self.commit and not self.confirm_mutation:
+            raise ValueError("commit=true requires confirm_mutation=true")
+        encoded = repr((self.args, self.kwargs, self.context))
+        if len(encoded) > 20_000:
+            raise ValueError("runtime replay args/kwargs/context exceed the 20,000 character limit")
+        unsafe_keys: list[str] = []
+
+        def visit(value: Any) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if re.search(r"(password|passwd|token|secret|api[_-]?key|authorization)", str(key), re.I):
+                        unsafe_keys.append(str(key))
+                    visit(child)
+            elif isinstance(value, list):
+                for child in value:
+                    visit(child)
+
+        visit({"args": self.args, "kwargs": self.kwargs, "context": self.context})
+        if unsafe_keys:
+            raise ValueError("runtime replay cannot persist credential or secret fields")
+        return self
+
+
 class OdooDebugRecordAssertion(BaseModel):
     """Immutable read-only live-Odoo assertion used before and after a fix."""
 
@@ -442,7 +512,7 @@ class OdooDebugEvidenceRecord(BaseModel):
     kind: Literal[
         "runtime_log", "traceback", "manual_observation", "code_inspection",
         "write_scope", "qa", "deploy", "module_upgrade", "baseline_assertion",
-        "replay_assertion", "recovery",
+        "replay_assertion", "runtime_replay", "recovery",
     ]
     source: Literal["client", "odoo_mcp", "odoo_live", "job_store"]
     summary: str = Field(..., max_length=8000)
@@ -475,6 +545,10 @@ class OdooDebugAndFixRequest(BaseModel):
     clarification_answer: str | None = Field(default=None, max_length=5000, description="User answer requested by the nested code-change target/material clarification gate.")
     verification_evidence: list[str] = Field(default_factory=list, max_length=20, description="Evidence from replaying the same scenario after deploy.")
     verification_assertion: OdooDebugRecordAssertion | None = Field(default=None, description="Live check: model/domain/fields plus expected_values or expected_count bounds.")
+    runtime_replay: OdooDebugRuntimeReplay | None = Field(
+        default=None,
+        description="Optional authorized SSH/Odoo-shell record-method replay used before and after deployment.",
+    )
     writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=50, description="Exact writes generated from returned debug/code context.")
     job_id: str | None = Field(default=None, max_length=64, description="Safe-deploy job currently owned by this debug session.")
     reproduction_passed: bool | None = Field(default=None, description="True only when the same scenario passes after deploy.")
@@ -532,6 +606,12 @@ class OdooDebugAndFixRequest(BaseModel):
         if not value or not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
             raise ValueError("correlation_id contains unsafe characters")
         return value
+
+    @model_validator(mode="after")
+    def runtime_replay_requires_acceptance_assertion(self):
+        if self.runtime_replay is not None and self.verification_assertion is None:
+            raise ValueError("runtime_replay requires verification_assertion for independent database proof")
+        return self
 
 
 class ModuleAnalyzeRequest(BaseModel):

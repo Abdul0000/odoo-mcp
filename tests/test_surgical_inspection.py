@@ -5,6 +5,7 @@ import pytest
 
 from odoo_agent_server.routers import tools as tools_router
 from odoo_agent_server.services import live_assertion_service
+from odoo_agent_server.services.odoosh_service import OdooShService
 from odoo_agent_server.routers.tools import (
     _build_safe_generic_autopatch,
     _analysis_index_target_paths,
@@ -27,10 +28,12 @@ from odoo_agent_server.routers.tools import (
 from odoo_agent_server.schemas import (
     JobRecord,
     JobStatus,
+    CommandResult,
     OdooCodeChangeRequest,
     OdooCodeFileChange,
     OdooDebugAndFixRequest,
     OdooDebugRecordAssertion,
+    OdooDebugRuntimeReplay,
     OdooResult,
 )
 
@@ -705,6 +708,353 @@ def test_debug_truth_gate_rejects_nondiscriminating_baseline():
     assert truth["verified_fixed"] is False
     assert truth["discriminating_baseline"] is False
     assert truth["success_allowed"] is False
+
+
+def test_runtime_replay_requires_explicit_mutation_authorization_and_assertion():
+    with pytest.raises(ValueError, match="confirm_mutation"):
+        OdooDebugRuntimeReplay(
+            model="zk.machine",
+            record_ids=[7],
+            method="action_download_attendance",
+        )
+
+    replay = OdooDebugRuntimeReplay(
+        model="zk.machine",
+        record_ids=[7],
+        method="action_download_attendance",
+        confirm_mutation=True,
+    )
+    with pytest.raises(ValueError, match="verification_assertion"):
+        _debug_payload("Download action raises an error", runtime_replay=replay)
+
+
+def test_runtime_replay_target_is_immutable_after_debug_start(monkeypatch):
+    _prepare_debug_workflow(monkeypatch)
+
+    async def fake_code_change(payload):
+        return {"status": "needs_writes", "write_generation": {"contexts": []}}
+
+    async def failed_runtime_replay(session, phase):
+        return {
+            "phase": phase,
+            "status": "failed",
+            "action_executed": True,
+            "passed": False,
+            "fresh_error_count": 1,
+        }
+
+    async def failed_assertion(session, assertion, phase):
+        return {"phase": phase, "query_status": "ok", "passed": False}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change", fake_code_change)
+    monkeypatch.setattr(tools_router, "_debug_run_runtime_replay", failed_runtime_replay)
+    monkeypatch.setattr(tools_router, "_debug_run_live_assertion", failed_assertion)
+    assertion = OdooDebugRecordAssertion(
+        model="hr.attendance",
+        fields=["id"],
+        expected_count_min=1,
+    )
+    original = OdooDebugRuntimeReplay(
+        model="zk.machine",
+        record_ids=[7],
+        method="action_download_attendance",
+        confirm_mutation=True,
+    )
+    start = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload(
+            "Download attendance raises an error",
+            verification_assertion=assertion,
+            runtime_replay=original,
+        )
+    ))
+    changed = original.model_copy(update={"record_ids": [8]})
+
+    with pytest.raises(Exception, match="runtime_replay is immutable"):
+        asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+            _debug_payload(
+                "Download attendance raises an error",
+                action="continue",
+                debug_session_id=start["debug_session"]["id"],
+                verification_assertion=assertion,
+                runtime_replay=changed,
+            )
+        ))
+
+
+def test_odoosh_runtime_replay_parses_trusted_action_result(monkeypatch):
+    service = OdooShService()
+    monkeypatch.setattr(service, "_db_name", lambda: "test_db")
+    monkeypatch.setattr(service, "_odoo_path", lambda: "/home/odoo/src/odoo")
+    monkeypatch.setattr(service, "_addons_path_shell_setup", lambda: "")
+
+    def fake_run_shell(script, timeout_seconds=60):
+        assert "action_download_attendance" not in script
+        assert "MCP_RUNTIME_REPLAY_JSON:" in script
+        return CommandResult(
+            command=["ssh"],
+            cwd="odoosh:ssh",
+            exit_code=0,
+            stdout=(
+                "MCP_RUNTIME_REPLAY_BEGIN:dbg-attendance\n"
+                "MCP_RUNTIME_REPLAY_JSON:"
+                '{"status":"ok","action_executed":true,"committed":true,"returned":true}\n'
+                "MCP_RUNTIME_REPLAY_END:dbg-attendance\n"
+            ),
+        )
+
+    monkeypatch.setattr(service, "run_shell", fake_run_shell)
+    result = service.runtime_replay(
+        {
+            "model": "zk.machine",
+            "record_ids": [7],
+            "method": "action_download_attendance",
+            "confirm_mutation": True,
+            "commit": True,
+        },
+        correlation_id="dbg-attendance",
+    )
+
+    assert result.status == "ok"
+    assert result.result["passed"] is True
+    assert result.result["fresh_error_count"] == 0
+    assert result.result["correlation_id"] == "dbg-attendance"
+
+
+def test_odoosh_runtime_replay_rejects_fresh_error_even_when_method_returns(monkeypatch):
+    service = OdooShService()
+    monkeypatch.setattr(service, "_db_name", lambda: "test_db")
+    monkeypatch.setattr(service, "_odoo_path", lambda: "/home/odoo/src/odoo")
+    monkeypatch.setattr(service, "_addons_path_shell_setup", lambda: "")
+    monkeypatch.setattr(
+        service,
+        "run_shell",
+        lambda script, timeout_seconds=60: CommandResult(
+            command=["ssh"],
+            cwd="odoosh:ssh",
+            exit_code=0,
+            stdout=(
+                "MCP_RUNTIME_REPLAY_BEGIN:dbg-errors\n"
+                "2026-07-30 12:00:00,000 ERROR test_db odoo.addons.custom: device sync failed\n"
+                "MCP_RUNTIME_REPLAY_JSON:"
+                '{"status":"ok","action_executed":true,"committed":true,"returned":true}\n'
+                "MCP_RUNTIME_REPLAY_END:dbg-errors\n"
+            ),
+        ),
+    )
+
+    result = service.runtime_replay(
+        {
+            "model": "zk.machine",
+            "record_ids": [7],
+            "method": "action_download_attendance",
+            "confirm_mutation": True,
+            "commit": True,
+        },
+        correlation_id="dbg-errors",
+    )
+
+    assert result.status == "failed"
+    assert result.result["passed"] is False
+    assert result.result["fresh_error_count"] == 1
+
+
+def test_runtime_truth_gate_accepts_trusted_replay_without_manual_claim():
+    session = {
+        "deploy_confirmed": True,
+        "runtime_replay": {"model": "zk.machine"},
+        "verification_assertion": {"model": "hr.attendance"},
+        "baseline_runtime_replay": {
+            "action_executed": True,
+            "passed": False,
+            "fresh_error_count": 1,
+        },
+        "replay_runtime_replay": {
+            "action_executed": True,
+            "passed": True,
+            "fresh_error_count": 0,
+        },
+        "baseline_assertion": {"query_status": "ok", "passed": False},
+        "replay_assertion": {"query_status": "ok", "passed": True},
+        "evidence_ledger": [],
+    }
+
+    truth = tools_router._debug_truth_gate(session)
+
+    assert truth["verified_fixed"] is True
+    assert truth["runtime_replay_passed"] is True
+    assert truth["manual_replay_passed"] is False
+    assert truth["success_allowed"] is True
+
+
+def test_debug_deploy_automatically_replays_ssh_action_and_assertion(monkeypatch):
+    store = _prepare_debug_workflow(monkeypatch)
+
+    async def fake_code_change(payload):
+        if payload.writes:
+            return {"status": "deploy_started", "job_id": "deploy-runtime"}
+        return {
+            "status": "needs_writes",
+            "write_generation": {"contexts": [{"relative_path": "custom_sale/models/machine.py"}]},
+        }
+
+    async def fake_runtime_replay(session, phase):
+        return {
+            "phase": phase,
+            "status": "failed" if phase == "baseline" else "ok",
+            "action_executed": True,
+            "passed": phase == "replay",
+            "fresh_error_count": 1 if phase == "baseline" else 0,
+            "fresh_errors": ["ValidationError"] if phase == "baseline" else [],
+        }
+
+    async def fake_live_assertion(session, assertion, phase):
+        return {
+            "phase": phase,
+            "query_status": "ok",
+            "passed": phase == "replay",
+            "assertion_fingerprint": "attendance-assertion",
+        }
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change", fake_code_change)
+    monkeypatch.setattr(tools_router, "_debug_run_runtime_replay", fake_runtime_replay)
+    monkeypatch.setattr(tools_router, "_debug_run_live_assertion", fake_live_assertion)
+    assertion = OdooDebugRecordAssertion(
+        model="hr.attendance",
+        domain=[["employee_id", "=", 11]],
+        fields=["check_out"],
+        expected_count_min=1,
+    )
+    replay = OdooDebugRuntimeReplay(
+        model="zk.machine",
+        record_ids=[7],
+        method="action_download_attendance",
+        confirm_mutation=True,
+    )
+    start = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload(
+            "Download attendance raises a ValidationError",
+            verification_assertion=assertion,
+            runtime_replay=replay,
+        )
+    ))
+    session_id = start["debug_session"]["id"]
+    asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload(
+            "Download attendance raises a ValidationError",
+            action="continue",
+            debug_session_id=session_id,
+            verification_assertion=assertion,
+            runtime_replay=replay,
+            writes=[OdooCodeFileChange(
+                relative_path="custom_sale/models/machine.py",
+                content="VALUE = True\n",
+            )],
+        )
+    ))
+    store.jobs["deploy-runtime"] = JobRecord(
+        id="deploy-runtime",
+        job_type="safe_deploy_module",
+        status=JobStatus.passed,
+        request={"upgrade_module": True},
+        result={
+            "odoosh_check_commit": {"deployed": True},
+            "module_upgrade": {"requested": True, "passed": True},
+        },
+    )
+
+    verified = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload(
+            "Download attendance raises a ValidationError",
+            action="poll",
+            debug_session_id=session_id,
+            job_id="deploy-runtime",
+            verification_assertion=assertion,
+            runtime_replay=replay,
+        )
+    ))
+
+    assert verified["status"] == "debug_verified"
+    assert verified["success_allowed"] is True
+    assert verified["truth_gate"]["runtime_replay_passed"] is True
+    assert verified["truth_gate"]["manual_replay_passed"] is False
+
+
+def test_failed_ssh_replay_automatically_reenters_diagnosis(monkeypatch):
+    store = _prepare_debug_workflow(monkeypatch)
+    calls = {"code": 0}
+
+    async def fake_code_change(payload):
+        calls["code"] += 1
+        return {
+            "status": "needs_writes",
+            "write_generation": {"contexts": [{"relative_path": "custom_sale/models/machine.py"}]},
+        }
+
+    async def failed_runtime_replay(session, phase):
+        return {
+            "phase": phase,
+            "status": "failed",
+            "action_executed": True,
+            "passed": False,
+            "fresh_error_count": 1,
+            "fresh_errors": ["ValidationError: overlapping attendance"],
+        }
+
+    async def failed_assertion(session, assertion, phase):
+        return {"phase": phase, "query_status": "ok", "passed": False}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change", fake_code_change)
+    monkeypatch.setattr(tools_router, "_debug_run_runtime_replay", failed_runtime_replay)
+    monkeypatch.setattr(tools_router, "_debug_run_live_assertion", failed_assertion)
+    assertion = OdooDebugRecordAssertion(
+        model="hr.attendance",
+        fields=["id"],
+        expected_count_min=1,
+    )
+    replay = OdooDebugRuntimeReplay(
+        model="zk.machine",
+        record_ids=[7],
+        method="action_download_attendance",
+        confirm_mutation=True,
+    )
+    start = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload(
+            "Download attendance raises a ValidationError",
+            verification_assertion=assertion,
+            runtime_replay=replay,
+        )
+    ))
+    session_id = start["debug_session"]["id"]
+    session = store.states["Test 18"]["debug_sessions"][session_id]
+    session["phase"] = "deploying"
+    session["fix_cycles"] = 1
+    session["job_id"] = "deploy-replay-failed"
+    store.jobs["deploy-replay-failed"] = JobRecord(
+        id="deploy-replay-failed",
+        job_type="safe_deploy_module",
+        status=JobStatus.passed,
+        request={"upgrade_module": True},
+        result={
+            "odoosh_check_commit": {"deployed": True},
+            "module_upgrade": {"requested": True, "passed": True},
+        },
+    )
+
+    result = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload(
+            "Download attendance raises a ValidationError",
+            action="poll",
+            debug_session_id=session_id,
+            job_id="deploy-replay-failed",
+            verification_assertion=assertion,
+            runtime_replay=replay,
+        )
+    ))
+
+    assert result["status"] == "debug_needs_writes"
+    assert result["success_allowed"] is False
+    assert result["debug_session"]["fix_cycles"] == 1
+    assert calls["code"] == 2
 
 
 def test_debug_session_rejects_unowned_job_and_out_of_phase_writes(monkeypatch):

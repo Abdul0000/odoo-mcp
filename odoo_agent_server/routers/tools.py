@@ -311,6 +311,8 @@ _TOOL_DESCRIPTORS = [
             "It detects the Odoo surface, collects and redacts Odoo.sh evidence, persists a correlation-scoped session, "
             "hands exact writes to workflow.odoo_code_change, reuses the existing QA/safe-deploy/jobs pipeline, "
             "and permits verified_fixed only from deploy proof plus an immutable live assertion that fails before the fix and passes after replay. "
+            "For a public button/model method, runtime_replay executes the same record method through SSH/Odoo shell before and after deploy, "
+            "captures only fresh correlated errors, and verifies the database assertion without asking the user to click again. "
             "Manual text/booleans remain untrusted. Deterministic small edits are routed directly "
             "to workflow.odoo_code_change. It never runs arbitrary console commands or duplicates Git/deploy logic."
         ),
@@ -3947,7 +3949,7 @@ def _detect_debug_surface(payload: OdooDebugAndFixRequest) -> str:
 
 
 def _debug_requires_runtime_loop(payload: OdooDebugAndFixRequest) -> bool:
-    if payload.surface != "auto" or payload.action == "start" or payload.runtime_evidence:
+    if payload.surface != "auto" or payload.action == "start" or payload.runtime_evidence or payload.runtime_replay:
         return True
     text = " ".join([payload.issue_description, *payload.reproduction_steps]).lower()
     for marker in _DEBUG_RUNTIME_MARKERS:
@@ -4091,6 +4093,17 @@ def _debug_truth_gate(session: dict[str, Any]) -> dict[str, Any]:
     deployed = bool(session.get("deploy_confirmed") or session.get("already_deployed_confirmed"))
     baseline = session.get("baseline_assertion") if isinstance(session.get("baseline_assertion"), dict) else {}
     replay = session.get("replay_assertion") if isinstance(session.get("replay_assertion"), dict) else {}
+    runtime_replay_configured = bool(session.get("runtime_replay"))
+    baseline_runtime = (
+        session.get("baseline_runtime_replay")
+        if isinstance(session.get("baseline_runtime_replay"), dict)
+        else {}
+    )
+    replay_runtime = (
+        session.get("replay_runtime_replay")
+        if isinstance(session.get("replay_runtime_replay"), dict)
+        else {}
+    )
     has_discriminating_contract = bool(
         session.get("verification_assertion")
         and baseline
@@ -4114,7 +4127,36 @@ def _debug_truth_gate(session: dict[str, Any]) -> dict[str, Any]:
         and session.get("expected_result_verified") is True
         and manual_replay_evidence
     )
-    verified = bool(deployed and independent_replay_passed and manual_replay_passed)
+    runtime_baseline_discriminating = bool(
+        runtime_replay_configured
+        and baseline_runtime.get("action_executed") is True
+        and (
+            baseline_runtime.get("passed") is False
+            or (
+                baseline.get("query_status") == "ok"
+                and baseline.get("passed") is False
+            )
+        )
+    )
+    runtime_replay_passed = bool(
+        runtime_replay_configured
+        and replay_runtime.get("action_executed") is True
+        and replay_runtime.get("passed") is True
+        and int(replay_runtime.get("fresh_error_count") or 0) == 0
+    )
+    same_scenario_replay_passed = (
+        runtime_replay_passed if runtime_replay_configured else manual_replay_passed
+    )
+    discriminating_baseline = bool(
+        has_discriminating_contract
+        and (runtime_baseline_discriminating if runtime_replay_configured else True)
+    )
+    verified = bool(
+        deployed
+        and discriminating_baseline
+        and independent_replay_passed
+        and same_scenario_replay_passed
+    )
     if verified:
         claim_status = "verified_fixed"
     elif session.get("phase") == "blocked":
@@ -4130,16 +4172,20 @@ def _debug_truth_gate(session: dict[str, Any]) -> dict[str, Any]:
         "verified_fixed": verified,
         "deploy_proof": deployed,
         "manual_replay_passed": manual_replay_passed,
+        "runtime_replay_configured": runtime_replay_configured,
+        "runtime_baseline_discriminating": runtime_baseline_discriminating,
+        "runtime_replay_passed": runtime_replay_passed,
+        "same_scenario_replay_passed": same_scenario_replay_passed,
         "independent_replay_passed": independent_replay_passed,
-        "discriminating_baseline": has_discriminating_contract,
+        "discriminating_baseline": discriminating_baseline,
         "success_allowed": verified,
         "missing_proof": [
             label
             for label, present in (
                 ("deploy", deployed),
-                ("pre-fix failing live assertion", has_discriminating_contract),
+                ("pre-fix failing live assertion/action", discriminating_baseline),
                 ("post-replay passing live assertion", independent_replay_passed),
-                ("same-scenario replay confirmation", manual_replay_passed),
+                ("same-scenario replay confirmation", same_scenario_replay_passed),
             )
             if not present
         ],
@@ -4163,6 +4209,17 @@ def _debug_public_session(session: dict[str, Any]) -> dict[str, Any]:
         "job_id": session.get("job_id"),
         "deploy_confirmed": session.get("deploy_confirmed", False),
         "already_deployed_confirmed": session.get("already_deployed_confirmed", False),
+        "runtime_replay_configured": bool(session.get("runtime_replay")),
+        "baseline_runtime_replay_passed": (
+            session.get("baseline_runtime_replay", {}).get("passed")
+            if isinstance(session.get("baseline_runtime_replay"), dict)
+            else None
+        ),
+        "replay_runtime_replay_passed": (
+            session.get("replay_runtime_replay", {}).get("passed")
+            if isinstance(session.get("replay_runtime_replay"), dict)
+            else None
+        ),
         "evidence_count": len(session.get("evidence_ledger") or []),
         "trusted_evidence_count": sum(
             1 for item in session.get("evidence_ledger") or []
@@ -4311,6 +4368,68 @@ def _debug_assertion_payload(assertion: OdooDebugRecordAssertion | dict[str, Any
     return OdooDebugRecordAssertion.model_validate(assertion).model_dump(mode="json")
 
 
+def _debug_runtime_replay_payload(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    return dict(value)
+
+
+async def _debug_run_runtime_replay(
+    session: dict[str, Any],
+    *,
+    phase: str,
+) -> dict[str, Any]:
+    replay = _debug_runtime_replay_payload(session.get("runtime_replay"))
+    if replay is None:
+        return {
+            "phase": phase,
+            "action_executed": False,
+            "passed": False,
+            "error": "No runtime replay contract is configured.",
+        }
+    try:
+        client = ClientResolverService().resolve_client(
+            client_name=session.get("client_name"),
+            project_path=session.get("project_path"),
+            require_complete=False,
+        )
+        result = await asyncio.to_thread(
+            OdooShService(client).runtime_replay,
+            replay,
+            correlation_id=str(session.get("correlation_id") or ""),
+        )
+        proof = dict(result.result) if isinstance(result.result, dict) else {}
+        proof.update({
+            "phase": phase,
+            "status": result.status,
+            "passed": bool(result.status == "ok" and proof.get("passed") is True),
+            "error": _redact_debug_text(result.error or str(proof.get("error") or ""), 4_000) or None,
+        })
+    except Exception as exc:  # noqa: BLE001
+        proof = {
+            "phase": phase,
+            "status": "failed",
+            "action_executed": False,
+            "committed": False,
+            "passed": False,
+            "fresh_error_count": 0,
+            "fresh_errors": [],
+            "error": _redact_debug_text(f"{type(exc).__name__}: {exc}", 4_000),
+        }
+    _debug_record_evidence(
+        session,
+        kind="runtime_replay",
+        source="odoo_live",
+        summary=json.dumps(proof, ensure_ascii=False, sort_keys=True, default=str),
+        trusted=True,
+        passed=bool(proof.get("passed")),
+        job_id=str(session.get("job_id") or "") or None,
+    )
+    return proof
+
+
 async def _debug_run_live_assertion(
     session: dict[str, Any],
     assertion_value: dict[str, Any],
@@ -4427,6 +4546,7 @@ def _debug_next_call(
             "operation_id": session.get("operation_id"),
             "correlation_id": session.get("correlation_id"),
             "verification_assertion": session.get("verification_assertion"),
+            "runtime_replay": session.get("runtime_replay"),
             "max_fix_cycles": session.get("max_fix_cycles", 3),
             "max_surgical_files": max(12, int(session.get("max_surgical_files") or 12)),
             "max_surgical_content_chars": session.get("max_surgical_content_chars", 200_000),
@@ -4663,6 +4783,7 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
                 "writes": [],
             }))
         assertion_payload = _debug_assertion_payload(payload.verification_assertion)
+        runtime_replay_payload = _debug_runtime_replay_payload(payload.runtime_replay)
         session = {
             "id": uuid4().hex,
             "operation_id": operation_id,
@@ -4688,6 +4809,7 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
             "evidence_fingerprints": [],
             "evidence_ledger": [],
             "verification_assertion": assertion_payload,
+            "runtime_replay": runtime_replay_payload,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         _append_debug_evidence(
@@ -4697,6 +4819,19 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
             source="client",
             trusted=False,
         )
+        if runtime_replay_payload:
+            session["baseline_runtime_replay"] = await _debug_run_runtime_replay(
+                session,
+                phase="baseline",
+            )
+            _append_debug_evidence(
+                session,
+                [json.dumps(session["baseline_runtime_replay"], ensure_ascii=False, sort_keys=True)],
+                kind="runtime_replay",
+                source="odoo_live",
+                trusted=True,
+                passed=bool(session["baseline_runtime_replay"].get("passed")),
+            )
         error_pack = await asyncio.to_thread(_debug_collect_error_pack, client_name, payload.tail_lines)
         _append_debug_evidence(
             session,
@@ -4725,6 +4860,9 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
     supplied_assertion = _debug_assertion_payload(payload.verification_assertion)
     if supplied_assertion is not None and supplied_assertion != session.get("verification_assertion"):
         raise HTTPException(status_code=409, detail="verification_assertion is immutable after debug start.")
+    supplied_runtime_replay = _debug_runtime_replay_payload(payload.runtime_replay)
+    if supplied_runtime_replay is not None and supplied_runtime_replay != session.get("runtime_replay"):
+        raise HTTPException(status_code=409, detail="runtime_replay is immutable after debug start.")
     if session.get("phase") == "completed":
         truth_gate = _debug_truth_gate(session)
         if not truth_gate["verified_fixed"]:
@@ -4897,41 +5035,77 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
                 passed=True,
                 job_id=str(job_id),
             )
-            session["reproduction_passed"] = payload.reproduction_passed
-            session["expected_result_verified"] = payload.expected_result_verified
-            verification_added = _append_debug_evidence(
-                session,
-                payload.verification_evidence,
-                kind="manual_observation",
-                source="client",
-                trusted=False,
-                passed=bool(
-                    payload.reproduction_passed is True
-                    and payload.expected_result_verified is True
-                ),
-                job_id=str(job_id),
-            )
-            has_verification_evidence = any(
-                str(item or "").strip() for item in payload.verification_evidence
-            )
             assertion_payload = session.get("verification_assertion")
-            if (
-                assertion_payload
-                and payload.reproduction_passed is True
-                and payload.expected_result_verified is True
-                and has_verification_evidence
-            ):
+            if session.get("runtime_replay"):
+                session["replay_runtime_replay"] = await _debug_run_runtime_replay(
+                    session,
+                    phase="replay",
+                )
+                session["reproduction_passed"] = bool(
+                    session["replay_runtime_replay"].get("passed")
+                )
                 session["replay_assertion"] = await _debug_run_live_assertion(
                     session,
                     assertion_payload,
                     phase="replay",
                 )
+                session["expected_result_verified"] = bool(
+                    session["replay_assertion"].get("passed")
+                )
+                runtime_summary = json.dumps(
+                    session["replay_runtime_replay"],
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                verification_added = _append_debug_evidence(
+                    session,
+                    [runtime_summary],
+                    kind="runtime_replay",
+                    source="odoo_live",
+                    trusted=True,
+                    passed=bool(session["reproduction_passed"]),
+                    job_id=str(job_id),
+                )
+                has_verification_evidence = True
+            else:
+                session["reproduction_passed"] = payload.reproduction_passed
+                session["expected_result_verified"] = payload.expected_result_verified
+                verification_added = _append_debug_evidence(
+                    session,
+                    payload.verification_evidence,
+                    kind="manual_observation",
+                    source="client",
+                    trusted=False,
+                    passed=bool(
+                        payload.reproduction_passed is True
+                        and payload.expected_result_verified is True
+                    ),
+                    job_id=str(job_id),
+                )
+                has_verification_evidence = any(
+                    str(item or "").strip() for item in payload.verification_evidence
+                )
+                if (
+                    assertion_payload
+                    and payload.reproduction_passed is True
+                    and payload.expected_result_verified is True
+                    and has_verification_evidence
+                ):
+                    session["replay_assertion"] = await _debug_run_live_assertion(
+                        session,
+                        assertion_payload,
+                        phase="replay",
+                    )
             truth_gate = _debug_truth_gate(session)
             if truth_gate["verified_fixed"]:
                 session["phase"] = "completed"
-                session["verification_evidence"] = [
-                    _redact_debug_text(item, 4_000) for item in payload.verification_evidence
-                ][-10:]
+                session["verification_evidence"] = (
+                    ["Trusted SSH/Odoo-shell replay and database assertion passed."]
+                    if session.get("runtime_replay")
+                    else [
+                        _redact_debug_text(item, 4_000) for item in payload.verification_evidence
+                    ][-10:]
+                )
                 _debug_session_store(store, session, client_name=client_name)
                 issue_fingerprint = code_change_issue_fingerprint(
                     project_path=str(session.get("project_path") or ""),
@@ -4965,8 +5139,8 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
                 }
 
             replay_failed = bool(
-                payload.reproduction_passed is False
-                or payload.expected_result_verified is False
+                session.get("reproduction_passed") is False
+                or session.get("expected_result_verified") is False
                 or (
                     isinstance(session.get("replay_assertion"), dict)
                     and session["replay_assertion"].get("passed") is False
@@ -4974,9 +5148,16 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
             )
             if replay_failed:
                 trusted_replay_failure = bool(
-                    isinstance(session.get("replay_assertion"), dict)
-                    and session["replay_assertion"].get("query_status") == "ok"
-                    and session["replay_assertion"].get("passed") is False
+                    (
+                        isinstance(session.get("replay_assertion"), dict)
+                        and session["replay_assertion"].get("query_status") == "ok"
+                        and session["replay_assertion"].get("passed") is False
+                    )
+                    or (
+                        isinstance(session.get("replay_runtime_replay"), dict)
+                        and session["replay_runtime_replay"].get("action_executed") is True
+                        and session["replay_runtime_replay"].get("passed") is False
+                    )
                 )
                 if verification_added <= 0 and not trusted_replay_failure:
                     _debug_session_store(store, session, client_name=client_name)
