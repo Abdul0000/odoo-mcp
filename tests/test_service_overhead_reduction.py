@@ -3,7 +3,14 @@ from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor
 
 from odoo_agent_server.config import settings
-from odoo_agent_server.schemas import CommandResult, JobRecord, JobStatus, OdooModuleRequest
+from odoo_agent_server.schemas import (
+    CommandResult,
+    JobRecord,
+    JobStatus,
+    OdooModuleRequest,
+    OdooFailureDiagnosis,
+    OdooOperationHandoff,
+)
 from odoo_agent_server.routers.odoo import _background_job_response
 from odoo_agent_server.services import core_sync_service
 from odoo_agent_server.services.odoosh_service import OdooShService, _SshMasterPool
@@ -93,6 +100,117 @@ def test_debug_sessions_are_atomically_isolated_under_concurrent_updates(tmp_pat
         session = store.get_debug_session(f"{index:032x}", client_name="Test 18")
         assert session["operation_id"] == f"operation-{index}"
     assert store.find_debug_session_by_operation("operation-7", client_name="Test 18")["id"] == f"{7:032x}"
+
+
+def test_operation_handoff_is_client_scoped_resumable_and_completed_immutable(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    store = JsonStore()
+    handoff = OdooOperationHandoff(
+        operation_id="codeop-example-001",
+        client_name="Test 18",
+        module_name="x_module",
+        objective="Apply the requested module change.",
+        completed_checkpoints=["inspection"],
+        next_action="Generate the exact write set.",
+    )
+
+    store.save_operation_handoff(handoff, client_name="Test 18")
+    stored = store.get_operation_handoff(handoff.operation_id, client_name="Test 18")
+    assert stored["completed_checkpoints"] == ["inspection"]
+
+    completed = store.complete_operation_handoff(handoff.operation_id, client_name="Test 18")
+    assert completed["status"] == "completed"
+    assert completed["acceptance_evidence_remaining"] == []
+
+    replayed = store.save_operation_handoff(completed, client_name="Test 18")
+    assert replayed["status"] == "completed"
+
+
+def test_terminal_deploy_job_completes_bound_operation_handoff(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    store = JsonStore()
+    handoff = OdooOperationHandoff(
+        operation_id="codeop-terminal-001",
+        client_name="Test 18",
+        module_name="x_module",
+        objective="Deploy the verified module change.",
+        next_action="Poll the deploy job.",
+        acceptance_evidence_remaining=["terminal_deployment_proof"],
+    )
+    store.save_operation_handoff(handoff, client_name="Test 18")
+    job = store.create_job(JobRecord(
+        job_type="safe_deploy_module",
+        status=JobStatus.running,
+        request={"client_name": "Test 18"},
+    ))
+
+    finished = store.finish_job(job, JobStatus.passed, {"deploy_confirmed": True})
+    store.bind_operation_handoff_to_job(
+        finished.id,
+        handoff.operation_id,
+        client_name="Test 18",
+    )
+    completed = store.get_operation_handoff(handoff.operation_id, client_name="Test 18")
+
+    assert completed["status"] == "completed"
+    assert completed["acceptance_evidence_remaining"] == []
+    assert "terminal_deployment_proof" in completed["completed_checkpoints"]
+
+
+def test_trusted_evidence_lookup_is_bound_to_one_debug_session(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    store = JsonStore()
+    first_id, second_id = "a" * 32, "b" * 32
+    first_diagnosis = OdooFailureDiagnosis(
+        origin="custom_code",
+        crux="First issue maps to custom code.",
+        hypothesis="Repair the first issue custom branch.",
+        evidence_ids=["evidence.first.001"],
+        debug_session_id=first_id,
+        next_strategy="repair_custom_code",
+    )
+    second_diagnosis = first_diagnosis.model_copy(update={
+        "evidence_ids": ["evidence.second.001"],
+        "debug_session_id": second_id,
+    })
+    store.save_debug_session(
+        {
+            "id": first_id,
+            "operation_id": "operation-first",
+            "phase": "diagnosing",
+            "module_name": "x_module",
+            "issue_description": "First runtime issue",
+            "diagnosis": first_diagnosis.model_dump(mode="json"),
+            "evidence_ledger": [{"id": "evidence.first.001", "trusted": True}],
+        },
+        client_name="Test 18",
+    )
+    store.save_debug_session(
+        {
+            "id": second_id,
+            "operation_id": "operation-second",
+            "phase": "diagnosing",
+            "module_name": "x_module",
+            "issue_description": "Second runtime issue",
+            "diagnosis": second_diagnosis.model_dump(mode="json"),
+            "evidence_ledger": [{"id": "evidence.second.001", "trusted": True}],
+        },
+        client_name="Test 18",
+    )
+
+    assert store.trusted_debug_evidence_ids(
+        "Test 18",
+        debug_session_id=first_id,
+        module_name="x_module",
+        task_description="Diagnose First runtime issue completely.",
+    ) == {"evidence.first.001"}
+    assert store.trusted_debug_evidence_ids(
+        "Test 18",
+        debug_session_id=first_id,
+        module_name="x_module",
+        task_description="A different runtime issue",
+    ) == set()
+    assert store.trusted_debug_evidence_ids("Test 18") == set()
 
 
 def test_odoo_background_wait_honors_request_timeout(tmp_path, monkeypatch):

@@ -12,6 +12,9 @@ from odoo_agent_server.routers.tools import (
     _contract_candidate_paths,
     _complete_code_batch,
     _code_batch_fingerprint,
+    _code_operation_id,
+    _debug_infer_diagnosis,
+    _debug_operation_handoff,
     _debug_requires_runtime_loop,
     _detect_debug_surface,
     _redact_debug_text,
@@ -21,6 +24,7 @@ from odoo_agent_server.routers.tools import (
     _rank_core_directory_files,
     _rank_core_required_paths,
     _prepare_code_batch,
+    _save_code_operation_handoff,
     _task_description_search_clues,
     _target_edit_policy_rule,
     _safe_unique_python_function_rebase,
@@ -32,6 +36,7 @@ from odoo_agent_server.schemas import (
     OdooCodeChangeRequest,
     OdooCodeFileChange,
     OdooDebugAndFixRequest,
+    OdooFailureDiagnosis,
     OdooDebugRecordAssertion,
     OdooDebugRuntimeReplay,
     OdooResult,
@@ -80,6 +85,88 @@ def _debug_payload(issue: str, **overrides) -> OdooDebugAndFixRequest:
         expected_result="The exact scenario completes and saves the expected record.",
         **overrides,
     )
+
+
+def test_debug_diagnosis_uses_trusted_ledger_not_user_narrative():
+    unrelated = {
+        "id": "b" * 32,
+        "module_name": "custom_sale",
+        "issue_description": "Traceback in /custom_sale/models/order.py",
+        "evidence_ledger": [
+            {
+                "id": "evidence-unrelated-001",
+                "trusted": True,
+                "summary": "Focused source inspection completed without a runtime traceback.",
+            }
+        ],
+    }
+    assert _debug_infer_diagnosis(unrelated).origin == "unknown"
+
+    trusted_traceback = {
+        **unrelated,
+        "evidence_ledger": [
+            {
+                "id": "evidence-traceback-001",
+                "trusted": True,
+                "summary": "Traceback: File /srv/addons/custom_sale/models/order.py, line 42",
+            }
+        ],
+    }
+    assert _debug_infer_diagnosis(trusted_traceback).origin == "custom_code"
+
+    claimed = OdooFailureDiagnosis(
+        origin="custom_code",
+        crux="Claimed unrelated custom failure.",
+        hypothesis="Claimed unrelated repair hypothesis.",
+        evidence_ids=["evidence-unrelated-001"],
+        debug_session_id="b" * 32,
+        next_strategy="repair_custom_code",
+    )
+    assert tools_router._debug_resolve_diagnosis(unrelated, claimed).origin == "unknown"
+
+
+def test_code_operation_id_uses_the_complete_task_description():
+    prefix = "A" * 2000
+    first = _payload(prefix + " first distinct ending")
+    second = _payload(prefix + " second distinct ending")
+    arguments = {
+        "client_name": "Test 18",
+        "project_path": "C:/repo",
+        "module_name": "custom_sale",
+    }
+
+    assert _code_operation_id(first, **arguments) != _code_operation_id(second, **arguments)
+
+
+def test_handoff_storage_failure_is_nonblocking():
+    class FailingStore:
+        def save_operation_handoff(self, *args, **kwargs):
+            raise OSError("simulated sidecar failure")
+
+    result = _save_code_operation_handoff(
+        FailingStore(),
+        payload=_payload("Apply one deterministic field change. " + ("detail " * 1200)),
+        client_name="Test 18",
+        project_path="C:/repo",
+        module_name="custom_sale",
+        target_files=["custom_sale/models/order.py"],
+        status="active",
+        current_blocker=None,
+        next_action="Continue the owned code workflow.",
+    )
+
+    assert result["persistence_status"] == "failed"
+    assert result["persistence_error_type"] == "OSError"
+    assert len(result["objective"]) == 5000
+
+    debug_handoff = _debug_operation_handoff({
+        "id": "c" * 32,
+        "operation_id": "dbgop-objective-boundary",
+        "issue_description": "issue " * 1500,
+        "expected_result": "expected " * 1000,
+        "phase": "diagnosing",
+    })
+    assert len(debug_handoff.objective) == 5000
 
 
 def _prepare_debug_workflow(monkeypatch):

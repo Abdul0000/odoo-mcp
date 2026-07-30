@@ -19,7 +19,16 @@ except ImportError:  # pragma: no cover - Windows
 from fastapi import HTTPException, status
 
 from ..config import get_odoo_clients, settings
-from ..schemas import ApprovalRecord, ApprovalStatus, AuditEvent, JobRecord, JobStatus, JobStep
+from ..schemas import (
+    ApprovalRecord,
+    ApprovalStatus,
+    AuditEvent,
+    JobRecord,
+    JobStatus,
+    JobStep,
+    OdooFailureDiagnosis,
+    OdooOperationHandoff,
+)
 
 
 class JsonStore:
@@ -206,7 +215,69 @@ class JsonStore:
         job.status = status_
         job.finished_at = datetime.now(timezone.utc).isoformat()
         job.result = result
-        return self.update_job(job)
+        finished = self.update_job(job)
+        self._sync_operation_handoff_for_job(finished)
+        return finished
+
+    def bind_operation_handoff_to_job(
+        self,
+        job_id: str,
+        operation_id: str,
+        *,
+        client_name: str | None = None,
+    ) -> JobRecord:
+        """Attach optional continuation metadata without changing job ownership."""
+        job = self.get_job(job_id)
+        request = dict(job.request or {})
+        request["handoff_operation_id"] = operation_id
+        if client_name and not request.get("client_name"):
+            request["client_name"] = client_name
+        job.request = request
+        updated = self.update_job(job)
+        if updated.status not in {JobStatus.queued, JobStatus.running}:
+            self._sync_operation_handoff_for_job(updated)
+        return updated
+
+    def _sync_operation_handoff_for_job(self, job: JobRecord) -> None:
+        """Best-effort terminal sidecar sync; it must never fail the owned job."""
+        request = dict(job.request or {})
+        operation_id = str(request.get("handoff_operation_id") or "")
+        if not operation_id:
+            return
+        client_name = request.get("client_name")
+        try:
+            handoff = OdooOperationHandoff.model_validate(
+                self.get_operation_handoff(operation_id, client_name=client_name)
+            )
+            result = job.result if isinstance(job.result, dict) else {}
+            deploy_confirmed = bool(
+                result.get("deploy_confirmed")
+                or result.get("already_deployed_confirmed")
+            )
+            if job.status == JobStatus.passed and deploy_confirmed:
+                handoff.status = "completed"
+                handoff.current_blocker = None
+                handoff.next_action = "Stop and return the terminal verified result."
+                handoff.acceptance_evidence_remaining = []
+                if "terminal_deployment_proof" not in handoff.completed_checkpoints:
+                    handoff.completed_checkpoints.append("terminal_deployment_proof")
+            else:
+                handoff.status = "blocked"
+                handoff.current_blocker = str(
+                    result.get("failed_step")
+                    or result.get("error")
+                    or result.get("status")
+                    or job.status.value
+                )[:3000]
+                handoff.next_action = (
+                    f"Resume or diagnose safe-deploy job {job.id} from its terminal blocker."
+                )
+                handoff.acceptance_evidence_remaining = ["terminal_deployment_proof"]
+            self.save_operation_handoff(handoff, client_name=client_name)
+        except Exception:
+            # Handoffs are recovery metadata. Their storage must never alter
+            # the terminal state of the server-owned deployment job.
+            return
 
     def log_audit(self, action: str, status_: str, summary: str = "", metadata: dict[str, Any] | None = None) -> AuditEvent:
         event = AuditEvent(action=action, status=status_, summary=summary, metadata=metadata or {})
@@ -332,6 +403,81 @@ class JsonStore:
         safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", client_name or "default")
         return self.root / f"debug_sessions__{safe}.json"
 
+    def _operation_handoffs_file_for_client(self, client_name: str | None) -> Path:
+        safe = re.sub(r"[^a-zA-Z0-9_.-]", "_", client_name or "default")
+        return self.root / f"operation_handoffs__{safe}.json"
+
+    def save_operation_handoff(
+        self,
+        handoff: OdooOperationHandoff | dict[str, Any],
+        client_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Atomically upsert one bounded per-client continuation artifact."""
+        record = OdooOperationHandoff.model_validate(handoff)
+        path = self._operation_handoffs_file_for_client(client_name or record.client_name)
+
+        def update(rows):
+            for index, row in enumerate(rows):
+                if row.get("operation_id") != record.operation_id:
+                    continue
+                existing = OdooOperationHandoff.model_validate(row)
+                if existing.status == "completed":
+                    if record.status != "completed":
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail="Completed operation handoff is immutable.",
+                        )
+                    record.created_at = existing.created_at
+                    record.updated_at = existing.updated_at
+                    rows[index] = existing.model_dump(mode="json")
+                    break
+                record.created_at = existing.created_at
+                record.updated_at = datetime.now(timezone.utc).isoformat()
+                rows[index] = record.model_dump(mode="json")
+                break
+            else:
+                rows.append(record.model_dump(mode="json"))
+            rows.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""))
+            if len(rows) > 50:
+                del rows[:-50]
+
+        self._update_list(path, update)
+        self.log_audit(
+            "operation_handoff.save",
+            record.status,
+            record.operation_id,
+            {"client_name": client_name or record.client_name, "module_name": record.module_name},
+        )
+        return record.model_dump(mode="json")
+
+    def get_operation_handoff(
+        self,
+        operation_id: str,
+        client_name: str | None = None,
+    ) -> dict[str, Any]:
+        for row in self._read_list(self._operation_handoffs_file_for_client(client_name)):
+            if row.get("operation_id") == operation_id:
+                return OdooOperationHandoff.model_validate(row).model_dump(mode="json")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Operation handoff not found.")
+
+    def complete_operation_handoff(
+        self,
+        operation_id: str,
+        *,
+        client_name: str | None = None,
+        next_action: str = "Stop and return the terminal verified result.",
+    ) -> dict[str, Any]:
+        current = OdooOperationHandoff.model_validate(
+            self.get_operation_handoff(operation_id, client_name=client_name)
+        )
+        if current.status == "completed":
+            return current.model_dump(mode="json")
+        current.status = "completed"
+        current.current_blocker = None
+        current.next_action = next_action
+        current.acceptance_evidence_remaining = []
+        return self.save_operation_handoff(current, client_name=client_name)
+
     def save_debug_session(self, session: dict[str, Any], client_name: str | None = None) -> dict[str, Any]:
         """Atomically upsert one isolated debug session.
 
@@ -379,6 +525,56 @@ class JsonStore:
             if row.get("operation_id") == operation_id:
                 return dict(row)
         return None
+
+    def trusted_debug_evidence_ids(
+        self,
+        client_name: str | None = None,
+        *,
+        debug_session_id: str | None = None,
+        module_name: str | None = None,
+        task_description: str | None = None,
+    ) -> set[str]:
+        """Return trusted evidence only from the exact bound issue/module session."""
+        if not debug_session_id:
+            return set()
+        normalized_task = re.sub(r"\s+", " ", str(task_description or "").lower())
+        trusted: set[str] = set()
+        for session in self._read_list(self._debug_sessions_file_for_client(client_name)):
+            if session.get("id") != debug_session_id:
+                continue
+            session_modules = {
+                str(session.get("module_name") or "").strip(),
+                str(session.get("requested_module_name") or "").strip(),
+            }
+            if module_name and module_name not in session_modules:
+                break
+            session_issue = re.sub(
+                r"\s+",
+                " ",
+                str(session.get("issue_description") or "").lower(),
+            ).strip()
+            if session_issue and session_issue not in normalized_task:
+                break
+            try:
+                diagnosis = OdooFailureDiagnosis.model_validate(session.get("diagnosis"))
+            except Exception:
+                break
+            if (
+                diagnosis.debug_session_id != debug_session_id
+                or diagnosis.origin != "custom_code"
+                or diagnosis.next_strategy != "repair_custom_code"
+            ):
+                break
+            diagnosed_ids = set(diagnosis.evidence_ids)
+            for item in session.get("evidence_ledger") or []:
+                if (
+                    isinstance(item, dict)
+                    and item.get("trusted") is True
+                    and item.get("id") in diagnosed_ids
+                ):
+                    trusted.add(str(item["id"]))
+            break
+        return trusted
 
     def save_session_state(self, state: dict, client_name: str | None = None) -> dict:
         """Persist arbitrary session state (sha, module, step history, etc.).

@@ -124,6 +124,10 @@ Stop and ask the user before planning further if:
   module-upgrade evidence before claiming success.
 - Keep unchanged Studio/view/deprecation/cache warnings as nonblocking baseline debt.
   Escalate only newly introduced or changed-scope failures.
+- Persist a compact, self-contained operation handoff only for multi-phase or
+  interrupted work: locked scope, decisions with reasons, exact targets,
+  completed checkpoints, failed fingerprints, blocker, and next action.
+  Resume from it instead of reconstructing settled context or restarting work.
 
 ---
 

@@ -41,6 +41,8 @@ from ..schemas import (
     OdooCodeChangeRequest,
     OdooDebugAndFixRequest,
     OdooDebugEvidenceRecord,
+    OdooFailureDiagnosis,
+    OdooOperationHandoff,
     OdooDebugRecordAssertion,
     ModuleAnalyzeRequest,
     FrontendVisualImplementRequest,
@@ -2180,6 +2182,99 @@ def _code_batch_fingerprint(writes: list[OdooCodeFileChange]) -> str:
     ).hexdigest()
 
 
+def _code_operation_id(
+    payload: OdooCodeChangeRequest,
+    *,
+    client_name: str | None,
+    project_path: str,
+    module_name: str,
+) -> str:
+    if payload.operation_id:
+        return str(payload.operation_id)
+    normalized = "|".join((
+        str(client_name or ""),
+        str(Path(project_path).resolve()),
+        module_name,
+        _normalized_task_type(payload),
+        payload.intent or "",
+        re.sub(r"\s+", " ", payload.task_description.strip().lower()),
+    ))
+    return "codeop-" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
+def _persist_operation_handoff(
+    store: JsonStore,
+    handoff: OdooOperationHandoff,
+    *,
+    client_name: str | None,
+) -> dict[str, Any]:
+    """Persist recovery metadata without making it a core-workflow dependency."""
+    if not hasattr(store, "save_operation_handoff"):
+        return handoff.model_copy(
+            update={"persistence_status": "unavailable"}
+        ).model_dump(mode="json")
+    try:
+        return store.save_operation_handoff(handoff, client_name=client_name)
+    except Exception as exc:
+        return handoff.model_copy(
+            update={
+                "persistence_status": "failed",
+                "persistence_error_type": type(exc).__name__,
+            }
+        ).model_dump(mode="json")
+
+
+def _save_code_operation_handoff(
+    store: JsonStore,
+    *,
+    payload: OdooCodeChangeRequest,
+    client_name: str | None,
+    project_path: str,
+    module_name: str,
+    target_files: list[str],
+    status: str,
+    current_blocker: str | None,
+    next_action: str,
+    completed_checkpoints: list[str] | None = None,
+    acceptance_evidence_remaining: list[str] | None = None,
+) -> dict[str, Any]:
+    """Persist only multi-phase continuation state, never source/log payloads."""
+    handoff = OdooOperationHandoff(
+        operation_id=_code_operation_id(
+            payload,
+            client_name=client_name,
+            project_path=project_path,
+            module_name=module_name,
+        ),
+        client_name=str(client_name)[:200] if client_name else None,
+        project_path=str(Path(project_path).resolve())[:2000],
+        module_name=module_name[:200],
+        objective=payload.task_description[:5000],
+        locked_scope=[
+            f"module:{module_name}",
+            f"task_type:{_normalized_task_type(payload)}",
+            f"intent:{payload.intent or 'unspecified'}",
+        ],
+        decisions_with_reasons=[
+            "Use the existing server-owned code-change, QA, Git, deploy, and upgrade pipeline.",
+            "Preserve installed-source ownership and the resolved edit policy.",
+        ],
+        target_files=[
+            path[:500]
+            for path in dict.fromkeys(str(path) for path in target_files if str(path))
+        ][:100],
+        completed_checkpoints=list(dict.fromkeys(completed_checkpoints or []))[:100],
+        current_blocker=str(current_blocker)[:3000] if current_blocker else None,
+        next_action=next_action[:3000],
+        acceptance_evidence_remaining=list(dict.fromkeys(
+            acceptance_evidence_remaining or []
+        ))[:50],
+        diagnosis=payload.investigation_diagnosis,
+        status=typing.cast(Any, status),
+    )
+    return _persist_operation_handoff(store, handoff, client_name=client_name)
+
+
 def _prepare_code_batch(
     store: JsonStore,
     *,
@@ -2232,6 +2327,23 @@ def _prepare_code_batch(
     if len(operations) > 20:
         operations = dict(list(operations.items())[-20:])
     store.save_session_state({"code_change_batch_operations": operations}, client_name=client_name)
+    _save_code_operation_handoff(
+        store,
+        payload=payload,
+        client_name=client_name,
+        project_path=project_path,
+        module_name=module_name,
+        target_files=[item.relative_path for item in payload.writes],
+        status="active",
+        current_blocker=None,
+        next_action=f"Apply and verify local batch {payload.batch_index + 1} of {payload.total_batches}.",
+        completed_checkpoints=["client_validated", "batch_contract_bound"],
+        acceptance_evidence_remaining=[
+            "all_local_batches_verified",
+            "whole_module_qa",
+            "terminal_deployment_proof",
+        ],
+    )
     return record, fingerprint, False
 
 
@@ -2257,6 +2369,27 @@ def _complete_code_batch(
     current["updated_at"] = datetime.now(timezone.utc).isoformat()
     operations[record["operation_id"]] = current
     store.save_session_state({"code_change_batch_operations": operations}, client_name=client_name)
+    try:
+        if not (
+            hasattr(store, "get_operation_handoff")
+            and hasattr(store, "save_operation_handoff")
+        ):
+            return current
+        handoff = OdooOperationHandoff.model_validate(
+            store.get_operation_handoff(record["operation_id"], client_name=client_name)
+        )
+        checkpoint = f"batch_{batch_index}_verified"
+        if checkpoint not in handoff.completed_checkpoints:
+            handoff.completed_checkpoints.append(checkpoint)
+        handoff.target_files = list(dict.fromkeys([
+            *handoff.target_files,
+            *written_paths,
+        ]))[-100:]
+        handoff.next_action = "Continue with the next dependency-ordered local batch."
+        store.save_operation_handoff(handoff, client_name=client_name)
+    except Exception:
+        # Batch completion remains authoritative; handoff is only a sidecar.
+        pass
     return current
 
 
@@ -2276,6 +2409,28 @@ def _record_code_batch_deploy(
         current["deploy_started_at"] = datetime.now(timezone.utc).isoformat()
     operations[record["operation_id"]] = current
     store.save_session_state({"code_change_batch_operations": operations}, client_name=client_name)
+    try:
+        if not (
+            hasattr(store, "get_operation_handoff")
+            and hasattr(store, "save_operation_handoff")
+        ):
+            return current
+        handoff = OdooOperationHandoff.model_validate(
+            store.get_operation_handoff(record["operation_id"], client_name=client_name)
+        )
+        handoff.completed_checkpoints = list(dict.fromkeys([
+            *handoff.completed_checkpoints,
+            "all_local_batches_verified",
+            "whole_module_qa_passed",
+            "safe_deploy_started",
+        ]))
+        handoff.current_blocker = None
+        handoff.next_action = f"Poll the owned safe-deploy job {job_id} to a terminal result."
+        handoff.acceptance_evidence_remaining = ["terminal_deployment_proof"]
+        store.save_operation_handoff(handoff, client_name=client_name)
+    except Exception:
+        # Deployment ownership remains with the job even if sidecar sync fails.
+        pass
     return current
 
 
@@ -3212,11 +3367,28 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             },
         }
 
+    diagnosis_session_id = (
+        payload.investigation_diagnosis.debug_session_id
+        if payload.investigation_diagnosis is not None
+        else None
+    )
+    trusted_diagnosis_evidence = (
+        state_store.trusted_debug_evidence_ids(
+            client_name,
+            debug_session_id=diagnosis_session_id,
+            module_name=effective_module_name,
+            task_description=payload.task_description,
+        )
+        if diagnosis_session_id
+        else set()
+    )
     failure_guard = repeated_failure_guard_status(
         client_name=client_name,
         fingerprint=issue_fingerprint,
         task_description=payload.task_description,
         investigation_evidence=payload.investigation_evidence,
+        investigation_diagnosis=payload.investigation_diagnosis,
+        trusted_evidence_ids=trusted_diagnosis_evidence,
         functional_verification_passed=payload.functional_verification_passed,
     )
     if failure_guard.get("blocked"):
@@ -3265,6 +3437,29 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         ]
         clarification = _material_clarification(payload)
         if clarification:
+            resolved_target_files = [
+                str(r.get("relative_path"))
+                for r in custom_reads
+                if r.get("status") == "read" and r.get("relative_path")
+            ]
+            handoff = _save_code_operation_handoff(
+                state_store,
+                payload=payload,
+                client_name=client_name,
+                project_path=project_path,
+                module_name=effective_module_name,
+                target_files=resolved_target_files,
+                status="blocked",
+                current_blocker="A material product/scope choice remains unresolved.",
+                next_action="Ask the returned single clarification, then continue the same operation.",
+                completed_checkpoints=["client_validated", "focused_inspection", "target_resolution"],
+                acceptance_evidence_remaining=[
+                    "clarification_answer",
+                    "complete_write_set",
+                    "qa_and_core_verification",
+                    "terminal_deployment_proof",
+                ],
+            )
             JsonStore().save_session_state({
                 "pending_code_change": {
                     "client_name": client_name,
@@ -3277,6 +3472,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                     "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
                     "status": "awaiting_user_clarification",
                     "clarification": clarification,
+                    "handoff": handoff,
                     "request": _code_change_continuation_arguments(
                         payload,
                         client_name=client_name,
@@ -3300,6 +3496,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 "steps": steps,
                 "workflow_profile": adaptive_profile,
                 "clarification_gate": clarification,
+                "handoff": handoff,
                 "module_contract": module_contract,
                 "contract_status": contract_record.get("status", "pending"),
                 "write_generation": {"required": False, "blocked_by": "material_clarification"},
@@ -3326,6 +3523,28 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         # Persist unresolved implementation context so short follow-ups such as
         # "yes", "implement", "push", or "revert" can continue the latest task.
         # This is an internal continuation contract, not a user-facing result.
+        resolved_target_files = [
+            str(r.get("relative_path"))
+            for r in custom_reads
+            if r.get("status") == "read" and r.get("relative_path")
+        ]
+        handoff = _save_code_operation_handoff(
+            state_store,
+            payload=payload,
+            client_name=client_name,
+            project_path=project_path,
+            module_name=effective_module_name,
+            target_files=resolved_target_files,
+            status="active",
+            current_blocker="Exact writes have not yet been generated from the focused source contexts.",
+            next_action="Generate one complete write set from write_generation.contexts and continue this operation.",
+            completed_checkpoints=["client_validated", "focused_inspection", "target_resolution"],
+            acceptance_evidence_remaining=[
+                "complete_write_set",
+                "qa_and_core_verification",
+                "terminal_deployment_proof",
+            ],
+        )
         JsonStore().save_session_state({
             "pending_code_change": {
                 "client_name": client_name,
@@ -3337,6 +3556,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 "target_hint": _target_hint(payload),
                 "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
                 "status": "awaiting_internal_writes",
+                "handoff": handoff,
                 "request": _code_change_continuation_arguments(
                     payload,
                     client_name=client_name,
@@ -3412,6 +3632,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                     "Preserve unrelated code and do not rewrite omitted source.",
                 ],
             },
+            "handoff": handoff,
             "next_call": {
                 "tool": "workflow.odoo_code_change",
                 "arguments": _code_change_continuation_arguments(
@@ -3810,6 +4031,19 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     )
 
     if not payload.auto_deploy:
+        handoff = _save_code_operation_handoff(
+            state_store,
+            payload=payload,
+            client_name=client_name,
+            project_path=project_path,
+            module_name=effective_module_name,
+            target_files=deploy_paths,
+            status="active",
+            current_blocker="Deployment was intentionally not started because auto_deploy=false.",
+            next_action="Continue this operation with auto_deploy=true when deployment is authorized.",
+            completed_checkpoints=["writes_applied", "qa_passed", "core_verification_passed"],
+            acceptance_evidence_remaining=["terminal_deployment_proof"],
+        )
         return {
             "status": "ready_to_deploy",
             "message": "Requested change passed scoped verification. auto_deploy=false, so no deploy job was started.",
@@ -3825,6 +4059,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "module_contract": module_contract,
             "workflow_profile": adaptive_profile,
             "contract_status": "fulfilled",
+            "handoff": handoff,
             "success_allowed": False,
             "completion_required": True,
         }
@@ -3849,6 +4084,19 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         deploy_struct = deploy.model_dump(mode="json") if hasattr(deploy, "model_dump") else deploy
     except HTTPException as exc:
         deploy_detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+        handoff = _save_code_operation_handoff(
+            state_store,
+            payload=payload,
+            client_name=client_name,
+            project_path=project_path,
+            module_name=effective_module_name,
+            target_files=deploy_paths,
+            status="blocked",
+            current_blocker=str(deploy_detail.get("message") or deploy_detail),
+            next_action="Resolve the deploy-validation blocker, then resume the same operation without repeating writes or QA.",
+            completed_checkpoints=["writes_applied", "qa_passed", "core_verification_passed"],
+            acceptance_evidence_remaining=["safe_deploy_job", "terminal_deployment_proof"],
+        )
         return {
             "status": "deploy_blocked",
             "message": "Code was written and verified, but safe deploy was blocked by client validation.",
@@ -3861,6 +4109,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "qa": qa_struct,
             "verify_against_core": verify.model_dump(mode="json"),
             "deploy_validation": deploy_detail,
+            "handoff": handoff,
             "success_allowed": False,
             "completion_required": True,
             "source_deployed": False,
@@ -3876,6 +4125,35 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             record=batch_record,
             job_id=job_id,
         )
+    handoff = _save_code_operation_handoff(
+        state_store,
+        payload=payload,
+        client_name=client_name,
+        project_path=project_path,
+        module_name=effective_module_name,
+        target_files=deploy_paths,
+        status="active",
+        current_blocker=None,
+        next_action=f"Poll the owned safe-deploy job {job_id} to a terminal result.",
+        completed_checkpoints=[
+            "writes_applied",
+            "qa_passed",
+            "core_verification_passed",
+            "safe_deploy_started",
+        ],
+        acceptance_evidence_remaining=["terminal_deployment_proof"],
+    )
+    if job_id and hasattr(state_store, "bind_operation_handoff_to_job"):
+        try:
+            state_store.bind_operation_handoff_to_job(
+                str(job_id),
+                str(handoff["operation_id"]),
+                client_name=client_name,
+            )
+        except Exception:
+            # The deploy job remains authoritative when optional recovery
+            # metadata cannot be attached.
+            pass
     record_code_change_deploy_attempt(client_name=client_name, fingerprint=issue_fingerprint, job_id=job_id)
     frontend_touched = any(str(path).endswith((".xml", ".scss", ".css", ".js")) for path in deploy_paths)
     return {
@@ -3899,6 +4177,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "deploy_impact": deploy_impact.as_dict(),
         "safe_deploy": deploy_struct,
         "job_id": job_id,
+        "handoff": handoff,
         "completion_required": True,
         "success_allowed": False,
         "source_pushed": False,
@@ -4021,6 +4300,12 @@ def _debug_session_store(
         sessions = dict(state.get("debug_sessions") or {}) if isinstance(state, dict) else {}
         sessions[str(session["id"])] = session
         store.save_session_state({"debug_sessions": sessions}, client_name=client_name)
+    if session.get("operation_id") and hasattr(store, "save_operation_handoff"):
+        _persist_operation_handoff(
+            store,
+            _debug_operation_handoff(session),
+            client_name=client_name,
+        )
     return session
 
 
@@ -4087,6 +4372,178 @@ def _debug_record_evidence(
     ledger.append(record.model_dump(mode="json"))
     session["evidence_ledger"] = ledger[-50:]
     return True
+
+
+def _debug_trusted_evidence_ids(session: dict[str, Any]) -> list[str]:
+    return [
+        str(item["id"])
+        for item in session.get("evidence_ledger") or []
+        if isinstance(item, dict) and item.get("trusted") is True and item.get("id")
+    ]
+
+
+def _debug_infer_diagnosis(session: dict[str, Any]) -> OdooFailureDiagnosis:
+    """Classify only evidence visible to the connector; remain unknown otherwise."""
+    evidence_text = "\n".join(
+        str(item.get("summary") or "")
+        for item in session.get("evidence_ledger") or []
+        if isinstance(item, dict) and item.get("trusted") is True
+    )
+    # Origin controls whether another repair may be authorized, so classify
+    # from server-trusted ledger entries only. User narrative remains useful
+    # for search/reproduction but cannot be combined with unrelated evidence
+    # to manufacture a custom-code diagnosis.
+    text = evidence_text.lower()
+    module_name = str(session.get("module_name") or "").strip().lower()
+    debug_session_id = str(session.get("id") or "") or None
+    trusted_ids = _debug_trusted_evidence_ids(session)[-20:]
+
+    connector_markers = (
+        "project path not found",
+        "unterminated quoted string",
+        "connector command",
+        "checkout is missing",
+        "error-pack collection failed",
+        "ssh configuration",
+    )
+    provider_markers = (
+        "rate limit",
+        "too many requests",
+        "provider timeout",
+        "provider unavailable",
+        "service unavailable",
+    )
+    custom_markers = (
+        f"/{module_name}/" if module_name else "",
+        f"addons/{module_name}/" if module_name else "",
+        f"{module_name}\\" if module_name else "",
+    )
+
+    if any(marker and marker in text for marker in connector_markers):
+        return OdooFailureDiagnosis(
+            origin="connector_pipeline",
+            crux="Connector checkout, command, SSH, or orchestration failed independently of module behavior.",
+            verified_facts=["The trusted connector evidence contains a connector-pipeline failure marker."],
+            hypothesis="Repair or resume the connector checkpoint without changing Odoo module code.",
+            evidence_ids=trusted_ids,
+            debug_session_id=debug_session_id,
+            next_strategy="resume_connector",
+        )
+    if any(marker in text for marker in provider_markers):
+        return OdooFailureDiagnosis(
+            origin="provider_transport",
+            crux="The external provider transport failed before module behavior could be verified.",
+            verified_facts=["The trusted evidence contains a provider transport or rate-limit marker."],
+            hypothesis="Retry the provider operation within a bounded policy; do not patch module code.",
+            evidence_ids=trusted_ids,
+            debug_session_id=debug_session_id,
+            next_strategy="retry_provider_bounded",
+        )
+    if (
+        trusted_ids
+        and "traceback" in text
+        and any(marker and marker in text for marker in custom_markers)
+    ):
+        return OdooFailureDiagnosis(
+            origin="custom_code",
+            crux=f"The trusted traceback enters changed or installed custom addon {module_name}.",
+            verified_facts=["A trusted traceback references the selected custom addon."],
+            unknowns=["The exact causal statement must be confirmed against the referenced source unit."],
+            hypothesis="Inspect the earliest custom-addon frame and repair the violated runtime contract.",
+            evidence_ids=trusted_ids,
+            debug_session_id=debug_session_id,
+            next_strategy="repair_custom_code",
+        )
+    return OdooFailureDiagnosis(
+        origin="unknown",
+        crux="Trusted evidence does not yet distinguish module code, baseline, connector, provider, or context failure.",
+        verified_facts=["Evidence collection completed but no safe origin classification was proven."] if trusted_ids else [],
+        unknowns=["The earliest causal boundary remains unverified."],
+        hypothesis="Collect one focused primary-source observation before authorizing another repair.",
+        evidence_ids=trusted_ids,
+        debug_session_id=debug_session_id,
+        next_strategy="collect_focused_evidence",
+    )
+
+
+def _debug_resolve_diagnosis(
+    session: dict[str, Any],
+    supplied: OdooFailureDiagnosis | dict[str, Any] | None = None,
+) -> OdooFailureDiagnosis:
+    inferred = _debug_infer_diagnosis(session)
+    if supplied is None:
+        return inferred
+    candidate = OdooFailureDiagnosis.model_validate(supplied)
+    trusted_ids = set(_debug_trusted_evidence_ids(session))
+    if candidate.debug_session_id != session.get("id"):
+        return inferred
+    if not candidate.evidence_ids or not set(candidate.evidence_ids).issubset(trusted_ids):
+        return inferred
+    if candidate.origin != inferred.origin:
+        return inferred
+    if candidate.origin == "custom_code" and candidate.next_strategy != "repair_custom_code":
+        return inferred
+    if candidate.origin != "custom_code" and candidate.next_strategy == "repair_custom_code":
+        return inferred
+    return candidate
+
+
+def _debug_operation_handoff(session: dict[str, Any]) -> OdooOperationHandoff:
+    truth_gate = _debug_truth_gate(session)
+    phase = str(session.get("phase") or "diagnosing")
+    status = "completed" if phase == "completed" else ("blocked" if phase == "blocked" else "active")
+    next_action = {
+        "awaiting_writes": "Generate the complete evidence-backed writes and continue this debug session.",
+        "awaiting_clarification": "Answer the one material clarification and continue this debug session.",
+        "deploying": f"Poll the owned safe-deploy job {session.get('job_id')} through this debug session.",
+        "recovery_required": "Resume from the stored checkpoint without repeating completed writes or deploy steps.",
+        "blocked": "Resolve the stored blocker with focused primary-source evidence.",
+        "completed": "Stop and report the verified terminal result.",
+    }.get(phase, "Continue focused diagnosis from the stored evidence pointers.")
+    diagnosis = session.get("diagnosis")
+    objective = (
+        f"{session.get('issue_description', '')}\n"
+        f"Expected: {session.get('expected_result', '')}"
+    )[:5000]
+    return OdooOperationHandoff(
+        operation_id=str(session["operation_id"]),
+        client_name=str(session.get("client_name"))[:200] if session.get("client_name") else None,
+        project_path=str(session.get("project_path"))[:2000] if session.get("project_path") else None,
+        module_name=str(session.get("module_name"))[:200] if session.get("module_name") else None,
+        objective=objective,
+        locked_scope=[
+            f"surface:{session.get('surface') or 'auto'}",
+            f"correlation_id:{session.get('correlation_id') or 'unset'}",
+        ],
+        decisions_with_reasons=[
+            "The normal code-change and safe-deploy workflows remain the only mutation/deployment owners.",
+            "Only trusted evidence-linked custom-code diagnosis can authorize a repeated repair.",
+        ],
+        target_files=[
+            str(path)[:500] for path in (session.get("diagnosed_paths") or [])
+        ][:100],
+        completed_checkpoints=[
+            value
+            for value, present in (
+                ("runtime_evidence_collected", bool(session.get("evidence_ledger"))),
+                ("writes_applied", int(session.get("fix_cycles") or 0) > 0),
+                ("safe_deploy_started", bool(session.get("job_id"))),
+                ("deployment_confirmed", bool(session.get("deploy_confirmed") or session.get("already_deployed_confirmed"))),
+            )
+            if present
+        ],
+        failed_attempt_fingerprints=list(session.get("write_fingerprints") or [])[-20:],
+        current_blocker=(
+            None
+            if status == "completed"
+            else str(session.get("last_code_change_status") or truth_gate.get("missing_proof") or phase)
+        ),
+        next_action=next_action,
+        acceptance_evidence_remaining=list(truth_gate.get("missing_proof") or []),
+        diagnosis=OdooFailureDiagnosis.model_validate(diagnosis) if diagnosis else None,
+        status=typing.cast(Any, status),
+        created_at=str(session.get("created_at") or datetime.now(timezone.utc).isoformat()),
+    )
 
 
 def _debug_truth_gate(session: dict[str, Any]) -> dict[str, Any]:
@@ -4225,6 +4682,16 @@ def _debug_public_session(session: dict[str, Any]) -> dict[str, Any]:
             1 for item in session.get("evidence_ledger") or []
             if isinstance(item, dict) and item.get("trusted") is True
         ),
+        "diagnosis": session.get("diagnosis"),
+        "handoff": {
+            "operation_id": session.get("operation_id"),
+            "status": (
+                "completed"
+                if session.get("phase") == "completed"
+                else ("blocked" if session.get("phase") == "blocked" else "active")
+            ),
+            "reload_from_store": True,
+        },
         "truth_gate": truth_gate,
     }
 
@@ -4495,6 +4962,7 @@ def _debug_task_description(session: dict[str, Any]) -> str:
         f"Detected surface: {session['surface']}\n"
         f"Correlation ID: {session['correlation_id']}\n"
         f"Reproduction steps:\n{reproduction}\n\n"
+        f"Structured diagnosis:\n{json.dumps(session.get('diagnosis') or {}, ensure_ascii=False, sort_keys=True)}\n\n"
         f"Sanitized runtime evidence:\n{evidence or 'No traceback captured yet; inspect the exact entry point and add bounded instrumentation only when needed.'}\n\n"
         "Implementation contract: identify the evidence-backed root cause; make the smallest complete multi-file fix; "
         "preserve unrelated behavior; use structured correlation-scoped logging only where runtime visibility is missing; "
@@ -4547,6 +5015,7 @@ def _debug_next_call(
             "correlation_id": session.get("correlation_id"),
             "verification_assertion": session.get("verification_assertion"),
             "runtime_replay": session.get("runtime_replay"),
+            "failure_diagnosis": session.get("diagnosis"),
             "max_fix_cycles": session.get("max_fix_cycles", 3),
             "max_surgical_files": max(12, int(session.get("max_surgical_files") or 12)),
             "max_surgical_content_chars": session.get("max_surgical_content_chars", 200_000),
@@ -4588,6 +5057,11 @@ async def _debug_begin_code_inspection(
             auto_deploy=payload.auto_deploy,
             deploy_mode="auto",
             investigation_evidence=list(session.get("evidence") or [])[-20:],
+            investigation_diagnosis=(
+                OdooFailureDiagnosis.model_validate(session["diagnosis"])
+                if session.get("diagnosis")
+                else None
+            ),
         ))
     except Exception as exc:
         session["phase"] = "recovery_required"
@@ -4846,6 +5320,10 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
                 assertion_payload,
                 phase="baseline",
             )
+        session["diagnosis"] = _debug_resolve_diagnosis(
+            session,
+            payload.failure_diagnosis,
+        ).model_dump(mode="json")
         _debug_session_store(store, session, client_name=client_name)
         return await _debug_begin_code_inspection(payload, session, store)
 
@@ -4897,6 +5375,10 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
         source="client",
         trusted=False,
     )
+    session["diagnosis"] = _debug_resolve_diagnosis(
+        session,
+        payload.failure_diagnosis or session.get("diagnosis"),
+    ).model_dump(mode="json")
     if session.get("phase") == "awaiting_clarification":
         if not str(payload.clarification_answer or "").strip():
             return {
@@ -5120,6 +5602,12 @@ async def _workflow_odoo_debug_and_fix(payload: OdooDebugAndFixRequest) -> dict[
                     fingerprint=issue_fingerprint,
                     task_description=str(session.get("issue_description") or ""),
                     investigation_evidence=list(session.get("evidence") or []),
+                    investigation_diagnosis=(
+                        OdooFailureDiagnosis.model_validate(session["diagnosis"])
+                        if session.get("diagnosis")
+                        else None
+                    ),
+                    trusted_evidence_ids=_debug_trusted_evidence_ids(session),
                     functional_verification_passed=True,
                 )
                 return {
@@ -5924,6 +6412,8 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             "terminal": {"type": "boolean"}, "must_continue": {"type": "boolean"},
             "summary_allowed": {"type": "boolean"}, "blocking_scope": {"type": "string"},
             "debug_session": {"type": "object", "additionalProperties": True},
+            "diagnosis": {"type": "object", "additionalProperties": True},
+            "handoff": {"type": "object", "additionalProperties": True},
             "diagnosis_evidence": {"type": "array", "items": {"type": "string"}},
             "reproduction_passed": {"type": "boolean"},
             "expected_result_verified": {"type": "boolean"},
@@ -5981,6 +6471,31 @@ def _dynamic_tool_output_schema(name: str) -> dict:
                     "unchanged_observations": {"type": "integer", "minimum": 0},
                     "action": {"type": "string"},
                     "reason": {"type": "string"},
+                    "redirect_kind": {
+                        "type": "string",
+                        "enum": [
+                            "none", "preserve_protected_work", "use_focused_evidence",
+                            "load_exact_source", "reload_handoff", "resume_connector",
+                            "retry_provider_bounded", "ask_material_question",
+                        ],
+                    },
+                    "next_action": {
+                        "type": ["object", "null"],
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": [
+                                    "continue_with_backoff", "use_focused_evidence",
+                                    "load_exact_source", "reload_handoff",
+                                    "resume_connector", "retry_provider_bounded",
+                                    "ask_material_question",
+                                ],
+                            },
+                            "instruction": {"type": "string", "minLength": 3, "maxLength": 1000},
+                        },
+                        "required": ["type", "instruction"],
+                        "additionalProperties": False,
+                    },
                     "poll_after_seconds": {"type": ["integer", "null"]},
                     "cancellation_supported": {"type": "boolean"},
                     "force_cancelled": {"type": "boolean"},
@@ -5988,6 +6503,7 @@ def _dynamic_tool_output_schema(name: str) -> dict:
                 "required": [
                     "status", "phase", "protected", "stalled", "idle_seconds",
                     "unchanged_observations", "action", "reason",
+                    "redirect_kind", "next_action",
                     "cancellation_supported", "force_cancelled",
                 ],
                 "additionalProperties": False,

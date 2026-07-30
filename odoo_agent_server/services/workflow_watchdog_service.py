@@ -94,8 +94,9 @@ class WorkflowWatchdogService:
                 "elapsed_seconds": round(elapsed, 1),
                 "reason": "The read-only operation exceeded its configured runtime budget.",
                 "action": "switch_strategy",
+                "redirect_kind": "use_focused_evidence",
                 "next_action": {
-                    "type": "use_focused_evidence_or_ask_one_material_question",
+                    "type": "use_focused_evidence",
                     "instruction": (
                         "Do not repeat the same broad operation. Continue from focused evidence already "
                         "collected, or ask one precise user question only when the task contract is unclear."
@@ -146,15 +147,50 @@ class WorkflowWatchdogService:
         if terminal:
             action = "stop_polling"
             reason = "Job is terminal."
+            redirect_kind = "none"
         elif protected:
             action = "continue_with_backoff"
             reason = "Mutation-capable or unknown work is protected from cancellation."
+            redirect_kind = "preserve_protected_work"
         elif stalled:
             action = "switch_strategy"
             reason = "Read-only job exceeded its budget without observable progress."
+            redirect_kind = self._job_redirect_kind(job)
         else:
             action = "continue"
             reason = "No confirmed stall."
+            redirect_kind = "none"
+
+        next_actions = {
+            "preserve_protected_work": {
+                "type": "continue_with_backoff",
+                "instruction": "Keep the owned coding/deploy/database work running and poll after the returned backoff.",
+            },
+            "use_focused_evidence": {
+                "type": "use_focused_evidence",
+                "instruction": "Do not repeat the broad read; continue from focused evidence or narrow the source query.",
+            },
+            "load_exact_source": {
+                "type": "load_exact_source",
+                "instruction": "Load only the missing primary source identified by the diagnosis.",
+            },
+            "reload_handoff": {
+                "type": "reload_handoff",
+                "instruction": "Reload the persisted operation handoff instead of adding more context.",
+            },
+            "resume_connector": {
+                "type": "resume_connector",
+                "instruction": "Resume or repair the connector checkpoint without changing Odoo module code.",
+            },
+            "retry_provider_bounded": {
+                "type": "retry_provider_bounded",
+                "instruction": "Retry the provider transport within its bounded retry/backoff policy.",
+            },
+            "ask_material_question": {
+                "type": "ask_material_question",
+                "instruction": "Ask one precise question only because a material product decision remains unresolved.",
+            },
+        }
 
         return {
             "status": "terminal" if terminal else ("stalled" if stalled else "active"),
@@ -165,6 +201,8 @@ class WorkflowWatchdogService:
             "unchanged_observations": unchanged,
             "action": action,
             "reason": reason,
+            "redirect_kind": redirect_kind,
+            "next_action": next_actions.get(redirect_kind),
             "poll_after_seconds": None if terminal else min(10, max(1, 2 ** min(unchanged, 3))),
             "cancellation_supported": False,
             "force_cancelled": False,
@@ -222,6 +260,18 @@ class WorkflowWatchdogService:
                 result.get("updated_at"),
             )
         )
+
+    def _job_redirect_kind(self, job: JobRecord) -> str:
+        result = job.result if isinstance(job.result, dict) else {}
+        diagnosis = result.get("diagnosis") if isinstance(result.get("diagnosis"), dict) else {}
+        origin = str(result.get("failure_origin") or diagnosis.get("origin") or "")
+        return {
+            "missing_context": "load_exact_source",
+            "context_degradation": "reload_handoff",
+            "connector_pipeline": "resume_connector",
+            "provider_transport": "retry_provider_bounded",
+            "material_ambiguity": "ask_material_question",
+        }.get(origin, "use_focused_evidence")
 
     def _parse_time(self, value: Any) -> datetime | None:
         if not value:

@@ -14,6 +14,8 @@ completion. Findings come first, ordered by severity with file/line evidence.
 5. Prioritize concrete bugs, data/access leaks, workflow breaks, upgrade risks,
    N+1 behavior, and missing regression coverage.
 6. Separate introduced findings from unchanged baseline debt.
+7. Treat the diff and owning source as primary evidence; generated summaries
+   are navigation aids, never substitutes for inspecting the changed code.
 
 ## REVIEW CONTRACT
 
@@ -23,6 +25,8 @@ completion. Findings come first, ordered by severity with file/line evidence.
   context, scoped `sudo()`, and transaction boundaries.
 - Verify provider retries, signatures, secrets, and auditability.
 - Require evidence for tested/deployed/verified claims.
+- Use deterministic tools for syntax, schema, type, lint, and test checks; use
+  model judgment for intent, architecture, security, and regression risk.
 - If no material issue is found, say so and state residual unrun checks.
 - Do not invent requirements from exception words or expand a surgical review
   into unrelated redesign.

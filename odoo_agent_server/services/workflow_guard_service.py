@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import settings
-from ..schemas import CommandResult, JobStatus, OdooResult
+from ..schemas import CommandResult, JobStatus, OdooFailureDiagnosis, OdooResult
 from .store_service import JsonStore
 
 _RESUMABLE_SAFE_DEPLOY_RESULTS = {
@@ -387,13 +387,17 @@ def repeated_failure_guard_status(
     fingerprint: str,
     task_description: str,
     investigation_evidence: list[str] | None = None,
+    investigation_diagnosis: OdooFailureDiagnosis | dict[str, Any] | None = None,
+    trusted_evidence_ids: list[str] | set[str] | None = None,
     functional_verification_passed: bool = False,
 ) -> dict[str, Any]:
     """Evaluate the generic two-attempt escalation guard.
 
     Existing workflows are unchanged unless the request explicitly indicates
     that the symptom persists and two prior deploy jobs for the same issue have
-    completed successfully without functional verification.
+    completed successfully without functional verification. A third repair
+    requires a custom-code diagnosis linked to trusted server evidence; free
+    text alone cannot unlock another write/deploy cycle.
     """
     store = JsonStore()
     state = store.load_session_state(client_name)
@@ -425,12 +429,36 @@ def repeated_failure_guard_status(
 
     recurrence_reported = bool(_REPEATED_FAILURE_MARKERS.search(task_description or ""))
     evidence = [str(item).strip() for item in (investigation_evidence or []) if str(item).strip()]
-    blocked = recurrence_reported and passed_attempts >= 2 and not evidence
+    diagnosis = (
+        OdooFailureDiagnosis.model_validate(investigation_diagnosis)
+        if investigation_diagnosis is not None
+        else None
+    )
+    trusted_ids = {str(item) for item in (trusted_evidence_ids or []) if str(item)}
+    linked_trusted_ids = (
+        sorted(set(diagnosis.evidence_ids) & trusted_ids)
+        if diagnosis is not None
+        else []
+    )
+    diagnosis_authorizes_repair = bool(
+        diagnosis is not None
+        and diagnosis.origin == "custom_code"
+        and diagnosis.next_strategy == "repair_custom_code"
+        and bool(diagnosis.debug_session_id)
+        and diagnosis.crux.strip()
+        and diagnosis.hypothesis.strip()
+        and linked_trusted_ids
+    )
+    blocked = recurrence_reported and passed_attempts >= 2 and not diagnosis_authorizes_repair
     return {
         "blocked": blocked,
         "passed_attempts": passed_attempts,
         "recurrence_reported": recurrence_reported,
         "investigation_evidence_present": bool(evidence),
+        "diagnosis_present": diagnosis is not None,
+        "diagnosis_origin": diagnosis.origin if diagnosis is not None else None,
+        "trusted_evidence_ids": linked_trusted_ids,
+        "diagnosis_authorizes_repair": diagnosis_authorizes_repair,
     }
 
 

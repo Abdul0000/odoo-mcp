@@ -25,9 +25,14 @@ Live business-record mutations and functional scenario execution are routed to
   actions.
 - Keep credentials and unrestricted Odoo access server-side.
 - Return bounded high-signal responses with pagination/artifact fallback.
+- Keep always-loaded context minimal; return stable artifact or handoff
+  pointers for large evidence and reload only the slice needed for the next
+  decision.
 - Mark tools accurately as read-only, destructive, idempotent, and open-world;
   annotations are hints, not authorization.
 - Make errors actionable and preserve stable operation/job IDs for recovery.
+- Return a machine-readable failure origin, crux, evidence IDs, recovery
+  strategy, and executable next action instead of a generic retry instruction.
 - Do not introduce a second MCP SDK/framework into this connector unless a
   protocol migration is explicitly requested and independently verified.
 - Claim completion only from stored workflow evidence, never generated

@@ -290,6 +290,87 @@ class OdooTargetResolutionResult(BaseModel):
     )
 
 
+class OdooFailureDiagnosis(BaseModel):
+    """Bounded, evidence-linked explanation of why a workflow failed."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    origin: Literal[
+        "custom_code",
+        "preexisting_baseline",
+        "connector_pipeline",
+        "provider_transport",
+        "missing_context",
+        "context_degradation",
+        "unknown",
+    ] = "unknown"
+    crux: str = Field(..., min_length=3, max_length=2000)
+    verified_facts: list[str] = Field(default_factory=list, max_length=20)
+    assumptions: list[str] = Field(default_factory=list, max_length=20)
+    unknowns: list[str] = Field(default_factory=list, max_length=20)
+    hypothesis: str = Field(..., min_length=3, max_length=3000)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=50)
+    debug_session_id: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{32}$",
+        description="Exact server-owned debug session containing evidence_ids.",
+    )
+    next_strategy: Literal[
+        "repair_custom_code",
+        "preserve_baseline",
+        "resume_connector",
+        "retry_provider_bounded",
+        "load_exact_source",
+        "reload_handoff",
+        "ask_material_question",
+        "collect_focused_evidence",
+    ] = "collect_focused_evidence"
+
+    @field_validator("evidence_ids")
+    @classmethod
+    def diagnosis_evidence_ids_must_be_safe(cls, values: list[str]) -> list[str]:
+        clean: list[str] = []
+        for value in values:
+            evidence_id = str(value or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", evidence_id):
+                raise ValueError("evidence_ids must contain safe stable identifiers")
+            if evidence_id not in clean:
+                clean.append(evidence_id)
+        return clean
+
+
+class OdooOperationHandoff(BaseModel):
+    """Durable, bounded continuation state for one multi-phase operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation_id: str = Field(..., min_length=8, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    client_name: str | None = Field(default=None, max_length=200)
+    project_path: str | None = Field(default=None, max_length=2000)
+    module_name: str | None = Field(default=None, max_length=200)
+    objective: str = Field(..., min_length=3, max_length=5000)
+    locked_scope: list[str] = Field(default_factory=list, max_length=100)
+    decisions_with_reasons: list[str] = Field(default_factory=list, max_length=50)
+    target_files: list[str] = Field(default_factory=list, max_length=100)
+    completed_checkpoints: list[str] = Field(default_factory=list, max_length=100)
+    failed_attempt_fingerprints: list[str] = Field(default_factory=list, max_length=20)
+    current_blocker: str | None = Field(default=None, max_length=3000)
+    next_action: str = Field(..., min_length=3, max_length=3000)
+    acceptance_evidence_remaining: list[str] = Field(default_factory=list, max_length=50)
+    diagnosis: OdooFailureDiagnosis | None = None
+    status: Literal["active", "blocked", "completed"] = "active"
+    persistence_status: Literal["persisted", "unavailable", "failed"] = "persisted"
+    persistence_error_type: str | None = Field(default=None, max_length=200)
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+    @model_validator(mode="after")
+    def handoff_must_remain_bounded(self):
+        if len(self.model_dump_json()) > 80_000:
+            raise ValueError("operation handoff exceeds the bounded context contract")
+        return self
+
+
 class OdooCodeChangeRequest(BaseModel):
     """Provider-safe high-level Odoo code-change workflow.
 
@@ -331,7 +412,11 @@ class OdooCodeChangeRequest(BaseModel):
     auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
     deploy_mode: Literal["auto", "always_upgrade", "source_only"] = Field(default="auto", description="Automatic impact classification by default. always_upgrade forces -u; source_only is allowed only for verified non-structural changes.")
     max_search_matches: int = Field(default=20, ge=1, le=100, description="Max candidate matches returned during inspect mode")
-    investigation_evidence: list[str] = Field(default_factory=list, max_length=50, description="Generic evidence gathered after repeated functional failure. Non-empty evidence unlocks a blocked follow-up write.")
+    investigation_evidence: list[str] = Field(default_factory=list, max_length=50, description="Backward-compatible sanitized evidence summaries. Text alone never unlocks a repeated-failure repair.")
+    investigation_diagnosis: "OdooFailureDiagnosis | None" = Field(
+        default=None,
+        description="Structured diagnosis required to unlock an evidence-backed repair after repeated deployed failures.",
+    )
     functional_verification_passed: bool = Field(default=False, description="Set true only when the user-visible behavior was verified; resets repeated-failure attempt history for this issue.")
     clarification_answer: str | None = Field(
         default=None,
@@ -542,6 +627,10 @@ class OdooDebugAndFixRequest(BaseModel):
     operation_id: str | None = Field(default=None, max_length=64, description="Stable idempotency key for start/retry.")
     correlation_id: str | None = Field(default=None, max_length=80, description="Safe request/record correlation identifier.")
     runtime_evidence: list[str] = Field(default_factory=list, max_length=50, description="New sanitized logs, traceback, console, or network evidence.")
+    failure_diagnosis: OdooFailureDiagnosis | None = Field(
+        default=None,
+        description="Optional evidence-linked diagnosis. Server evidence remains authoritative and may override an unsupported origin.",
+    )
     clarification_answer: str | None = Field(default=None, max_length=5000, description="User answer requested by the nested code-change target/material clarification gate.")
     verification_evidence: list[str] = Field(default_factory=list, max_length=20, description="Evidence from replaying the same scenario after deploy.")
     verification_assertion: OdooDebugRecordAssertion | None = Field(default=None, description="Live check: model/domain/fields plus expected_values or expected_count bounds.")
@@ -1595,6 +1684,21 @@ class JobRecord(BaseModel):
         return None
 
 
+class WatchdogNextAction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal[
+        "continue_with_backoff",
+        "use_focused_evidence",
+        "load_exact_source",
+        "reload_handoff",
+        "resume_connector",
+        "retry_provider_bounded",
+        "ask_material_question",
+    ]
+    instruction: str = Field(..., min_length=3, max_length=1000)
+
+
 class WatchdogAssessment(BaseModel):
     status: Literal["active", "stalled", "terminal"]
     phase: str
@@ -1604,6 +1708,17 @@ class WatchdogAssessment(BaseModel):
     unchanged_observations: int = Field(ge=0)
     action: Literal["continue", "continue_with_backoff", "switch_strategy", "stop_polling"]
     reason: str
+    redirect_kind: Literal[
+        "none",
+        "preserve_protected_work",
+        "use_focused_evidence",
+        "load_exact_source",
+        "reload_handoff",
+        "resume_connector",
+        "retry_provider_bounded",
+        "ask_material_question",
+    ] = "none"
+    next_action: WatchdogNextAction | None = None
     poll_after_seconds: int | None = Field(default=None, ge=1, le=10)
     cancellation_supported: bool = False
     force_cancelled: bool = False

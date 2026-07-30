@@ -53,6 +53,7 @@ async def test_read_only_tool_redirects_after_runtime_budget(monkeypatch):
     assert result["cancellation_requested"] is True
     assert result["force_cancelled"] is False
     assert result["success_allowed"] is False
+    assert result["next_action"]["type"] == "use_focused_evidence"
 
 
 @pytest.mark.asyncio
@@ -89,6 +90,7 @@ def test_deploy_job_remains_protected_when_stale(monkeypatch):
     assert assessment["protected"] is True
     assert assessment["cancellation_supported"] is False
     assert assessment["action"] == "continue_with_backoff"
+    assert assessment["redirect_kind"] == "preserve_protected_work"
 
 
 def test_stale_read_job_recommends_strategy_switch_without_claiming_cancel(monkeypatch):
@@ -106,6 +108,28 @@ def test_stale_read_job_recommends_strategy_switch_without_claiming_cancel(monke
     assert assessment["protected"] is False
     assert assessment["cancellation_supported"] is False
     assert assessment["action"] == "switch_strategy"
+    assert assessment["redirect_kind"] == "use_focused_evidence"
+    assert assessment["next_action"]["type"] == "use_focused_evidence"
+
+
+def test_stale_read_job_redirects_by_server_failure_origin(monkeypatch):
+    old = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+    monkeypatch.setattr(settings, "workflow_watchdog_observation_budget_seconds", 120)
+    job = JobRecord(
+        id="context-1",
+        job_type="module_analysis",
+        status=JobStatus.running,
+        created_at=old,
+        result={"diagnosis": {"origin": "context_degradation"}},
+    )
+    service = WorkflowWatchdogService()
+
+    service.assess_job(job)
+    service.assess_job(job)
+    assessment = service.assess_job(job)
+
+    assert assessment["redirect_kind"] == "reload_handoff"
+    assert assessment["next_action"]["type"] == "reload_handoff"
 
 
 def test_unknown_job_is_conservatively_protected():
@@ -188,6 +212,10 @@ def test_jobs_get_output_schema_advertises_watchdog_contract():
     watchdog = tool_output_schema("jobs.get")["properties"]["watchdog"]
     assert watchdog["additionalProperties"] is False
     assert {"status", "protected", "stalled", "action", "reason"} <= set(watchdog["properties"])
+    assert {"redirect_kind", "next_action"} <= set(watchdog["properties"])
+    next_action = watchdog["properties"]["next_action"]
+    assert next_action["additionalProperties"] is False
+    assert set(next_action["required"]) == {"type", "instruction"}
 
 
 def test_mcp_watchdog_coexists_with_operation_guard(tmp_path, monkeypatch):

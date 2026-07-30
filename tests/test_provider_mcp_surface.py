@@ -103,6 +103,8 @@ def test_provider_mcp_workflow_schema_contains_autopatch_fields():
         if isinstance(value, dict)
     ]
     assert all(len(description) <= 80 for description in descriptions)
+    assert "investigation_diagnosis" in properties
+    assert "handoff" in workflow["outputSchema"]["properties"]
 
 
 def test_provider_debug_workflow_exposes_persisted_replay_contract():
@@ -127,6 +129,7 @@ def test_provider_debug_workflow_exposes_persisted_replay_contract():
         "max_fix_cycles",
         "max_surgical_files",
         "max_surgical_content_chars",
+        "failure_diagnosis",
     ):
         assert field in properties
     assert properties["max_fix_cycles"]["maximum"] == 5
@@ -149,6 +152,8 @@ def test_provider_debug_workflow_exposes_persisted_replay_contract():
     assert "expected_result_verified" in output
     assert "claim_status" in output
     assert "truth_gate" in output
+    assert "diagnosis" in output
+    assert "handoff" in output
 
 
 def test_provider_workflow_accepts_up_to_fifty_atomic_writes():

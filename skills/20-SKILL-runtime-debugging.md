@@ -13,8 +13,11 @@ task and must not load this skill.
    INFO/WARNING noise.
 3. Orient on the earliest evidence-backed causal failure, not its downstream
    symptoms; separate verified facts, assumptions, and unknowns.
-4. Map the traceback to changed custom source and classify the failure as
-   `custom_code`, `preexisting_baseline`, or `connector_pipeline`.
+4. Map trusted evidence to the failure origin: `custom_code`,
+   `preexisting_baseline`, `connector_pipeline`, `provider_transport`,
+   `missing_context`, or `context_degradation`. Only `custom_code` evidence
+   authorizes a module repair; each other origin redirects to its own recovery
+   path.
 5. Form one falsifiable hypothesis and apply the smallest complete repair
    through `workflow.odoo_debug_and_fix`.
 6. Reuse the existing code-change, QA, safe-deploy, resume, and replay flow.
@@ -38,6 +41,9 @@ task and must not load this skill.
 - Do not retry blindly or restart completed commit/push/deploy checkpoints.
 - Keep per-record batch failures isolated.
 - Manual text and booleans cannot prove a fix.
+- A repeated-failure override requires a structured diagnosis whose evidence
+  IDs exist in the same bound server-owned debug session; narrative text or
+  evidence from another task cannot unlock it.
 - Claim `verified_fixed` only when deployment proof and immutable replay/live
   assertion both pass; otherwise report `implemented_unverified` or the exact
   blocker with evidence.
