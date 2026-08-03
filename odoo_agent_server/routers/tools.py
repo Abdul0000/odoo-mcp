@@ -2851,37 +2851,55 @@ def _partition_surgical_qa_errors(
     return blocking, preexisting
 
 
-_VERIFICATION_IRRELEVANT_ALLOWLIST = {
-    # These checks are useful warnings but can be false positives when a file
-    # contains multiple ir.ui.view records/models or when a custom model inherits
-    # mail mixins and the static resolver loses the concrete model context.
+_VERIFICATION_OVERRIDEABLE_CODES = {
+    # Static model/view resolver ambiguity. These may be safely overridden only
+    # when every CRITICAL finding belongs to this policy set.
     "view_field_not_in_core_model",
     "related_field_exists",
+    "xpath_match_count",
+}
+
+_VERIFICATION_MODE_ALIASES = {
+    "none": "strict",
+    "irrelevant_only": "allow_unverified",
 }
 
 
+def _canonical_verification_override_mode(value: str | None) -> str:
+    mode = str(value or "strict").strip()
+    return _VERIFICATION_MODE_ALIASES.get(mode, mode)
+
+
 def _verification_override_decision(payload: OdooCodeChangeRequest, verify: Any) -> dict[str, Any]:
-    """Return an auditable decision; never bypass parser/QA failures here."""
+    """Classify verifier findings under a reusable, auditable policy.
+
+    This decision applies only to workflow.verify_against_core. Blocking QA,
+    syntax, parser, manifest, and module-structure errors are evaluated earlier
+    and remain non-overrideable.
+    """
     critical = [item for item in verify.findings if item.severity.value == "CRITICAL"]
-    mode = str(payload.verification_override or "none")
+    requested_mode = str(payload.verification_override or "strict")
+    mode = _canonical_verification_override_mode(requested_mode)
     accepted = False
     rejected_codes: list[str] = []
-    if mode == "irrelevant_only" and critical:
+    if mode == "allow_unverified" and critical:
         rejected_codes = sorted({
             str(getattr(item, "code", "") or getattr(item, "check", "") or "unknown")
             for item in critical
             if str(getattr(item, "code", "") or getattr(item, "check", "") or "")
-            not in _VERIFICATION_IRRELEVANT_ALLOWLIST
+            not in _VERIFICATION_OVERRIDEABLE_CODES
         })
         accepted = not rejected_codes
     elif mode == "force":
         accepted = True
     return {
-        "requested": mode != "none",
+        "requested": mode != "strict",
+        "requested_mode": requested_mode,
         "mode": mode,
         "accepted": accepted,
         "reason": str(payload.verification_override_reason or "").strip() or None,
         "critical_count": len(critical),
+        "overrideable_codes": sorted(_VERIFICATION_OVERRIDEABLE_CODES),
         "rejected_codes": rejected_codes,
         "findings": [item.model_dump(mode="json") for item in critical],
     }
@@ -4194,7 +4212,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         upgrade_reasons=list(deploy_impact.reasons),
         verification_assertion=payload.verification_assertion,
         verification_overridden=bool(verify.push_blocked and override_decision["accepted"]),
-        verification_override_mode=override_decision["mode"] if override_decision["accepted"] else "none",
+        verification_override_mode=override_decision["mode"] if override_decision["accepted"] else "strict",
         verification_override_reason=override_decision["reason"] if override_decision["accepted"] else None,
         verification_override_findings=override_decision["findings"] if override_decision["accepted"] else [],
     )

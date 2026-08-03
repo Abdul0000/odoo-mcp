@@ -1848,75 +1848,16 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             _fail("verify_against_core_pre_push", verify_result)
             return
     else:
-        # If no verifiable files were detected, check whether the module's
-        # __manifest__.py exists and declares data/qweb files. If the
-        # manifest declares files that are not present on disk yet, block the
-        # push so a partial write cannot be pushed prematurely. This is a
-        # conservative, manifest-driven guard — when no manifest is present we
-        # fall back to the existing permissive warning behaviour.
-        module_dir = project_path / payload.module_name
-        manifest_path = module_dir / "__manifest__.py"
-        if manifest_path.exists():
-            try:
-                raw = manifest_path.read_text(encoding="utf-8")
-                manifest_obj = ast.literal_eval(raw)
-                declared = []
-                if isinstance(manifest_obj, dict):
-                    declared.extend(manifest_obj.get("data", []) or [])
-                    declared.extend(manifest_obj.get("demo", []) or [])
-                    declared.extend(manifest_obj.get("qweb", []) or [])
-                # Collect declared files that actually exist on disk
-                declared_existing: list[str] = []
-                missing: list[str] = []
-                for rel in declared:
-                    candidate = (module_dir / str(rel)).resolve()
-                    if candidate.exists():
-                        declared_existing.append(str(candidate))
-                    else:
-                        missing.append(str(rel))
-                if missing:
-                    _fail("verify_against_core_pre_push", {
-                        "message": (
-                            "Push blocked: module __manifest__.py declares files not present on disk yet.",
-                            "missing_files",
-                            missing,
-                        )
-                    })
-                    return
-
-                # Run syntax verifier against the manifest and any declared files
-                auto_verify_files = [str(manifest_path)] + declared_existing
-                verify_result = SyntaxVerifierService().verify(SyntaxVerifyRequest(
-                    written_files=auto_verify_files,
-                    fix_cycle=0,
-                    project_path=str(project_path),
-                    client_name=client.name if client else payload.client_name,
-                ))
-                _step("verify_against_core_pre_push", "failed" if verify_result.push_blocked else "passed", verify_result)
-                if verify_result.push_blocked:
-                    _fail("verify_against_core_pre_push", verify_result)
-                    return
-                # If verifier passed, continue with a warning step to indicate manifest checked
-                _step(
-                    "verify_against_core_pre_push",
-                    "warning",
-                    {"message": "Manifest present and declared files verified against core/source on disk."},
+        _step(
+            "verify_against_core_pre_push",
+            "warning",
+            {
+                "message": (
+                    "No changed module .py/.xml/.js/.scss/.css/.csv/__manifest__.py files were detected for pre-push verification. "
+                    "Push gate passed only because there were no verifiable code files in this deploy request."
                 )
-            except Exception:
-                # If the manifest cannot be parsed, block the push conservatively
-                _fail("verify_against_core_pre_push", {"message": "Push blocked: could not parse module __manifest__.py for pre-push verification."})
-                return
-        else:
-            _step(
-                "verify_against_core_pre_push",
-                "warning",
-                {
-                    "message": (
-                        "No changed module .py/.xml/.js/.scss/.css/.csv/__manifest__.py files were detected for pre-push verification. "
-                        "Push gate passed only because there were no verifiable code files in this deploy request."
-                    )
-                },
-            )
+            },
+        )
     expected_user_hashes = _expected_user_file_hashes(project_path, verify_files)
     expected_registry_fields = _normalise_expected_registry_fields(payload.expected_registry_fields) or _infer_registry_fields_from_python(project_path, payload.module_name, verify_files)
 

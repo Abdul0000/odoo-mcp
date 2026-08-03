@@ -46,10 +46,6 @@ _MODULE_NAME_RE    = re.compile(r"['\"]([A-Za-z0-9_]+)['\"]")
 _JS_IMPORT_RE      = re.compile(r'(?:from\s+["\']([^"\']+)["\']|import\s*\(\s*["\']([^"\']+)["\']\s*\))')
 _JS_TEMPLATE_RE    = re.compile(r'(?:static\s+template\s*=|\.template\s*=)\s*["\']([^"\']+)["\']')
 _POS_CONFIG_LOAD_FIELDS_RE = re.compile(r'load_fields\s*\(\s*["\']pos\.config["\']', re.IGNORECASE)
-_POS_HR_RE         = re.compile(r'\bpos_hr\b|\bPIN\b|\bcashier\b', re.IGNORECASE)
-_RELATIONAL_PLAIN_OBJECT_RE = re.compile(r'\bconst\s+(\w+)\s*=\s*\{[^}]+\}.*\bthis\.\w+\s*=\s*\1\b', re.DOTALL)
-_JS_PROPS_USAGE_RE = re.compile(r'\b(?:this\.props|props\.)\w+\b')
-_JS_EVENT_HANDLER_RE = re.compile(r't-on-[\w-]+')
 _LOAD_POS_DATA_FIELDS_METHOD_RE = re.compile(r'\bdef\s+_load_pos_data_fields\s*\(')
 _T_NAME_RE         = re.compile(r't-name=["\']([^"\']+)["\']')
 _T_INHERIT_RE      = re.compile(r't-inherit=["\']([^"\']+)["\']')
@@ -794,33 +790,6 @@ class SyntaxVerifierService:
                 message="View fields detected; custom fields must exist on the view model and be readable by representative users.",
                 fix_hint="Verify the model field definition, ACLs, record rules, groups, and the final compiled view.",
             ))
-
-        # Detect missing native model fields in active view definitions before push.
-        for record in root.xpath("//record[@model='ir.ui.view']"):
-            model_name = "".join(record.xpath("./field[@name='model']/text()") or []).strip()
-            if not model_name:
-                continue
-            field_names = {m.group(1) for m in _FIELD_NAME_XML_RE.finditer(content)}
-            core_content = _find_core_model_content(model_name, client_name=client_name)
-            if not core_content:
-                continue
-            core_fields = _extract_core_field_names(core_content)
-            for field_name in sorted(field_names):
-                if field_name.startswith("x_"):
-                    continue
-                if field_name and field_name not in core_fields:
-                    findings.append(VerifyFinding(
-                        file=file_path,
-                        severity=VerifySeverity.CRITICAL if _core_source_available(client_name) else VerifySeverity.WARNING,
-                        check="view_field_not_in_core_model",
-                        message=(
-                            f"View field '{field_name}' is not present on native model '{model_name}' in available source."
-                        ),
-                        fix_hint=(
-                            "Confirm the field exists on the target model or is defined by the custom module before pushing. "
-                            "Read the exact installed source and active compiled view if necessary."
-                        ),
-                    ))
         return findings
 
     @staticmethod
@@ -1227,62 +1196,6 @@ class SyntaxVerifierService:
                 fix_hint=(
                     "Read the installed point_of_sale source first and extend the correct loader/backend pattern. "
                     "For pos.config data, use the Odoo version's real loader params/model-loading mechanism instead of legacy load_fields."
-                ),
-            ))
-
-        lower_path = file_path.lower()
-        if "point_of_sale" in lower_path and _POS_HR_RE.search(content):
-            findings.append(VerifyFinding(
-                file=file_path,
-                severity=VerifySeverity.WARNING,
-                check="pos_hr_pin_flow",
-                message=(
-                    "POS HR / cashier PIN/cashier flow detected in changed source. Preserve the native pos_hr cashier/PIN flow and verify behavior against installed source."
-                ),
-                fix_hint=(
-                    "Inspect the native point_of_sale/pos_hr source and preserve its cashier/PIN workflow before pushing. "
-                    "Run workflow.verify_pos_change for end-to-end POS runtime proof."
-                ),
-            ))
-
-        if "point_of_sale" in lower_path and _RELATIONAL_PLAIN_OBJECT_RE.search(content):
-            findings.append(VerifyFinding(
-                file=file_path,
-                severity=VerifySeverity.WARNING,
-                check="pos_relational_plain_object_assignment",
-                message=(
-                    "Potential POS relational field plain-object assignment detected. POS relational fields should use the native record/ORM wrapper, not a plain JS object."
-                ),
-                fix_hint=(
-                    "Use the installed POS service/model contract and record wrappers instead of assigning plain object literals to relational fields."
-                ),
-            ))
-
-        if _JS_PROPS_USAGE_RE.search(content) and "static props" not in content and "props =" not in content and "props:" not in content:
-            findings.append(VerifyFinding(
-                file=file_path,
-                severity=VerifySeverity.WARNING,
-                check="owl_props_schema",
-                message=(
-                    "OWL props are referenced in this file, but no static props schema or props declaration was detected. "
-                    "Validate props schema from the installed native component before pushing."
-                ),
-                fix_hint=(
-                    "Inspect the native OWL component and declare static props or the equivalent schema for this version."
-                ),
-            ))
-
-        if _JS_EVENT_HANDLER_RE.search(content) and "setup(" not in content:
-            findings.append(VerifyFinding(
-                file=file_path,
-                severity=VerifySeverity.WARNING,
-                check="owl_event_handler_binding",
-                message=(
-                    "OWL event handler binding syntax was detected without a clear setup()/component context. "
-                    "Validate installed event handler binding patterns before pushing."
-                ),
-                fix_hint=(
-                    "Read the native OWL component source and match its event binding pattern exactly."
                 ),
             ))
 

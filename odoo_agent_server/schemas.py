@@ -410,8 +410,8 @@ class OdooCodeChangeRequest(BaseModel):
     total_batches: int = Field(default=1, ge=1, le=20, description="Total local write batches. Only the final batch can reach full QA/deploy.")
     commit_message: str | None = Field(default=None, max_length=300, description="Commit message for safe deploy. Defaults to a concise message from task_description.")
     auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
-    verification_override: Literal["none", "irrelevant_only", "force"] = Field(
-        default="none",
+    verification_override: Literal["strict", "allow_unverified", "force", "none", "irrelevant_only"] = Field(
+        default="strict",
         description=(
             "Explicit user-authorized override for workflow.verify_against_core only. "
             "'irrelevant_only' may continue when every CRITICAL finding is a known static-analysis ambiguity; "
@@ -470,7 +470,7 @@ class OdooCodeChangeRequest(BaseModel):
                 raise ValueError("multi-batch writes require a stable 8-64 character operation_id")
             if not self.writes:
                 raise ValueError("each explicit multi-batch call requires non-empty writes")
-        if self.verification_override != "none":
+        if self.verification_override not in {"strict", "none"}:
             if not str(self.verification_override_reason or "").strip():
                 raise ValueError("verification_override_reason is required when verification_override is enabled")
         if self.verification_override == "force":
@@ -1814,7 +1814,7 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     branch: str | None = Field(default=None, description="Defaults to current branch or TARGET_GIT_BRANCH")
     run_qa: bool = Field(default=True, description="Run qa.self_run by default so deploy failures surface before long Odoo.sh polling. Set False only for an explicit, intentional bypass.")
     verification_overridden: bool = Field(default=False, description="Audit flag: pre-push verification was explicitly overridden by an authorized workflow request.")
-    verification_override_mode: Literal["none", "irrelevant_only", "force"] = Field(default="none")
+    verification_override_mode: Literal["strict", "allow_unverified", "force", "none", "irrelevant_only"] = Field(default="strict")
     verification_override_reason: str | None = Field(default=None, max_length=1000)
     verification_override_findings: list[dict[str, Any]] = Field(default_factory=list, max_length=200, description="Sanitized CRITICAL findings accepted by the explicit override.")
     wait_for_odoosh: bool = Field(default=True)

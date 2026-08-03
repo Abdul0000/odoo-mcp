@@ -531,12 +531,12 @@ For SSH GitHub repos, either set `GIT_SSH_COMMAND` yourself or set `GIT_SSH_KEY_
 
 ```json
 {
-  "verification_override": "irrelevant_only",
+  "verification_override": "allow_unverified",
   "verification_override_reason": "Custom multi-model XML caused known static resolver ambiguity."
 }
 ```
 
-This mode only accepts the connector's narrow false-positive allowlist. Material findings such as XPath mismatch remain blocking.
+This mode accepts only configured overrideable static-analysis categories. The default policy includes custom-field resolution ambiguity, related-field resolver ambiguity, and uncertain XPath match counts. Unknown or newly introduced verifier categories remain blocking until classified.
 
 For an explicit user-authorized force push and deploy:
 

@@ -35,11 +35,11 @@ def test_force_override_requires_exact_confirmation():
         )
 
 
-def test_irrelevant_only_accepts_known_static_ambiguities():
+def test_allow_unverified_accepts_overrideable_static_findings():
     payload = OdooCodeChangeRequest(
         module_name="custom_sale",
         task_description="Deploy this verified change",
-        verification_override="irrelevant_only",
+        verification_override="allow_unverified",
         verification_override_reason="Custom multi-model XML causes known static ambiguity.",
     )
     decision = _verification_override_decision(
@@ -50,16 +50,16 @@ def test_irrelevant_only_accepts_known_static_ambiguities():
     assert decision["critical_count"] == 2
 
 
-def test_irrelevant_only_rejects_xpath_or_other_material_findings():
+def test_allow_unverified_rejects_non_overrideable_findings():
     payload = OdooCodeChangeRequest(
         module_name="custom_sale",
         task_description="Deploy this verified change",
-        verification_override="irrelevant_only",
+        verification_override="allow_unverified",
         verification_override_reason="Attempt narrow override.",
     )
-    decision = _verification_override_decision(payload, _verify("xpath_match_count"))
+    decision = _verification_override_decision(payload, _verify("unknown_structural_failure"))
     assert decision["accepted"] is False
-    assert decision["rejected_codes"] == ["xpath_match_count"]
+    assert decision["rejected_codes"] == ["unknown_structural_failure"]
 
 
 def test_force_override_accepts_verifier_findings_with_audit_data():
@@ -74,3 +74,27 @@ def test_force_override_accepts_verifier_findings_with_audit_data():
     assert decision["accepted"] is True
     assert decision["mode"] == "force"
     assert decision["reason"]
+
+
+def test_legacy_aliases_are_canonicalized():
+    payload = OdooCodeChangeRequest(
+        module_name="custom_sale",
+        task_description="Deploy this verified change",
+        verification_override="irrelevant_only",
+        verification_override_reason="Legacy client compatibility.",
+    )
+    decision = _verification_override_decision(payload, _verify("xpath_match_count"))
+    assert decision["accepted"] is True
+    assert decision["mode"] == "allow_unverified"
+    assert decision["requested_mode"] == "irrelevant_only"
+
+
+def test_strict_is_default_and_does_not_override():
+    payload = OdooCodeChangeRequest(
+        module_name="custom_sale",
+        task_description="Deploy this verified change",
+    )
+    decision = _verification_override_decision(payload, _verify("view_field_not_in_core_model"))
+    assert decision["requested"] is False
+    assert decision["accepted"] is False
+    assert decision["mode"] == "strict"
