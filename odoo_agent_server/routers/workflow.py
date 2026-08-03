@@ -1984,16 +1984,21 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             check_payload = raw_payload if isinstance(raw_payload, dict) else {}
         except Exception:
             check_payload = {}
+        deployed_observed_epoch = int(time.time())
+        deployed_job = store.get_job(job_id)
+        deployed_job.request["sha_deployed_observed_epoch"] = deployed_observed_epoch
+        store.update_job(deployed_job)
         odoosh_deploy_confirmation = {
             "status": "passed",
             "deployed": True,
             "expected_sha": pushed_sha,
+            "observed_epoch": deployed_observed_epoch,
             "payload": check_payload,
             "command_result": check_result.model_dump(mode="json"),
         }
         failure_guard = getattr(odoosh, "recent_build_failure", None)
         if callable(failure_guard):
-            failure_result = failure_guard(push_started_epoch)
+            failure_result = failure_guard(deployed_observed_epoch)
             failure_status = "failed" if failure_result.exit_code == 1 else "passed" if failure_result.exit_code == 0 else "warning"
             _step(f"{step_prefix}odoosh_build_failure_guard", failure_status, failure_result)
             if failure_result.exit_code == 1:

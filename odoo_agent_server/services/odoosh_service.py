@@ -788,31 +788,31 @@ class OdooShService:
         return result.model_copy(update={"stdout": summary[-20000:]})
 
     def recent_build_failure(self, since_epoch: int, tail_lines: int = 150) -> CommandResult:
-        """Detect Odoo.sh build/runtime failures in logs modified after ``since_epoch``.
+        """Detect Odoo.sh build/runtime failures logged after ``since_epoch``.
 
-        Odoo.sh can update ``~/src/user`` to a pushed SHA even when the build test
-        fails and the running environment stays on the last successful build.
-        This guard catches that case before module upgrade.
+        Filtering is applied to each timestamped log record rather than the log
+        file mtime, so failures from an earlier build cannot block a newly
+        observed deployment of the expected SHA.
         """
         safe_lines = max(100, min(tail_lines, 2000))
         safe_since = max(0, int(since_epoch))
+        cutoff_text = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(safe_since))
         script = (
             "set +e; "
-            f"since={safe_since}; "
             "for f in ~/logs/*.log; do "
             "  [ -f \"$f\" ] || continue; "
-            "  m=$(stat -c %Y \"$f\" 2>/dev/null || stat -f %m \"$f\" 2>/dev/null || echo 0); "
-            "  [ \"$m\" -ge \"$since\" ] || continue; "
-            f"  tail -n {safe_lines} \"$f\" | awk -v file=\"$f\" '"
+            f"  tail -n {safe_lines} \"$f\" | awk -v file=\"$f\" -v cutoff=\"{cutoff_text}\" '"
             "function emit(line) { "
             "  if (!emitted) { print \"__ODOO_MCP_LOG_FILE__:\" file; emitted=1 } "
             "  print line "
             "} "
-            "/Traceback \\(most recent call last\\)/ { in_trace=1; emit($0); next } "
-            "in_trace && /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][[:space:]]/ { in_trace=0 } "
-            "in_trace { emit($0); next } "
-            "/(^|[[:space:]])(ERROR|CRITICAL)([[:space:]:]|$)/ { emit($0); next } "
-            "/Test:[[:space:]]*Failed|Build[[:space:]]+failed|Failed to load registry|"
+            "function timestamped(line) { return line ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][[:space:]][0-9][0-9]:[0-9][0-9]:[0-9][0-9]/ } "
+            "timestamped($0) { record_recent=(substr($0,1,19) >= cutoff); if (!record_recent) in_trace=0 } "
+            "record_recent && /Traceback \\(most recent call last\\)/ { in_trace=1; emit($0); next } "
+            "in_trace && timestamped($0) { in_trace=0 } "
+            "in_trace && record_recent { emit($0); next } "
+            "record_recent && /(^|[[:space:]])(ERROR|CRITICAL)([[:space:]:]|$)/ { emit($0); next } "
+            "record_recent && /Test:[[:space:]]*Failed|Build[[:space:]]+failed|Failed to load registry|"
             "ParseError|ValidationError|ModuleNotFoundError|ImportError/ { emit($0) }"
             "'; "
             "done; exit 0"

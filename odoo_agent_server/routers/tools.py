@@ -7223,10 +7223,13 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                     resume_results["message"] = "Odoo.sh did not report the pushed commit as deployed within the polling window. Completed commit/push steps will not be replayed."
                     resume_results["next_call"] = {"tool": "workflow.resume_job", "arguments": {"job_id": job_id}}
                     return _persist_resume_result(store, job, resume_results, original_request)
+                deployed_observed_epoch = int(time.time())
+                original_request["sha_deployed_observed_epoch"] = deployed_observed_epoch
+                job.request["sha_deployed_observed_epoch"] = deployed_observed_epoch
+                store.update_job(job)
                 failure_guard = getattr(odoosh, "recent_build_failure", None)
                 if callable(failure_guard):
-                    since_epoch = int(original_request.get("push_started_epoch") or 0)
-                    failure = failure_guard(since_epoch)
+                    failure = failure_guard(deployed_observed_epoch)
                     resume_results["steps_run"]["odoosh_build_failure_guard"] = {"status": "failed" if failure.exit_code == 1 else "ok" if failure.exit_code == 0 else "warning", "result": _step_payload(failure)}
                     if failure.exit_code == 1:
                         resume_results["status"] = "deploy_failed"

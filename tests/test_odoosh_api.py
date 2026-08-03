@@ -103,6 +103,9 @@ def test_recent_build_failure_defaults_to_remote_filtered_150_lines(monkeypatch)
 
     assert "tail -n 150" in captured["script"]
     assert "awk -v file=" in captured["script"]
+    assert "-v cutoff=" in captured["script"]
+    assert "substr($0,1,19) >= cutoff" in captured["script"]
+    assert "stat -c %Y" not in captured["script"]
     assert "(ERROR|CRITICAL)" in captured["script"]
     assert "WARNING" not in captured["script"]
     assert "INFO" not in captured["script"]
