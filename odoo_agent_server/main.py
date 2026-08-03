@@ -34,7 +34,7 @@ if os.getenv("RENDER", "").lower() in {"1", "true", "yes"} and settings.api_toke
 
 app = FastAPI(
     title="Odoo MCP Agent Connector",
-    version="1.8.0",
+    version="1.8.1",
     description=(
         "Provider-safe Odoo 16-19 development connector with server-owned source discovery, "
         "verification, Git, Odoo.sh deployment, recovery jobs, OAuth, and on-demand skills."
@@ -42,9 +42,41 @@ app = FastAPI(
 )
 
 
+REQUIRED_CODING_TOOLS = {
+    "workflow_odoo_code_change",
+    "workflow_odoo_debug_and_fix",
+    "workflow_resume_job",
+}
+
+
+def tool_registry_status() -> dict[str, object]:
+    registered = set(provider_tool_names_safe())
+    missing = sorted(REQUIRED_CODING_TOOLS - registered)
+    return {
+        "registered_tools": sorted(registered),
+        "missing_tools": missing,
+        "coding_workflow_ready": not missing,
+    }
+
+
+@app.on_event("startup")
+def validate_required_tool_registry() -> None:
+    status = tool_registry_status()
+    if status["missing_tools"]:
+        raise RuntimeError(
+            "Missing required MCP coding tools: "
+            + ", ".join(status["missing_tools"])
+        )
+
+
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "service": "odoo-mcp-agent-connector"}
+def health() -> dict[str, object]:
+    status = tool_registry_status()
+    return {
+        "status": "ok" if status["coding_workflow_ready"] else "degraded",
+        "service": "odoo-mcp-agent-connector",
+        **status,
+    }
 
 
 @app.get("/agent-instructions")

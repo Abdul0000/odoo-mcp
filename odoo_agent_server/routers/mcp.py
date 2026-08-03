@@ -520,7 +520,11 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
             {
                 "protocolVersion": "2025-06-18",
                 "capabilities": {
-                    "tools": {"listChanged": False},
+                    # Clients must refresh the tool manifest after a connector
+                    # update/redeploy. Advertising listChanged avoids stale
+                    # manifests that produce "Resource not found" for newly
+                    # registered composite workflows.
+                    "tools": {"listChanged": True},
                     "prompts": {"listChanged": False},
                 },
                 "serverInfo": {"name": "odoo-mcp-agent-connector", "version": "1.8.0"},

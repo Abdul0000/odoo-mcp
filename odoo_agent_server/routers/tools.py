@@ -183,13 +183,26 @@ def strict_safe_tool_name(name: str) -> str:
 
 
 def internal_tool_name(name: str) -> str:
-    """Map an external strict tool name back to the internal dotted name."""
-    if name in _TOOL_INPUT_MODELS:
-        return name
-    for actual in _TOOL_INPUT_MODELS:
-        if strict_safe_tool_name(actual) == name:
-            return actual
-    return name
+    """Map provider/OpenAPI aliases back to the internal dotted name.
+
+    Some connector hosts prepend the MCP server namespace to a tool name
+    (for example ``odoo_mcp.workflow_odoo_code_change``) while strict MCP
+    clients use ``workflow_odoo_code_change``. Accept all three forms so a
+    refreshed connector cannot advertise a valid workflow and then reject it
+    as an unknown resource at call time.
+    """
+    raw = str(name or "").strip()
+    candidates = [raw]
+    for prefix in ("odoo_mcp.", "odoo_mcp_", "odoo-mcp.", "odoo-mcp_"):
+        if raw.startswith(prefix):
+            candidates.append(raw[len(prefix):])
+    for candidate in candidates:
+        if candidate in _TOOL_INPUT_MODELS:
+            return candidate
+        for actual in _TOOL_INPUT_MODELS:
+            if strict_safe_tool_name(actual) == candidate:
+                return actual
+    return raw
 
 
 def _agent_priority(name: str) -> tuple[int, str]:

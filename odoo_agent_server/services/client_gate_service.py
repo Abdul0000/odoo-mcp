@@ -418,6 +418,33 @@ class ClientGateService:
 
         coding_ready = bool(base_ok)
 
+        # A checkout is not genuinely coding-ready when the provider-facing
+        # composite workflow is missing from the active MCP registry. This
+        # prevents the contradictory state where client.check succeeds but the
+        # next workflow call returns "Resource not found".
+        if coding_ready:
+            try:
+                from ..main import tool_registry_status
+
+                registry = tool_registry_status()
+                if registry.get("coding_workflow_ready"):
+                    pass_check("coding_workflows", "Required MCP coding workflows are registered.")
+                else:
+                    fail(
+                        "coding_workflows",
+                        "Required MCP coding workflows are missing: "
+                        + ", ".join(registry.get("missing_tools", [])),
+                        "workflow_registration_error",
+                    )
+                    coding_ready = False
+            except Exception as exc:
+                fail(
+                    "coding_workflows",
+                    f"Could not verify MCP coding workflow registration: {exc}",
+                    "workflow_registration_error",
+                )
+                coding_ready = False
+
         # Odoo shell is useful for data/model operations, but it is not required
         # for coding work. It runs through the selected client's Odoo.sh SSH
         # settings; no process-wide environment is mutated.
