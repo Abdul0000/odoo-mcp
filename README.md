@@ -524,3 +524,28 @@ For complete addon verification, `workflow.module_test` starts one background jo
 Legacy `ODOO_AGENT_BACKGROUND_MAX_WORKERS=1` values are accepted and safely clamped to two workers internally.
 
 For SSH GitHub repos, either set `GIT_SSH_COMMAND` yourself or set `GIT_SSH_KEY_PATH`; `repo.prepare` will build a safe `GIT_SSH_COMMAND` using that key.
+
+## Explicit verification override
+
+`workflow.odoo_code_change` remains strict by default. For verified static-analysis false positives, callers may set:
+
+```json
+{
+  "verification_override": "irrelevant_only",
+  "verification_override_reason": "Custom multi-model XML caused known static resolver ambiguity."
+}
+```
+
+This mode only accepts the connector's narrow false-positive allowlist. Material findings such as XPath mismatch remain blocking.
+
+For an explicit user-authorized force push and deploy:
+
+```json
+{
+  "verification_override": "force",
+  "verification_override_confirmation": "I AUTHORIZE FORCE PUSH AND DEPLOY",
+  "verification_override_reason": "User reviewed the reported findings and explicitly accepted the deployment risk."
+}
+```
+
+The force override applies only to `workflow.verify_against_core`. Blocking QA, Python/XML syntax, parser, manifest, and module-structure failures still stop deployment. Override mode, reason, and accepted findings are attached to the safe-deploy request and returned in workflow results for auditability.

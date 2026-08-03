@@ -803,8 +803,9 @@ _TOOL_DESCRIPTORS = [
         name="workflow.verify_against_core",
         title="Verify code against core",
         description=(
-            "V14+ PRE-PUSH MANDATORY: Cross-check written files against Odoo core source before git.push. "
+            "V14+ PRE-PUSH DEFAULT: Cross-check written files against Odoo core source before git.push. "
             "CALL THIS before every git.push. If push_blocked=True, fix CRITICAL findings and call again (max 3 cycles). "
+            "workflow.odoo_code_change may continue only with an explicit auditable verification_override; force mode requires the exact confirmation phrase and never bypasses blocking QA/parser/manifest errors. "
             "Verifies: Python — _inherit model existence, depends[] field names, comodel_name modules, related= chains, compute= method presence. "
             "XML — xpath @name nodes in core view, <field name=...> vs core model fields. "
             "Manifest — depends[] module names in /home/odoo/src/* roots. "
@@ -2850,6 +2851,42 @@ def _partition_surgical_qa_errors(
     return blocking, preexisting
 
 
+_VERIFICATION_IRRELEVANT_ALLOWLIST = {
+    # These checks are useful warnings but can be false positives when a file
+    # contains multiple ir.ui.view records/models or when a custom model inherits
+    # mail mixins and the static resolver loses the concrete model context.
+    "view_field_not_in_core_model",
+    "related_field_exists",
+}
+
+
+def _verification_override_decision(payload: OdooCodeChangeRequest, verify: Any) -> dict[str, Any]:
+    """Return an auditable decision; never bypass parser/QA failures here."""
+    critical = [item for item in verify.findings if item.severity.value == "CRITICAL"]
+    mode = str(payload.verification_override or "none")
+    accepted = False
+    rejected_codes: list[str] = []
+    if mode == "irrelevant_only" and critical:
+        rejected_codes = sorted({
+            str(getattr(item, "code", "") or getattr(item, "check", "") or "unknown")
+            for item in critical
+            if str(getattr(item, "code", "") or getattr(item, "check", "") or "")
+            not in _VERIFICATION_IRRELEVANT_ALLOWLIST
+        })
+        accepted = not rejected_codes
+    elif mode == "force":
+        accepted = True
+    return {
+        "requested": mode != "none",
+        "mode": mode,
+        "accepted": accepted,
+        "reason": str(payload.verification_override_reason or "").strip() or None,
+        "critical_count": len(critical),
+        "rejected_codes": rejected_codes,
+        "findings": [item.model_dump(mode="json") for item in critical],
+    }
+
+
 async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     """Provider-safe composite Odoo code-change workflow.
 
@@ -4011,10 +4048,26 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "blocking_errors": len(blocking_qa_errors),
         "preexisting_nonblocking": len(preexisting_qa_errors),
     })
-    steps.append({"step": "workflow.verify_against_core", "status": verify.status, "push_blocked": verify.push_blocked, "critical_count": verify.critical_count})
+    override_decision = _verification_override_decision(payload, verify)
+    verification_effectively_blocked = bool(verify.push_blocked and not override_decision["accepted"])
+    steps.append({
+        "step": "workflow.verify_against_core",
+        "status": verify.status,
+        "push_blocked": verify.push_blocked,
+        "critical_count": verify.critical_count,
+        "override": override_decision,
+    })
+    if verify.push_blocked and override_decision["accepted"]:
+        steps.append({
+            "step": "workflow.verification_override",
+            "status": "accepted",
+            "mode": override_decision["mode"],
+            "critical_count": override_decision["critical_count"],
+            "reason": override_decision["reason"],
+        })
 
-    if blocking_qa_errors or verify.push_blocked:
-        core_errors = [item for item in verify.findings if item.severity.value == "CRITICAL"]
+    if blocking_qa_errors or verification_effectively_blocked:
+        core_errors = [item for item in verify.findings if item.severity.value == "CRITICAL"] if verification_effectively_blocked else []
         repair_findings = (
             [item.model_dump(mode="json") for item in blocking_qa_errors]
             + [item.model_dump(mode="json") for item in core_errors]
@@ -4140,6 +4193,10 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         deploy_impact=deploy_impact.impact,
         upgrade_reasons=list(deploy_impact.reasons),
         verification_assertion=payload.verification_assertion,
+        verification_overridden=bool(verify.push_blocked and override_decision["accepted"]),
+        verification_override_mode=override_decision["mode"] if override_decision["accepted"] else "none",
+        verification_override_reason=override_decision["reason"] if override_decision["accepted"] else None,
+        verification_override_findings=override_decision["findings"] if override_decision["accepted"] else [],
     )
     try:
         deploy = await safe_deploy_module(deploy_payload)
@@ -4247,6 +4304,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "source_deployed": False,
         "module_upgraded": False,
         "core_verified": not verify.push_blocked,
+        "verification_overridden": bool(verify.push_blocked and override_decision["accepted"]),
+        "verification_override": override_decision,
         "module_structure_complete": not preexisting_qa_errors,
         "surgical_scope_verified": True,
         "module_contract": module_contract,
