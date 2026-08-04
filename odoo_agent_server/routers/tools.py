@@ -3417,24 +3417,46 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         project_path=project_path,
         require_complete=False,
     )
-    target_resolution = ExistingTargetResolutionService().resolve(
-        project=project,
-        module_path=module_dir,
-        module_name=effective_module_name,
-        task_description=effective_task_description,
-        target_hint=_target_hint(payload),
-        intent=payload.intent,
-        task_type=_normalized_task_type(payload),
-        change_request=payload.change_request,
-        hint=payload.target_resolution,
-        candidate_paths=[
-            *[project / str(item.get("relative_path")) for item in custom_reads if item.get("status") == "read"],
-            *[Path(str(item.get("path"))) for item in core_reads if item.get("status") == "read"],
-        ],
-        planned_paths=[write.relative_path for write in (payload.writes or generated_writes)],
-        client=resolution_client,
-        create_module=payload.create_module,
-    )
+    planned_writes = list(payload.writes or generated_writes)
+    explicit_file_operation = bool(planned_writes) and all(
+        bool(str(write.relative_path or "").strip()) for write in planned_writes
+    ) and not (payload.target_resolution and payload.target_resolution.identifier)
+    if payload.patch_strategy == "explicit_writes" and explicit_file_operation:
+        target_resolution = OdooTargetResolutionResult(
+            status="scope_verified",
+            mode="existing",
+            kind="file",
+            identifier=effective_module_name,
+            source_verified=True,
+            writes_blocked=False,
+            reason="Exact module-relative file operations were supplied; object-level target resolution is not required.",
+            edit_policy={
+                "ownership": "client_custom",
+                "strategy": "direct_edit",
+                "direct_edit_paths": [write.relative_path for write in planned_writes[:20]],
+                "protected_source_paths": [],
+                "reason": "All requested paths are constrained to the validated client custom module.",
+            },
+        )
+    else:
+        target_resolution = ExistingTargetResolutionService().resolve(
+            project=project,
+            module_path=module_dir,
+            module_name=effective_module_name,
+            task_description=effective_task_description,
+            target_hint=_target_hint(payload),
+            intent=payload.intent,
+            task_type=_normalized_task_type(payload),
+            change_request=payload.change_request,
+            hint=payload.target_resolution,
+            candidate_paths=[
+                *[project / str(item.get("relative_path")) for item in custom_reads if item.get("status") == "read"],
+                *[Path(str(item.get("path"))) for item in core_reads if item.get("status") == "read"],
+            ],
+            planned_paths=[write.relative_path for write in planned_writes],
+            client=resolution_client,
+            create_module=payload.create_module,
+        )
     target_resolution_data = target_resolution.model_dump(mode="json")
     steps.append({
         "step": "workflow.resolve_existing_target",
@@ -3844,7 +3866,26 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     writes_for_this_call = [] if final_batch_replay else writes_to_apply
     for write_index, change in enumerate(writes_for_this_call, start=1):
         rel = _safe_module_relative(effective_module_name, change.relative_path)
-        application_mode = "full_content"
+        application_mode = "delete" if change.operation == "delete" else "full_content"
+        if change.operation == "delete":
+            target = project / rel
+            if not target.exists():
+                write_results.append({"relative_path": rel, "status": "already_absent", "application_mode": application_mode})
+            else:
+                result = repo_delete(RepoDeleteRequest(project_path=project_path, client_name=client_name, relative_path=rel))
+                write_results.append({"relative_path": rel, "status": result.get("status", "deleted"), "application_mode": application_mode})
+            # Deleted paths remain visible to Git/deploy changed-file detection, but
+            # must not be passed to syntax/core verification as existing files.
+            if write_index % write_batch_size == 0 or write_index == len(writes_for_this_call):
+                steps.append({
+                    "step": "repo.write_batch",
+                    "status": "ok",
+                    "batch": ((write_index - 1) // write_batch_size) + 1,
+                    "completed_writes": write_index,
+                    "total_writes": len(writes_for_this_call),
+                    "deploy_started": False,
+                })
+            continue
         if change.content is not None and (change.search is not None or change.replace is not None):
             raise HTTPException(status_code=400, detail=f"Provide either content or search/replace, not both, for {rel}")
         if change.content is not None:
@@ -3893,7 +3934,14 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 if not change.regex and target.suffix.lower() == ".py" and change.count in {0, 1}:
                     detail += f"; safe function refresh was not applicable: {rebase_reason}"
                 raise HTTPException(status_code=409, detail=detail)
-        result = repo_write(RepoWriteRequest(project_path=project_path, client_name=client_name, relative_path=rel, content=new_content))
+        result = repo_write(RepoWriteRequest(
+            project_path=project_path,
+            client_name=client_name,
+            relative_path=rel,
+            content=new_content,
+            mode=change.mode,
+            force=change.force,
+        ))
         written_abs = str((project / rel).resolve())
         if written_abs not in written_files_abs:
             written_files_abs.append(written_abs)

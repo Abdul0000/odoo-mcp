@@ -221,11 +221,25 @@ class OdooCodeFileChange(BaseModel):
     safe deploy as one server-owned operation.
     """
     relative_path: str = Field(..., description="File path inside project_path, normally <module>/...")
+    operation: Literal["write", "delete"] = Field(default="write", description="Explicit repository file operation. Defaults to backward-compatible write behavior.")
+    mode: Literal["overwrite", "append"] = Field(default="overwrite", description="Write mode forwarded to repo.write for full-content writes.")
+    force: bool = Field(default=False, description="Explicitly authorize protected overwrites such as intentional large file shrink operations.")
     content: str | None = Field(default=None, description="Complete replacement file content. Use only when the whole file is intentionally rewritten.")
     search: str | None = Field(default=None, description="Literal or regex text to replace in the existing file.")
     replace: str | None = Field(default=None, description="Replacement text when search is provided.")
     regex: bool = Field(default=False, description="Treat search as a Python regular expression.")
     count: int = Field(default=0, ge=0, le=1000, description="Maximum replacements. 0 means replace all occurrences.")
+
+    @model_validator(mode="after")
+    def validate_file_operation(self):
+        if self.operation == "delete":
+            if self.content is not None or self.search is not None or self.replace is not None:
+                raise ValueError("Delete operations cannot include content or search/replace fields")
+            if self.mode != "overwrite" or self.force:
+                raise ValueError("Delete operations do not accept mode or force")
+        elif self.mode == "append" and self.search is not None:
+            raise ValueError("Append mode is only supported for full-content writes")
+        return self
 
 
 class OdooTargetResolutionHint(BaseModel):

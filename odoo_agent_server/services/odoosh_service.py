@@ -710,45 +710,15 @@ class OdooShService:
         module_name: str,
         verify_manifest: bool = False,
     ) -> CommandResult:
-        """Verify changed files and, only when needed, the manifest in one SSH session."""
-        if not verify_manifest:
-            return self.verify_user_file_hashes(expected_hashes)
-        entries: list[tuple[str, str]] = []
-        for rel_path, expected_hash in expected_hashes.items():
-            rel = self._safe_user_relative_path(rel_path)
-            digest = str(expected_hash).strip().lower()
-            if not re.fullmatch(r"[0-9a-f]{64}", digest):
-                return CommandResult(
-                    command=["odoosh.verify_deployed_changes"],
-                    cwd="odoosh:ssh",
-                    exit_code=2,
-                    stderr=f"Invalid SHA-256 digest for {rel_path}",
-                )
-            entries.append((rel, digest))
-        safe_module = self._safe_user_relative_path(module_name)
-        user_addons = self._user_addons_path().rstrip("/")
-        script_lines = ["set +e", "failures=0", "echo ODOOSH_DEPLOY_VERIFY_START"]
-        for rel, expected_hash in entries:
-            remote_path = f"{user_addons}/{rel}"
-            script_lines.extend([
-                f"rel={shlex.quote(rel)}",
-                f"file={shlex.quote(remote_path)}",
-                f"expected={shlex.quote(expected_hash)}",
-                'if [ ! -f "$file" ]; then echo "MISSING $rel"; failures=1; else '
-                "actual=$(sha256sum \"$file\" 2>/dev/null | awk '{print $1}'); "
-                'if [ "$actual" = "$expected" ]; then echo "OK $rel $actual"; '
-                'else echo "MISMATCH $rel expected=$expected actual=$actual"; failures=1; fi; fi',
-            ])
-        manifest = f"{user_addons}/{safe_module}/__manifest__.py"
-        script_lines.extend([
-            f"manifest={shlex.quote(manifest)}",
-            'if [ ! -f "$manifest" ]; then echo "MISSING_MANIFEST $manifest"; failures=1; '
-            'elif ! grep -E "[\'\"]installable[\'\"] *: *True" "$manifest" >/dev/null; then '
-            'echo "MANIFEST_NOT_INSTALLABLE $manifest"; failures=1; else echo "MODULE_MANIFEST_OK"; fi',
-            'if [ "$failures" -eq 0 ]; then echo ODOOSH_DEPLOY_VERIFY_OK; else echo ODOOSH_DEPLOY_VERIFY_FAILED; fi',
-            "exit $failures",
-        ])
-        return self.run_shell("; ".join(script_lines), timeout_seconds=45)
+        """Verify deployed files and manifest through the same proven helpers used by resume flows.
+
+        Keeping the checks sequential avoids nested shell-quoting differences while
+        preserving the exact verification semantics and failure markers.
+        """
+        file_result = self.verify_user_file_hashes(expected_hashes)
+        if file_result.exit_code != 0 or not verify_manifest:
+            return file_result
+        return self.verify_module_manifest(module_name)
 
     def tail_log(self, log_name: OdooShLogName, tail_lines: int = 200) -> CommandResult:
         safe_lines = max(20, min(tail_lines, 2000))

@@ -109,6 +109,27 @@ def _odoosh_service_for_client(client=None):
     return OdooShService()
 
 
+
+
+def _classify_deployed_verification_failure(result: CommandResult) -> tuple[str, str]:
+    """Differentiate real source mismatches from transport/shell failures."""
+    output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    mismatch_markers = ("MISSING ", "MISMATCH ", "MISSING_MANIFEST", "MANIFEST_NOT_INSTALLABLE")
+    if getattr(result, "timed_out", False):
+        return (
+            "deploy_verification_timeout",
+            "Odoo.sh deployed-code verification timed out before a mismatch could be established.",
+        )
+    if any(marker in output for marker in mismatch_markers):
+        return (
+            "deploy_code_mismatch",
+            "Odoo.sh source checkout did not match the changed local/GitHub files. Module upgrade was not attempted.",
+        )
+    return (
+        "deploy_verification_command_failed",
+        "The deployed-code verification command failed; no source mismatch was established and module upgrade was not attempted.",
+    )
+
 def _odoo_service_for_client(client=None):
     """Instantiate OdooService with per-client config while keeping tests/fakes compatible."""
     if client is not None:
@@ -2030,16 +2051,21 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         _step("odoosh_deployed_change_verify", "passed" if code_verify.exit_code == 0 else "failed", code_verify)
         if code_verify.exit_code != 0:
             job = store.get_job(job_id)
+            failure_status, failure_message = _classify_deployed_verification_failure(code_verify)
             result = {
-                "status": "deploy_code_mismatch",
-                "message": "Odoo.sh source checkout did not match the changed local/GitHub files. Module upgrade was not attempted.",
+                "status": failure_status,
+                "message": failure_message,
                 "module_name": payload.module_name,
                 "sha": pushed_sha,
                 "verified_files": sorted(expected_user_hashes),
-                "next_call": {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}},
+                "next_call": (
+                    {"tool": "workflow.resume_job", "arguments": {"job_id": job_id, "override_step": "verify_deployed_code"}}
+                    if failure_status != "deploy_code_mismatch"
+                    else {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}}
+                ),
             }
             store.finish_job(job, JobStatus.failed, result)
-            _save_state("deploy_code_mismatch")
+            _save_state(failure_status)
             return
     else:
         _step("odoosh_deployed_change_verify", "skipped", {"message": "No changed deploy files or manifest required verification."})
