@@ -1859,6 +1859,13 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
         default=None,
         description="Optional bounded live Odoo record/count assertion executed after source, upgrade, and registry verification.",
     )
+    github_push_fallback: bool = Field(
+        default=True,
+        description=(
+            "When Odoo.sh deploy validation is blocked only by SSH/public-key or connection availability, "
+            "allow verified source to be committed and pushed to GitHub without claiming Odoo.sh deployment or module upgrade."
+        ),
+    )
     force_new_deploy: bool = Field(
         default=False,
         description=(

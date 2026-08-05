@@ -661,11 +661,32 @@ def _wait_workflow_job_until_terminal(store: JsonStore, job_id: str, poll_interv
 @router.post("/safe-deploy-module", response_model=WorkflowReport)
 async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport:
     client_gate = ClientGateService()
-    validation_lease = client_gate.issue_job_validation_lease(
-        payload.client_name,
-        action="workflow.safe_deploy_module",
-        project_path=payload.project_path,
-    )
+    try:
+        validation_lease = client_gate.issue_job_validation_lease(
+            payload.client_name,
+            action="workflow.safe_deploy_module",
+            project_path=payload.project_path,
+        )
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        validation = detail.get("validation") if isinstance(detail, dict) else None
+        fallback_allowed = bool(
+            payload.github_push_fallback
+            and settings.github_push_fallback_enabled
+            and isinstance(validation, dict)
+            and validation.get("github_push_ready")
+            and validation.get("deploy_fallback_eligible")
+        )
+        if not fallback_allowed:
+            raise
+        validation_lease = client_gate.issue_job_validation_lease(
+            payload.client_name,
+            action="workflow.safe_deploy_module.github_fallback",
+            project_path=payload.project_path,
+        )
+        validation_lease["github_push_fallback"] = True
+        validation_lease["deploy_fallback_reason"] = validation.get("deploy_fallback_reason")
+        validation_lease["fingerprint"] = client_gate._job_lease_fingerprint(validation_lease)
 
     """Start the single owner deploy pipeline for one project/module.
 
@@ -1964,6 +1985,49 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     pushed_job.request["expected_user_file_hashes"] = expected_user_hashes
     pushed_job.request["expected_registry_fields"] = expected_registry_fields
     store.update_job(pushed_job)
+
+    validation_lease = (pushed_job.request or {}).get("validation_lease") or {}
+    github_fallback_active = bool(
+        payload.github_push_fallback
+        and settings.github_push_fallback_enabled
+        and isinstance(validation_lease, dict)
+        and validation_lease.get("github_push_fallback")
+    )
+    if github_fallback_active:
+        final_result = {
+            "status": "github_pushed_deploy_pending",
+            "message": (
+                "Verified source was committed and pushed to GitHub. Odoo.sh deployment and module upgrade remain pending "
+                "because Odoo.sh SSH/public-key access is unavailable."
+            ),
+            "module_name": payload.module_name,
+            "sha": pushed_sha,
+            "pushed_sha": pushed_sha,
+            "branch": branch,
+            "remote": payload.remote,
+            "github_pushed": True,
+            "source_pushed": True,
+            "source_on_odoosh": False,
+            "source_deployed": False,
+            "module_upgraded": False,
+            "deploy_confirmed": False,
+            "success_allowed": True,
+            "completion_required": False,
+            "deploy_fallback_reason": validation_lease.get("deploy_fallback_reason") or "odoosh_ssh_unavailable",
+            "next_call": {
+                "tool": "workflow.resume_job",
+                "arguments": {"job_id": job_id, "override_step": "wait_odoosh"},
+            },
+        }
+        job = store.get_job(job_id)
+        store.finish_job(job, JobStatus.warning, final_result)
+        _save_state("github_pushed_deploy_pending", {
+            "github_pushed": True,
+            "source_deployed": False,
+            "module_upgrade_pending": bool(payload.upgrade_module),
+        })
+        approval.mark_consumed(payload.approval_id, "workflow.safe_deploy_module pushed verified source through GitHub fallback")
+        return
 
     def _wait_for_odoosh_deployment(step_prefix: str = "") -> bool:
         nonlocal odoosh_deploy_confirmation, push_started_epoch

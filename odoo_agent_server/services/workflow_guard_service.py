@@ -18,6 +18,7 @@ _RESUMABLE_SAFE_DEPLOY_RESULTS = {
     "module_upgrade_running",
     "module_upgrade_timeout",
     "deploy_code_mismatch",
+    "github_pushed_deploy_pending",
 }
 _ACTIVE_JOB_STATUSES = {JobStatus.queued, JobStatus.running, JobStatus.warning}
 

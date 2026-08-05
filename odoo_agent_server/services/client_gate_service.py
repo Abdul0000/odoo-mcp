@@ -327,6 +327,8 @@ class ClientGateService:
     def _requirement_for_action(self, action: str) -> str:
         if action.startswith("odoosh."):
             return "ssh_ready"
+        if action == "workflow.safe_deploy_module.github_fallback":
+            return "coding_ready"
         if action in {"workflow.safe_deploy_module", "workflow.resume_job"}:
             return "deploy_ready"
         if action.startswith("odoo.module"):
@@ -475,6 +477,16 @@ class ClientGateService:
         # Odoo.sh error packs, and run the module upgrade. HTTPS JSON-RPC can
         # make data queries work, but it is not enough to prove source deploy.
         deploy_ready = bool(coding_ready and ssh_ok)
+        github_push_ready = bool(coding_ready and resolved.path and Path(resolved.path).expanduser().is_dir())
+        ssh_log_text = "\n".join(log).lower()
+        fallback_transport_markers = ("permission denied (publickey)", "connection refused", "connection timed out", "no route to host")
+        deploy_fallback_eligible = bool(
+            github_push_ready
+            and not deploy_ready
+            and checks.get("odoosh_ssh") in {"failed", "skipped"}
+            and (checks.get("odoosh_ssh") == "skipped" or any(marker in ssh_log_text for marker in fallback_transport_markers))
+        )
+        deploy_fallback_reason = "odoosh_ssh_unavailable" if deploy_fallback_eligible else None
         data_query_ready = bool(shell_ok or ssh_ok)
         full_validation_passed = bool(coding_ready and shell_ok and ssh_ok)
         now = datetime.now(timezone.utc).isoformat()
@@ -499,6 +511,9 @@ class ClientGateService:
             "validated": coding_ready,
             "coding_ready": coding_ready,
             "deploy_ready": deploy_ready,
+            "github_push_ready": github_push_ready,
+            "deploy_fallback_eligible": deploy_fallback_eligible,
+            "deploy_fallback_reason": deploy_fallback_reason,
             "data_query_ready": data_query_ready,
             "shell_ready": shell_ok,
             "ssh_ready": ssh_ok,
@@ -531,6 +546,9 @@ class ClientGateService:
             "validated": coding_ready,
             "coding_ready": coding_ready,
             "deploy_ready": deploy_ready,
+            "github_push_ready": github_push_ready,
+            "deploy_fallback_eligible": deploy_fallback_eligible,
+            "deploy_fallback_reason": deploy_fallback_reason,
             "data_query_ready": data_query_ready,
             "shell_ready": shell_ok,
             "ssh_ready": ssh_ok,

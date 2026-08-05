@@ -77,6 +77,7 @@ class Settings(BaseSettings):
 
     # Best-effort deploy follow-through for raw git.push fallback paths.
     auto_upgrade_on_push: bool = Field(default=True, alias="ODOO_AGENT_AUTO_UPGRADE_ON_PUSH")
+    github_push_fallback_enabled: bool = Field(default=True, alias="ODOO_AGENT_GITHUB_PUSH_FALLBACK_ENABLED")
     safe_deploy_stale_running_seconds: int = Field(default=7200, alias="ODOO_AGENT_SAFE_DEPLOY_STALE_RUNNING_SECONDS")
     # Two workers are the safe minimum: safe-deploy can wait for a nested
     # module-deploy job submitted to the same bounded executor.

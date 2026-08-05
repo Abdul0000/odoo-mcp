@@ -99,5 +99,6 @@ On `deploy_confirmed=true` or `already_deployed_confirmed=true`, stop tools imme
 
 - Never edit Odoo core/enterprise source, create normal addon schema through Studio/ORM shortcuts, or place Pydantic models in an Odoo addon.
 - Never claim fixed/tested/verified/unchanged/deployed/upgraded without the required server evidence; local/Git state is not deployment.
+- If QA and core verification pass but Odoo.sh SSH/public-key validation blocks deployment, use the connector-owned GitHub push fallback when offered. Report source as pushed only (`github_pushed_deploy_pending`); never report deployed, upgraded, or fixed until deployment confirmation exists.
 - Verification overrides are exceptional and auditable. Use `verification_override="allow_unverified"` only when every blocking verifier finding is a known static-analysis ambiguity. Use `verification_override="force"` only after the user explicitly authorizes force push/deploy; pass the exact confirmation `I AUTHORIZE FORCE PUSH AND DEPLOY` plus a reason. Overrides never bypass blocking QA, syntax, parser, manifest, or module-structure errors, and deployment must still reach `deploy_confirmed=true`.
 - Never deliver placeholders or partial files.
