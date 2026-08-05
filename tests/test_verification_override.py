@@ -1,6 +1,9 @@
 import pytest
 
-from odoo_agent_server.routers.tools import _verification_override_decision
+from odoo_agent_server.routers.tools import (
+    _resolve_force_override_authorization,
+    _verification_override_decision,
+)
 from odoo_agent_server.schemas import OdooCodeChangeRequest, SyntaxVerifyResult, VerifyFinding
 
 
@@ -98,3 +101,97 @@ def test_strict_is_default_and_does_not_override():
     assert decision["requested"] is False
     assert decision["accepted"] is False
     assert decision["mode"] == "strict"
+
+
+def test_force_override_request_allows_missing_confirmation_for_persisted_grant_lookup():
+    payload = OdooCodeChangeRequest(
+        module_name="custom_sale",
+        task_description="Continue the same authorized deployment",
+        verification_override="force",
+        verification_override_reason="User already authorized this exact case.",
+    )
+    assert payload.verification_override_confirmation is None
+
+
+def test_force_override_decision_requires_resolved_case_authorization():
+    payload = OdooCodeChangeRequest(
+        module_name="custom_sale",
+        task_description="Deploy this verified change",
+        verification_override="force",
+        verification_override_reason="User accepts verifier risk.",
+    )
+    denied = _verification_override_decision(payload, _verify("xpath_match_count"))
+    assert denied["accepted"] is False
+    assert denied["confirmation_required"] is True
+
+    accepted = _verification_override_decision(
+        payload,
+        _verify("xpath_match_count"),
+        force_authorization={
+            "authorized": True,
+            "source": "persisted_case_grant",
+            "case_id": "forcecase-test",
+        },
+    )
+    assert accepted["accepted"] is True
+    assert accepted["authorization_source"] == "persisted_case_grant"
+
+
+class _MemoryStore:
+    def __init__(self):
+        self.state = {}
+
+    def load_session_state(self, client_name=None):
+        return dict(self.state)
+
+    def save_session_state(self, updates, client_name=None):
+        self.state.update(updates)
+        return dict(self.state)
+
+
+def test_force_confirmation_is_reused_only_for_the_same_diff_and_findings(tmp_path):
+    store = _MemoryStore()
+    confirmed = OdooCodeChangeRequest(
+        module_name="custom_sale",
+        task_description="Deploy this verified change",
+        verification_override="force",
+        verification_override_reason="User accepts this exact case.",
+        verification_override_confirmation="I AUTHORIZE FORCE PUSH AND DEPLOY",
+    )
+    first = _resolve_force_override_authorization(
+        store,
+        confirmed,
+        client_name="Client A",
+        project_path=str(tmp_path),
+        module_name="custom_sale",
+        git_diff="diff-a",
+        verify=_verify("xpath_match_count"),
+    )
+    assert first["authorized"] is True
+    assert first["source"] == "explicit_confirmation"
+
+    continued = confirmed.model_copy(update={"verification_override_confirmation": None})
+    reused = _resolve_force_override_authorization(
+        store,
+        continued,
+        client_name="Client A",
+        project_path=str(tmp_path),
+        module_name="custom_sale",
+        git_diff="diff-a",
+        verify=_verify("xpath_match_count"),
+    )
+    assert reused["authorized"] is True
+    assert reused["source"] == "persisted_case_grant"
+    assert reused["case_id"] == first["case_id"]
+
+    changed_diff = _resolve_force_override_authorization(
+        store,
+        continued,
+        client_name="Client A",
+        project_path=str(tmp_path),
+        module_name="custom_sale",
+        git_diff="diff-b",
+        verify=_verify("xpath_match_count"),
+    )
+    assert changed_diff["authorized"] is False
+    assert changed_diff["case_id"] != first["case_id"]

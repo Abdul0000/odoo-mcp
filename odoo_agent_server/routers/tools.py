@@ -2883,7 +2883,101 @@ def _canonical_verification_override_mode(value: str | None) -> str:
     return _VERIFICATION_MODE_ALIASES.get(mode, mode)
 
 
-def _verification_override_decision(payload: OdooCodeChangeRequest, verify: Any) -> dict[str, Any]:
+def _force_verification_case_id(
+    *,
+    client_name: str | None,
+    project_path: str,
+    module_name: str,
+    git_diff: str,
+    verify: Any,
+) -> str:
+    """Return a stable authorization key for one exact force-deploy case.
+
+    The grant changes whenever the working-tree diff or CRITICAL verifier findings
+    change, so an approval cannot silently carry over to different code or risk.
+    """
+    critical = [
+        item.model_dump(mode="json")
+        for item in verify.findings
+        if item.severity.value == "CRITICAL"
+    ]
+    normalized = {
+        "client_name": str(client_name or ""),
+        "project_path": str(Path(project_path).resolve()),
+        "module_name": module_name,
+        "git_diff_sha256": hashlib.sha256((git_diff or "").encode("utf-8")).hexdigest(),
+        "critical_findings": critical,
+    }
+    raw = json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)
+    return "forcecase-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _resolve_force_override_authorization(
+    store: JsonStore,
+    payload: OdooCodeChangeRequest,
+    *,
+    client_name: str | None,
+    project_path: str,
+    module_name: str,
+    git_diff: str,
+    verify: Any,
+) -> dict[str, Any]:
+    """Persist and reuse one explicit force confirmation for the same case.
+
+    A grant is scoped to the exact dirty diff and CRITICAL finding set. It is not
+    reusable after code or verifier risk changes. Grants expire after 24 hours.
+    """
+    if _canonical_verification_override_mode(payload.verification_override) != "force":
+        return {"authorized": False, "source": None, "case_id": None}
+
+    case_id = _force_verification_case_id(
+        client_name=client_name,
+        project_path=project_path,
+        module_name=module_name,
+        git_diff=git_diff,
+        verify=verify,
+    )
+    now = time.time()
+    state = store.load_session_state(client_name)
+    grants = dict(state.get("verification_force_grants") or {})
+    grants = {
+        key: value
+        for key, value in grants.items()
+        if now - float((value or {}).get("authorized_at") or 0) <= 86400
+    }
+
+    if payload.verification_override_confirmation == "I AUTHORIZE FORCE PUSH AND DEPLOY":
+        grants[case_id] = {
+            "authorized_at": now,
+            "client_name": client_name,
+            "project_path": str(Path(project_path).resolve()),
+            "module_name": module_name,
+            "reason": str(payload.verification_override_reason or "").strip(),
+        }
+        if len(grants) > 20:
+            grants = dict(sorted(
+                grants.items(),
+                key=lambda item: float((item[1] or {}).get("authorized_at") or 0),
+            )[-20:])
+        store.save_session_state({"verification_force_grants": grants}, client_name=client_name)
+        return {"authorized": True, "source": "explicit_confirmation", "case_id": case_id}
+
+    if case_id in grants:
+        if state.get("verification_force_grants") != grants:
+            store.save_session_state({"verification_force_grants": grants}, client_name=client_name)
+        return {"authorized": True, "source": "persisted_case_grant", "case_id": case_id}
+
+    if state.get("verification_force_grants") != grants:
+        store.save_session_state({"verification_force_grants": grants}, client_name=client_name)
+    return {"authorized": False, "source": None, "case_id": case_id}
+
+
+def _verification_override_decision(
+    payload: OdooCodeChangeRequest,
+    verify: Any,
+    *,
+    force_authorization: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Classify verifier findings under a reusable, auditable policy.
 
     This decision applies only to workflow.verify_against_core. Blocking QA,
@@ -2904,13 +2998,19 @@ def _verification_override_decision(payload: OdooCodeChangeRequest, verify: Any)
         })
         accepted = not rejected_codes
     elif mode == "force":
-        accepted = True
+        accepted = bool(
+            (force_authorization or {}).get("authorized")
+            or payload.verification_override_confirmation == "I AUTHORIZE FORCE PUSH AND DEPLOY"
+        )
     return {
         "requested": mode != "strict",
         "requested_mode": requested_mode,
         "mode": mode,
         "accepted": accepted,
         "reason": str(payload.verification_override_reason or "").strip() or None,
+        "authorization_source": (force_authorization or {}).get("source"),
+        "authorization_case_id": (force_authorization or {}).get("case_id"),
+        "confirmation_required": bool(mode == "force" and not accepted),
         "critical_count": len(critical),
         "overrideable_codes": sorted(_VERIFICATION_OVERRIDEABLE_CODES),
         "rejected_codes": rejected_codes,
@@ -4127,7 +4227,20 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "blocking_errors": len(blocking_qa_errors),
         "preexisting_nonblocking": len(preexisting_qa_errors),
     })
-    override_decision = _verification_override_decision(payload, verify)
+    force_authorization = _resolve_force_override_authorization(
+        state_store,
+        payload,
+        client_name=client_name,
+        project_path=project_path,
+        module_name=effective_module_name,
+        git_diff=diff.stdout,
+        verify=verify,
+    )
+    override_decision = _verification_override_decision(
+        payload,
+        verify,
+        force_authorization=force_authorization,
+    )
     verification_effectively_blocked = bool(verify.push_blocked and not override_decision["accepted"])
     steps.append({
         "step": "workflow.verify_against_core",
@@ -4143,7 +4256,50 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "mode": override_decision["mode"],
             "critical_count": override_decision["critical_count"],
             "reason": override_decision["reason"],
+            "authorization_source": override_decision.get("authorization_source"),
+            "authorization_case_id": override_decision.get("authorization_case_id"),
         })
+
+    if (
+        verify.push_blocked
+        and override_decision["mode"] == "force"
+        and not override_decision["accepted"]
+        and not blocking_qa_errors
+    ):
+        continuation = _code_change_continuation_arguments(
+            payload,
+            client_name=client_name,
+            project_path=project_path,
+            module_name=effective_module_name,
+            target_files=deploy_paths,
+            preserve_writes=False,
+            batch_index=payload.batch_index if batch_record is not None else None,
+        )
+        continuation.pop("verification_override_confirmation", None)
+        return {
+            "status": "verification_authorization_required",
+            "message": (
+                "Force verification override requires one explicit confirmation for this exact "
+                "diff and verifier finding set. After confirmation, the server will reuse the "
+                "case-scoped grant for all continuations of the same deployment."
+            ),
+            "client_name": client_name,
+            "project_path": project_path,
+            "module_name": effective_module_name,
+            "steps": steps,
+            "git_diff": {"exit_code": diff.exit_code, "stdout": diff.stdout[-12000:], "stderr": diff.stderr[-4000:]},
+            "qa": qa_struct,
+            "verify_against_core": verify.model_dump(mode="json"),
+            "verification_override": override_decision,
+            "confirmation_phrase": "I AUTHORIZE FORCE PUSH AND DEPLOY",
+            "success_allowed": False,
+            "completion_required": True,
+            "next_call": {
+                "tool": "workflow.odoo_code_change",
+                "arguments": continuation,
+                "required_generated_arguments": ["verification_override_confirmation"],
+            },
+        }
 
     if blocking_qa_errors or verification_effectively_blocked:
         core_errors = [item for item in verify.findings if item.severity.value == "CRITICAL"] if verification_effectively_blocked else []

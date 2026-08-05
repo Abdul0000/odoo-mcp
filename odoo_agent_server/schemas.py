@@ -495,9 +495,10 @@ class OdooCodeChangeRequest(BaseModel):
             if not str(self.verification_override_reason or "").strip():
                 raise ValueError("verification_override_reason is required when verification_override is enabled")
         if self.verification_override == "force":
-            if self.verification_override_confirmation != "I AUTHORIZE FORCE PUSH AND DEPLOY":
+            confirmation = self.verification_override_confirmation
+            if confirmation is not None and confirmation != "I AUTHORIZE FORCE PUSH AND DEPLOY":
                 raise ValueError(
-                    "verification_override='force' requires exact confirmation: "
+                    "verification_override='force' requires exact confirmation when supplied: "
                     "I AUTHORIZE FORCE PUSH AND DEPLOY"
                 )
         return self
