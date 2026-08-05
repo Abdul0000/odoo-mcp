@@ -424,6 +424,13 @@ class OdooCodeChangeRequest(BaseModel):
     total_batches: int = Field(default=1, ge=1, le=20, description="Total local write batches. Only the final batch can reach full QA/deploy.")
     commit_message: str | None = Field(default=None, max_length=300, description="Commit message for safe deploy. Defaults to a concise message from task_description.")
     auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
+    force_new_deploy: bool = Field(
+        default=False,
+        description=(
+            "Start a fresh safe-deploy job even when an older resumable job exists for the same module. "
+            "Use for a new verified working-tree change after a prior github_pushed_deploy_pending result."
+        ),
+    )
     verification_override: Literal["strict", "allow_unverified", "force", "none", "irrelevant_only"] = Field(
         default="strict",
         description=(

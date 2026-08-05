@@ -4276,6 +4276,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         verification_override_mode=override_decision["mode"] if override_decision["accepted"] else "strict",
         verification_override_reason=override_decision["reason"] if override_decision["accepted"] else None,
         verification_override_findings=override_decision["findings"] if override_decision["accepted"] else [],
+        force_new_deploy=payload.force_new_deploy,
     )
     try:
         deploy = await safe_deploy_module(deploy_payload)

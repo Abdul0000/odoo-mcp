@@ -99,6 +99,24 @@ router = APIRouter(prefix="/workflow", tags=["workflow"], dependencies=[AuthDepe
 _SAFE_DEPLOY_ENTRY_LOCK = Lock()
 
 
+def _has_fresh_scoped_changes(payload: SafeDeployModuleRequest) -> bool:
+    """Return True when this request contains local source newer than a resumable job.
+
+    A github_pushed_deploy_pending job owns the SHA it already pushed, but it must not
+    block a later verified repair that is still present in the working tree. Only paths
+    explicitly approved by the current safe-deploy request are considered.
+    """
+    try:
+        changed = GitService().changed_files(payload.project_path)
+    except Exception:
+        return False
+    if changed.exit_code != 0:
+        return False
+    approved = {str(path).strip().replace("\\", "/") for path in payload.paths if str(path).strip()}
+    current = {line.strip().replace("\\", "/") for line in (changed.stdout or "").splitlines() if line.strip()}
+    return bool(approved & current)
+
+
 def _odoosh_service_for_client(client=None):
     """Instantiate OdooShService with per-client config while keeping tests/fakes compatible."""
     if client is not None:
@@ -783,6 +801,16 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                     module_name=payload.module_name,
                     client_name=payload.client_name,
                 )
+                if (
+                    existing_job is not None
+                    and existing_job.status not in {JobStatus.queued, JobStatus.running}
+                    and _has_fresh_scoped_changes(payload)
+                ):
+                    # The old resumable job owns an earlier pushed SHA. A new verified
+                    # scoped diff must create a fresh commit/push instead of being
+                    # redirected back to that stale deployment checkpoint. Active jobs
+                    # remain exclusive and are never bypassed.
+                    existing_job = None
             if existing_job is not None:
                 return _existing_job_report(existing_job)
 
