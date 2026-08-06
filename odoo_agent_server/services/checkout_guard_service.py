@@ -113,6 +113,84 @@ def module_was_successfully_deployed(
     return False
 
 
+def _working_tree_dirty(status_result: Any) -> bool:
+    if getattr(status_result, "exit_code", 1) != 0:
+        return False
+    return any(line.strip() and not line.startswith("##") for line in (getattr(status_result, "stdout", "") or "").splitlines())
+
+
+def _ensure_checkout_matches_remote_head(
+    *,
+    project: Path,
+    branch: str | None,
+    remote: str,
+    git: GitService,
+    timeout_seconds: int,
+) -> dict[str, Any]:
+    """Fetch and prove checkout ancestry without discarding local work.
+
+    Clean behind-only checkouts are fast-forwarded. Dirty checkouts are preserved,
+    but deploy is blocked when the remote advanced or local HEAD is ahead/diverged.
+    Test doubles that do not implement the freshness API keep legacy behavior.
+    """
+    required = ("fetch_remote", "compare_with_remote", "head_sha", "remote_head_sha", "status")
+    if not all(callable(getattr(git, name, None)) for name in required):
+        return {"checked": False, "status": "unsupported_by_git_adapter", "ok": True}
+
+    status_result = git.status(str(project))
+    if getattr(status_result, "exit_code", 1) != 0:
+        return {"checked": True, "status": "status_failed", "ok": False, "error": getattr(status_result, "stderr", "") or "git status failed"}
+    dirty = _working_tree_dirty(status_result)
+    fetch_result = git.fetch_remote(str(project), remote=remote, timeout_seconds=timeout_seconds)
+    if getattr(fetch_result, "exit_code", 1) != 0:
+        return {"checked": True, "status": "fetch_failed", "ok": False, "dirty": dirty, "error": getattr(fetch_result, "stderr", "") or "git fetch failed", "fetch_result": _command_dump(fetch_result)}
+
+    local_result = git.head_sha(str(project))
+    remote_result = git.remote_head_sha(str(project), remote=remote, branch=branch, timeout_seconds=min(timeout_seconds, 60))
+    compare_result = git.compare_with_remote(str(project), remote=remote, branch=branch, timeout_seconds=min(timeout_seconds, 60))
+    if any(getattr(item, "exit_code", 1) != 0 for item in (local_result, remote_result, compare_result)):
+        return {
+            "checked": True, "status": "comparison_failed", "ok": False, "dirty": dirty,
+            "error": getattr(compare_result, "stderr", "") or getattr(remote_result, "stderr", "") or "Unable to compare local and remote HEAD",
+        }
+    local_head = (getattr(local_result, "stdout", "") or "").strip()
+    remote_head = (getattr(remote_result, "stdout", "") or "").strip()
+    ahead_text, behind_text = (getattr(compare_result, "stdout", "") or "0 0").strip().split()[:2]
+    ahead, behind = int(ahead_text), int(behind_text)
+    result = {
+        "checked": True, "ok": True, "status": "current", "dirty": dirty,
+        "local_head": local_head, "remote_head": remote_head, "ahead": ahead, "behind": behind,
+        "branch": branch, "remote": remote,
+    }
+    if ahead and behind:
+        result.update({"ok": False, "status": "diverged", "error": "Local checkout diverged from the remote branch; refusing to commit or push."})
+        return result
+    if ahead:
+        result.update({"ok": False, "status": "local_ahead", "error": "Local checkout contains commits not present on the remote branch; refusing to bundle or replay them in a new deploy."})
+        return result
+    if behind:
+        if dirty:
+            result.update({"ok": False, "status": "remote_advanced_dirty", "error": "Remote branch advanced while the checkout has local changes; preserve the diff and rebase it on the latest remote HEAD before deploying."})
+            return result
+        fast_forward = getattr(git, "fast_forward", None)
+        if not callable(fast_forward):
+            result.update({"ok": False, "status": "fast_forward_unavailable", "error": "Checkout is behind remote and the Git adapter cannot fast-forward safely."})
+            return result
+        ff_result = fast_forward(str(project), remote=remote, branch=branch, timeout_seconds=timeout_seconds)
+        if getattr(ff_result, "exit_code", 1) != 0:
+            result.update({"ok": False, "status": "fast_forward_failed", "error": getattr(ff_result, "stderr", "") or "git merge --ff-only failed", "fast_forward_result": _command_dump(ff_result)})
+            return result
+        refreshed = git.head_sha(str(project))
+        result.update({
+            "status": "fast_forwarded", "local_head_before": local_head,
+            "local_head": (getattr(refreshed, "stdout", "") or "").strip(),
+            "ahead": 0, "behind": 0, "fast_forward_result": _command_dump(ff_result),
+        })
+    elif dirty:
+        result["status"] = "dirty_current"
+    return result
+
+
 def ensure_module_exists_or_sync(
     *,
     project_path: str | Path,
@@ -147,6 +225,21 @@ def ensure_module_exists_or_sync(
     }
 
     if module_path.exists():
+        freshness = _ensure_checkout_matches_remote_head(
+            project=project, branch=resolved_branch, remote=remote, git=git, timeout_seconds=timeout_seconds,
+        )
+        result["freshness"] = freshness
+        result.update({
+            "ok": bool(freshness.get("ok", True)),
+            "status": str(freshness.get("status") or "present"),
+            "local_head": freshness.get("local_head"),
+            "remote_head": freshness.get("remote_head"),
+            "ahead": freshness.get("ahead"),
+            "behind": freshness.get("behind"),
+            "dirty": freshness.get("dirty"),
+        })
+        if not result["ok"]:
+            result["error"] = freshness.get("error")
         return result
 
     result.update({"ok": False, "status": "sync_failed", "sync_attempted": True})

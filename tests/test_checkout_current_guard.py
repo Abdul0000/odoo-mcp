@@ -263,3 +263,93 @@ def test_coding_task_plan_known_prior_success_fails_fast_when_sync_does_not_rest
     assert excinfo.value.status_code == 409
     assert "Module 'x_module' not found" in str(excinfo.value.detail)
     assert fake_git.calls == ["fetch_reset_hard"]
+
+
+def _git(cwd: Path, *args: str) -> str:
+    import subprocess
+
+    completed = subprocess.run(
+        ["git", *args], cwd=str(cwd), text=True, capture_output=True, check=True,
+    )
+    return completed.stdout.strip()
+
+
+def _make_remote_pair(tmp_path: Path) -> tuple[Path, Path, Path]:
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    work = tmp_path / "work"
+    _git(tmp_path, "init", "--bare", str(remote))
+    _git(tmp_path, "init", "-b", "test_branch", str(seed))
+    _git(seed, "config", "user.name", "Test")
+    _git(seed, "config", "user.email", "test@example.com")
+    (seed / "x_module").mkdir()
+    (seed / "x_module" / "__manifest__.py").write_text("{'name': 'X'}\n", encoding="utf-8")
+    _git(seed, "add", ".")
+    _git(seed, "commit", "-m", "initial")
+    _git(seed, "remote", "add", "origin", str(remote))
+    _git(seed, "push", "-u", "origin", "test_branch")
+    _git(tmp_path, "clone", "-b", "test_branch", str(remote), str(work))
+    _git(work, "config", "user.name", "Test")
+    _git(work, "config", "user.email", "test@example.com")
+    return remote, seed, work
+
+
+def test_checkout_guard_fast_forwards_clean_checkout(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    _remote, seed, work = _make_remote_pair(tmp_path)
+    (seed / "x_module" / "models.py").write_text("VALUE = 2\n", encoding="utf-8")
+    _git(seed, "add", ".")
+    _git(seed, "commit", "-m", "remote update")
+    remote_sha = _git(seed, "rev-parse", "HEAD")
+    _git(seed, "push", "origin", "test_branch")
+
+    result = checkout_guard_service.ensure_module_exists_or_sync(
+        project_path=work,
+        module_name="x_module",
+        branch="test_branch",
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "fast_forwarded"
+    assert result["local_head"] == remote_sha
+    assert _git(work, "rev-parse", "HEAD") == remote_sha
+
+
+def test_checkout_guard_blocks_dirty_checkout_when_remote_advanced(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    _remote, seed, work = _make_remote_pair(tmp_path)
+    (work / "x_module" / "__manifest__.py").write_text("{'name': 'Local edit'}\n", encoding="utf-8")
+    (seed / "x_module" / "models.py").write_text("VALUE = 3\n", encoding="utf-8")
+    _git(seed, "add", ".")
+    _git(seed, "commit", "-m", "remote update")
+    _git(seed, "push", "origin", "test_branch")
+
+    result = checkout_guard_service.ensure_module_exists_or_sync(
+        project_path=work,
+        module_name="x_module",
+        branch="test_branch",
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "remote_advanced_dirty"
+    assert result["dirty"] is True
+    assert "preserve the diff" in result["error"]
+
+
+def test_checkout_guard_blocks_unpushed_local_commit(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    _remote, _seed, work = _make_remote_pair(tmp_path)
+    (work / "x_module" / "models.py").write_text("VALUE = 4\n", encoding="utf-8")
+    _git(work, "add", ".")
+    _git(work, "commit", "-m", "local only")
+
+    result = checkout_guard_service.ensure_module_exists_or_sync(
+        project_path=work,
+        module_name="x_module",
+        branch="test_branch",
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "local_ahead"
+    assert result["ahead"] == 1
+    assert "refusing to bundle" in result["error"]

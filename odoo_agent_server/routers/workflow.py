@@ -117,6 +117,27 @@ def _has_fresh_scoped_changes(payload: SafeDeployModuleRequest) -> bool:
     return bool(approved & current)
 
 
+def _scoped_diff_fingerprint(payload: SafeDeployModuleRequest) -> str | None:
+    """Hash the approved working-tree diff so resumable jobs cannot absorb new work."""
+    try:
+        git = GitService()
+        changed = git.changed_files(payload.project_path)
+        if changed.exit_code != 0:
+            return None
+        approved = sorted({str(path).strip().replace("\\", "/") for path in payload.paths if str(path).strip()})
+        current = {line.strip().replace("\\", "/") for line in (changed.stdout or "").splitlines() if line.strip()}
+        scoped = [path for path in approved if path in current]
+        if not scoped:
+            return None
+        diff = git.diff(payload.project_path, staged=False, timeout_seconds=30)
+        if diff.exit_code != 0:
+            return None
+        material = "\n".join(scoped) + "\n---DIFF---\n" + (diff.stdout or "")
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    except Exception:
+        return None
+
+
 def _odoosh_service_for_client(client=None):
     """Instantiate OdooShService with per-client config while keeping tests/fakes compatible."""
     if client is not None:
@@ -795,6 +816,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
 
         with _SAFE_DEPLOY_ENTRY_LOCK:
             existing_job = None
+            current_diff_fingerprint = _scoped_diff_fingerprint(payload)
             if not payload.force_new_deploy:
                 existing_job = find_blocking_safe_deploy(
                     project_path=payload.project_path,
@@ -804,7 +826,13 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
                 if (
                     existing_job is not None
                     and existing_job.status not in {JobStatus.queued, JobStatus.running}
-                    and _has_fresh_scoped_changes(payload)
+                    and (
+                        _has_fresh_scoped_changes(payload)
+                        or (
+                            current_diff_fingerprint is not None
+                            and current_diff_fingerprint != (existing_job.request or {}).get("diff_fingerprint")
+                        )
+                    )
                 ):
                     # The old resumable job owns an earlier pushed SHA. A new verified
                     # scoped diff must create a fresh commit/push instead of being
@@ -817,6 +845,7 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
             store = JsonStore()
             job_request = payload.model_dump(mode="json")
             job_request["validation_lease"] = validation_lease
+            job_request["diff_fingerprint"] = current_diff_fingerprint
             job = store.create_job(JobRecord(
                 job_type="safe_deploy_module",
                 status=JobStatus.running,
@@ -1659,17 +1688,34 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             return
         rollback_attempted = True
         try:
+            remote_head = git.remote_head_sha(str(project_path), payload.remote, branch, 60)  # type: ignore[name-defined]
+            current_head = git.head_sha(str(project_path))
+            remote_sha = (remote_head.stdout or "").strip() if remote_head.exit_code == 0 else ""
+            current_sha = (current_head.stdout or "").strip() if current_head.exit_code == 0 else ""
+            if remote_sha != pushed_sha or current_sha != pushed_sha:
+                _step("rollback_guard", "warning", {
+                    "reason": reason,
+                    "message": "Automatic rollback skipped because the job no longer exclusively owns local and remote HEAD.",
+                    "pushed_sha": pushed_sha,
+                    "remote_head": remote_sha,
+                    "local_head": current_sha,
+                    "rollback_commit_created": False,
+                })
+                return
             revert_result = git.revert_commit(str(project_path), pushed_sha, 180)  # type: ignore[name-defined]
             _step("rollback_git_revert", "passed" if revert_result.exit_code == 0 else "failed", revert_result)
             if revert_result.exit_code == 0:
                 push_back = git.push(str(project_path), payload.remote, branch, True, min(payload.timeout_seconds, 600))  # type: ignore[name-defined]
-                _step("rollback_git_push", "passed" if push_back.exit_code == 0 else "failed", push_back)
+                _step("rollback_git_push", "passed" if push_back.exit_code == 0 else "failed", {
+                    "result": push_back.model_dump(mode="json") if hasattr(push_back, "model_dump") else push_back,
+                    "rollback_commit_created": True,
+                })
         except Exception as exc:  # noqa: BLE001
             _step("rollback_exception", "failed", error=f"{reason}: {exc}")
 
     def _fail(name: str, result=None, error: str | None = None) -> None:
         _step(name, "failed", result, error)
-        if name in {"odoosh_verify_module_manifest", "odoo_module_deploy", "odoo_module_status", "registry_field_verify"}:
+        if name == "odoosh_verify_module_manifest":
             _rollback_after_failure(name)
         job = store.get_job(job_id)
         store.finish_job(job, JobStatus.failed, {"failed_step": name, "module_name": payload.module_name, "rollback_attempted": rollback_attempted})
@@ -1720,6 +1766,18 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         _save_state("checkout_stale_or_missing", {"checkout_error": result["error"]})
         approval.mark_failed(payload.approval_id, "workflow.safe_deploy_module checkout/module guard failed")
         return
+    baseline_local_sha = str(checkout_guard.get("local_head") or "")
+    baseline_remote_sha = str(checkout_guard.get("remote_head") or "")
+    if baseline_local_sha or baseline_remote_sha:
+        _step("checkout_baseline_lock", "passed", {
+            "local_head": baseline_local_sha,
+            "remote_head": baseline_remote_sha,
+            "branch": branch,
+            "dirty": checkout_guard.get("dirty"),
+            "ahead": checkout_guard.get("ahead"),
+            "behind": checkout_guard.get("behind"),
+        })
+
     try:
         deploy_paths = _normalise_safe_deploy_paths(project_path, payload.module_name, payload.paths)
     except Exception as exc:  # noqa: BLE001
@@ -1943,6 +2001,23 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         return
     _step("git_validate_target", "passed", target_result)
 
+    if baseline_local_sha and baseline_remote_sha:
+        current_local = git.head_sha(str(project_path))
+        current_remote = git.remote_head_sha(str(project_path), payload.remote, branch, 60)
+        current_local_sha = (current_local.stdout or "").strip() if current_local.exit_code == 0 else ""
+        current_remote_sha = (current_remote.stdout or "").strip() if current_remote.exit_code == 0 else ""
+        baseline_ok = current_local_sha == baseline_local_sha and current_remote_sha == baseline_remote_sha
+        _step("pre_commit_baseline_verify", "passed" if baseline_ok else "failed", {
+            "baseline_local_sha": baseline_local_sha,
+            "baseline_remote_sha": baseline_remote_sha,
+            "current_local_sha": current_local_sha,
+            "current_remote_sha": current_remote_sha,
+            "message": "Commit baseline is unchanged." if baseline_ok else "Local or remote HEAD changed after inspection; refusing to commit stale work.",
+        })
+        if not baseline_ok:
+            _fail("pre_commit_baseline_verify", error="Remote/local baseline changed before commit; rebase the preserved diff on the latest remote HEAD.")
+            return
+
     if idempotent_clean_retry:
         _step("git_commit", "skipped", {"message": "Skipped duplicate commit because requested paths are already represented in HEAD."})
         head_path_gate = idempotent_head_path_gate or _assert_head_commit_contains_paths(git, project_path, deploy_paths)
@@ -1961,6 +2036,19 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             _fail("git_commit", commit_result)
             return
         _step("git_commit", "passed", commit_result)
+
+        if baseline_local_sha and callable(getattr(git, "head_parent_sha", None)):
+            parent_result = git.head_parent_sha(str(project_path))
+            parent_sha = (parent_result.stdout or "").strip() if parent_result.exit_code == 0 else ""
+            parent_ok = parent_sha == baseline_local_sha
+            _step("git_commit_parent_gate", "passed" if parent_ok else "failed", {
+                "expected_parent": baseline_local_sha,
+                "actual_parent": parent_sha,
+                "message": "New commit is based on the locked checkout HEAD." if parent_ok else "New commit parent does not match the locked checkout HEAD.",
+            })
+            if not parent_ok:
+                _fail("git_commit_parent_gate", error="New commit parent does not match pre-commit baseline; refusing to push.")
+                return
 
         head_path_gate = _assert_head_commit_contains_paths(git, project_path, deploy_paths)
         if head_path_gate.exit_code != 0:

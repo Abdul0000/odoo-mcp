@@ -81,6 +81,45 @@ class GitService:
             stdout="\n".join(seen) + ("\n" if seen else ""),
         )
 
+    def fetch_remote(self, project_path: str, remote: str = "origin", timeout_seconds: int = 120) -> CommandResult:
+        """Fetch remote refs without modifying the working tree."""
+        project = self._project(project_path)
+        return self._run(["git", "fetch", "--prune", remote], project, timeout_seconds)
+
+    def compare_with_remote(self, project_path: str, remote: str = "origin", branch: str | None = None, timeout_seconds: int = 30) -> CommandResult:
+        """Return ``ahead behind`` counts for HEAD versus ``remote/branch``."""
+        project = self._project(project_path)
+        if not branch:
+            branch_result = self.current_branch(str(project))
+            if branch_result.exit_code != 0:
+                return branch_result
+            branch = branch_result.stdout.strip()
+        if branch in {"", "HEAD", None}:
+            return CommandResult(command=["git", "rev-list"], cwd=str(project), exit_code=2, stderr="Cannot compare remote without an explicit branch.")
+        result = self._run(["git", "rev-list", "--left-right", "--count", f"HEAD...{remote}/{branch}"], project, timeout_seconds)
+        if result.exit_code != 0:
+            return result
+        parts = (result.stdout or "").strip().replace("\t", " ").split()
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            return CommandResult(command=result.command, cwd=str(project), exit_code=2, stdout=result.stdout, stderr="Unexpected rev-list ahead/behind output.")
+        return CommandResult(command=["git", "compare-with-remote", remote, branch], cwd=str(project), exit_code=0, stdout=f"{parts[0]} {parts[1]}\n")
+
+    def fast_forward(self, project_path: str, remote: str = "origin", branch: str | None = None, timeout_seconds: int = 120) -> CommandResult:
+        """Fast-forward a clean checkout to the fetched remote branch only."""
+        project = self._project(project_path)
+        if not branch:
+            branch_result = self.current_branch(str(project))
+            if branch_result.exit_code != 0:
+                return branch_result
+            branch = branch_result.stdout.strip()
+        if branch in {"", "HEAD", None}:
+            return CommandResult(command=["git", "merge", "--ff-only"], cwd=str(project), exit_code=2, stderr="Cannot fast-forward without an explicit branch.")
+        return self._run(["git", "merge", "--ff-only", f"{remote}/{branch}"], project, timeout_seconds)
+
+    def head_parent_sha(self, project_path: str, timeout_seconds: int = 20) -> CommandResult:
+        """Return the first parent of HEAD for commit-parent safety assertions."""
+        return self._run(["git", "rev-parse", "HEAD^"], self._project(project_path), timeout_seconds)
+
     def remote_head_sha(self, project_path: str, remote: str = "origin", branch: str | None = None, timeout_seconds: int = 30) -> CommandResult:
         """Read the remote branch SHA after push so safe deploy can prove GitHub received it."""
         project = self._project(project_path)
