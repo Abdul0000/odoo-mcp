@@ -93,6 +93,27 @@ def test_multi_write_merges_imports_without_duplicates(tmp_path, monkeypatch):
     assert (module / "__init__.py").read_text(encoding="utf-8").count("from . import models") == 1
 
 
+def test_multi_write_rejects_delete_of_auto_wired_init(tmp_path, monkeypatch):
+    project, module = _addon(tmp_path, monkeypatch)
+    (module / "__init__.py").write_text("", encoding="utf-8")
+    files = [
+        SimpleNamespace(
+            relative_path="device_module/models/device.py",
+            content="VALUE = 1\n",
+            create_dirs=True,
+            mode="overwrite",
+            force=False,
+        )
+    ]
+
+    with pytest.raises(HTTPException, match="cannot be written and deleted"):
+        RepoService().write_many_fast_safe(
+            str(project), files, delete_paths=["device_module/models/__init__.py"]
+        )
+
+    assert not (module / "models" / "device.py").exists()
+
+
 def test_invalid_existing_init_rolls_back_primary_python_write(tmp_path, monkeypatch):
     project, module = _addon(tmp_path, monkeypatch)
     models = module / "models"

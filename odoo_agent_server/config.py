@@ -62,9 +62,19 @@ class Settings(BaseSettings):
     # multi-file edits and keeps the slower git-worktree transaction for larger
     # or riskier changes.  Validation is still handled by the normal verifier
     # on the exact files changed by the task.
-    fast_write_max_files: int = Field(default=8, alias="ODOO_AGENT_FAST_WRITE_MAX_FILES")
-    fast_write_max_bytes_each: int = Field(default=300_000, alias="ODOO_AGENT_FAST_WRITE_MAX_BYTES_EACH")
-    fast_write_max_total_bytes: int = Field(default=750_000, alias="ODOO_AGENT_FAST_WRITE_MAX_TOTAL_BYTES")
+    fast_write_max_files: int = Field(default=50, alias="ODOO_AGENT_FAST_WRITE_MAX_FILES")
+    fast_write_max_bytes_each: int = Field(default=500_000, alias="ODOO_AGENT_FAST_WRITE_MAX_BYTES_EACH")
+    fast_write_max_total_bytes: int = Field(default=5_000_000, alias="ODOO_AGENT_FAST_WRITE_MAX_TOTAL_BYTES")
+
+    # SHA-bound coding sessions keep one module snapshot warm across the
+    # inspect -> writes -> repair continuation without weakening final QA.
+    coding_session_ttl_seconds: int = Field(default=3600, ge=300, le=86400, alias="ODOO_AGENT_CODING_SESSION_TTL_SECONDS")
+    coding_session_max_count: int = Field(default=20, ge=2, le=200, alias="ODOO_AGENT_CODING_SESSION_MAX_COUNT")
+    coding_session_bundle_max_files: int = Field(default=2000, ge=50, le=20000, alias="ODOO_AGENT_CODING_SESSION_BUNDLE_MAX_FILES")
+    coding_session_bundle_max_bytes: int = Field(default=50_000_000, ge=1_000_000, le=500_000_000, alias="ODOO_AGENT_CODING_SESSION_BUNDLE_MAX_BYTES")
+    coding_workspace_max_modules: int = Field(default=5, ge=1, le=10, alias="ODOO_AGENT_CODING_WORKSPACE_MAX_MODULES")
+    coding_workspace_ttl_seconds: int = Field(default=14400, ge=300, le=86400, alias="ODOO_AGENT_CODING_WORKSPACE_TTL_SECONDS")
+    coding_workspace_max_count: int = Field(default=20, ge=2, le=200, alias="ODOO_AGENT_CODING_WORKSPACE_MAX_COUNT")
 
     # Fast/correct agent optimisations. These keep strict validation while avoiding
     # repeated full-source scans on every OWL/POS/website task.

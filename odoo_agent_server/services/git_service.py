@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -304,6 +305,23 @@ class GitService:
         if result.exit_code == 0:
             sha = self.head_sha(str(project)).stdout.strip()
             result.stdout = (result.stdout or "") + f"\nPUSH_OK\nbranch={branch}\nsha={sha}\n"
+            # Workspace context is an optimization, never a push dependency.
+            # Rebind unchanged module snapshots to the pushed SHA and refresh
+            # only modules whose source fingerprint changed.
+            try:
+                from .coding_session_service import CodingWorkspaceService
+
+                workspace_sync = CodingWorkspaceService().sync_project_after_push(
+                    str(project),
+                    sha,
+                )
+                result.stdout += "CODING_WORKSPACE_SYNC=" + json.dumps(
+                    workspace_sync,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ) + "\n"
+            except Exception:  # noqa: BLE001 - cache maintenance cannot fail a valid push
+                result.stdout += "CODING_WORKSPACE_SYNC=deferred\n"
         return result
 
     def _run(self, command: list[str], cwd: Path, timeout_seconds: int) -> CommandResult:

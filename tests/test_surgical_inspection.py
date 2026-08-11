@@ -1,4 +1,6 @@
 import asyncio
+import subprocess
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -12,6 +14,7 @@ from odoo_agent_server.routers.tools import (
     _contract_candidate_paths,
     _complete_code_batch,
     _code_batch_fingerprint,
+    _code_change_continuation_arguments,
     _code_operation_id,
     _debug_infer_diagnosis,
     _debug_operation_handoff,
@@ -30,6 +33,9 @@ from odoo_agent_server.routers.tools import (
     _safe_unique_python_function_rebase,
     _write_generation_output_schema,
 )
+from odoo_agent_server.config import settings
+from odoo_agent_server.services.coding_session_service import CodingSessionService, CodingWorkspaceService
+from odoo_agent_server.services.git_service import GitService
 from odoo_agent_server.schemas import (
     JobRecord,
     JobStatus,
@@ -137,6 +143,327 @@ def test_code_operation_id_uses_the_complete_task_description():
     }
 
     assert _code_operation_id(first, **arguments) != _code_operation_id(second, **arguments)
+
+
+def test_code_change_continuation_preserves_coding_session():
+    payload = _payload(
+        "Continue the exact inspected change",
+        coding_session_id="codeop-session-001",
+        workspace_session_id="workspace-session-001",
+    )
+
+    arguments = _code_change_continuation_arguments(
+        payload,
+        client_name="Test 18",
+        project_path="C:/repo",
+        module_name="custom_sale",
+        preserve_writes=False,
+    )
+
+    assert arguments["coding_session_id"] == "codeop-session-001"
+    assert arguments["workspace_session_id"] == "workspace-session-001"
+
+
+def _workspace_repo(tmp_path: Path, module_count: int = 6) -> tuple[Path, dict[str, Path]]:
+    project = tmp_path / "repo"
+    modules: dict[str, Path] = {}
+    for index in range(1, module_count + 1):
+        name = f"custom_module_{index}"
+        module = project / name
+        (module / "models").mkdir(parents=True)
+        (module / "__manifest__.py").write_text(
+            repr({"name": name, "depends": ["base"]}) + "\n",
+            encoding="utf-8",
+        )
+        (module / "models" / "record.py").write_text(
+            f"VALUE = {index}\n",
+            encoding="utf-8",
+        )
+        modules[name] = module
+    subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=project, check=True)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=project, check=True, capture_output=True)
+    return project, modules
+
+
+def test_coding_workspace_loads_modules_on_demand_and_evicts_lru(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "coding_workspace_max_modules", 5)
+    project, modules = _workspace_repo(tmp_path)
+    service = CodingWorkspaceService()
+    workspace = service.open_or_resume(
+        workspace_session_id=None,
+        client_name="Test 18",
+        project_path=str(project),
+    )
+
+    for name in list(modules)[:5]:
+        activation = service.activate_module(
+            workspace["id"], module_name=name, module_path=str(modules[name])
+        )
+        assert activation["status"] == "loaded_on_demand"
+    service.activate_module(
+        workspace["id"],
+        module_name="custom_module_1",
+        module_path=str(modules["custom_module_1"]),
+    )
+    sixth = service.activate_module(
+        workspace["id"],
+        module_name="custom_module_6",
+        module_path=str(modules["custom_module_6"]),
+    )
+
+    cached = sixth["workspace"]["modules"]
+    assert len(cached) == 5
+    assert sixth["evicted_module"] == "custom_module_2"
+    assert "custom_module_1" in cached
+    assert "custom_module_6" in cached
+    assert len(list(service.root.glob("*.zip"))) == 5
+
+
+def test_coding_workspace_reuses_analysis_and_invalidates_it_after_write(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project, modules = _workspace_repo(tmp_path, module_count=1)
+    module = modules["custom_module_1"]
+    service = CodingWorkspaceService()
+    workspace = service.open_or_resume(
+        workspace_session_id="workspace-analysis-001",
+        client_name="Test 18",
+        project_path=str(project),
+    )
+    first = service.activate_module(
+        workspace["id"], module_name="custom_module_1", module_path=str(module)
+    )
+    stored = service.store_analysis(
+        workspace["id"],
+        module_name="custom_module_1",
+        analysis_index={"status": "analyzed", "source_evidence": []},
+    )
+    cached = service.activate_module(
+        workspace["id"], module_name="custom_module_1", module_path=str(module)
+    )
+    assert first["cache_hit"] is False
+    assert cached["cache_hit"] is True
+    assert cached["module"]["analysis_index"]["status"] == "analyzed"
+    assert stored["modules"]["custom_module_1"]["analysis_index"] is not None
+
+    (module / "models" / "record.py").write_text("VALUE = 99\n", encoding="utf-8")
+    refreshed = service.refresh_module(
+        workspace["id"], module_name="custom_module_1"
+    )
+    entry = refreshed["modules"]["custom_module_1"]
+    assert entry["status"] == "refreshed_after_write"
+    assert entry["analysis_index"] is None
+    assert entry["bundle_version"] == 2
+
+
+def test_coding_workspace_syncs_changed_and_unchanged_modules_after_push(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project, modules = _workspace_repo(tmp_path, module_count=2)
+    service = CodingWorkspaceService()
+    workspace = service.open_or_resume(
+        workspace_session_id="workspace-push-sync-001",
+        client_name="Test 18",
+        project_path=str(project),
+    )
+    for name, module in modules.items():
+        service.activate_module(workspace["id"], module_name=name, module_path=str(module))
+        service.store_analysis(
+            workspace["id"],
+            module_name=name,
+            analysis_index={"status": "analyzed", "module_name": name},
+        )
+
+    changed_file = modules["custom_module_1"] / "models" / "record.py"
+    changed_file.write_text("VALUE = 500\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-m", "change first module"], cwd=project, check=True, capture_output=True)
+    pushed_sha = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=project, check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+    result = service.sync_project_after_push(str(project), pushed_sha)
+    current = service.open_or_resume(
+        workspace_session_id=workspace["id"],
+        client_name="Test 18",
+        project_path=str(project),
+    )
+    first = current["modules"]["custom_module_1"]
+    second = current["modules"]["custom_module_2"]
+    assert result["workspace_count"] == 1
+    assert result["checked_modules"] == 2
+    assert result["refreshed_modules"] == ["custom_module_1"]
+    assert result["rebound_modules"] == ["custom_module_2"]
+    assert first["analysis_index"] is None
+    assert second["analysis_index"]["status"] == "analyzed"
+    assert first["base_sha"] == second["base_sha"] == pushed_sha
+
+
+def test_successful_git_push_runs_nonblocking_workspace_sync(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project, _modules = _workspace_repo(tmp_path, module_count=1)
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=project, check=True)
+    branch = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=project,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    called: dict[str, str] = {}
+
+    def sync_after_push(_service, project_path, pushed_sha=None):
+        called.update(project_path=project_path, pushed_sha=str(pushed_sha or ""))
+        return {"workspace_count": 0, "checked_modules": 0, "base_sha": pushed_sha}
+
+    monkeypatch.setattr(CodingWorkspaceService, "sync_project_after_push", sync_after_push)
+    git = GitService()
+    monkeypatch.setattr(git, "_project", lambda _path: project.resolve())
+    monkeypatch.setattr(
+        git,
+        "validate_target",
+        lambda *_args, **_kwargs: CommandResult(
+            command=["git", "validate-target"], cwd=str(project), exit_code=0
+        ),
+    )
+
+    result = git.push(str(project), branch=branch)
+
+    assert result.exit_code == 0
+    assert called["project_path"] == str(project.resolve())
+    assert called["pushed_sha"]
+    assert "CODING_WORKSPACE_SYNC=" in result.stdout
+
+
+def test_coding_session_is_sha_bound_and_refreshes_module_bundle(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    module = project / "custom_sale"
+    (module / "models").mkdir(parents=True)
+    (module / "__manifest__.py").write_text("{'name': 'Custom Sale'}\n", encoding="utf-8")
+    model = module / "models" / "sale_order.py"
+    model.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=project, check=True)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=project, check=True, capture_output=True)
+
+    service = CodingSessionService()
+    opened = service.open(
+        session_id="codeop-session-001",
+        client_name="Test 18",
+        project_path=str(project),
+        module_name="custom_sale",
+        module_path=str(module),
+        task_description="Change the sale order behavior",
+        target_files=["custom_sale/models/sale_order.py"],
+        evidence={"core_paths": []},
+    )
+    bundle_path = service.root / opened["bundle"]["name"]
+    with zipfile.ZipFile(bundle_path) as archive:
+        assert "custom_sale/models/sale_order.py" in archive.namelist()
+    assert service.resume(
+        "codeop-session-001", client_name="Test 18", project_path=str(project),
+        task_description="Change the sale order behavior",
+    )["valid"] is True
+
+    wrong_task = service.resume(
+        "codeop-session-001", client_name="Test 18", project_path=str(project),
+        task_description="Unrelated new task",
+    )
+    assert wrong_task["valid"] is False
+    assert wrong_task["resume_reason"] == "task_changed"
+
+    model.write_text("VALUE = 222\n", encoding="utf-8")
+    stale = service.resume(
+        "codeop-session-001", client_name="Test 18", project_path=str(project),
+        task_description="Change the sale order behavior",
+    )
+    assert stale["valid"] is False
+    assert stale["resume_reason"] == "module_changed"
+
+    refreshed = service.refresh("codeop-session-001", status_value="written")
+    assert refreshed["bundle_version"] == 2
+    assert service.resume(
+        "codeop-session-001", client_name="Test 18", project_path=str(project),
+        task_description="Change the sale order behavior",
+    )["valid"] is True
+
+
+def test_coding_session_becomes_stale_when_git_head_changes(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    module = project / "custom_sale"
+    module.mkdir(parents=True)
+    (module / "__manifest__.py").write_text("{'name': 'Custom Sale'}\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=project, check=True)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=project, check=True, capture_output=True)
+    service = CodingSessionService()
+    service.open(
+        session_id="codeop-session-002",
+        client_name="Test 18",
+        project_path=str(project),
+        module_name="custom_sale",
+        module_path=str(module),
+        task_description="Change the sale order behavior",
+        target_files=[],
+        evidence={},
+    )
+    (project / "README.md").write_text("new commit\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-m", "advance"], cwd=project, check=True, capture_output=True)
+
+    stale = service.resume(
+        "codeop-session-002", client_name="Test 18", project_path=str(project),
+        task_description="Change the sale order behavior",
+    )
+    assert stale["valid"] is False
+    assert stale["resume_reason"] == "git_head_changed"
+
+
+def test_coding_session_can_checkpoint_direct_write_without_zip(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project = tmp_path / "repo"
+    module = project / "custom_sale"
+    module.mkdir(parents=True)
+    (module / "__manifest__.py").write_text("{'name': 'Custom Sale'}\n", encoding="utf-8")
+    subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=project, check=True)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=project, check=True, capture_output=True)
+    service = CodingSessionService()
+    opened = service.open(
+        session_id="codeop-session-003",
+        client_name="Test 18",
+        project_path=str(project),
+        module_name="custom_sale",
+        module_path=str(module),
+        task_description="Direct deterministic fix",
+        target_files=[],
+        evidence={},
+        create_bundle=False,
+    )
+    assert opened["bundle"] == {}
+
+    refreshed = service.refresh(
+        "codeop-session-003", status_value="written", create_bundle=False
+    )
+    assert refreshed["bundle"] == {}
+    assert refreshed["module_fingerprint"]
+    assert service.resume(
+        "codeop-session-003", client_name="Test 18", project_path=str(project),
+        task_description="Direct deterministic fix",
+    )["valid"] is True
 
 
 def test_handoff_storage_failure_is_nonblocking():

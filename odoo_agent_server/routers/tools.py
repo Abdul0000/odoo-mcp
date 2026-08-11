@@ -158,6 +158,7 @@ from ..services.live_assertion_service import LiveAssertionService
 from ..services.functional_operation_service import FunctionalOperationService
 from ..services.module_test_service import ModuleTestService
 from ..services.existing_target_resolution_service import ExistingTargetResolutionService
+from ..services.coding_session_service import CodingSessionService, CodingWorkspaceService
 from ..services.background_executor import submit_background
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
@@ -317,6 +318,8 @@ _TOOL_DESCRIPTORS = [
             "A cached Odoo-aware index maps functional labels through menus/actions/views/models/fields/QWeb/JS relationships, then reads exact match-centered ranges. "
             "Task descriptions automatically supply quoted identifiers/selectors/XML IDs/methods for focused inspection. "
             "An exact quoted replacement that occurs once can complete in one call; ambiguous or complex work returns exact editable source units in write_generation.contexts for a second call with non-empty writes. "
+            "The returned workspace_session_id keeps up to five module snapshots warm for separate tasks in the same checkout; modules load only on demand, use LRU eviction, revalidate independently, and refresh after writes/push. "
+            "Keep coding_session_id only for its exact task, but preserve workspace_session_id when switching modules in the same repository. "
             "Existing-addon surgical changes use baseline-delta QA: unchanged unrelated legacy findings are reported but do not block commit/deploy; new, task-required, manifest/version, and changed-scope errors still block."
         ),
         requires_approval=True,
@@ -2721,6 +2724,7 @@ def _code_change_continuation_arguments(
     target_files: list[str] | None = None,
     preserve_writes: bool,
     batch_index: int | None = None,
+    coding_session_id: str | None = None,
 ) -> dict[str, Any]:
     """Preserve the exact request contract across every code-change continuation."""
     arguments = payload.model_dump(mode="json", exclude_none=True)
@@ -2737,6 +2741,9 @@ def _code_change_continuation_arguments(
         arguments["target_files"] = target_files
     if batch_index is not None:
         arguments["batch_index"] = batch_index
+    effective_session_id = coding_session_id or payload.coding_session_id
+    if effective_session_id:
+        arguments["coding_session_id"] = effective_session_id
     return arguments
 
 
@@ -3030,7 +3037,76 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     repo = RepoService()
     gate = PreWriteGateService()
     state_store = JsonStore()
+    coding_sessions = CodingSessionService()
+    coding_workspaces = CodingWorkspaceService()
+    coding_session: dict[str, Any] | None = None
+    coding_workspace: dict[str, Any] | None = None
+    workspace_module_context: dict[str, Any] = {}
+    coding_session_resumed = False
     steps: list[dict[str, Any]] = []
+
+    if payload.coding_session_id:
+        try:
+            coding_session = coding_sessions.resume(
+                payload.coding_session_id,
+                client_name=client_name,
+                project_path=project_path,
+                task_description=payload.task_description,
+            )
+        except HTTPException as exc:
+            if exc.status_code not in {400, 404}:
+                raise
+            coding_session = {
+                "id": payload.coding_session_id,
+                "valid": False,
+                "status": "stale",
+                "resume_reason": "session_missing_or_invalid",
+            }
+        if not coding_session.get("valid"):
+            refresh_arguments = payload.model_dump(mode="json", exclude_none=True)
+            refresh_arguments.pop("coding_session_id", None)
+            refresh_arguments.pop("writes", None)
+            refresh_arguments["project_path"] = project_path
+            return {
+                "status": "coding_session_stale",
+                "message": (
+                    "The module changed after focused inspection, so the generated writes were not applied. "
+                    "Refresh the coding session from current source, then regenerate the write set."
+                ),
+                "client_name": client_name,
+                "project_path": project_path,
+                "module_name": coding_session.get("module_name") or payload.module_name,
+                "coding_session": coding_sessions.public_summary(coding_session),
+                "writes_blocked": True,
+                "success_allowed": False,
+                "completion_required": True,
+                "next_call": {
+                    "tool": "workflow.odoo_code_change",
+                    "arguments": refresh_arguments,
+                    "required_generated_arguments": [],
+                },
+            }
+        coding_session_resumed = True
+        if not payload.workspace_session_id and coding_session.get("workspace_session_id"):
+            payload = payload.model_copy(update={
+                "workspace_session_id": coding_session.get("workspace_session_id"),
+            })
+        project_path = str(coding_session["project_path"])
+        state_store.save_session_state({
+            "workflow_prepare_cache": {
+                "project_path": project_path,
+                "at": time.time(),
+                "branch": None,
+                "sha": coding_session.get("base_sha"),
+            }
+        }, client_name=client_name)
+        steps.append({
+            "step": "workflow.coding_session",
+            "status": "resumed",
+            "session_id": payload.coding_session_id,
+            "bundle_version": coding_session.get("bundle_version"),
+            "base_sha": coding_session.get("base_sha"),
+        })
 
     # 1) Prepare checkout once.  In real multi-client use the client config supplies
     # repo URL/branch; for already-materialized local checkouts/tests, avoid failing
@@ -3071,6 +3147,18 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "success_allowed": False,
         }
     effective_module_name = module.module_name
+    if coding_session_resumed and effective_module_name != str(coding_session.get("module_name") or ""):
+        return {
+            "status": "coding_session_stale",
+            "message": "The resumed coding session belongs to a different module; no write was applied.",
+            "client_name": client_name,
+            "project_path": project_path,
+            "module_name": effective_module_name,
+            "coding_session": coding_sessions.public_summary(coding_session),
+            "writes_blocked": True,
+            "success_allowed": False,
+            "completion_required": True,
+        }
     deploy_diagnostics = state_store.load_session_state(client_name).get("module_deploy_diagnostics") or {}
     deploy_diagnostic = deploy_diagnostics.get(effective_module_name) if isinstance(deploy_diagnostics, dict) else None
     installability_repair = _is_installability_repair_request(payload)
@@ -3118,6 +3206,28 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         target_hint=_target_hint(payload),
     )
     module_dir = project / module.path
+    coding_workspace = coding_workspaces.open_or_resume(
+        workspace_session_id=payload.workspace_session_id,
+        client_name=client_name,
+        project_path=project_path,
+    )
+    workspace_activation = coding_workspaces.activate_module(
+        str(coding_workspace["id"]),
+        module_name=effective_module_name,
+        module_path=str(module_dir),
+    )
+    coding_workspace = workspace_activation["workspace"]
+    workspace_module_context = workspace_activation["module"]
+    payload = payload.model_copy(update={
+        "workspace_session_id": coding_workspace["id"],
+    })
+    steps.append({
+        "step": "workflow.coding_workspace",
+        "status": workspace_activation["status"],
+        "workspace_session_id": coding_workspace["id"],
+        "module_count": len(coding_workspace.get("modules") or {}),
+        "evicted_module": workspace_activation.get("evicted_module"),
+    })
     module_contract, contract_record = _persist_module_contract(
         state_store,
         client_name=client_name,
@@ -3150,14 +3260,27 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     analysis_index: dict[str, Any] | None = None
     analysis_source_cache: dict[str, dict[str, Any]] = {}
     if not payload.writes and not payload.target_files:
-        analysis_index = ModuleAnalysisService().analyze(
-            project=project,
-            module_path=module_dir,
-            module_name=effective_module_name,
-            analysis_goal=payload.task_description,
-            max_files=adaptive_profile["inspection_file_limit"],
-            max_total_chars={"small": 12000, "medium": 18000, "large": 25000}[adaptive_profile["tier"]],
-        )
+        cached_workspace_analysis = workspace_module_context.get("analysis_index")
+        if isinstance(cached_workspace_analysis, dict):
+            analysis_index = dict(cached_workspace_analysis)
+            analysis_index["cache_hit"] = True
+            analysis_index["analysis_goal"] = payload.task_description
+            analysis_status = "workspace_cache"
+        else:
+            analysis_index = ModuleAnalysisService().analyze(
+                project=project,
+                module_path=module_dir,
+                module_name=effective_module_name,
+                analysis_goal=payload.task_description,
+                max_files=adaptive_profile["inspection_file_limit"],
+                max_total_chars={"small": 12000, "medium": 18000, "large": 25000}[adaptive_profile["tier"]],
+            )
+            coding_workspace = coding_workspaces.store_analysis(
+                str(coding_workspace["id"]),
+                module_name=effective_module_name,
+                analysis_index=analysis_index,
+            )
+            analysis_status = "cached" if analysis_index.get("cache_hit") else "built"
         analysis_source_cache = {
             f"{module.path.rstrip('/')}/{str(item.get('path') or '').lstrip('/')}": item
             for item in analysis_index.get("source_evidence") or []
@@ -3165,7 +3288,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         }
         steps.append({
             "step": "workflow.module_analyze.index",
-            "status": "cached" if analysis_index.get("cache_hit") else "built",
+            "status": analysis_status,
             "files": analysis_index.get("inventory", {}).get("returned_files", 0),
             "git_sha": analysis_index.get("git_sha"),
         })
@@ -3334,6 +3457,19 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     session_state = JsonStore().load_session_state(client_name=client_name)
     evidence_cache = (session_state.get("code_change_evidence") or {}) if isinstance(session_state, dict) else {}
     cached_evidence = evidence_cache.get(evidence_signature) if isinstance(evidence_cache, dict) else None
+    if coding_session_resumed and isinstance(coding_session.get("evidence"), dict):
+        session_evidence = coding_session["evidence"]
+        cached_evidence = {
+            "scope": session_evidence.get("scope"),
+            "frontend_preflight": session_evidence.get("frontend_preflight"),
+            "core_paths": list(session_evidence.get("core_paths") or []),
+            "task_profile": session_evidence.get("task_profile"),
+        }
+        steps.append({
+            "step": "workflow.inspection_evidence",
+            "status": "cached_session",
+            "session_id": coding_session.get("id"),
+        })
 
     # Ensure scope has at least manifest when nothing else exists.
     if not custom_file_paths_abs and manifest_abs.exists():
@@ -3404,7 +3540,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     # common dependency manifests are read with /home/odoo/src/odoo/addons priority.
     existing_scope_paths = {item.path for item in scope.instructions} if scope is not None else set()
     extra_core_reads: list[str] = []
-    for dep in ([] if frontend_fast_path else _parse_manifest_depends(manifest_abs)):
+    for dep in ([] if frontend_fast_path or coding_session_resumed else _parse_manifest_depends(manifest_abs)):
         if dep == effective_module_name:
             continue
         try:
@@ -3450,51 +3586,58 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         })
         gate.record_frontend_preflight(frontend_preflight, frontend_preflight_payload)
 
+    session_core_paths = list((cached_evidence or {}).get("core_paths") or []) if coding_session_resumed else []
     core_reads: list[dict[str, Any]] = []
-    core_files: list[Path] = []
-    core_file_seen: set[str] = set()
-    directory_extras: list[Path] = []
-    for raw_path in ranked_mandatory_paths:
-        path = Path(str(raw_path)).expanduser()
-        try:
-            resolved = path.resolve()
-        except Exception:
-            resolved = path
-        if resolved.is_dir():
-            files = _rank_core_directory_files(resolved, payload, write_rel_paths or frontend_paths)
-            if not files:
-                core_reads.append({"path": str(resolved), "status": "dir_no_readable_files"})
+    if session_core_paths:
+        core_reads = [
+            {"path": str(path), "status": "read", "read_mode": "coding_session_cache"}
+            for path in session_core_paths[:core_read_limit]
+        ]
+    else:
+        core_files: list[Path] = []
+        core_file_seen: set[str] = set()
+        directory_extras: list[Path] = []
+        for raw_path in ranked_mandatory_paths:
+            path = Path(str(raw_path)).expanduser()
+            try:
+                resolved = path.resolve()
+            except Exception:
+                resolved = path
+            if resolved.is_dir():
+                files = _rank_core_directory_files(resolved, payload, write_rel_paths or frontend_paths)
+                if not files:
+                    core_reads.append({"path": str(resolved), "status": "dir_no_readable_files"})
+                    continue
+                first = files[0]
+                if str(first) not in core_file_seen:
+                    core_file_seen.add(str(first)); core_files.append(first)
+                directory_extras.extend(files[1:])
                 continue
-            first = files[0]
-            if str(first) not in core_file_seen:
-                core_file_seen.add(str(first)); core_files.append(first)
-            directory_extras.extend(files[1:])
-            continue
-        if not resolved.exists() or not resolved.is_file():
-            core_reads.append({"path": str(resolved), "status": "missing"})
-            continue
-        if str(resolved) not in core_file_seen:
-            core_file_seen.add(str(resolved)); core_files.append(resolved)
+            if not resolved.exists() or not resolved.is_file():
+                core_reads.append({"path": str(resolved), "status": "missing"})
+                continue
+            if str(resolved) not in core_file_seen:
+                core_file_seen.add(str(resolved)); core_files.append(resolved)
 
-    terms = _core_relevance_terms(payload, write_rel_paths or frontend_paths)
-    suffixes = {Path(path).suffix.lower() for path in (write_rel_paths or frontend_paths) if Path(path).suffix}
-    directory_extras.sort(key=lambda path: _core_path_relevance(path, terms, suffixes, _normalized_task_type(payload)))
-    for file_path in directory_extras:
-        if len(core_files) >= core_read_limit:
-            break
-        if str(file_path) not in core_file_seen:
-            core_file_seen.add(str(file_path)); core_files.append(file_path)
+        terms = _core_relevance_terms(payload, write_rel_paths or frontend_paths)
+        suffixes = {Path(path).suffix.lower() for path in (write_rel_paths or frontend_paths) if Path(path).suffix}
+        directory_extras.sort(key=lambda path: _core_path_relevance(path, terms, suffixes, _normalized_task_type(payload)))
+        for file_path in directory_extras:
+            if len(core_files) >= core_read_limit:
+                break
+            if str(file_path) not in core_file_seen:
+                core_file_seen.add(str(file_path)); core_files.append(file_path)
 
-    for resolved in core_files[:core_read_limit]:
-        try:
-            _ = _read_text_safe(resolved, 200_000)
-            gate.record_repo_inspection(project_path=str(resolved.parent), relative_path=resolved.name, client_name=client_name, action="workflow.odoo_code_change.read_core", is_content_read=True)
-            core_reads.append({"path": str(resolved), "status": "read"})
-        except Exception as exc:  # noqa: BLE001
-            core_reads.append({"path": str(resolved), "status": "failed", "error": str(exc)})
+        for resolved in core_files[:core_read_limit]:
+            try:
+                _ = _read_text_safe(resolved, 200_000)
+                gate.record_repo_inspection(project_path=str(resolved.parent), relative_path=resolved.name, client_name=client_name, action="workflow.odoo_code_change.read_core", is_content_read=True)
+                core_reads.append({"path": str(resolved), "status": "read"})
+            except Exception as exc:  # noqa: BLE001
+                core_reads.append({"path": str(resolved), "status": "failed", "error": str(exc)})
     steps.append({
         "step": "repo.read_core",
-        "status": "ok",
+        "status": "cached_session" if session_core_paths else "ok",
         "count": len([r for r in core_reads if r.get("status") == "read"]),
         "limit": core_read_limit,
         "required_candidates": len(list(dict.fromkeys(mandatory_paths))),
@@ -3572,6 +3715,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
+            "coding_workspace": coding_workspaces.public_summary(coding_workspace),
             "steps": steps,
             "target_resolution": target_resolution_data,
             "clarification_gate": {
@@ -3659,6 +3803,65 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         }
 
     writes_to_apply = list(payload.writes or generated_writes)
+    coding_session_id = payload.coding_session_id or _code_operation_id(
+        payload,
+        client_name=client_name,
+        project_path=project_path,
+        module_name=effective_module_name,
+    )
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", coding_session_id):
+        coding_session_id = "codesess-" + hashlib.sha256(
+            coding_session_id.encode("utf-8")
+        ).hexdigest()[:24]
+    coding_session_evidence = {
+        "evidence_signature": evidence_signature,
+        "scope": scope.model_dump(mode="json") if scope is not None else None,
+        "frontend_preflight": frontend_preflight.model_dump(mode="json") if frontend_preflight is not None else None,
+        "core_paths": [r.get("path") for r in core_reads if r.get("status") == "read" and r.get("path")],
+        "target_resolution": target_resolution_data,
+        "task_profile": _task_profile(payload, frontend_paths),
+        "module_contract": module_contract,
+        "structure_findings": structure_findings,
+    }
+    session_target_files = [
+        str(r.get("relative_path"))
+        for r in custom_reads
+        if r.get("status") == "read" and r.get("relative_path")
+    ]
+    if coding_session_resumed:
+        coding_session = coding_sessions.mark(
+            coding_session_id,
+            "ready_to_write",
+            evidence=coding_session_evidence,
+            target_files=session_target_files,
+            workspace_session_id=str(coding_workspace["id"]),
+        )
+        coding_session["valid"] = True
+    else:
+        coding_session = coding_sessions.open(
+            session_id=coding_session_id,
+            client_name=client_name,
+            project_path=project_path,
+            module_name=effective_module_name,
+            module_path=str(module_dir),
+            task_description=payload.task_description,
+            target_files=session_target_files,
+            evidence=coding_session_evidence,
+            status_value="ready_to_write",
+            create_bundle=False,
+            workspace_session_id=str(coding_workspace["id"]),
+            snapshot_metadata=workspace_module_context,
+        )
+        coding_session["valid"] = True
+        steps.append({
+            "step": "workflow.coding_session",
+            "status": "opened",
+            "session_id": coding_session_id,
+            "bundle_version": coding_session.get("bundle_version"),
+            "base_sha": coding_session.get("base_sha"),
+        })
+    payload = payload.model_copy(update={"coding_session_id": coding_session_id})
+
     if not writes_to_apply:
         write_context = _exact_write_context(project, custom_reads, payload=payload)
         write_context_text = "\n".join(str(item.get("content") or "") for item in write_context)
@@ -3727,6 +3930,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 "client_name": client_name,
                 "project_path": project_path,
                 "module_name": effective_module_name,
+                "coding_session": coding_sessions.public_summary(coding_session),
+                "coding_workspace": coding_workspaces.public_summary(coding_workspace),
                 "steps": steps,
                 "workflow_profile": adaptive_profile,
                 "clarification_gate": clarification,
@@ -3790,6 +3995,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 "target_hint": _target_hint(payload),
                 "target_files": [r.get("relative_path") for r in custom_reads if r.get("status") == "read"],
                 "status": "awaiting_internal_writes",
+                "coding_session_id": coding_session_id,
                 "handoff": handoff,
                 "request": _code_change_continuation_arguments(
                     payload,
@@ -3802,6 +4008,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                         if r.get("status") == "read" and r.get("relative_path")
                     ],
                     preserve_writes=False,
+                    coding_session_id=coding_session_id,
                 ),
             }
         }, client_name=client_name)
@@ -3811,6 +4018,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
+            "coding_session": coding_sessions.public_summary(coding_session),
+            "coding_workspace": coding_workspaces.public_summary(coding_workspace),
             "steps": steps,
             "target_resolution": target_resolution_data,
             "custom_reads": custom_read_metadata,
@@ -3881,6 +4090,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                         if r.get("status") == "read" and r.get("relative_path")
                     ],
                     preserve_writes=False,
+                    coding_session_id=coding_session_id,
                 ),
                 "required_generated_arguments": ["writes"],
             },
@@ -3928,7 +4138,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             } if next_index < payload.total_batches else None,
         }
 
-    # 5) Apply writes through normal repo.write so the pre-write gate is still enforced.
+    # 5) Resolve the complete write set in memory, then apply it through one
+    # guarded rollback-safe batch transaction.
     final_batch_replay = bool(batch_already_staged and batch_record is not None)
     if final_batch_replay and batch_record.get("deploy_job_id"):
         job_id = str(batch_record["deploy_job_id"])
@@ -3938,6 +4149,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
+            "coding_session": coding_sessions.public_summary(coding_session),
+            "coding_workspace": coding_workspaces.public_summary(coding_workspace),
             "workflow_profile": adaptive_profile,
             "job_id": job_id,
             "completion_required": True,
@@ -3962,29 +4175,15 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         if final_batch_replay
         else []
     )
-    write_batch_size = int(adaptive_profile["local_batch_size"])
     writes_for_this_call = [] if final_batch_replay else writes_to_apply
-    for write_index, change in enumerate(writes_for_this_call, start=1):
+    prepared_write_items: list[RepoWriteItem] = []
+    prepared_write_meta: list[dict[str, Any]] = []
+    delete_rel_paths: list[str] = []
+    for change in writes_for_this_call:
         rel = _safe_module_relative(effective_module_name, change.relative_path)
         application_mode = "delete" if change.operation == "delete" else "full_content"
         if change.operation == "delete":
-            target = project / rel
-            if not target.exists():
-                write_results.append({"relative_path": rel, "status": "already_absent", "application_mode": application_mode})
-            else:
-                result = repo_delete(RepoDeleteRequest(project_path=project_path, client_name=client_name, relative_path=rel))
-                write_results.append({"relative_path": rel, "status": result.get("status", "deleted"), "application_mode": application_mode})
-            # Deleted paths remain visible to Git/deploy changed-file detection, but
-            # must not be passed to syntax/core verification as existing files.
-            if write_index % write_batch_size == 0 or write_index == len(writes_for_this_call):
-                steps.append({
-                    "step": "repo.write_batch",
-                    "status": "ok",
-                    "batch": ((write_index - 1) // write_batch_size) + 1,
-                    "completed_writes": write_index,
-                    "total_writes": len(writes_for_this_call),
-                    "deploy_started": False,
-                })
+            delete_rel_paths.append(rel)
             continue
         if change.content is not None and (change.search is not None or change.replace is not None):
             raise HTTPException(status_code=400, detail=f"Provide either content or search/replace, not both, for {rel}")
@@ -4034,43 +4233,134 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 if not change.regex and target.suffix.lower() == ".py" and change.count in {0, 1}:
                     detail += f"; safe function refresh was not applicable: {rebase_reason}"
                 raise HTTPException(status_code=409, detail=detail)
-        result = repo_write(RepoWriteRequest(
-            project_path=project_path,
-            client_name=client_name,
+        prepared_write_items.append(RepoWriteItem(
             relative_path=rel,
             content=new_content,
+            create_dirs=True,
             mode=change.mode,
             force=change.force,
         ))
-        written_abs = str((project / rel).resolve())
-        if written_abs not in written_files_abs:
-            written_files_abs.append(written_abs)
-        write_results.append({
+        prepared_write_meta.append({
             "relative_path": rel,
-            "status": "written",
-            "size": result.size,
             "application_mode": application_mode,
-            "extra": result.extra,
         })
-        for auto_rel in result.extra.get("auto_wired_init_files", []) if isinstance(result.extra, dict) else []:
-            auto_abs = str((project / str(auto_rel)).resolve())
-            if auto_abs not in written_files_abs:
-                written_files_abs.append(auto_abs)
-                write_results.append({"relative_path": str(auto_rel), "status": "auto_wired", "size": Path(auto_abs).stat().st_size})
-        if write_index % write_batch_size == 0 or write_index == len(writes_for_this_call):
-            steps.append({
-                "step": "repo.write_batch",
-                "status": "ok",
-                "batch": ((write_index - 1) // write_batch_size) + 1,
-                "completed_writes": write_index,
-                "total_writes": len(writes_for_this_call),
-                "deploy_started": False,
+
+    batch_strategy = "none"
+    if prepared_write_items:
+        batch_result = repo_write_many_smart(RepoWriteManySmartRequest(
+            project_path=project_path,
+            client_name=client_name,
+            files=prepared_write_items,
+            delete_paths=delete_rel_paths,
+            strategy="auto",
+            timeout_seconds=180,
+        ))
+        if batch_result.exit_code != 0:
+            raise HTTPException(
+                status_code=409,
+                detail=batch_result.stderr or batch_result.stdout or "Batch write failed and was rolled back.",
+            )
+        batch_strategy = "fast_safe" if "SMART_STRATEGY=fast_safe" in batch_result.stdout else "atomic"
+        for metadata in prepared_write_meta:
+            rel = str(metadata["relative_path"])
+            target = project / rel
+            written_abs = str(target.resolve())
+            if written_abs not in written_files_abs:
+                written_files_abs.append(written_abs)
+            write_results.append({
+                **metadata,
+                "status": "written",
+                "size": target.stat().st_size if target.is_file() else 0,
+                "batch_strategy": batch_strategy,
             })
+        auto_match = re.search(r"auto_wired_init_files=(\[[^\n]*\])", batch_result.stdout or "")
+        if auto_match:
+            try:
+                auto_paths = ast.literal_eval(auto_match.group(1))
+            except (SyntaxError, ValueError):
+                auto_paths = []
+            for auto_rel in auto_paths if isinstance(auto_paths, list) else []:
+                auto_abs = str((project / str(auto_rel)).resolve())
+                if auto_abs not in written_files_abs and Path(auto_abs).is_file():
+                    written_files_abs.append(auto_abs)
+                    write_results.append({
+                        "relative_path": str(auto_rel),
+                        "status": "auto_wired",
+                        "size": Path(auto_abs).stat().st_size,
+                        "batch_strategy": batch_strategy,
+                    })
+
+        for rel in delete_rel_paths:
+            if (project / rel).exists():
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Batch reported success but delete target still exists: {rel}",
+                )
+            write_results.append({
+                "relative_path": rel,
+                "status": "deleted",
+                "application_mode": "delete",
+                "batch_strategy": batch_strategy,
+            })
+    else:
+        # A delete-only request has no file payload for the public batch schema;
+        # each delete remains protected by its existing gate and audit path.
+        for rel in delete_rel_paths:
+            target = project / rel
+            if not target.exists():
+                write_results.append({"relative_path": rel, "status": "already_absent", "application_mode": "delete"})
+                continue
+            result = repo_delete(RepoDeleteRequest(project_path=project_path, client_name=client_name, relative_path=rel))
+            write_results.append({"relative_path": rel, "status": result.get("status", "deleted"), "application_mode": "delete"})
+
+    if writes_for_this_call:
+        steps.append({
+            "step": "repo.write_batch",
+            "status": "ok",
+            "batch_strategy": batch_strategy,
+            "completed_writes": len(writes_for_this_call),
+            "total_writes": len(writes_for_this_call),
+            "lock_transactions": 1 if prepared_write_items else len(delete_rel_paths),
+            "deploy_started": False,
+        })
     steps.append({
         "step": "repo.write",
         "status": "replayed" if final_batch_replay else "ok",
         "written_count": 0 if final_batch_replay else len(written_files_abs),
     })
+    if writes_for_this_call:
+        session_targets = [
+            _safe_module_relative(effective_module_name, change.relative_path)
+            for change in writes_for_this_call
+        ]
+        coding_workspace = coding_workspaces.refresh_module(
+            str(coding_workspace["id"]),
+            module_name=effective_module_name,
+            status_value="refreshed_after_write",
+        )
+        refreshed_workspace_module = dict(
+            (coding_workspace.get("modules") or {}).get(effective_module_name) or {}
+        )
+        coding_session = coding_sessions.refresh(
+            coding_session_id,
+            status_value="written",
+            target_files=session_targets,
+            evidence=coding_session_evidence,
+            create_bundle=False,
+            snapshot_metadata=refreshed_workspace_module,
+        )
+        steps.append({
+            "step": "workflow.coding_session_checkpoint",
+            "status": "workspace_snapshot_reused",
+            "session_id": coding_session_id,
+            "bundle_version": coding_session.get("bundle_version"),
+        })
+        steps.append({
+            "step": "workflow.coding_workspace_checkpoint",
+            "status": "refreshed_after_write",
+            "workspace_session_id": coding_workspace["id"],
+            "module_name": effective_module_name,
+        })
 
     if batch_record is not None and payload.batch_index < payload.total_batches - 1:
         batch_verify = verify_against_core(SyntaxVerifyRequest(
@@ -4092,6 +4382,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 "client_name": client_name,
                 "project_path": project_path,
                 "module_name": effective_module_name,
+                "coding_session": coding_sessions.public_summary(coding_session),
+                "coding_workspace": coding_workspaces.public_summary(coding_workspace),
                 "workflow_profile": adaptive_profile,
                 "steps": steps,
                 "write_results": write_results,
@@ -4320,12 +4612,33 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             + [str(item.file) for item in core_errors if item.file]
             + [str(r.get("relative_path")) for r in custom_reads if r.get("status") == "read" and r.get("relative_path")]
         ))
+        if (coding_session.get("bundle") or {}).get("sha256"):
+            coding_session = coding_sessions.mark(
+                coding_session_id,
+                "repair_required",
+                target_files=repair_targets,
+                repair_attempts=repair_attempts,
+            )
+        else:
+            coding_session = coding_sessions.refresh(
+                coding_session_id,
+                status_value="repair_required",
+                target_files=repair_targets,
+                evidence=coding_session_evidence,
+            )
+            coding_session = coding_sessions.mark(
+                coding_session_id,
+                "repair_required",
+                repair_attempts=repair_attempts,
+            )
         return {
             "status": "internal_repair_required",
             "message": "INTERNAL_CONTINUATION_REQUIRED: a newly introduced or task-required verification error remains. Apply only the returned blocking findings and immediately rerun workflow.odoo_code_change; do not stop, summarize, or ask the user to repair files.",
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
+            "coding_session": coding_sessions.public_summary(coding_session),
+            "coding_workspace": coding_workspaces.public_summary(coding_workspace),
             "steps": steps,
             "target_resolution": target_resolution_data,
             "write_results": write_results,
@@ -4381,6 +4694,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     )
 
     if not payload.auto_deploy:
+        coding_session = coding_sessions.mark(coding_session_id, "ready_to_deploy")
         handoff = _save_code_operation_handoff(
             state_store,
             payload=payload,
@@ -4400,6 +4714,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
+            "coding_session": coding_sessions.public_summary(coding_session),
+            "coding_workspace": coding_workspaces.public_summary(coding_workspace),
             "steps": steps,
             "write_results": write_results,
             "qa": qa_struct,
@@ -4435,10 +4751,16 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         force_new_deploy=payload.force_new_deploy,
     )
     try:
+        coding_session = coding_sessions.mark(coding_session_id, "deploying")
         deploy = await safe_deploy_module(deploy_payload)
         deploy_struct = deploy.model_dump(mode="json") if hasattr(deploy, "model_dump") else deploy
     except HTTPException as exc:
         deploy_detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+        coding_session = coding_sessions.mark(
+            coding_session_id,
+            "deploy_blocked",
+            deploy_blocker=str(deploy_detail.get("message") or deploy_detail)[:3000],
+        )
         handoff = _save_code_operation_handoff(
             state_store,
             payload=payload,
@@ -4458,6 +4780,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "client_name": client_name,
             "project_path": project_path,
             "module_name": effective_module_name,
+            "coding_session": coding_sessions.public_summary(coding_session),
+            "coding_workspace": coding_workspaces.public_summary(coding_workspace),
             "steps": steps + [{"step": "workflow.safe_deploy_module", "status": "blocked", "detail": deploy_detail}],
             "write_results": write_results,
             "git_diff": {"exit_code": diff.exit_code, "stdout_preview": diff.stdout[-12000:], "stderr_preview": diff.stderr[-4000:]},
@@ -4473,6 +4797,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "allowed_summary": "Code was written and verified, but not pushed/deployed/upgraded. Fix the deploy validation blocker, then rerun with auto_deploy=true.",
         }
     job_id = deploy_struct.get("job_id") if isinstance(deploy_struct, dict) else None
+    coding_session = coding_sessions.mark(coding_session_id, "deploying", deploy_job_id=job_id)
     if batch_record is not None:
         _record_code_batch_deploy(
             state_store,
@@ -4517,6 +4842,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "client_name": client_name,
         "project_path": project_path,
         "module_name": effective_module_name,
+        "coding_session": coding_sessions.public_summary(coding_session),
+        "coding_workspace": coding_workspaces.public_summary(coding_workspace),
         "steps": steps,
         "target_resolution": target_resolution_data,
         "write_results": write_results,

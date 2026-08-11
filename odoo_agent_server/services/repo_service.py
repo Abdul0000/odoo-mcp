@@ -651,20 +651,39 @@ class RepoService:
         finally:
             patch_path.unlink(missing_ok=True)
 
-    def write_many_atomic(self, project_path: str, files: list[object], check_only: bool = False, timeout_seconds: int = 60) -> CommandResult:
+    def write_many_atomic(
+        self,
+        project_path: str,
+        files: list[object],
+        check_only: bool = False,
+        timeout_seconds: int = 60,
+        delete_paths: list[str] | None = None,
+    ) -> CommandResult:
         """Write many files as one atomic transaction via temp worktree/branch."""
         project = self.project(project_path)
         normalized_files = self._normalise_write_many_files(project, files, action="repo.write_many_atomic")
+        normalized_deletes = self._normalise_delete_many_paths(
+            project, delete_paths or [], normalized_files, action="repo.write_many_atomic"
+        )
 
         return self._run_atomic_worktree_transaction(
             project=project,
             transaction_name="repo.write_many_atomic",
             timeout_seconds=timeout_seconds,
             check_only=check_only,
-            mutate_worktree=lambda worktree: self._write_many_inside_worktree_with_wiring(worktree, normalized_files),
+            mutate_worktree=lambda worktree: self._write_many_inside_worktree_with_wiring(
+                worktree, normalized_files, normalized_deletes
+            ),
         )
 
-    def write_many_fast_safe(self, project_path: str, files: list[object], check_only: bool = False, timeout_seconds: int = 30) -> CommandResult:
+    def write_many_fast_safe(
+        self,
+        project_path: str,
+        files: list[object],
+        check_only: bool = False,
+        timeout_seconds: int = 30,
+        delete_paths: list[str] | None = None,
+    ) -> CommandResult:
         """Write small related files without the heavy git-worktree transaction.
 
         This path is intentionally still safe: it validates every path, takes the
@@ -675,8 +694,14 @@ class RepoService:
         """
         project = self.project(project_path)
         normalized_files = self._normalise_write_many_files(project, files, action="repo.write_many_fast_safe")
+        normalized_deletes = self._normalise_delete_many_paths(
+            project, delete_paths or [], normalized_files, action="repo.write_many_fast_safe"
+        )
         normalized_files, auto_wired = self._expand_odoo_package_writes(project, normalized_files)
-        allowed, reason = self._fast_safe_write_allowed(normalized_files)
+        normalized_deletes = self._normalise_delete_many_paths(
+            project, normalized_deletes, normalized_files, action="repo.write_many_fast_safe"
+        )
+        allowed, reason = self._fast_safe_write_allowed(normalized_files, normalized_deletes)
         if not allowed:
             return CommandResult(
                 command=["repo", "write_many_fast_safe"],
@@ -699,6 +724,7 @@ class RepoService:
                     f"Fast-safe check-only passed for {len(normalized_files)} file(s), "
                     f"{total_bytes} bytes total. Real checkout unchanged.\n"
                     f"files={', '.join(str(item['relative_path']) for item in normalized_files)}\n"
+                    f"delete_paths={normalized_deletes}\n"
                     f"auto_wired_init_files={auto_wired}"
                 ),
             )
@@ -720,6 +746,11 @@ class RepoService:
                     if target.exists() and not target.is_file():
                         raise RuntimeError(f"Target exists but is not a file: {target}")
                     backups[rel] = target.read_bytes() if target.exists() else None
+                for rel in normalized_deletes:
+                    target = self._safe_join(project, rel)
+                    if target.exists() and not target.is_file():
+                        raise RuntimeError(f"Delete target exists but is not a file: {target}")
+                    backups[rel] = target.read_bytes() if target.exists() else None
 
                 for item in normalized_files:
                     rel = str(item["relative_path"])
@@ -733,6 +764,13 @@ class RepoService:
                     tmp.write_bytes(new_bytes)
                     tmp.replace(target)
                     changed.append(rel)
+                for rel in normalized_deletes:
+                    target = self._safe_join(project, rel)
+                    if target.exists():
+                        target.unlink()
+                        changed.append(rel)
+                    else:
+                        unchanged.append(rel)
             except Exception as exc:  # noqa: BLE001
                 rollback_errors: list[str] = []
                 for rel, old_bytes in backups.items():
@@ -762,33 +800,56 @@ class RepoService:
                 f"changed={changed}\n"
                 f"unchanged={unchanged}\n"
                 f"auto_wired_init_files={auto_wired}\n"
-                f"files={len(normalized_files)} total_bytes={total_bytes} elapsed_ms={elapsed_ms}\n"
+                f"files={len(normalized_files)} deletes={len(normalized_deletes)} total_bytes={total_bytes} elapsed_ms={elapsed_ms}\n"
                 "Next: run git.diff and workflow.verify_against_core on these changed files only."
             ),
         )
 
-    def write_many_smart(self, project_path: str, files: list[object], check_only: bool = False, timeout_seconds: int = 60, strategy: str = "auto") -> CommandResult:
+    def write_many_smart(
+        self,
+        project_path: str,
+        files: list[object],
+        check_only: bool = False,
+        timeout_seconds: int = 60,
+        strategy: str = "auto",
+        delete_paths: list[str] | None = None,
+    ) -> CommandResult:
         """Choose the fastest safe writer without weakening validation quality."""
         project = self.project(project_path)
         normalized_files = self._normalise_write_many_files(project, files, action="repo.write_many_smart")
+        normalized_deletes = self._normalise_delete_many_paths(
+            project, delete_paths or [], normalized_files, action="repo.write_many_smart"
+        )
         normalized_files, _ = self._expand_odoo_package_writes(project, normalized_files)
         strategy = (strategy or "auto").strip().lower()
         if strategy not in {"auto", "fast_safe", "atomic"}:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="strategy must be one of: auto, fast_safe, atomic")
 
         if strategy == "atomic":
-            return self.write_many_atomic(project_path, files, check_only=check_only, timeout_seconds=timeout_seconds)
+            return self.write_many_atomic(
+                project_path, files, check_only=check_only, timeout_seconds=timeout_seconds,
+                delete_paths=normalized_deletes,
+            )
 
-        allowed, reason = self._fast_safe_write_allowed(normalized_files)
+        allowed, reason = self._fast_safe_write_allowed(normalized_files, normalized_deletes)
         if strategy == "fast_safe":
-            return self.write_many_fast_safe(project_path, files, check_only=check_only, timeout_seconds=min(timeout_seconds, 180))
+            return self.write_many_fast_safe(
+                project_path, files, check_only=check_only, timeout_seconds=min(timeout_seconds, 180),
+                delete_paths=normalized_deletes,
+            )
 
         if allowed:
-            result = self.write_many_fast_safe(project_path, files, check_only=check_only, timeout_seconds=min(timeout_seconds, 180))
+            result = self.write_many_fast_safe(
+                project_path, files, check_only=check_only, timeout_seconds=min(timeout_seconds, 180),
+                delete_paths=normalized_deletes,
+            )
             result.stdout = "SMART_STRATEGY=fast_safe\n" + result.stdout
             return result
 
-        result = self.write_many_atomic(project_path, files, check_only=check_only, timeout_seconds=timeout_seconds)
+        result = self.write_many_atomic(
+            project_path, files, check_only=check_only, timeout_seconds=timeout_seconds,
+            delete_paths=normalized_deletes,
+        )
         result.stdout = f"SMART_STRATEGY=atomic reason={reason}\n" + result.stdout
         return result
 
@@ -813,6 +874,35 @@ class RepoService:
         if not normalized_files:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="files must not be empty")
         return normalized_files
+
+    def _normalise_delete_many_paths(
+        self,
+        project: Path,
+        delete_paths: list[str],
+        files: list[dict[str, object]],
+        *,
+        action: str,
+    ) -> list[str]:
+        write_paths = {str(item["relative_path"]) for item in files}
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_path in delete_paths:
+            self._reject_git_internal_path(str(raw_path))
+            resolved = self._safe_join(project, str(raw_path))
+            rel = resolved.relative_to(project).as_posix()
+            if rel in write_paths:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Path cannot be written and deleted in the same {action}: {rel}",
+                )
+            if rel in seen:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Duplicate delete path in {action}: {rel}",
+                )
+            seen.add(rel)
+            normalized.append(rel)
+        return normalized
 
     def _resolve_write_content(self, existing_bytes: bytes | None, item: dict[str, object], rel: str) -> bytes:
         """Apply mode + shrink-guard for one file inside a multi-file write. Returns final bytes to write."""
@@ -840,12 +930,17 @@ class RepoService:
                 )
         return new_content.encode("utf-8")
 
-    def _fast_safe_write_allowed(self, files: list[dict[str, object]]) -> tuple[bool, str]:
+    def _fast_safe_write_allowed(
+        self,
+        files: list[dict[str, object]],
+        delete_paths: list[str] | None = None,
+    ) -> tuple[bool, str]:
         max_files = max(1, int(getattr(settings, "fast_write_max_files", 8)))
         max_each = max(1, int(getattr(settings, "fast_write_max_bytes_each", 300_000)))
         max_total = max(1, int(getattr(settings, "fast_write_max_total_bytes", 750_000)))
-        if len(files) > max_files:
-            return False, f"file count {len(files)} > max {max_files}"
+        mutation_count = len(files) + len(delete_paths or [])
+        if mutation_count > max_files:
+            return False, f"mutation count {mutation_count} > max {max_files}"
         total = 0
         for item in files:
             rel = str(item["relative_path"])
@@ -947,7 +1042,12 @@ class RepoService:
             changed.append(rel)
         return CommandResult(command=["repo", "write_many_atomic"], cwd=str(worktree), exit_code=0, stdout="Prepared files: " + ", ".join(changed))
 
-    def _write_many_inside_worktree_with_wiring(self, worktree: Path, files: list[dict[str, object]]) -> CommandResult:
+    def _write_many_inside_worktree_with_wiring(
+        self,
+        worktree: Path,
+        files: list[dict[str, object]],
+        delete_paths: list[str] | None = None,
+    ) -> CommandResult:
         try:
             expanded, auto_wired = OdooPackageWiringService().expand(worktree, files)
         except Exception as exc:  # noqa: BLE001
@@ -959,7 +1059,26 @@ class RepoService:
             )
         result = self._write_many_inside_worktree(worktree, expanded)
         if result.exit_code == 0:
+            write_paths = {str(item["relative_path"]) for item in expanded}
+            collision = next((rel for rel in delete_paths or [] if rel in write_paths), None)
+            if collision:
+                return CommandResult(
+                    command=["repo", "write_many_atomic"], cwd=str(worktree), exit_code=1,
+                    stderr=f"Path cannot be written and deleted in the same repo.write_many_atomic: {collision}",
+                )
+            deleted: list[str] = []
+            for rel in delete_paths or []:
+                target = self._safe_join(worktree, rel)
+                if target.exists() and not target.is_file():
+                    return CommandResult(
+                        command=["repo", "write_many_atomic"], cwd=str(worktree), exit_code=1,
+                        stderr=f"Delete target exists but is not a file: {target}",
+                    )
+                if target.exists():
+                    target.unlink()
+                    deleted.append(rel)
             result.stdout = result.stdout + f"\nauto_wired_init_files={auto_wired}"
+            result.stdout = result.stdout + f"\ndeleted_files={deleted}"
         return result
 
     @staticmethod

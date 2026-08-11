@@ -204,11 +204,11 @@ def repo_apply_patch(payload: RepoPatchRequest) -> CommandResult:
 @router.post("/write-many-fast-safe", response_model=CommandResult)
 def repo_write_many_fast_safe(payload: RepoWriteManyFastSafeRequest) -> CommandResult:
     _require_explicit_client_when_multiclient(payload, "repo.write_many_fast_safe")
-    PreWriteGateService().ensure_repo_write_allowed(project_path=payload.project_path, relative_paths=[item.relative_path for item in payload.files], client_name=payload.client_name, action="repo.write_many_fast_safe", check_only=payload.check_only)
+    PreWriteGateService().ensure_repo_write_allowed(project_path=payload.project_path, relative_paths=[item.relative_path for item in payload.files] + payload.delete_paths, client_name=payload.client_name, action="repo.write_many_fast_safe", check_only=payload.check_only)
     approval = ApprovalService()
     if not payload.check_only:
         approval.ensure_allowed("repo.write_many_fast_safe", payload.approval_id, _preview(payload))
-    result = RepoService().write_many_fast_safe(payload.project_path, payload.files, payload.check_only, payload.timeout_seconds)
+    result = RepoService().write_many_fast_safe(payload.project_path, payload.files, payload.check_only, payload.timeout_seconds, payload.delete_paths)
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.write_many_fast_safe succeeded", "repo.write_many_fast_safe failed")
     if not payload.check_only or result.exit_code != 0:
@@ -219,11 +219,11 @@ def repo_write_many_fast_safe(payload: RepoWriteManyFastSafeRequest) -> CommandR
 @router.post("/write-many-smart", response_model=CommandResult)
 def repo_write_many_smart(payload: RepoWriteManySmartRequest) -> CommandResult:
     _require_explicit_client_when_multiclient(payload, "repo.write_many_smart")
-    PreWriteGateService().ensure_repo_write_allowed(project_path=payload.project_path, relative_paths=[item.relative_path for item in payload.files], client_name=payload.client_name, action="repo.write_many_smart", check_only=payload.check_only)
+    PreWriteGateService().ensure_repo_write_allowed(project_path=payload.project_path, relative_paths=[item.relative_path for item in payload.files] + payload.delete_paths, client_name=payload.client_name, action="repo.write_many_smart", check_only=payload.check_only)
     approval = ApprovalService()
     if not payload.check_only:
         approval.ensure_allowed("repo.write_many_smart", payload.approval_id, _preview(payload))
-    result = RepoService().write_many_smart(payload.project_path, payload.files, payload.check_only, payload.timeout_seconds, payload.strategy)
+    result = RepoService().write_many_smart(payload.project_path, payload.files, payload.check_only, payload.timeout_seconds, payload.strategy, payload.delete_paths)
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.write_many_smart succeeded", "repo.write_many_smart failed")
     if not payload.check_only or result.exit_code != 0:
@@ -234,11 +234,11 @@ def repo_write_many_smart(payload: RepoWriteManySmartRequest) -> CommandResult:
 @router.post("/write-many-atomic", response_model=CommandResult)
 def repo_write_many_atomic(payload: RepoWriteManyAtomicRequest) -> CommandResult:
     _require_explicit_client_when_multiclient(payload, "repo.write_many_atomic")
-    PreWriteGateService().ensure_repo_write_allowed(project_path=payload.project_path, relative_paths=[item.relative_path for item in payload.files], client_name=payload.client_name, action="repo.write_many_atomic", check_only=payload.check_only)
+    PreWriteGateService().ensure_repo_write_allowed(project_path=payload.project_path, relative_paths=[item.relative_path for item in payload.files] + payload.delete_paths, client_name=payload.client_name, action="repo.write_many_atomic", check_only=payload.check_only)
     approval = ApprovalService()
     if not payload.check_only:
         approval.ensure_allowed("repo.write_many_atomic", payload.approval_id, _preview(payload))
-    result = RepoService().write_many_atomic(payload.project_path, payload.files, payload.check_only, payload.timeout_seconds)
+    result = RepoService().write_many_atomic(payload.project_path, payload.files, payload.check_only, payload.timeout_seconds, payload.delete_paths)
     if not payload.check_only:
         approval.finalize_command(payload.approval_id, result.exit_code, "repo.write_many_atomic succeeded", "repo.write_many_atomic failed")
     if not payload.check_only or result.exit_code != 0:

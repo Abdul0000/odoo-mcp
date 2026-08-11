@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
+from odoo_agent_server.schemas import RepoWriteItem
+from odoo_agent_server.services.repo_service import RepoService
 
 
 def _auth():
@@ -69,6 +71,42 @@ def test_repo_write_many_smart_accepts_path_alias(tmp_path, monkeypatch):
     assert response.json()["exit_code"] == 0
     assert (project / "sale_order_notebook_tab" / "models" / "sale_order.py").read_text(encoding="utf-8") == "from odoo import fields, models\n"
     assert (project / "sale_order_notebook_tab" / "views" / "sale_order_views.xml").read_text(encoding="utf-8") == "<odoo/>\n"
+
+
+def test_repo_write_many_smart_writes_and_deletes_in_one_transaction(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    project.mkdir()
+    keep = project / "keep.txt"
+    remove = project / "remove.txt"
+    keep.write_text("before\n", encoding="utf-8")
+    remove.write_text("obsolete\n", encoding="utf-8")
+
+    result = RepoService().write_many_smart(
+        str(project),
+        [RepoWriteItem(relative_path="keep.txt", content="after\n")],
+        delete_paths=["remove.txt"],
+    )
+
+    assert result.exit_code == 0
+    assert keep.read_text(encoding="utf-8") == "after\n"
+    assert not remove.exists()
+    assert "deletes=1" in result.stdout
+
+
+def test_repo_write_many_rejects_write_delete_collision(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    project.mkdir()
+
+    with pytest.raises(Exception) as exc_info:
+        RepoService().write_many_smart(
+            str(project),
+            [RepoWriteItem(relative_path="same.txt", content="new\n")],
+            delete_paths=["same.txt"],
+        )
+
+    assert "cannot be written and deleted" in str(exc_info.value)
 
 
 def test_repo_rejects_path_escape(tmp_path, monkeypatch):

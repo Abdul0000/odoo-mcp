@@ -489,11 +489,17 @@ For every coding task, the MCP agent should start with the repository tools, not
 repo_prepare → repo_list_custom_modules → repo_read → repo_apply_patch_atomic or repo_write_many_smart → git_diff → qa_self_run → workflow_verify_against_core(changed files only) → workflow_safe_deploy_module → workflow_resume_job/jobs_get only when returned as next_call
 ```
 
+`workflow.odoo_code_change` now owns this sequence as a persistent coding session. The first call prepares the checkout, resolves the module/targets, and reads focused custom and installed-source evidence. Its repository workspace creates one SHA-bound uncompressed module ZIP checkpoint and the task session adopts that validated snapshot metadata instead of archiving the same module twice. When a generated-write continuation is required it returns `needs_writes`, focused contexts, `coding_session_id`, and `workspace_session_id`. The continuation passes both IDs unchanged, skips pull/module-wide discovery/core rereads while the Git SHA and module fingerprint are unchanged, rereads only exact write targets for safety, and applies the complete change set through one smart batch transaction. Search/replace resolution happens in memory before mutation; related writes and deletes share rollback protection. QA, core verification, Git, deployment, and module upgrade remain unchanged and server-owned.
+
+If another process changes Git HEAD or module files, the session returns `coding_session_stale` before applying generated writes. Its clean `next_call` starts a fresh inspection, preventing stale-context edits. Bundles are internal checkpoints under the state directory; they are never committed, pushed, or exposed as arbitrary filesystem paths.
+
+Each repository also receives a durable `workspace_session_id`. It retains at most five independently fingerprinted module contexts, loads a module only when a task requests it, and evicts the least recently used module when full. A task's `coding_session_id` remains strict to that exact task/module; the workspace ID may be carried to a different module in the same checkout. Writes immediately resnapshot only the active module and invalidate its cached analysis. After a successful Git push, unchanged cached modules are rebound to the new HEAD without rereading, while changed modules are resnapshotted and invalidated. Workspace cache maintenance is best-effort metadata and cannot block Git, QA, deployment, or upgrade.
+
 New MCP/REST tools:
 
 - `repo.prepare`: clones the target repo if missing, otherwise runs `git fetch`, `git checkout <branch>`, and `git pull --ff-only origin <branch>`. Defaults come from `TARGET_GIT_REPO`, `TARGET_GIT_BRANCH`, `TARGET_PROJECT_PATH`, and `WORKSPACE_ROOT`.
 - `repo.list_custom_modules`: scans the checkout for Odoo custom modules using `__manifest__.py`, instead of relying only on installed modules in Odoo.
-- `repo.write_many_smart`: preferred multi-file writer; auto-selects fast-safe for small edits and atomic worktree for larger/riskier edits.
+- `repo.write_many_smart`: preferred multi-file writer; auto-selects fast-safe for small edits and atomic worktree for larger/riskier edits. Optional `delete_paths` join writes and deletes in the same transaction.
 - `repo.write_many_fast_safe`: small multi-file writer with path validation, repo lock, backups, temporary replacement, and rollback; no git worktree overhead.
 - `repo.write_many_atomic`: large/risky multi-file writer; writes many files as one all-or-none temp worktree transaction; the real checkout is touched only after the full generated diff validates.
 - `repo.apply_patch_atomic`: validates and applies a multi-file patch in a temporary worktree/branch, then validates the resulting diff against the real checkout before applying it.
@@ -507,6 +513,10 @@ ODOO_AGENT_API_TOKEN=<strong-random-secret>
 ODOO_AGENT_BACKGROUND_MAX_WORKERS=2
 ODOO_AGENT_WATCHDOG_ENABLED=true
 ODOO_AGENT_WATCHDOG_MODE=safe_redirect
+ODOO_AGENT_FAST_WRITE_MAX_FILES=50
+ODOO_AGENT_FAST_WRITE_MAX_BYTES_EACH=500000
+ODOO_AGENT_FAST_WRITE_MAX_TOTAL_BYTES=5000000
+ODOO_AGENT_CODING_SESSION_TTL_SECONDS=3600
 TARGET_GIT_REPO=git@github.com:Abdul0000/test_18.git
 TARGET_GIT_BRANCH=feature_branch
 TARGET_PROJECT_PATH=/workspace/repos/odoo_project

@@ -419,6 +419,26 @@ class OdooCodeChangeRequest(BaseModel):
     allow_autopatch: bool = Field(default=False, description="Enable supported structured style/text autopatches. An explicit quoted replacement such as Replace 'Old' with 'New' is always eligible when it occurs exactly once; ambiguous or complex work remains two-pass.")
     target_files: list[str] = Field(default_factory=list, max_length=50, description="Candidate/target files inside the module to read and use for scope advice")
     writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=50, description="Actual file edits to apply (maximum 50). If empty, an unambiguous deterministic small edit may complete in one call; complex work returns focused inspection context for an exact second-call write.")
+    coding_session_id: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+        description=(
+            "Server-owned SHA-bound coding session returned by a previous inspect/repair phase. "
+            "Pass it unchanged with generated writes to reuse the prepared checkout, module bundle, and source evidence."
+        ),
+    )
+    workspace_session_id: str | None = Field(
+        default=None,
+        min_length=8,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+        description=(
+            "Repo-bound workspace context returned by code-change. Preserve it across separate tasks "
+            "in the same checkout to reuse up to five independently validated module contexts."
+        ),
+    )
     operation_id: str | None = Field(default=None, max_length=64, description="Stable idempotency key required for a multi-batch large-module write.")
     batch_index: int = Field(default=0, ge=0, le=19, description="Zero-based local write batch index.")
     total_batches: int = Field(default=1, ge=1, le=20, description="Total local write batches. Only the final batch can reach full QA/deploy.")
@@ -902,6 +922,11 @@ class RepoWriteManyAtomicRequest(BaseProjectRequest, ApprovalMixin):
     model_config = ConfigDict(extra="forbid")
 
     files: list[RepoWriteItem] = Field(..., min_length=1, max_length=200, description="Files to write as one atomic multi-file transaction")
+    delete_paths: list[str] = Field(
+        default_factory=list,
+        max_length=200,
+        description="Optional paths to delete in the same rollback-safe transaction as files.",
+    )
     check_only: bool = Field(default=False, description="Validate the transaction without changing the real checkout")
     timeout_seconds: int = Field(default=60, ge=5, le=300)
 
@@ -910,6 +935,11 @@ class RepoWriteManyFastSafeRequest(BaseProjectRequest, ApprovalMixin):
     model_config = ConfigDict(extra="forbid")
 
     files: list[RepoWriteItem] = Field(..., min_length=1, max_length=50, description="Small related files to write using lock + backup + rollback, without git worktree overhead")
+    delete_paths: list[str] = Field(
+        default_factory=list,
+        max_length=50,
+        description="Optional paths to delete in the same lock + backup + rollback transaction as files.",
+    )
     check_only: bool = Field(default=False, description="Validate paths, limits, and parent directories without changing the checkout")
     timeout_seconds: int = Field(default=30, ge=5, le=180, description="Lock timeout for the fast-safe write")
 
