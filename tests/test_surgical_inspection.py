@@ -42,6 +42,7 @@ from odoo_agent_server.config import settings
 from odoo_agent_server.services.coding_session_service import CodingSessionService, CodingWorkspaceService
 from odoo_agent_server.services.git_service import GitService
 from odoo_agent_server.services.verification_proof_service import VerificationProofService
+from odoo_agent_server.services.workflow_progress_service import WorkflowProgressService
 from odoo_agent_server.routers.workflow import _normalise_safe_deploy_paths
 from odoo_agent_server.schemas import (
     JobRecord,
@@ -189,7 +190,8 @@ def test_coding_session_restores_canonical_task_on_provider_paraphrase():
 
 
 @pytest.mark.asyncio
-async def test_code_change_wrapper_keeps_event_loop_responsive(monkeypatch):
+async def test_code_change_wrapper_keeps_event_loop_responsive(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     async def blocking_impl(_payload):
         time.sleep(0.15)
         return {"status": "ok"}
@@ -204,6 +206,37 @@ async def test_code_change_wrapper_keeps_event_loop_responsive(monkeypatch):
     assert heartbeat_elapsed < 0.10
     assert result["status"] == "ok"
     assert result["orchestration_metrics"]["queue_wait_ms"] >= 0
+    assert result["workflow_progress"]["terminal"] is True
+    assert result["workflow_progress"]["current_phase"] == "completed"
+    recent = WorkflowProgressService.summary()["recent"]
+    assert recent[0]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_code_change_exposes_live_progress_while_worker_is_running(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    started = threading.Event()
+    release = threading.Event()
+
+    async def blocking_impl(_payload):
+        started.set()
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+        return {"status": "ok", "orchestration_metrics": {"total_ms": 10, "phases_ms": {}}}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change_impl", blocking_impl)
+    task = asyncio.create_task(tools_router._workflow_odoo_code_change(_payload("Observed code change")))
+    while not started.is_set():
+        await asyncio.sleep(0.01)
+
+    progress = WorkflowProgressService.summary()
+    assert progress["active_count"] == 1
+    assert progress["active"][0]["current_phase"] == "starting"
+    assert progress["active"][0]["terminal"] is False
+
+    release.set()
+    result = await task
+    assert result["workflow_progress"]["terminal"] is True
 
 
 @pytest.mark.asyncio

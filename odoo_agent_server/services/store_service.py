@@ -67,6 +67,7 @@ class JsonStore:
         self.jobs_dir = self.root / "jobs"
         self.audit_file = self.root / "audit.json"
         self.mutations_file = self.root / "functional_mutations.json"
+        self.workflow_progress_file = self.root / "workflow_progress.json"
         self.artifacts_dir = self.root / "artifacts"
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self._migrate_legacy_jobs()
@@ -125,6 +126,36 @@ class JsonStore:
             stat = path.stat()
             self._read_cache[str(path)] = (stat.st_mtime, stat.st_size, [dict(row) for row in rows])
             return result
+
+    def update_workflow_progress(self, operation_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+        """Atomically merge one bounded, secret-free workflow progress record."""
+        def update(rows: list[dict[str, Any]]) -> dict[str, Any]:
+            index = next(
+                (idx for idx, row in enumerate(rows) if row.get("operation_id") == operation_id),
+                None,
+            )
+            record = dict(rows[index]) if index is not None else {"operation_id": operation_id}
+            record.update(changes)
+            if index is None:
+                rows.append(record)
+            else:
+                rows[index] = record
+            rows.sort(key=lambda row: str(row.get("last_progress_at") or ""))
+            del rows[:-50]
+            return dict(record)
+
+        return self._update_list(self.workflow_progress_file, update)
+
+    def get_workflow_progress(self, operation_id: str) -> dict[str, Any] | None:
+        for row in self._read_list(self.workflow_progress_file):
+            if row.get("operation_id") == operation_id:
+                return row
+        return None
+
+    def list_workflow_progress(self, limit: int = 5) -> list[dict[str, Any]]:
+        rows = self._read_list(self.workflow_progress_file)
+        rows.sort(key=lambda row: str(row.get("last_progress_at") or ""), reverse=True)
+        return rows[:max(1, min(int(limit), 50))]
 
     def create_approval(self, record: ApprovalRecord) -> ApprovalRecord:
         self._update_list(self.approvals_file, lambda rows: rows.append(record.model_dump(mode="json")))

@@ -162,6 +162,8 @@ from ..services.existing_target_resolution_service import ExistingTargetResoluti
 from ..services.coding_session_service import CodingSessionService, CodingWorkspaceService
 from ..services.verification_proof_service import VerificationProofService
 from ..services.background_executor import submit_background
+from ..services.runtime_identity_service import runtime_identity
+from ..services.workflow_progress_service import WorkflowProgressService
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
@@ -3075,11 +3077,34 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     loop = asyncio.get_running_loop()
     submitted_at = time.perf_counter()
     worker_started_at: list[float] = []
+    progress = WorkflowProgressService()
+    progress_id = progress.operation_id(payload)
+    progress.start(
+        progress_id,
+        client_name=payload.client_name,
+        module_name=payload.module_name,
+    )
 
     def run() -> dict[str, Any]:
         worker_started_at.append(time.perf_counter())
+        queue_wait_ms = round((worker_started_at[0] - submitted_at) * 1000)
+        progress.phase(progress_id, "starting", queue_wait_ms=queue_wait_ms)
         try:
-            return asyncio.run(_workflow_odoo_code_change_impl(payload))
+            result = asyncio.run(_workflow_odoo_code_change_impl(payload))
+            if isinstance(result, dict):
+                metrics = dict(result.get("orchestration_metrics") or {})
+                metrics["queue_wait_ms"] = queue_wait_ms
+                metrics["admission_capacity"] = _CODING_WORKFLOW_ADMISSION_CAPACITY
+                result["orchestration_metrics"] = metrics
+                result["workflow_progress"] = progress.finish(
+                    progress_id,
+                    status=str(result.get("status") or "completed"),
+                    metrics=metrics,
+                )
+            return result
+        except BaseException as exc:
+            progress.fail(progress_id, exc)
+            raise
         finally:
             # Release only after protected work actually finishes. A disconnected
             # or cancelled caller must not free capacity while its worker remains
@@ -3092,12 +3117,6 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         admission.release()
         raise
     result = await asyncio.shield(future)
-    if isinstance(result, dict):
-        metrics = dict(result.get("orchestration_metrics") or {})
-        started = worker_started_at[0] if worker_started_at else submitted_at
-        metrics["queue_wait_ms"] = round((started - submitted_at) * 1000)
-        metrics["admission_capacity"] = _CODING_WORKFLOW_ADMISSION_CAPACITY
-        result["orchestration_metrics"] = metrics
     return result
 
 
@@ -3110,9 +3129,16 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     """
     workflow_started = time.perf_counter()
     phase_timings: dict[str, int] = {}
+    progress = WorkflowProgressService()
+    progress_id = progress.operation_id(payload)
 
-    def phase_done(name: str, started: float) -> None:
-        phase_timings[name] = round((time.perf_counter() - started) * 1000)
+    def phase_started(name: str, **extra: Any) -> None:
+        progress.phase(progress_id, name, **extra)
+
+    def phase_done(name: str, started: float, **extra: Any) -> None:
+        elapsed_ms = round((time.perf_counter() - started) * 1000)
+        phase_timings[name] = elapsed_ms
+        progress.phase_done(progress_id, name, elapsed_ms, **extra)
 
     def orchestration_metrics() -> dict[str, Any]:
         return {
@@ -3121,6 +3147,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         }
 
     prepare_started = time.perf_counter()
+    phase_started("repo_prepare", client_name=payload.client_name, module_name=payload.module_name)
     resolved_client_name, project_path = _resolve_code_change_project(payload)
     client_name = resolved_client_name or payload.client_name
     repo = RepoService()
@@ -3228,6 +3255,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
 
     # 2) Discover/validate module once, with a safe fuzzy resolver for human hints.
     discovery_started = time.perf_counter()
+    phase_started("module_discovery")
     _ensure_root_module_scaffold(repo, project, payload)
     modules = repo.list_custom_modules(project_path, max_depth=5, include_uninstallable=False)
     module, module_resolution = _resolve_fuzzy_module(payload, modules)
@@ -3302,6 +3330,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     module_dir = project / module.path
     module_root_rel = module.path
     workspace_started = time.perf_counter()
+    phase_started("workspace_activation", client_name=client_name, module_name=effective_module_name)
     coding_workspace = coding_workspaces.open_or_resume(
         workspace_session_id=payload.workspace_session_id,
         client_name=client_name,
@@ -3334,7 +3363,12 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         "module_count": len(coding_workspace.get("modules") or {}),
         "evicted_module": workspace_activation.get("evicted_module"),
     })
-    phase_done("workspace_activation", workspace_started)
+    phase_done(
+        "workspace_activation",
+        workspace_started,
+        cache_hit=bool(workspace_activation.get("cache_hit")),
+        workspace_cache_hit=bool(workspace_activation.get("cache_hit")),
+    )
     module_contract, contract_record = _persist_module_contract(
         state_store,
         client_name=client_name,
@@ -3353,6 +3387,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     )
     persisted_requirements = "\n\n--- Additional requirement ---\n\n".join(contract_record.get("requirement_sources") or [])
     analysis_started = time.perf_counter()
+    phase_started("validation_and_index")
     cached_workspace_analysis = workspace_module_context.get("analysis_index")
     cached_validator_findings = (
         cached_workspace_analysis.get("validator_findings")
@@ -3421,8 +3456,17 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
             "files": analysis_index.get("inventory", {}).get("returned_files", 0),
             "git_sha": analysis_index.get("git_sha"),
         })
-    phase_done("validation_and_index", analysis_started)
+    phase_done(
+        "validation_and_index",
+        analysis_started,
+        cache_hit=bool(
+            workspace_activation.get("cache_hit")
+            or (analysis_index and analysis_index.get("cache_hit"))
+        ),
+        analysis_cache_hit=bool(analysis_index and analysis_index.get("cache_hit")),
+    )
     inspection_started = time.perf_counter()
+    phase_started("focused_inspection")
 
     # 3) Read custom manifest + target/custom files.  This also records gate evidence.
     custom_rel_paths: list[str] = [manifest_rel]
@@ -4245,6 +4289,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
 
     phase_done("focused_inspection", inspection_started)
     write_started = time.perf_counter()
+    phase_started("write_and_checkpoint")
     batch_record, batch_fingerprint, batch_already_staged = _prepare_code_batch(
         state_store,
         client_name=client_name,
@@ -4630,6 +4675,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     verification_started = time.perf_counter()
+    phase_started("qa_and_core_verification")
     qa = self_run(SelfRunRequest(
         project_path=project_path,
         client_name=client_name,
@@ -4916,6 +4962,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     )
     try:
         coding_session = coding_sessions.mark(coding_session_id, "deploying")
+        phase_started("deploy_handoff")
         deploy = await safe_deploy_module(deploy_payload)
         deploy_struct = deploy.model_dump(mode="json") if hasattr(deploy, "model_dump") else deploy
     except HTTPException as exc:
@@ -6822,7 +6869,12 @@ def _start_client_validation(req: ClientCheckRequest) -> dict[str, Any]:
 async def _dispatch(name: str, args: dict) -> object:
     if name == "connector.health":
         EmptyRequest.model_validate(args)
-        return {"status": "ok", "service": "odoo-mcp-agent-connector"}
+        return {
+            "status": "ok",
+            "service": "odoo-mcp-agent-connector",
+            "runtime": runtime_identity(),
+            "workflow_progress": WorkflowProgressService.summary(),
+        }
     if name == "skills.list":
         req = SkillListRequest.model_validate(args)
         return SkillService().list(req.task_description)

@@ -258,3 +258,24 @@ def test_provider_workflow_preserves_long_module_requirements():
         task_description="Build a comprehensive module. " + ("Detailed requirement. " * 300),
     )
     assert len(request.task_description) > 2000
+
+
+def test_provider_health_exposes_live_identity_and_workflow_progress():
+    client = TestClient(app)
+    response = client.post(
+        "/mcp",
+        headers={"Authorization": f"Bearer {settings.api_token}"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "connector_health", "arguments": {}},
+        },
+    )
+
+    assert response.status_code == 200
+    structured = response.json()["result"]["structuredContent"]
+    assert structured["runtime"]["service_version"]
+    assert structured["runtime"]["commit_sha"]
+    assert structured["runtime"]["prompt_sha256"]
+    assert {"active_count", "active", "recent"} <= set(structured["workflow_progress"])

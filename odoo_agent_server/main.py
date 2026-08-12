@@ -27,14 +27,15 @@ from .routers.repo import router as repo_router
 from .routers.tools import router as tools_router
 from .routers.workflow import router as workflow_router
 from .services.prompt_service import load_mcp_system_prompt, load_client_check_system_prompt
-from .services.skill_service import SkillService
+from .services.runtime_identity_service import SERVICE_VERSION, runtime_identity
+from .services.workflow_progress_service import WorkflowProgressService
 
 if os.getenv("RENDER", "").lower() in {"1", "true", "yes"} and settings.api_token == "change-me":
     raise RuntimeError("ODOO_AGENT_API_TOKEN must be set to a non-default secret on Render")
 
 app = FastAPI(
     title="Odoo MCP Agent Connector",
-    version="1.8.1",
+    version=SERVICE_VERSION,
     description=(
         "Provider-safe Odoo 16-19 development connector with server-owned source discovery, "
         "verification, Git, Odoo.sh deployment, recovery jobs, OAuth, and on-demand skills."
@@ -75,6 +76,8 @@ def health() -> dict[str, object]:
     return {
         "status": "ok" if status["coding_workflow_ready"] else "degraded",
         "service": "odoo-mcp-agent-connector",
+        "runtime": runtime_identity(),
+        "workflow_progress": WorkflowProgressService.summary(),
         **status,
     }
 
@@ -92,12 +95,13 @@ def agent_instructions() -> dict:
     if len(client_names) > 1 and not ClientGateService().any_validated_client():
         return {
             "version": "client-check-gate",
+            "runtime": runtime_identity(),
             "prompt_source": "CLIENT_CHECK_SYSTEM_PROMPT.md",
             "system_prompt": load_client_check_system_prompt(),
             "requires_client_selection": True,
             "requires_validation": True,
             "available_client_names": client_names,
-            "next_action": "Call client.check, ask the user to select client_name, then call client.check(client_name=..., validate=true). After it passes, call workflow.agent_instructions again to load MCP_SYSTEM_PROMPT.md.",
+            "next_action": "Call client_check, ask the user to select client_name, then call client_check(client_name=..., validate=true). After it passes, call workflow_agent_instructions again.",
         }
     try:
         active_client = ClientResolverService().resolve_client(require_complete=False)
@@ -109,22 +113,23 @@ def agent_instructions() -> dict:
 
     return {
         "version": "v18-compact",
+        "runtime": runtime_identity(),
         "prompt_source": "MCP_SYSTEM_PROMPT.md",
         "system_prompt": load_mcp_system_prompt(),
         "instructions": {
             "role": "Odoo 16-19 development agent. Use the provider-safe composite workflow; installed source is final authority.",
             "rules": [
-                "Follow system_prompt exactly. Use workflow.odoo_code_change or its stated lane, execute returned next_call values, and trust server claim fields over prose.",
+                "Follow system_prompt exactly. Use workflow_odoo_code_change or its stated lane, execute returned next_call values, and trust server claim fields over prose.",
                 "Never call hidden repo, Git, verification, or deploy tools, expose credentials, or put Pydantic code inside Odoo addons; terminal success requires the proof defined in system_prompt.",
             ],
             "provider_flow": {
-                "code_change": "workflow.odoo_code_change",
-                "debug_and_fix": "workflow.odoo_debug_and_fix",
-                "module_analysis": "workflow.module_analyze",
-                "visual_change": "workflow.frontend_visual_implement",
-                "direct_install_check": "workflow.module_install_and_check",
-                "continuation": ["jobs.get", "workflow.resume_job"],
-                "diagnostics": ["artifacts.read", "odoosh.error_pack"],
+                "code_change": "workflow_odoo_code_change",
+                "debug_and_fix": "workflow_odoo_debug_and_fix",
+                "module_analysis": "workflow_module_analyze",
+                "visual_change": "workflow_frontend_visual_implement",
+                "direct_install_check": "workflow_module_install_and_check",
+                "continuation": ["jobs_get", "workflow_resume_job"],
+                "diagnostics": ["artifacts_read", "odoosh_error_pack"],
                 "terminal_success": ["deploy_confirmed=true", "already_deployed_confirmed=true"],
                 "debug_terminal_success": "truth_gate.verified_fixed=true",
                 "terminal_action": "stop_and_summarize",
@@ -132,17 +137,16 @@ def agent_instructions() -> dict:
             },
             "skills": {
                 "mode": "on_demand",
-                "list_tool": "skills.list",
-                "read_tool": "skills.read",
+                "list_tool": "skills_list",
+                "read_tool": "skills_read",
                 "selection": (
-                    "For an unclear domain, call skills.list with task_description and load only its "
+                    "For an unclear domain, call skills_list with task_description and load only its "
                     "single primary recommendation. Do not load overlapping skills."
                 ),
-                "available": SkillService.names(),
             },
             "multi_client": {
                 "available_clients": client_names if client_names else ["(using TARGET_GIT_* configuration)"],
-                "selection_rule": "When more than one client exists, client.check must pass for the explicitly selected client before workflow calls.",
+                "selection_rule": "When more than one client exists, client_check must pass for the explicitly selected client before workflow calls.",
             },
             "config": {
                 "repo_url": repo,
@@ -156,6 +160,7 @@ def agent_instructions() -> dict:
 def root() -> dict[str, object]:
     return {
         "service": "Odoo MCP Agent Connector",
+        "runtime": runtime_identity(),
         "ui": "not_required",
         "docs": "/docs",
         "openapi": "/openapi.json",
