@@ -13,6 +13,7 @@ from odoo_agent_server.services import live_assertion_service
 from odoo_agent_server.services.odoosh_service import OdooShService
 from odoo_agent_server.routers.tools import (
     _build_safe_generic_autopatch,
+    _build_validated_write_contract,
     _analysis_index_target_paths,
     _contract_candidate_paths,
     _complete_code_batch,
@@ -27,6 +28,7 @@ from odoo_agent_server.routers.tools import (
     _exact_write_context,
     _focused_search,
     _infer_code_change_search_patterns,
+    _inline_write_contexts,
     _rank_core_directory_files,
     _rank_core_required_paths,
     _prepare_code_batch,
@@ -34,6 +36,8 @@ from odoo_agent_server.routers.tools import (
     _save_code_operation_handoff,
     _task_description_search_clues,
     _target_edit_policy_rule,
+    _validate_contract_write_paths,
+    _validated_session_write_contract,
     _safe_unique_python_function_rebase,
     _safe_module_relative,
     _write_generation_output_schema,
@@ -56,6 +60,7 @@ from odoo_agent_server.schemas import (
     OdooDebugRecordAssertion,
     OdooDebugRuntimeReplay,
     OdooResult,
+    OdooTargetResolutionResult,
 )
 
 
@@ -731,6 +736,207 @@ def test_coding_session_can_checkpoint_direct_write_without_zip(tmp_path, monkey
         "codeop-session-003", client_name="Test 18", project_path=str(project),
         task_description="Direct deterministic fix",
     )["valid"] is True
+
+
+def _write_contract_fixture(tmp_path):
+    project = tmp_path / "repo"
+    module = project / "custom_sale"
+    target = module / "models" / "sale_order.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    manifest = module / "__manifest__.py"
+    manifest.write_text("{'name': 'Custom Sale'}\n", encoding="utf-8")
+    dependency = tmp_path / "core" / "sale" / "models" / "sale_order.py"
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text("CORE = 1\n", encoding="utf-8")
+    resolution = OdooTargetResolutionResult(
+        status="verified",
+        mode="existing",
+        kind="method",
+        identifier="action_confirm",
+        source_verified=True,
+        reason="Exact custom target verified.",
+        edit_policy={
+            "ownership": "client_custom",
+            "strategy": "direct_edit",
+            "direct_edit_paths": [str(target.resolve())],
+            "protected_source_paths": [],
+            "reason": "Edit the existing custom owner.",
+        },
+    )
+    contract = _build_validated_write_contract(
+        project=project,
+        module_name="custom_sale",
+        module_path="custom_sale",
+        manifest_path="custom_sale/__manifest__.py",
+        target_resolution=resolution.model_dump(mode="json"),
+        module_contract={"required_methods": ["action_confirm"]},
+        validator_findings=[],
+        custom_reads=[{
+            "relative_path": "custom_sale/models/sale_order.py",
+            "status": "read",
+        }],
+        core_reads=[{"path": str(dependency), "status": "read"}],
+    )
+    session = {
+        "module_name": "custom_sale",
+        "module_path": str(module.resolve()),
+        "status": "ready_to_write",
+        "evidence": {"write_contract": contract},
+    }
+    payload = OdooCodeChangeRequest(
+        project_path=str(project),
+        module_name="custom_sale",
+        task_description="Update existing action_confirm method",
+        coding_session_id="codeop-contract-001",
+        writes=[OdooCodeFileChange(
+            relative_path="custom_sale/models/sale_order.py",
+            search="VALUE = 1",
+            replace="VALUE = 2",
+            count=1,
+        )],
+        auto_deploy=False,
+    )
+    return project, dependency, resolution, contract, session, payload
+
+
+def test_validated_write_contract_reuses_target_and_detects_dependency_change(tmp_path):
+    project, dependency, resolution, _contract, session, payload = _write_contract_fixture(tmp_path)
+
+    resumed, stale_reason = _validated_session_write_contract(session, payload, project)
+    assert stale_reason is None
+    assert resumed["target_resolution"]["identifier"] == "action_confirm"
+    _validate_contract_write_paths(
+        project=project,
+        module_root_rel="custom_sale",
+        target_resolution=resolution,
+        writes=payload.writes,
+    )
+
+    dependency.write_text("CORE = 2\n", encoding="utf-8")
+    resumed, stale_reason = _validated_session_write_contract(session, payload, project)
+    assert resumed is None
+    assert stale_reason.startswith("inspected_dependency_changed:")
+
+
+def test_validated_write_contract_rejects_out_of_phase_replay(tmp_path):
+    project, _dependency, _resolution, _contract, session, payload = _write_contract_fixture(tmp_path)
+    session["status"] = "deploying"
+
+    resumed, stale_reason = _validated_session_write_contract(session, payload, project)
+
+    assert resumed is None
+    assert stale_reason == "coding_session_phase_deploying"
+
+
+def test_validated_write_contract_allows_owned_repair_and_batch_retry(tmp_path):
+    project, _dependency, _resolution, _contract, session, payload = _write_contract_fixture(tmp_path)
+    session["status"] = "repair_required"
+
+    resumed, stale_reason = _validated_session_write_contract(session, payload, project)
+    assert stale_reason is None
+    assert resumed is not None
+
+    session["status"] = "written"
+    batch_payload = payload.model_copy(update={
+        "operation_id": "batch-contract-001",
+        "batch_index": 0,
+        "total_batches": 2,
+    })
+    resumed, stale_reason = _validated_session_write_contract(session, batch_payload, project)
+    assert stale_reason is None
+    assert resumed is not None
+
+
+def test_write_context_overflow_preserves_complete_units_for_artifact():
+    contexts = [
+        {"relative_path": f"module/models/file_{index}.py", "content": "x" * 6000}
+        for index in range(3)
+    ]
+
+    inline, complete = _inline_write_contexts(contexts, max_chars=10_000)
+
+    assert complete is False
+    assert inline == [contexts[0]]
+    assert contexts[1]["content"] == "x" * 6000
+
+
+@pytest.mark.asyncio
+async def test_two_pass_write_handoff_does_not_repeat_module_or_target_resolution(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    module = project / "custom_sale"
+    models = module / "models"
+    models.mkdir(parents=True)
+    (module / "__manifest__.py").write_text(
+        "{'name': 'Custom Sale', 'version': '18.0.1.0.0', 'depends': ['sale']}\n",
+        encoding="utf-8",
+    )
+    (module / "__init__.py").write_text("from . import models\n", encoding="utf-8")
+    (models / "__init__.py").write_text("from . import sale_order\n", encoding="utf-8")
+    target = models / "sale_order.py"
+    target.write_text(
+        "from odoo import models\n\n"
+        "class SaleOrder(models.Model):\n"
+        "    _inherit = 'sale.order'\n\n"
+        "    def action_confirm(self):\n"
+        "        return super().action_confirm()\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=project, check=True)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=project, check=True, capture_output=True)
+    monkeypatch.setattr(
+        tools_router.ClientResolverService,
+        "resolve_client",
+        lambda *_args, **_kwargs: None,
+    )
+
+    first = await tools_router._workflow_odoo_code_change_impl(OdooCodeChangeRequest(
+        project_path=str(project),
+        module_name="custom_sale",
+        task_description="Update existing action_confirm method",
+        target_hint="action_confirm",
+        task_type="python_model",
+        target_files=["custom_sale/models/sale_order.py"],
+        auto_deploy=False,
+    ))
+    assert first["status"] == "needs_writes"
+
+    monkeypatch.setattr(
+        tools_router.RepoService,
+        "list_custom_modules",
+        lambda *_args, **_kwargs: pytest.fail("module discovery repeated on validated write handoff"),
+    )
+    monkeypatch.setattr(
+        tools_router.ExistingTargetResolutionService,
+        "resolve",
+        lambda *_args, **_kwargs: pytest.fail("target resolution repeated on validated write handoff"),
+    )
+    arguments = dict(first["next_call"]["arguments"])
+    arguments["auto_deploy"] = False
+    arguments["writes"] = [{
+        "relative_path": "custom_sale/models/sale_order.py",
+        "search": "        return super().action_confirm()",
+        "replace": "        result = super().action_confirm()\n        return result",
+        "count": 1,
+    }]
+
+    second = await tools_router._workflow_odoo_code_change_impl(
+        OdooCodeChangeRequest.model_validate(arguments)
+    )
+
+    assert second["status"] in {
+        "ready_to_deploy", "verified_not_deployed", "qa_failed", "verification_failed",
+    }
+    assert "result = super().action_confirm()" in target.read_text(encoding="utf-8")
+    assert any(
+        step.get("status") == "validated_write_contract"
+        for step in second.get("steps") or []
+    )
 
 
 def test_handoff_storage_failure_is_nonblocking():

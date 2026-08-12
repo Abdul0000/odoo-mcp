@@ -124,6 +124,7 @@ class WorkflowProgressService:
             "workspace_cache_hit",
             "analysis_cache_hit",
             "queue_wait_ms",
+            "write_handoff_mode",
         }
         return {key: value[key] for key in allowed if key in value}
 

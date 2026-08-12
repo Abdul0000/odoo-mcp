@@ -39,6 +39,7 @@ from ..schemas import (
     RestoreLastGoodCommitRequest,
     MenuCrawlerRequest,
     CodingTaskPlanRequest,
+    CustomModuleItem,
     OdooCodeChangeRequest,
     OdooDebugAndFixRequest,
     OdooDebugEvidenceRecord,
@@ -170,6 +171,7 @@ router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency
 _STRICT_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _CLIENT_VALIDATION_START_LOCK = threading.Lock()
 _CLIENT_VALIDATION_STALE_SECONDS = 900
+_VALIDATED_WRITE_CONTRACT_VERSION = 1
 
 
 def strict_safe_tool_name(name: str) -> str:
@@ -321,7 +323,8 @@ _TOOL_DESCRIPTORS = [
             "New files must use full content writes, not search/replace; missing parent directories are created automatically. "
             "A cached Odoo-aware index maps functional labels through menus/actions/views/models/fields/QWeb/JS relationships, then reads exact match-centered ranges. "
             "Task descriptions automatically supply quoted identifiers/selectors/XML IDs/methods for focused inspection. "
-            "An exact quoted replacement that occurs once can complete in one call; ambiguous or complex work returns exact editable source units in write_generation.contexts for a second call with non-empty writes. "
+            "An exact quoted replacement that occurs once can complete in one call; complex work returns exact editable source units and an on-demand context artifact when needed. "
+            "A valid coding_session_id plus writes uses the server-owned target contract and skips repeated module discovery, semantic inspection, and target resolution. "
             "The returned workspace_session_id keeps up to five module snapshots warm for separate tasks in the same checkout; modules load only on demand, use LRU eviction, revalidate independently, and refresh after writes/push. "
             "Keep coding_session_id only for its exact task, but preserve workspace_session_id when switching modules in the same repository. "
             "Existing-addon surgical changes use baseline-delta QA: unchanged unrelated legacy findings are reported but do not block commit/deploy; new, task-required, manifest/version, and changed-scope errors still block."
@@ -1673,6 +1676,159 @@ def _exact_write_context(
         if remaining < 1000:
             break
     return contexts
+
+
+def _sha256_path(path: Path) -> str | None:
+    """Hash one inspected file without following missing/non-file targets."""
+    try:
+        if not path.is_file():
+            return None
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _build_validated_write_contract(
+    *,
+    project: Path,
+    module_name: str,
+    module_path: str,
+    manifest_path: str,
+    target_resolution: dict[str, Any],
+    module_contract: dict[str, Any],
+    validator_findings: list[dict[str, Any]],
+    custom_reads: list[dict[str, Any]],
+    core_reads: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Create the immutable server-owned handoff used by the write pass.
+
+    Target interpretation is complete at this point. The continuation needs to
+    prove that source evidence is still current, not infer the target again.
+    """
+    external_evidence: list[dict[str, str]] = []
+    for item in core_reads:
+        if item.get("status") != "read" or not item.get("path"):
+            continue
+        path = Path(str(item["path"])).expanduser().resolve()
+        digest = _sha256_path(path)
+        if digest:
+            external_evidence.append({"path": str(path), "sha256": digest})
+
+    inspected_paths = list(dict.fromkeys(
+        str(item.get("relative_path") or "")
+        for item in custom_reads
+        if item.get("status") == "read" and item.get("relative_path")
+    ))
+    raw = {
+        "version": _VALIDATED_WRITE_CONTRACT_VERSION,
+        "module_name": module_name,
+        "module_path": module_path,
+        "manifest_path": manifest_path,
+        "target_resolution": target_resolution,
+        "module_contract": module_contract,
+        "validator_findings": validator_findings,
+        "inspected_paths": inspected_paths,
+        "external_evidence": external_evidence,
+    }
+    signature_payload = json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str)
+    raw["signature"] = hashlib.sha256(signature_payload.encode("utf-8")).hexdigest()
+    return raw
+
+
+def _validated_session_write_contract(
+    coding_session: dict[str, Any] | None,
+    payload: OdooCodeChangeRequest,
+    project: Path,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return a current write contract or a concrete stale-evidence reason.
+
+    Legacy sessions deliberately fall back to the full workflow. A present but
+    changed contract is stale and must never be silently reinterpreted.
+    """
+    if not coding_session or not payload.writes or payload.clarification_answer:
+        return None, None
+    evidence = coding_session.get("evidence")
+    contract = dict((evidence or {}).get("write_contract") or {}) if isinstance(evidence, dict) else {}
+    if not contract:
+        return None, None
+    signature = str(contract.pop("signature", ""))
+    expected = hashlib.sha256(
+        json.dumps(contract, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    contract["signature"] = signature
+    if not signature or signature != expected:
+        return None, "validated_write_contract_changed"
+    if int(contract.get("version") or 0) != _VALIDATED_WRITE_CONTRACT_VERSION:
+        return None, "validated_write_contract_version_changed"
+    if str(contract.get("module_name") or "") != str(coding_session.get("module_name") or ""):
+        return None, "validated_write_contract_module_changed"
+    module = (project / str(contract.get("module_path") or "")).resolve()
+    try:
+        module.relative_to(project.resolve())
+    except ValueError:
+        return None, "validated_write_contract_path_escaped"
+    if module != Path(str(coding_session.get("module_path") or "")).resolve() or not module.is_dir():
+        return None, "validated_write_contract_module_missing"
+    status_value = str(coding_session.get("status") or "")
+    allowed_statuses = {"ready_to_write", "repair_required"}
+    if payload.total_batches > 1:
+        allowed_statuses.add("written")
+    if status_value not in allowed_statuses:
+        return None, f"coding_session_phase_{status_value or 'unknown'}"
+    try:
+        resolution = OdooTargetResolutionResult.model_validate(contract.get("target_resolution") or {})
+    except ValidationError:
+        return None, "validated_target_contract_invalid"
+    if resolution.writes_blocked:
+        return None, "validated_target_contract_blocks_writes"
+    for item in contract.get("external_evidence") or []:
+        path = Path(str(item.get("path") or "")).expanduser().resolve()
+        if _sha256_path(path) != str(item.get("sha256") or ""):
+            return None, f"inspected_dependency_changed:{path}"
+    return contract, None
+
+
+def _validate_contract_write_paths(
+    *,
+    project: Path,
+    module_root_rel: str,
+    target_resolution: OdooTargetResolutionResult,
+    writes: list[OdooCodeFileChange],
+) -> None:
+    """Bind generated writes to the verified custom-module boundary."""
+    if target_resolution.writes_blocked:
+        raise HTTPException(status_code=409, detail="Validated target contract blocks writes")
+    planned = {
+        _safe_module_relative(module_root_rel.rsplit("/", 1)[-1], item.relative_path, module_root_rel)
+        for item in writes
+    }
+    module = (project / module_root_rel).resolve()
+    for rel in planned:
+        try:
+            (project / rel).resolve().relative_to(module)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=f"Write escaped validated module contract: {rel}") from exc
+
+
+def _inline_write_contexts(
+    contexts: list[dict[str, Any]],
+    *,
+    max_chars: int = 10_000,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Keep complete source units inline; move overflow to an artifact."""
+    selected: list[dict[str, Any]] = []
+    used = 0
+    for item in contexts:
+        size = len(json.dumps(item, ensure_ascii=False, default=str))
+        if used + size > max_chars:
+            break
+        selected.append(item)
+        used += size
+    return selected, len(selected) == len(contexts)
 
 
 def _module_hint_tokens(value: str) -> set[str]:
@@ -3159,6 +3315,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     coding_workspace: dict[str, Any] | None = None
     workspace_module_context: dict[str, Any] = {}
     coding_session_resumed = False
+    validated_write_contract: dict[str, Any] | None = None
     steps: list[dict[str, Any]] = []
 
     if payload.coding_session_id:
@@ -3204,6 +3361,9 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
             }
         payload, task_scope_restored = _restore_coding_session_task(payload, coding_session)
         coding_session_resumed = True
+        payload = payload.model_copy(update={
+            "module_name": str(coding_session.get("module_name") or payload.module_name),
+        })
         if not payload.workspace_session_id and coding_session.get("workspace_session_id"):
             payload = payload.model_copy(update={
                 "workspace_session_id": coding_session.get("workspace_session_id"),
@@ -3253,12 +3413,67 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
                 raise
     phase_done("repo_prepare", prepare_started)
 
+    if coding_session_resumed:
+        validated_write_contract, contract_stale_reason = _validated_session_write_contract(
+            coding_session,
+            payload,
+            project,
+        )
+        if contract_stale_reason:
+            refresh_arguments = payload.model_dump(mode="json", exclude_none=True)
+            refresh_arguments.pop("coding_session_id", None)
+            refresh_arguments.pop("writes", None)
+            return {
+                "status": "coding_session_stale",
+                "message": "Validated inspection evidence changed; no write was applied.",
+                "reason": contract_stale_reason,
+                "client_name": client_name,
+                "project_path": project_path,
+                "module_name": str(coding_session.get("module_name") or payload.module_name),
+                "coding_session": coding_sessions.public_summary(coding_session),
+                "writes_blocked": True,
+                "success_allowed": False,
+                "completion_required": True,
+                "next_call": {
+                    "tool": "workflow.odoo_code_change",
+                    "arguments": refresh_arguments,
+                    "required_generated_arguments": [],
+                },
+            }
+
     # 2) Discover/validate module once, with a safe fuzzy resolver for human hints.
     discovery_started = time.perf_counter()
     phase_started("module_discovery")
-    _ensure_root_module_scaffold(repo, project, payload)
-    modules = repo.list_custom_modules(project_path, max_depth=5, include_uninstallable=False)
-    module, module_resolution = _resolve_fuzzy_module(payload, modules)
+    modules: list[CustomModuleItem] = []
+    if validated_write_contract:
+        module_path = str(validated_write_contract["module_path"])
+        manifest_path = str(validated_write_contract["manifest_path"])
+        module_dir_from_contract = (project / module_path).resolve()
+        manifest_from_contract = (project / manifest_path).resolve()
+        if not module_dir_from_contract.is_dir() or not manifest_from_contract.is_file():
+            return {
+                "status": "coding_session_stale",
+                "message": "The validated module or manifest is no longer present; no write was applied.",
+                "reason": "validated_module_layout_changed",
+                "writes_blocked": True,
+                "success_allowed": False,
+                "completion_required": True,
+            }
+        module = CustomModuleItem(
+            module_name=str(validated_write_contract["module_name"]),
+            path=module_path,
+            manifest_path=manifest_path,
+        )
+        module_resolution = {
+            "requested": payload.module_name,
+            "resolved": module.module_name,
+            "strategy": "validated_write_contract",
+            "score": 1.0,
+        }
+    else:
+        _ensure_root_module_scaffold(repo, project, payload)
+        modules = repo.list_custom_modules(project_path, max_depth=5, include_uninstallable=False)
+        module, module_resolution = _resolve_fuzzy_module(payload, modules)
     if not module:
         return {
             "status": "failed",
@@ -3318,7 +3533,11 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
             f"{payload.task_description}\n\nConfirmed user clarification:\n"
             f"{str(payload.clarification_answer).strip()}"
         )
-    current_contract = OdooModuleValidator.requested_contract(effective_task_description, payload.create_module)
+    current_contract = (
+        dict(validated_write_contract.get("module_contract") or {})
+        if validated_write_contract
+        else OdooModuleValidator.requested_contract(effective_task_description, payload.create_module)
+    )
     issue_fingerprint = code_change_issue_fingerprint(
         project_path=project_path,
         module_name=effective_module_name,
@@ -3368,15 +3587,23 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         workspace_started,
         cache_hit=bool(workspace_activation.get("cache_hit")),
         workspace_cache_hit=bool(workspace_activation.get("cache_hit")),
+        write_handoff_mode="validated_contract" if validated_write_contract else "full",
     )
-    module_contract, contract_record = _persist_module_contract(
-        state_store,
-        client_name=client_name,
-        project_path=project_path,
-        module_name=effective_module_name,
-        current_contract=current_contract,
-        task_description=effective_task_description,
-    )
+    if validated_write_contract:
+        module_contract = dict(validated_write_contract.get("module_contract") or {})
+        stored_contracts = state_store.load_session_state(client_name).get("module_contracts") or {}
+        contract_record = dict(stored_contracts.get(effective_module_name) or {})
+        contract_record.setdefault("status", "pending")
+        contract_record.setdefault("requirement_sources", [payload.task_description])
+    else:
+        module_contract, contract_record = _persist_module_contract(
+            state_store,
+            client_name=client_name,
+            project_path=project_path,
+            module_name=effective_module_name,
+            current_contract=current_contract,
+            task_description=effective_task_description,
+        )
     adaptive_profile = _adaptive_workflow_profile(
         payload,
         module_contract,
@@ -3394,7 +3621,14 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         if isinstance(cached_workspace_analysis, dict)
         else None
     )
-    if coding_session_resumed and isinstance(cached_validator_findings, list):
+    if validated_write_contract:
+        reusable_validator_findings = list(validated_write_contract.get("validator_findings") or [])
+        structure_findings = [
+            finding for finding in reusable_validator_findings
+            if str(finding.get("severity") or "") == "error"
+        ]
+        steps.append({"step": "workflow.module_validator", "status": "validated_write_contract"})
+    elif coding_session_resumed and isinstance(cached_validator_findings, list):
         reusable_validator_findings = list(cached_validator_findings)
         structure_findings = [
             finding for finding in reusable_validator_findings
@@ -3466,14 +3700,18 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         analysis_cache_hit=bool(analysis_index and analysis_index.get("cache_hit")),
     )
     inspection_started = time.perf_counter()
-    phase_started("focused_inspection")
+    phase_started(
+        "focused_inspection",
+        write_handoff_mode="validated_contract" if validated_write_contract else "full",
+    )
 
     # 3) Read custom manifest + target/custom files.  This also records gate evidence.
     custom_rel_paths: list[str] = [manifest_rel]
-    for raw in payload.target_files:
-        rel = _safe_module_relative(effective_module_name, raw, module_root_rel)
-        if rel not in custom_rel_paths:
-            custom_rel_paths.append(rel)
+    if not validated_write_contract:
+        for raw in payload.target_files:
+            rel = _safe_module_relative(effective_module_name, raw, module_root_rel)
+            if rel not in custom_rel_paths:
+                custom_rel_paths.append(rel)
     for write in payload.writes:
         rel = _safe_module_relative(effective_module_name, write.relative_path, module_root_rel)
         if rel not in custom_rel_paths:
@@ -3584,7 +3822,12 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     custom_reads: list[dict[str, Any]] = []
     # One manifest plus up to 50 requested target/write paths. Keep this cap in
     # sync with OdooCodeChangeRequest so accepted writes are never left unread.
-    custom_read_limit = 51 if payload.writes else adaptive_profile["inspection_file_limit"] + 1
+    custom_read_limit = (
+        len(custom_rel_paths)
+        if validated_write_contract
+        else 51 if payload.writes
+        else adaptive_profile["inspection_file_limit"] + 1
+    )
     for rel in list(dict.fromkeys(custom_rel_paths))[:custom_read_limit]:
         target = project / rel
         if not target.exists() or not target.is_file():
@@ -3849,7 +4092,17 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     explicit_file_operation = bool(planned_writes) and all(
         bool(str(write.relative_path or "").strip()) for write in planned_writes
     ) and not (payload.target_resolution and payload.target_resolution.identifier)
-    if payload.patch_strategy == "explicit_writes" and explicit_file_operation:
+    if validated_write_contract:
+        target_resolution = OdooTargetResolutionResult.model_validate(
+            validated_write_contract.get("target_resolution") or {}
+        )
+        _validate_contract_write_paths(
+            project=project,
+            module_root_rel=module_root_rel,
+            target_resolution=target_resolution,
+            writes=planned_writes,
+        )
+    elif payload.patch_strategy == "explicit_writes" and explicit_file_operation:
         target_resolution = OdooTargetResolutionResult(
             status="scope_verified",
             mode="existing",
@@ -3888,7 +4141,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     target_resolution_data = target_resolution.model_dump(mode="json")
     steps.append({
         "step": "workflow.resolve_existing_target",
-        "status": target_resolution.status,
+        "status": "validated_write_contract" if validated_write_contract else target_resolution.status,
         "duration_ms": target_resolution.duration_ms,
         "cache_hit": target_resolution.cache_hit,
         "live_checked": target_resolution.live_checked,
@@ -3999,6 +4252,17 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         coding_session_id = "codesess-" + hashlib.sha256(
             coding_session_id.encode("utf-8")
         ).hexdigest()[:24]
+    write_contract = validated_write_contract or _build_validated_write_contract(
+        project=project,
+        module_name=effective_module_name,
+        module_path=module.path,
+        manifest_path=module.manifest_path,
+        target_resolution=target_resolution_data,
+        module_contract=module_contract,
+        validator_findings=reusable_validator_findings,
+        custom_reads=custom_reads,
+        core_reads=core_reads,
+    )
     coding_session_evidence = {
         "evidence_signature": evidence_signature,
         "scope": scope.model_dump(mode="json") if scope is not None else None,
@@ -4008,6 +4272,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         "task_profile": _task_profile(payload, frontend_paths),
         "module_contract": module_contract,
         "structure_findings": structure_findings,
+        "write_contract": write_contract,
     }
     session_target_files = [
         str(r.get("relative_path"))
@@ -4050,8 +4315,28 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
 
     if not writes_to_apply:
         phase_done("focused_inspection", inspection_started)
-        write_context = _exact_write_context(project, custom_reads, payload=payload)
-        write_context_text = "\n".join(str(item.get("content") or "") for item in write_context)
+        complete_write_context = _exact_write_context(
+            project,
+            custom_reads,
+            payload=payload,
+            max_chars=100_000,
+            max_files=50,
+        )
+        write_context, inline_context_complete = _inline_write_contexts(complete_write_context)
+        write_context_text = "\n".join(
+            str(item.get("content") or "") for item in complete_write_context
+        )
+        context_artifact = None
+        if not inline_context_complete:
+            context_artifact = state_store.create_artifact(
+                "code_change_write_context",
+                "workflow.odoo_code_change",
+                {
+                    "coding_session_id": coding_session_id,
+                    "module_name": effective_module_name,
+                    "contexts": complete_write_context,
+                },
+            )
         required_identifiers = list(dict.fromkeys(
             [*(module_contract.get("required_methods") or []), *(module_contract.get("required_symbols") or [])]
         ))
@@ -4241,6 +4526,21 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
                 "required": True,
                 "edit_policy": target_resolution_data["edit_policy"],
                 "contexts": write_context,
+                "inline_context_complete": inline_context_complete,
+                "context_artifact": context_artifact,
+                "context_artifact_next_call": (
+                    {
+                            "tool": "artifacts_read",
+                        "arguments": {
+                            "artifact_id": context_artifact["artifact_id"],
+                            "offset": 0,
+                            "max_chars": 12000,
+                        },
+                        "repeat_until": "next_offset is null",
+                    }
+                    if context_artifact
+                    else None
+                ),
                 "required_contract": module_contract,
                 "identifier_coverage": {
                     "required": required_identifiers,
@@ -4259,6 +4559,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
                 ),
                 "rules": [
                     "Generate one complete write set for every required contract item before making next_call.",
+                    "When context_artifact is present, read it completely through artifacts_read before generating writes; do not restart inspection.",
                     _target_edit_policy_rule(target_resolution.edit_policy.strategy),
                     "For every missing/new target, use content with the complete file; search/replace is valid only for an existing file returned with status=read.",
                     "Parent directories for content writes are created automatically; never ask the user to pre-create models, views, static, or tests directories.",
