@@ -403,6 +403,7 @@ def _normalize_remote_structured(value: Any, tool_name: str) -> dict[str, Any]:
         "schema_version", "status", "state_class", "outcome", "phase", "job_id", "operation_id", "terminal",
         "completion_required", "success_allowed", "next_call", "input_required",
         "input_request", "resume_call", "error", "error_code", "retryable", "deploy_confirmed",
+        "resume_token", "resume_token_expires_at", "resume_token_available", "resume_next_call",
         "reproduction_passed", "expected_result_verified", "claim_status", "truth_gate",
     }
     compact = {key: source[key] for key in compact_keys if key in source}
@@ -488,6 +489,7 @@ _PROVIDER_TOOL_NAMES = {
     "client.check",
     "workflow.agent_instructions",
     "workflow.odoo_code_change",
+    "workflow.resume_continuation",
     "workflow.odoo_debug_and_fix",
     "workflow.module_analyze",
     "workflow.module_test",
@@ -556,6 +558,11 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
         "module/target, persists a durable operation before work, applies one complete writes set, runs QA/core verification, "
         "and starts safe deploy. Short work returns directly; long work returns operation_id/job_id for jobs.get. An identical "
         "transport retry reuses the same job. On needs_writes, preserve coding_session_id/workspace_session_id and add writes."
+    ),
+    "workflow.resume_continuation": (
+        "Resume an interrupted code-change after an ephemeral Render restart. Pass the latest signed resume_token "
+        "returned by workflow_odoo_code_change or jobs_get. It restores the bounded task contract and revalidates "
+        "current checkout, source, target, QA, and deploy gates before any mutation."
     ),
     "workflow.odoo_debug_and_fix": (
         "Bounded runtime-debug workflow. It collects redacted evidence, diagnoses the exact failure, routes focused writes "

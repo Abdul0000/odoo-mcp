@@ -46,6 +46,7 @@ app = FastAPI(
 REQUIRED_CODING_TOOLS = {
     "workflow_odoo_code_change",
     "workflow_odoo_debug_and_fix",
+    "workflow_resume_continuation",
     "workflow_resume_job",
 }
 
@@ -128,7 +129,7 @@ def agent_instructions() -> dict:
                 "module_analysis": "workflow_module_analyze",
                 "visual_change": "workflow_frontend_visual_implement",
                 "direct_install_check": "workflow_module_install_and_check",
-                "continuation": ["jobs_get", "workflow_resume_job"],
+                "continuation": ["jobs_get", "workflow_resume_job", "workflow_resume_continuation"],
                 "diagnostics": ["artifacts_read", "odoosh_error_pack"],
                 "terminal_success": ["deploy_confirmed=true", "already_deployed_confirmed=true"],
                 "debug_terminal_success": "truth_gate.verified_fixed=true",

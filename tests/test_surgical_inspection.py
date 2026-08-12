@@ -4,6 +4,7 @@ import subprocess
 import threading
 import time
 import zipfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,7 @@ from odoo_agent_server.routers.tools import (
 )
 from odoo_agent_server.config import settings
 from odoo_agent_server.services.coding_session_service import CodingSessionService, CodingWorkspaceService
+from odoo_agent_server.services.continuation_token_service import ContinuationTokenError, ContinuationTokenService
 from odoo_agent_server.services.git_service import GitService
 from odoo_agent_server.services.verification_proof_service import VerificationProofService
 from odoo_agent_server.services.workflow_progress_service import WorkflowProgressService
@@ -56,6 +58,7 @@ from odoo_agent_server.schemas import (
     DeployedModuleVerifyRequest,
     OdooCodeChangeRequest,
     OdooCodeFileChange,
+    ContinuationResumeRequest,
     OdooDebugAndFixRequest,
     OdooFailureDiagnosis,
     OdooDebugRecordAssertion,
@@ -242,6 +245,231 @@ async def test_provider_code_change_persists_and_reuses_identical_timeout_retry(
     assert stored.job_type == "workflow.odoo_code_change"
     assert stored.request["operation_id"] == "provider-timeout-001"
     assert stored.completion_required is True
+
+
+def test_provider_code_change_recovers_expired_foreign_worker(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    submitted = []
+    monkeypatch.setattr(tools_router, "submit_background", submitted.append)
+    payload = _payload(
+        "Recover durable provider change",
+        operation_id="provider-orphan-001",
+        wait_for_result=False,
+    )
+    fingerprint = tools_router._code_change_async_fingerprint(payload)
+    job_id = f"codejob-{fingerprint[:40]}"
+    resume_arguments = payload.model_dump(mode="json", exclude_none=True)
+    JsonStore().create_job(JobRecord(
+        id=job_id,
+        job_type="workflow.odoo_code_change",
+        status=JobStatus.running,
+        created_at=(datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(),
+        request={
+            "operation_id": "provider-orphan-001",
+            "owner_instance_id": "dead-connector-instance",
+            "resume_arguments": resume_arguments,
+        },
+    ))
+
+    recovered = tools_router._recover_code_change_job_if_orphaned(
+        JsonStore().get_job(job_id),
+        JsonStore(),
+    )
+
+    assert recovered.status == JobStatus.running
+    assert recovered.request["owner_instance_id"] == tools_router._CODING_WORKFLOW_INSTANCE_ID
+    assert len(submitted) == 1
+
+
+def test_provider_code_change_preserves_foreign_worker_with_fresh_heartbeat(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    submitted = []
+    monkeypatch.setattr(tools_router, "submit_background", submitted.append)
+    payload = _payload(
+        "Reuse live provider change",
+        operation_id="provider-live-worker-001",
+        wait_for_result=False,
+    )
+    fingerprint = tools_router._code_change_async_fingerprint(payload)
+    job_id = f"codejob-{fingerprint[:40]}"
+    store = JsonStore()
+    store.create_job(JobRecord(
+        id=job_id,
+        job_type="workflow.odoo_code_change",
+        status=JobStatus.running,
+        created_at=(datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(),
+        request={
+            "operation_id": "provider-live-worker-001",
+            "owner_instance_id": "other-live-instance",
+            "resume_arguments": payload.model_dump(mode="json", exclude_none=True),
+        },
+    ))
+    store.update_workflow_progress("provider-live-worker-001", {
+        "worker_heartbeat_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    result = tools_router._start_or_reuse_code_change_job(payload)
+
+    assert result["status"] == "running"
+    assert result["async_job_reused"] is True
+    assert submitted == []
+
+
+def test_provider_code_change_reports_background_submission_failure(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+
+    def reject_submission(_callback):
+        raise RuntimeError("executor unavailable")
+
+    monkeypatch.setattr(tools_router, "submit_background", reject_submission)
+    result = tools_router._start_or_reuse_code_change_job(_payload(
+        "Submission failure",
+        operation_id="provider-submit-failure-001",
+        wait_for_result=False,
+    ))
+
+    assert result["status"] == "operation_not_started"
+    assert result["success_allowed"] is False
+    assert "executor unavailable" in result["error"]
+
+
+def test_client_carried_resume_token_is_signed_bounded_and_safe(monkeypatch):
+    monkeypatch.setattr(settings, "continuation_token_secret", "stable-render-secret")
+    monkeypatch.setattr(settings, "continuation_token_ttl_seconds", 7200)
+    payload = _payload(
+        "Update the billing form Authorization: Bearer private-token",
+        writes=[OdooCodeFileChange(relative_path="models/order.py", content="secret source")],
+        coding_session_id="coding-session-001",
+        workspace_session_id="workspace-session-001",
+        verification_override="force",
+        verification_override_reason="Explicit test authorization",
+        verification_override_confirmation="I AUTHORIZE FORCE PUSH AND DEPLOY",
+    )
+
+    issued = ContinuationTokenService().issue_code_change(payload, now=1_000)
+    decoded = ContinuationTokenService().decode_code_change(issued["resume_token"], now=1_001)
+
+    assert len(issued["resume_token"]) < 20_000
+    assert decoded["task_description"].endswith("Authorization: <redacted>")
+    assert "private-token" not in decoded["task_description"]
+    assert decoded["verification_override"] == "strict"
+    assert decoded["wait_for_result"] is False
+    assert "writes" not in decoded
+    assert "coding_session_id" not in decoded
+    assert "workspace_session_id" not in decoded
+    assert "verification_override_confirmation" not in decoded
+
+
+def test_client_carried_resume_token_rejects_tampering_and_expiry(monkeypatch):
+    monkeypatch.setattr(settings, "continuation_token_secret", "stable-render-secret")
+    monkeypatch.setattr(settings, "continuation_token_ttl_seconds", 3600)
+    service = ContinuationTokenService()
+    token = service.issue_code_change(_payload("Persist this task"), now=1_000)["resume_token"]
+    replacement = "A" if token[-1] != "A" else "B"
+
+    with pytest.raises(ContinuationTokenError, match="signature"):
+        service.decode_code_change(token[:-1] + replacement, now=1_001)
+    with pytest.raises(ContinuationTokenError, match="expired"):
+        service.decode_code_change(token, now=5_000)
+
+
+def test_client_carried_resume_token_requires_stable_secret(monkeypatch):
+    monkeypatch.setattr(settings, "continuation_token_secret", None)
+    monkeypatch.setattr(settings, "oauth_token_secret", None)
+    monkeypatch.setattr(settings, "api_token", "change-me")
+
+    with pytest.raises(ContinuationTokenError, match="stable"):
+        ContinuationTokenService().issue_code_change(_payload("Persist safely"), now=1_000)
+
+
+@pytest.mark.asyncio
+async def test_client_token_resumes_after_ephemeral_state_loss(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "continuation_token_secret", "stable-render-secret")
+    original_state = tmp_path / "render-instance-a"
+    restarted_state = tmp_path / "render-instance-b"
+    monkeypatch.setattr(settings, "state_dir", str(original_state))
+    token = ContinuationTokenService().issue_code_change(
+        _payload("Resume after Render restart", wait_for_result=False)
+    )["resume_token"]
+    monkeypatch.setattr(settings, "state_dir", str(restarted_state))
+    captured = {}
+
+    async def resumed(payload):
+        captured["payload"] = payload
+        return {"status": "running", "completion_required": True}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change", resumed)
+    result = await tools_router._workflow_resume_continuation(
+        ContinuationResumeRequest(resume_token=token)
+    )
+
+    assert not restarted_state.exists()
+    assert captured["payload"].task_description == "Resume after Render restart"
+    assert captured["payload"].coding_session_id is None
+    assert captured["payload"].workspace_session_id is None
+    assert captured["payload"].wait_for_result is False
+    assert result["resumed_from_client_token"] is True
+
+
+@pytest.mark.asyncio
+async def test_jobs_get_returns_client_resume_token(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "continuation_token_secret", "stable-render-secret")
+    payload = _payload(
+        "Return client resume token",
+        operation_id="provider-resume-token-001",
+        wait_for_result=False,
+    )
+    fingerprint = tools_router._code_change_async_fingerprint(payload)
+    job_id = f"codejob-{fingerprint[:40]}"
+    JsonStore().create_job(JobRecord(
+        id=job_id,
+        job_type="workflow.odoo_code_change",
+        status=JobStatus.running,
+        request={
+            "operation_id": payload.operation_id,
+            "owner_instance_id": tools_router._CODING_WORKFLOW_INSTANCE_ID,
+            "resume_arguments": payload.model_dump(mode="json", exclude_none=True),
+        },
+    ))
+
+    response = await tools_router._dispatch("jobs.get", {
+        "job_id": job_id,
+        "wait_for_result": False,
+    })
+
+    assert response["resume_token_available"] is True
+    assert response["resume_token"]
+    assert response["resume_next_call"]["tool"] == "workflow.resume_continuation"
+
+
+@pytest.mark.asyncio
+async def test_jobs_get_migrates_legacy_orphan_to_actionable_recovery(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    store = JsonStore()
+    store.create_job(JobRecord(
+        id="legacy-codejob-001",
+        job_type="workflow.odoo_code_change",
+        status=JobStatus.running,
+        created_at=(datetime.now(timezone.utc) - timedelta(minutes=2)).isoformat(),
+        request={
+            "operation_id": "legacy-operation-001",
+            "client_name": "Test 18",
+            "project_path": "C:/repo",
+            "module_name": "custom_sale",
+        },
+    ))
+
+    response = await tools_router._dispatch("jobs.get", {
+        "job_id": "legacy-codejob-001",
+        "wait_for_result": False,
+    })
+
+    assert response["state_class"] == "action_required"
+    assert response["recovery_required"] is True
+    assert response["completion_required"] is True
+    assert response["next_call"]["tool"] == "workflow.odoo_code_change"
+    assert response["next_call"]["required_generated_arguments"] == ["task_description"]
 
 
 @pytest.mark.asyncio

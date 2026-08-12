@@ -82,6 +82,7 @@ def test_provider_prompts_use_callable_remote_tool_names():
         "workflow_odoo_debug_and_fix", "workflow_module_analyze",
         "workflow_module_test", "workflow_module_install_and_check",
         "workflow_frontend_visual_implement", "workflow_resume_job",
+        "workflow_resume_continuation",
         "odoo_query", "odoo_search_read", "odoo_read_group", "jobs_get",
     ):
         assert marker in main_prompt
@@ -143,6 +144,7 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "odoo_read_group",
         "do not load a development skill or inspect source",
         "workflow_resume_job",
+        "workflow_resume_continuation",
         "workflow_busy",
         "jobs_get",
         "deploy_confirmed=true",
@@ -170,6 +172,9 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "informational, not an approval gate",
         "Do not generate another plan during `needs_writes`",
         "skip it for a single read-only data lookup",
+        "A watchdog `stalled` label is not a terminal result",
+        "`operation_interrupted`",
+        "A short follow-up such as `push` means continue the pending workflow",
         "omit it for a new task",
         "locks the canonical inspected task",
         "## VIEW AND XML GATE",

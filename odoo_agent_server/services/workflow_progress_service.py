@@ -72,6 +72,13 @@ class WorkflowProgressService:
             **self._safe_extra(extra),
         })
 
+    def worker_heartbeat(self, operation_id: str, owner_instance_id: str) -> dict[str, Any]:
+        """Renew worker ownership without pretending that the workflow advanced."""
+        return JsonStore().update_workflow_progress(operation_id, {
+            "worker_owner_instance_id": owner_instance_id,
+            "worker_heartbeat_at": self._now(),
+        })
+
     def finish(
         self,
         operation_id: str,

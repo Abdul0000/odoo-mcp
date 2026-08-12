@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     oauth_authorization_code_ttl_seconds: int = Field(default=600, alias="ODOO_AGENT_OAUTH_AUTH_CODE_TTL_SECONDS")
     oauth_access_token_ttl_seconds: int = Field(default=3600, alias="ODOO_AGENT_OAUTH_ACCESS_TOKEN_TTL_SECONDS")
     oauth_refresh_token_ttl_seconds: int = Field(default=2592000, alias="ODOO_AGENT_OAUTH_REFRESH_TOKEN_TTL_SECONDS")
+    continuation_token_secret: str | None = Field(default=None, alias="ODOO_AGENT_CONTINUATION_TOKEN_SECRET")
+    continuation_token_ttl_seconds: int = Field(
+        default=2592000,
+        ge=3600,
+        le=7776000,
+        alias="ODOO_AGENT_CONTINUATION_TOKEN_TTL_SECONDS",
+    )
     # Recover dynamic OAuth clients after ephemeral-state redeploys.
     # When enabled, unknown dcr_* client IDs are accepted only with normal
     # redirect validation. Compatibility redirect hosts remain allowed for

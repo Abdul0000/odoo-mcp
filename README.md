@@ -512,6 +512,8 @@ Recommended environment:
 ```env
 WORKSPACE_ROOT=/workspace/repos
 ODOO_AGENT_API_TOKEN=<strong-random-secret>
+ODOO_AGENT_CONTINUATION_TOKEN_SECRET=<stable-random-secret>
+ODOO_AGENT_CONTINUATION_TOKEN_TTL_SECONDS=2592000
 ODOO_AGENT_BACKGROUND_MAX_WORKERS=2
 ODOO_AGENT_WATCHDOG_ENABLED=true
 ODOO_AGENT_WATCHDOG_MODE=safe_redirect
@@ -536,6 +538,8 @@ GIT_SSH_KEY_PATH=/tmp/keys/github_key
 `ODOO_AGENT_OPERATION_GUARD_ENABLED=false` preserves the current MCP flow. Enable it only after validating the stricter duplicate/phase guard with your clients.
 
 The phase-aware watchdog is independent of the optional operation guard. It defaults to `safe_redirect`, so explicitly allowlisted read-only provider calls receive a runtime budget and provider `jobs.get` arguments expose their effective bounded wait. Set it to `shadow` only when observation without intervention is required. REST/internal wait values remain unchanged. Coding, file writes, Git, deployment, module upgrades, migrations, database work, and unknown job types are never timed out.
+
+On ephemeral hosts such as Render Free, code-change responses include a signed `resume_token`. The ChatGPT task carries this compact token; after a container restart or missing job, call `workflow_resume_continuation` with the latest token. It restores only the secret-free task contract and always revalidates current source, target ownership, QA, Git, and deployment gates. Keep `ODOO_AGENT_CONTINUATION_TOKEN_SECRET` stable across deploys; it falls back to the stable OAuth token secret or API token when omitted.
 
 Live functional operations are a separate, default-off lane. Set `ODOO_AGENT_FUNCTIONAL_OPERATIONS_ENABLED=true` only after validating the configured Odoo user's ACLs on a test database. `odoo.flow_test`, `odoo.record_create`, `odoo.record_write`, and `odoo.record_action` use authenticated HTTPS RPC with field/action policy checks, idempotent request IDs, read-back verification, and mutation audit; they never fall back to SSH superuser writes or enter the code/deploy workflow. Standard recipes are optional fast paths: arbitrary business/custom models can use ordered dynamic create/write/action/verify steps with prior-step `$ref` outputs, while security/system models and private/CRUD methods remain blocked.
 

@@ -111,6 +111,15 @@ class JobGetRequest(BaseModel):
     poll_interval_seconds: float = Field(default=1.0, ge=0.25, le=10.0, description="Delay between job status checks while waiting")
 
 
+class ContinuationResumeRequest(BaseModel):
+    resume_token: str = Field(
+        ...,
+        min_length=40,
+        max_length=20000,
+        description="Signed client-carried token returned by a previous code-change call.",
+    )
+
+
 class ArtifactReadRequest(BaseModel):
     artifact_id: str = Field(..., min_length=1, max_length=120, description="Artifact id returned by a previous tool response")
     offset: int = Field(default=0, ge=0, description="Zero-based character offset for text artifacts")

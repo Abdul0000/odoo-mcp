@@ -39,6 +39,7 @@ from ..schemas import (
     RestoreLastGoodCommitRequest,
     MenuCrawlerRequest,
     CodingTaskPlanRequest,
+    ContinuationResumeRequest,
     CustomModuleItem,
     OdooCodeChangeRequest,
     OdooDebugAndFixRequest,
@@ -165,6 +166,7 @@ from ..services.verification_proof_service import VerificationProofService
 from ..services.background_executor import submit_background
 from ..services.runtime_identity_service import runtime_identity
 from ..services.workflow_progress_service import WorkflowProgressService
+from ..services.continuation_token_service import ContinuationTokenError, ContinuationTokenService
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
 
@@ -330,6 +332,17 @@ _TOOL_DESCRIPTORS = [
             "Existing-addon surgical changes use baseline-delta QA: unchanged unrelated legacy findings are reported but do not block commit/deploy; new, task-required, manifest/version, and changed-scope errors still block."
         ),
         requires_approval=True,
+    ),
+    ToolDescriptor(
+        name="workflow.resume_continuation",
+        title="Resume code workflow from client token",
+        description=(
+            "Resume an interrupted Odoo code-change after an ephemeral Render restart using the signed "
+            "resume_token returned earlier. The token carries only the bounded task contract; current source, "
+            "client identity, target, QA, and deploy gates are revalidated before any write."
+        ),
+        requires_approval=True,
+        idempotent=True,
     ),
     ToolDescriptor(
         name="workflow.odoo_debug_and_fix",
@@ -860,6 +873,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.capability_check": EmptyRequest,
     "workflow.coding_task_plan": CodingTaskPlanRequest,
     "workflow.odoo_code_change": OdooCodeChangeRequest,
+    "workflow.resume_continuation": ContinuationResumeRequest,
     "workflow.odoo_debug_and_fix": OdooDebugAndFixRequest,
     "workflow.module_analyze": ModuleAnalyzeRequest,
     "workflow.module_test": OdooModuleTestRequest,
@@ -3216,7 +3230,9 @@ _CODING_WORKFLOW_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="odoo-code-change",
 )
 _CODING_WORKFLOW_JOB_LOCK = threading.Lock()
-_CODING_WORKFLOW_JOB_STALE_SECONDS = 3600
+_CODING_WORKFLOW_INSTANCE_ID = uuid4().hex
+_CODING_WORKFLOW_HEARTBEAT_SECONDS = 5
+_CODING_WORKFLOW_WORKER_LEASE_SECONDS = 30
 
 
 def _code_change_async_fingerprint(payload: OdooCodeChangeRequest) -> str:
@@ -3227,12 +3243,39 @@ def _code_change_async_fingerprint(payload: OdooCodeChangeRequest) -> str:
     ).hexdigest()
 
 
+def _code_change_resume_metadata(job: JobRecord) -> dict[str, Any]:
+    """Build a client-carried recovery token without relying on local job state."""
+    if job.job_type != "workflow.odoo_code_change":
+        return {}
+    resume_arguments = (job.request or {}).get("resume_arguments")
+    if not isinstance(resume_arguments, dict):
+        return {}
+    try:
+        payload = OdooCodeChangeRequest.model_validate(resume_arguments)
+        token = ContinuationTokenService().issue_code_change(payload)
+    except (ValidationError, ContinuationTokenError) as exc:
+        return {
+            "resume_token_available": False,
+            "resume_token_error": str(exc),
+        }
+    return {
+        **token,
+        "resume_token_available": True,
+        "resume_next_call": {
+            "tool": "workflow.resume_continuation",
+            "arguments": {"resume_token": token["resume_token"]},
+        },
+    }
+
+
 def _code_change_job_result(job: JobRecord, *, operation_id: str, reused: bool) -> dict[str, Any]:
+    resume_metadata = _code_change_resume_metadata(job)
     if job.status not in {JobStatus.queued, JobStatus.running} and isinstance(job.result, dict):
         result = dict(job.result)
         result.setdefault("job_id", job.id)
         result.setdefault("operation_id", operation_id)
         result["async_job_reused"] = reused
+        result.update(resume_metadata)
         return result
     return {
         "status": "running",
@@ -3246,7 +3289,121 @@ def _code_change_job_result(job: JobRecord, *, operation_id: str, reused: bool) 
         "success_allowed": False,
         "poll_after_seconds": 2,
         "next_call": job.next_call,
+        **resume_metadata,
     }
+
+
+async def _workflow_resume_continuation(payload: ContinuationResumeRequest) -> dict[str, Any]:
+    """Rehydrate a code-change request from a ChatGPT-carried signed token."""
+    try:
+        arguments = ContinuationTokenService().decode_code_change(payload.resume_token)
+        request = OdooCodeChangeRequest.model_validate(arguments)
+    except (ContinuationTokenError, ValidationError) as exc:
+        return {
+            "status": "resume_token_invalid",
+            "state_class": "blocked",
+            "message": str(exc),
+            "success_allowed": False,
+            "completion_required": False,
+            "next_call": None,
+        }
+    result = await _workflow_odoo_code_change(request.model_copy(update={
+        "wait_for_result": False,
+        "coding_session_id": None,
+        "workspace_session_id": None,
+    }))
+    result["resumed_from_client_token"] = True
+    return result
+
+
+def _parse_utc_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _code_change_worker_is_orphaned(job: JobRecord, store: JsonStore) -> bool:
+    """Return true only when another process owned an expired worker lease."""
+    if job.job_type != "workflow.odoo_code_change" or job.status not in {
+        JobStatus.queued,
+        JobStatus.running,
+    }:
+        return False
+    request = dict(job.request or {})
+    if request.get("owner_instance_id") == _CODING_WORKFLOW_INSTANCE_ID:
+        return False
+    operation_id = str(request.get("operation_id") or "")
+    progress = store.get_workflow_progress(operation_id) if operation_id else None
+    heartbeat_at = _parse_utc_timestamp(
+        (progress or {}).get("worker_heartbeat_at")
+        or (progress or {}).get("last_progress_at")
+        or job.created_at
+    )
+    if heartbeat_at is None:
+        return True
+    return (
+        datetime.now(timezone.utc) - heartbeat_at
+    ).total_seconds() > _CODING_WORKFLOW_WORKER_LEASE_SECONDS
+
+
+def _interrupt_orphaned_code_change_job(job: JobRecord, store: JsonStore) -> JobRecord:
+    """Close a provably dead worker while preserving an exact recovery call."""
+    if not _code_change_worker_is_orphaned(job, store):
+        return job
+    request = dict(job.request or {})
+    operation_id = str(request.get("operation_id") or "")
+    resume_arguments = request.get("resume_arguments")
+    if isinstance(resume_arguments, dict):
+        next_call = {"tool": "workflow.odoo_code_change", "arguments": resume_arguments}
+    else:
+        legacy_arguments = {
+            key: request[key]
+            for key in ("client_name", "project_path", "module_name")
+            if request.get(key)
+        }
+        legacy_arguments["wait_for_result"] = False
+        next_call = {
+            "tool": "workflow.odoo_code_change",
+            "arguments": legacy_arguments,
+            "required_generated_arguments": ["task_description"],
+        }
+    interrupted = store.finish_job(job, JobStatus.failed, {
+        "status": "operation_interrupted",
+        "state_class": "action_required",
+        "error": "The owning connector worker stopped and its heartbeat lease expired.",
+        "operation_id": operation_id,
+        "success_allowed": False,
+        "completion_required": True,
+        "next_call": next_call,
+    })
+    if operation_id:
+        store.update_workflow_progress(operation_id, {
+            "status": "operation_interrupted",
+            "current_phase": "worker_interrupted",
+            "last_progress_at": datetime.now(timezone.utc).isoformat(),
+            "terminal": True,
+        })
+    return interrupted
+
+
+def _recover_code_change_job_if_orphaned(job: JobRecord, store: JsonStore) -> JobRecord:
+    """Resume an orphan from its persisted request; never replace a live worker."""
+    if not _code_change_worker_is_orphaned(job, store):
+        return job
+    interrupted = _interrupt_orphaned_code_change_job(job, store)
+    resume_arguments = (interrupted.result or {}).get("next_call", {}).get("arguments")
+    if not isinstance(resume_arguments, dict):
+        return interrupted
+    try:
+        payload = OdooCodeChangeRequest.model_validate(resume_arguments)
+    except ValidationError:
+        return interrupted
+    started = _start_or_reuse_code_change_job(payload)
+    return store.get_job(str(started.get("job_id") or interrupted.id))
 
 
 def _start_or_reuse_code_change_job(payload: OdooCodeChangeRequest) -> dict[str, Any]:
@@ -3255,7 +3412,6 @@ def _start_or_reuse_code_change_job(payload: OdooCodeChangeRequest) -> dict[str,
     operation_id = WorkflowProgressService.operation_id(payload)
     fingerprint = _code_change_async_fingerprint(payload)
     job_id = f"codejob-{fingerprint[:40]}"
-    now = datetime.now(timezone.utc)
 
     with _CODING_WORKFLOW_JOB_LOCK:
         try:
@@ -3266,25 +3422,16 @@ def _start_or_reuse_code_change_job(payload: OdooCodeChangeRequest) -> dict[str,
             candidate = None
         if candidate is not None:
             if candidate.status in {JobStatus.queued, JobStatus.running}:
-                try:
-                    created = datetime.fromisoformat(candidate.created_at.replace("Z", "+00:00"))
-                    created = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
-                    stale = (now - created).total_seconds() > _CODING_WORKFLOW_JOB_STALE_SECONDS
-                except (TypeError, ValueError):
-                    stale = True
-                if stale:
-                    store.finish_job(candidate, JobStatus.failed, {
-                        "status": "operation_interrupted",
-                        "state_class": "failed",
-                        "error": "The previous connector process ended before this durable operation reached a terminal result.",
-                        "operation_id": operation_id,
-                        "success_allowed": False,
-                        "completion_required": False,
-                    })
+                candidate = _interrupt_orphaned_code_change_job(candidate, store)
+                if candidate.status not in {JobStatus.queued, JobStatus.running}:
                     candidate = None
+            elif isinstance(candidate.result, dict) and candidate.result.get("status") == "operation_interrupted":
+                candidate = None
             if candidate is not None:
                 return _code_change_job_result(candidate, operation_id=operation_id, reused=True)
 
+        resume_arguments = payload.model_dump(mode="json", exclude_none=True)
+        resume_arguments["wait_for_result"] = False
         job = store.create_job(JobRecord(
             id=job_id,
             job_type="workflow.odoo_code_change",
@@ -3292,6 +3439,8 @@ def _start_or_reuse_code_change_job(payload: OdooCodeChangeRequest) -> dict[str,
             request={
                 "operation_id": operation_id,
                 "request_fingerprint": fingerprint,
+                "owner_instance_id": _CODING_WORKFLOW_INSTANCE_ID,
+                "resume_arguments": resume_arguments,
                 "client_name": payload.client_name,
                 "project_path": payload.project_path,
                 "module_name": payload.module_name,
@@ -3302,6 +3451,20 @@ def _start_or_reuse_code_change_job(payload: OdooCodeChangeRequest) -> dict[str,
 
     def _background() -> None:
         worker_store = JsonStore()
+        heartbeat_stop = threading.Event()
+        worker_progress = WorkflowProgressService()
+
+        def _heartbeat() -> None:
+            worker_progress.worker_heartbeat(operation_id, _CODING_WORKFLOW_INSTANCE_ID)
+            while not heartbeat_stop.wait(_CODING_WORKFLOW_HEARTBEAT_SECONDS):
+                worker_progress.worker_heartbeat(operation_id, _CODING_WORKFLOW_INSTANCE_ID)
+
+        heartbeat_thread = threading.Thread(
+            target=_heartbeat,
+            name=f"odoo-code-heartbeat-{job.id[-8:]}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
         try:
             result = asyncio.run(_workflow_odoo_code_change(synchronous_payload))
             worker_store.finish_job(worker_store.get_job(job.id), JobStatus.passed, result)
@@ -3315,8 +3478,21 @@ def _start_or_reuse_code_change_job(payload: OdooCodeChangeRequest) -> dict[str,
                 "success_allowed": False,
                 "completion_required": False,
             })
+        finally:
+            heartbeat_stop.set()
 
-    submit_background(_background)
+    try:
+        submit_background(_background)
+    except Exception as exc:  # noqa: BLE001
+        failed = store.finish_job(store.get_job(job.id), JobStatus.failed, {
+            "status": "operation_not_started",
+            "state_class": "failed",
+            "error": f"The connector could not submit the durable worker: {exc}",
+            "operation_id": operation_id,
+            "success_allowed": False,
+            "completion_required": False,
+        })
+        return _code_change_job_result(failed, operation_id=operation_id, reused=False)
     return _code_change_job_result(job, operation_id=operation_id, reused=False)
 
 
@@ -3874,6 +4050,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     search_results: list[dict[str, Any]] = []
     focused_match_lines: dict[str, list[int]] = {}
     if not payload.writes:
+        phase_started("focused_target_search")
         patterns = _infer_code_change_search_patterns(payload)
         focused_paths: list[str] = []
         direct_targets = list(dict.fromkeys(
@@ -3981,6 +4158,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         else 51 if payload.writes
         else adaptive_profile["inspection_file_limit"] + 1
     )
+    phase_started("custom_source_read")
     for rel in list(dict.fromkeys(custom_rel_paths))[:custom_read_limit]:
         target = project / rel
         if not target.exists() or not target.is_file():
@@ -4048,6 +4226,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         custom_file_paths_abs.append(str(manifest_abs.resolve()))
 
     # 4) Scope advice with corrected installed-source priority (core addons first).
+    phase_started("scope_resolution")
     # Scope must follow the files actually being changed. Including every user-
     # supplied target file made focused controller fixes scan unrelated models
     # and escalate to L3/L4. Keep the manifest plus exact write files on write
@@ -4169,6 +4348,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
 
     session_core_paths = list((cached_evidence or {}).get("core_paths") or []) if coding_session_resumed else []
     core_reads: list[dict[str, Any]] = []
+    phase_started("core_source_read", cache_hit=bool(session_core_paths))
     if session_core_paths:
         core_reads = [
             {"path": str(path), "status": "read", "read_mode": "coding_session_cache"}
@@ -4236,6 +4416,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         cache = dict(list(cache.items())[-20:])
     JsonStore().save_session_state({"code_change_evidence": cache}, client_name=client_name)
 
+    phase_started("target_resolution")
     resolution_client = ClientResolverService().resolve_client(
         client_name=client_name,
         project_path=project_path,
@@ -7416,6 +7597,8 @@ async def _dispatch(name: str, args: dict) -> object:
         return coding_task_plan(CodingTaskPlanRequest.model_validate(args))
     if name == "workflow.odoo_code_change":
         return await _workflow_odoo_code_change(OdooCodeChangeRequest.model_validate(args))
+    if name == "workflow.resume_continuation":
+        return await _workflow_resume_continuation(ContinuationResumeRequest.model_validate(args))
     if name == "workflow.odoo_debug_and_fix":
         return await _workflow_odoo_debug_and_fix(OdooDebugAndFixRequest.model_validate(args))
     if name == "workflow.module_analyze":
@@ -7623,15 +7806,33 @@ async def _dispatch(name: str, args: dict) -> object:
     if name == "jobs.get":
         req = JobGetRequest.model_validate(args)
         watchdog = WorkflowWatchdogService()
-        if req.wait_for_result:
+        store = JsonStore()
+        job = _recover_code_change_job_if_orphaned(store.get_job(req.job_id), store)
+        if req.wait_for_result and job.status in {JobStatus.queued, JobStatus.running}:
             job = await asyncio.to_thread(
-                JsonStore().wait_job,
+                store.wait_job,
                 req.job_id,
                 req.wait_timeout_seconds,
                 req.poll_interval_seconds,
             )
-            return watchdog.annotate_job(job)
-        return watchdog.annotate_job(JsonStore().get_job(req.job_id))
+        annotated = watchdog.annotate_job(job)
+        result = job.result if isinstance(job.result, dict) else {}
+        if result.get("status") == "operation_interrupted":
+            response = annotated.model_dump(mode="json")
+            response.update({
+                "state_class": "action_required",
+                "recovery_required": True,
+                "completion_required": True,
+                "success_allowed": False,
+                "next_call": result.get("next_call"),
+            })
+            response.update(_code_change_resume_metadata(job))
+            return response
+        if job.job_type == "workflow.odoo_code_change":
+            response = annotated.model_dump(mode="json")
+            response.update(_code_change_resume_metadata(job))
+            return response
+        return annotated
     if name == "audit.list":
         req = AuditListRequest.model_validate(args)
         return JsonStore().list_audit(limit=req.limit)
@@ -7779,6 +7980,10 @@ def _dynamic_tool_output_schema(name: str) -> dict:
         "error": {"type": "string", "description": "Error detail when the operation failed."},
         "next_call": {"type": "object", "description": "Exact follow-up tool call; null or absent when terminal.", "additionalProperties": True},
         "input_request": {"type": "object", "description": "Exact structured human input contract when state_class=input_required.", "additionalProperties": True},
+        "resume_token": {"type": "string", "description": "Signed client-carried continuation token for ephemeral-server recovery."},
+        "resume_token_expires_at": {"type": "string"},
+        "resume_token_available": {"type": "boolean"},
+        "resume_next_call": {"type": "object", "additionalProperties": True},
     }
 
     if internal == "connector.health":
@@ -7877,6 +8082,7 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             "items": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
             "count": {"type": "integer"}, "job_id": {"type": "string"},
             "completion_required": {"type": "boolean"}, "deploy_confirmed": {"type": "boolean"},
+            "recovery_required": {"type": "boolean"},
             "terminal_action": {"type": "string"},
         })
         if internal == "jobs.get":

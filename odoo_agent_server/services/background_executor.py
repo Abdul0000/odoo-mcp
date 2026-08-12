@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, Any
 
 from ..config import settings
@@ -18,5 +18,6 @@ _EXECUTOR = ThreadPoolExecutor(
 )
 
 
-def submit_background(callback: Callable[[], Any]) -> None:
-    _EXECUTOR.submit(callback)
+def submit_background(callback: Callable[[], Any]) -> Future[Any]:
+    """Submit bounded background work and expose submission failures to callers."""
+    return _EXECUTOR.submit(callback)

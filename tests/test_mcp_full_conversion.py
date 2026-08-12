@@ -20,6 +20,7 @@ _PROVIDER_TOOLS = {
     "client_check",
     "workflow_agent_instructions",
     "workflow_odoo_code_change",
+    "workflow_resume_continuation",
     "workflow_odoo_debug_and_fix",
     "workflow_module_analyze",
     "workflow_module_test",

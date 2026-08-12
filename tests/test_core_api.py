@@ -71,7 +71,9 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
     assert "Pydantic code inside Odoo addons" in rules
     assert provider_flow["code_change"] == "workflow_odoo_code_change"
     assert provider_flow["visual_change"] == "workflow_frontend_visual_implement"
-    assert provider_flow["continuation"] == ["jobs_get", "workflow_resume_job"]
+    assert provider_flow["continuation"] == [
+        "jobs_get", "workflow_resume_job", "workflow_resume_continuation",
+    ]
     assert "deploy_confirmed=true" in provider_flow["terminal_success"]
     assert provider_flow["terminal_action"] == "stop_and_summarize"
     assert skills["mode"] == "on_demand"
