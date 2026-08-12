@@ -553,9 +553,9 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
     ),
     "workflow.odoo_code_change": (
         "Server-owned Odoo code workflow for existing changes or complete new addons. It prepares checkout, resolves the "
-        "module/target, returns a durable operation_id/job_id immediately, applies one complete writes set, runs QA/core "
-        "verification, and starts safe deploy. Poll jobs.get. A transport retry with identical arguments reuses the same job "
-        "and must not replay work. On needs_writes, preserve coding_session_id/workspace_session_id and call once with writes."
+        "module/target, persists a durable operation before work, applies one complete writes set, runs QA/core verification, "
+        "and starts safe deploy. Short work returns directly; long work returns operation_id/job_id for jobs.get. An identical "
+        "transport retry reuses the same job. On needs_writes, preserve coding_session_id/workspace_session_id and add writes."
     ),
     "workflow.odoo_debug_and_fix": (
         "Bounded runtime-debug workflow. It collects redacted evidence, diagnoses the exact failure, routes focused writes "

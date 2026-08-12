@@ -13,6 +13,7 @@ from odoo_agent_server.routers.jobs import get_job
 from odoo_agent_server.routers.mcp import _arguments_for_profile, _provider_safe_next_calls
 from odoo_agent_server.routers.tools import tool_output_schema
 from odoo_agent_server.schemas import JobRecord, JobStatus, JobStep
+from odoo_agent_server.services.workflow_progress_service import WorkflowProgressService
 from odoo_agent_server.services.workflow_watchdog_service import WorkflowWatchdogService
 
 
@@ -146,6 +147,25 @@ def test_watchdog_is_read_only_response_metadata():
     assert annotated.watchdog.protected is True
     assert "watchdog" not in job.model_dump()
     assert "watchdog" in annotated.model_dump()
+
+
+def test_code_change_job_exposes_live_phase_progress(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    operation_id = "progress-operation-001"
+    progress = WorkflowProgressService()
+    progress.start(operation_id, client_name="Test", module_name="x_module")
+    progress.phase(operation_id, "module_discovery")
+    job = JobRecord(
+        id="codejob-progress-001",
+        job_type="workflow.odoo_code_change",
+        status=JobStatus.running,
+        request={"operation_id": operation_id},
+    )
+
+    annotated = WorkflowWatchdogService().annotate_job(job)
+
+    assert annotated.workflow_progress["current_phase"] == "module_discovery"
+    assert annotated.watchdog.phase == "module_discovery"
 
 
 def test_wait_cap_is_provider_only_and_explicit(monkeypatch):

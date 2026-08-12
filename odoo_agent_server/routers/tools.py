@@ -3323,7 +3323,30 @@ def _start_or_reuse_code_change_job(payload: OdooCodeChangeRequest) -> dict[str,
 async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     """Run blocking work off-loop with bounded admission and no cancellation."""
     if not payload.wait_for_result:
-        return _start_or_reuse_code_change_job(payload)
+        started = _start_or_reuse_code_change_job(payload)
+        if started.get("state_class") != "running" or not started.get("job_id"):
+            return started
+        # Preserve the fast single-call experience for ordinary work while the
+        # durable job protects longer work from provider transport timeouts.
+        # This is a bounded observation only; timing out never cancels or
+        # restarts the protected workflow.
+        initial_wait = max(0, min(
+            15,
+            int(getattr(settings, "workflow_watchdog_wait_cap_seconds", 30) or 0),
+        ))
+        if initial_wait <= 0:
+            return started
+        waited = await asyncio.to_thread(
+            JsonStore().wait_job,
+            str(started["job_id"]),
+            initial_wait,
+            0.25,
+        )
+        return _code_change_job_result(
+            waited,
+            operation_id=str(started["operation_id"]),
+            reused=bool(started.get("async_job_reused")),
+        )
 
     admission = _CODING_WORKFLOW_ADMISSION
     if not admission.acquire(blocking=False):

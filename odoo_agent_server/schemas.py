@@ -1847,6 +1847,7 @@ class JobRecordWithWatchdog(JobRecord):
     """Read-only job response; watchdog metadata is never stored with the job."""
 
     watchdog: WatchdogAssessment
+    workflow_progress: dict[str, Any] | None = None
 
 
 class ToolDescriptor(BaseModel):

@@ -221,6 +221,7 @@ async def test_code_change_wrapper_keeps_event_loop_responsive(monkeypatch, tmp_
 @pytest.mark.asyncio
 async def test_provider_code_change_persists_and_reuses_identical_timeout_retry(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "workflow_watchdog_wait_cap_seconds", 0)
     submitted = []
     monkeypatch.setattr(tools_router, "submit_background", submitted.append)
     payload = _payload(
@@ -241,6 +242,27 @@ async def test_provider_code_change_persists_and_reuses_identical_timeout_retry(
     assert stored.job_type == "workflow.odoo_code_change"
     assert stored.request["operation_id"] == "provider-timeout-001"
     assert stored.completion_required is True
+
+
+@pytest.mark.asyncio
+async def test_provider_code_change_returns_short_completed_work_without_polling(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "workflow_watchdog_wait_cap_seconds", 2)
+
+    async def quick_impl(_payload):
+        return {"status": "needs_writes", "completion_required": True, "success_allowed": False,
+                "next_call": {"tool": "workflow.odoo_code_change", "arguments": {}}}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change_impl", quick_impl)
+    result = await tools_router._workflow_odoo_code_change(_payload(
+        "Quick durable inspection",
+        operation_id="provider-quick-001",
+        wait_for_result=False,
+    ))
+
+    assert result["status"] == "needs_writes"
+    assert result["async_job_reused"] is False
+    assert result["job_id"].startswith("codejob-")
 
 
 @pytest.mark.asyncio

@@ -54,6 +54,7 @@ _SAFE_PHASE_TOKENS = {
     "artifact",
     "skill",
 }
+_WORKFLOW_PROGRESS_UNSET = object()
 
 
 class WorkflowWatchdogService:
@@ -111,20 +112,32 @@ class WorkflowWatchdogService:
             }
 
     def annotate_job(self, job: JobRecord) -> JobRecordWithWatchdog:
+        progress = self._workflow_progress(job)
         return JobRecordWithWatchdog(
             **job.model_dump(mode="python"),
-            watchdog=WatchdogAssessment.model_validate(self.assess_job(job)),
+            watchdog=WatchdogAssessment.model_validate(self.assess_job(job, progress)),
+            workflow_progress=progress,
         )
 
-    def assess_job(self, job: JobRecord) -> dict[str, Any]:
+    def assess_job(
+        self,
+        job: JobRecord,
+        workflow_progress: dict[str, Any] | None | object = _WORKFLOW_PROGRESS_UNSET,
+    ) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
-        phase = self._job_phase(job)
+        progress = (
+            self._workflow_progress(job)
+            if workflow_progress is _WORKFLOW_PROGRESS_UNSET
+            else workflow_progress
+        )
+        progress = progress if isinstance(progress, dict) else None
+        phase = self._job_phase(job, progress)
         protected = self._job_is_protected(job, phase)
         terminal = job.status not in {JobStatus.queued, JobStatus.running}
-        last_activity = self._job_last_activity(job, now)
+        last_activity = self._job_last_activity(job, now, progress)
         idle_seconds = max((now - last_activity).total_seconds(), 0.0)
 
-        fingerprint = self._job_fingerprint(job)
+        fingerprint = self._job_fingerprint(job, progress)
         with self._job_states_lock:
             state = self._job_states.get(job.id, {})
             unchanged = (
@@ -238,18 +251,41 @@ class WorkflowWatchdogService:
             return False
         return True
 
-    def _job_phase(self, job: JobRecord) -> str:
+    def _workflow_progress(self, job: JobRecord) -> dict[str, Any] | None:
+        if job.job_type != "workflow.odoo_code_change":
+            return None
+        operation_id = str((job.request or {}).get("operation_id") or "")
+        if not operation_id:
+            return None
+        try:
+            from .store_service import JsonStore
+
+            progress = JsonStore().get_workflow_progress(operation_id)
+            return dict(progress) if isinstance(progress, dict) else None
+        except Exception:
+            return None
+
+    def _job_phase(self, job: JobRecord, progress: dict[str, Any] | None = None) -> str:
         if job.status not in {JobStatus.queued, JobStatus.running}:
             return "terminal"
+        if progress and progress.get("current_phase"):
+            return str(progress["current_phase"])
         return str(job.steps[-1].name if job.steps else job.job_type or "unknown")
 
-    def _job_last_activity(self, job: JobRecord, fallback: datetime) -> datetime:
+    def _job_last_activity(
+        self,
+        job: JobRecord,
+        fallback: datetime,
+        progress: dict[str, Any] | None = None,
+    ) -> datetime:
         candidates = [self._parse_time(job.created_at)]
         for step in job.steps:
             candidates.extend((self._parse_time(step.started_at), self._parse_time(step.finished_at)))
+        if progress:
+            candidates.append(self._parse_time(progress.get("last_progress_at")))
         return max((item for item in candidates if item is not None), default=fallback)
 
-    def _job_fingerprint(self, job: JobRecord) -> str:
+    def _job_fingerprint(self, job: JobRecord, progress: dict[str, Any] | None = None) -> str:
         last_step = job.steps[-1].model_dump(mode="json") if job.steps else None
         result = job.result if isinstance(job.result, dict) else {}
         return repr(
@@ -261,6 +297,8 @@ class WorkflowWatchdogService:
                 result.get("status"),
                 result.get("progress"),
                 result.get("updated_at"),
+                (progress or {}).get("current_phase"),
+                (progress or {}).get("last_progress_at"),
             )
         )
 
