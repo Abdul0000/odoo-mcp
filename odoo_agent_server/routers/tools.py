@@ -2754,6 +2754,23 @@ def _code_change_continuation_arguments(
     return arguments
 
 
+def _restore_coding_session_task(
+    payload: OdooCodeChangeRequest,
+    coding_session: dict[str, Any],
+) -> tuple[OdooCodeChangeRequest, bool]:
+    """Keep a resumed inspect-then-write call on its server-owned task scope.
+
+    Natural-language refinements made while generating writes are not a new
+    task.  The caller must omit ``coding_session_id`` to begin a materially new
+    scope; user answers to a workflow clarification continue through the
+    dedicated ``clarification_answer`` field.
+    """
+    canonical = str(coding_session.get("task_description") or "").strip()
+    if not canonical or canonical == payload.task_description.strip():
+        return payload, False
+    return payload.model_copy(update={"task_description": canonical}), True
+
+
 def _lock_resolved_target(
     payload: OdooCodeChangeRequest,
     target_resolution: OdooTargetResolutionResult,
@@ -3158,6 +3175,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
                     "required_generated_arguments": [],
                 },
             }
+        payload, task_scope_restored = _restore_coding_session_task(payload, coding_session)
         coding_session_resumed = True
         if not payload.workspace_session_id and coding_session.get("workspace_session_id"):
             payload = payload.model_copy(update={
@@ -3178,6 +3196,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
             "session_id": payload.coding_session_id,
             "bundle_version": coding_session.get("bundle_version"),
             "base_sha": coding_session.get("base_sha"),
+            "task_scope_restored": task_scope_restored,
         })
 
     # 1) Prepare checkout once.  In real multi-client use the client config supplies

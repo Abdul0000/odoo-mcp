@@ -81,6 +81,7 @@ class CodingSessionService:
             "snapshot_owner": "workspace" if snapshot_metadata is not None else "task",
             "module_name": module_name,
             "module_path": str(module),
+            "task_description": str(task_description or "").strip(),
             "task_hash": self.task_hash(task_description),
             "base_sha": self._git_sha(project),
             "module_fingerprint": snapshot["module_fingerprint"],
@@ -112,7 +113,15 @@ class CodingSessionService:
         stored_client = str(record.get("client_name") or "")
         if stored_client and str(client_name or "") != stored_client:
             return self._invalid(record, "client_changed")
-        if str(record.get("task_hash") or "") != self.task_hash(task_description):
+        incoming_task_changed = (
+            str(record.get("task_hash") or "") != self.task_hash(task_description)
+        )
+        # ``coding_session_id`` is the server-owned continuation contract.  A
+        # provider may paraphrase the task while generating writes, but that
+        # must not invalidate otherwise current source evidence.  New records
+        # retain the canonical task so the router can restore it.  Legacy
+        # records without that scope remain strict rather than guessing.
+        if incoming_task_changed and not str(record.get("task_description") or "").strip():
             return self._invalid(record, "task_changed")
         if float(record.get("expires_at") or 0) <= time.time():
             return self._invalid(record, "session_expired")
@@ -128,7 +137,12 @@ class CodingSessionService:
         if current_fingerprint != str(record.get("module_fingerprint") or ""):
             return self._invalid(record, "module_changed", current_sha=current_sha)
         record["valid"] = True
-        record["resume_reason"] = "snapshot_current"
+        record["resume_reason"] = (
+            "snapshot_current_scope_locked"
+            if incoming_task_changed
+            else "snapshot_current"
+        )
+        record["incoming_task_changed"] = incoming_task_changed
         record["updated_at"] = time.time()
         record["expires_at"] = time.time() + self._ttl_seconds()
         self._write(record)

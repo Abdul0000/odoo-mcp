@@ -71,7 +71,7 @@ For XML/QWeb/views/widgets/actions/menus, use `odoo-view-development`. Resolve i
 
 - Running is not success. Execute every returned `next_call` and poll `jobs.get` until terminal.
 - `workflow_busy` means no protected work started; wait `retry_after_seconds`, then retry the same call unchanged.
-- `needs_writes` means inspection is complete: generate one complete non-empty write set from `write_generation.contexts`, merge it into returned arguments, preserve session IDs, and call once. Never repeat the empty request.
+- `needs_writes` means inspection is complete: copy `next_call.arguments` unchanged, populate only the fields named by `required_generated_arguments` (normally one complete non-empty `writes` set from `write_generation.contexts`), preserve session IDs, and call once. Never rewrite the task description, repeat the empty request, or claim implementation before writes were applied.
 - `repair_required=true`, `must_continue=true`, or pending contract is internal continuation. Repair only returned blockers and continue. Stop after the connector exhausts its bounded diagnosed cycles.
 - Use `workflow.resume_job` for interrupted deploy ownership. The safe deploy job keeps its pinned validated client identity; resume the failed checkpoint instead of restarting completed inspection, QA, commit, or push.
 - Watchdog never cancels protected coding/write/Git/deploy/upgrade/database work. For `missing_context`, load the exact missing source; for `context_degradation`, reload the persisted handoff; for connector pipeline failure, resume its checkpoint; retry provider transport with bounded backoff.

@@ -30,6 +30,7 @@ from odoo_agent_server.routers.tools import (
     _rank_core_directory_files,
     _rank_core_required_paths,
     _prepare_code_batch,
+    _restore_coding_session_task,
     _save_code_operation_handoff,
     _task_description_search_clues,
     _target_edit_policy_rule,
@@ -169,6 +170,22 @@ def test_code_change_continuation_preserves_coding_session():
 
     assert arguments["coding_session_id"] == "codeop-session-001"
     assert arguments["workspace_session_id"] == "workspace-session-001"
+
+
+def test_coding_session_restores_canonical_task_on_provider_paraphrase():
+    payload = _payload(
+        "Refined implementation wording for the same inspected change",
+        coding_session_id="codeop-session-001",
+    )
+
+    restored, changed = _restore_coding_session_task(
+        payload,
+        {"task_description": "Continue the exact inspected change"},
+    )
+
+    assert changed is True
+    assert restored.task_description == "Continue the exact inspected change"
+    assert restored.coding_session_id == "codeop-session-001"
 
 
 @pytest.mark.asyncio
@@ -589,12 +606,13 @@ def test_coding_session_is_sha_bound_and_refreshes_module_bundle(tmp_path, monke
         task_description="Change the sale order behavior",
     )["valid"] is True
 
-    wrong_task = service.resume(
+    paraphrased_task = service.resume(
         "codeop-session-001", client_name="Test 18", project_path=str(project),
-        task_description="Unrelated new task",
+        task_description="Refined implementation wording for the same inspected task",
     )
-    assert wrong_task["valid"] is False
-    assert wrong_task["resume_reason"] == "task_changed"
+    assert paraphrased_task["valid"] is True
+    assert paraphrased_task["resume_reason"] == "snapshot_current_scope_locked"
+    assert paraphrased_task["task_description"] == "Change the sale order behavior"
 
     model.write_text("VALUE = 222\n", encoding="utf-8")
     stale = service.resume(
