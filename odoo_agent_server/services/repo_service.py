@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import os
 import re
 import shutil
@@ -27,8 +28,8 @@ class RepoService:
     """Safe local repository operations constrained by configured allowed roots."""
 
     _module_cache_lock = RLock()
-    _module_cache: dict[tuple[str, int, bool, int, float], tuple[float, list[CustomModuleItem]]] = {}
-    _module_cache_ttl_seconds = 30.0
+    _module_cache: dict[tuple[str, int, bool, str], tuple[float, list[CustomModuleItem]]] = {}
+    _module_cache_ttl_seconds = 300.0
 
     def project(self, project_path: str) -> Path:
         project = resolve_allowed_path(project_path)
@@ -119,12 +120,9 @@ class RepoService:
             expected_remote = plain_repo_url
             if expected_remote and not self._remote_matches(configured_remote, expected_remote):
                 raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=f"Configured remote mismatch: {configured_remote} != {expected_remote}")
-            # Speed: dry-run fetch first — skip full fetch if nothing changed
-            dry = self._run(["git", "fetch", "--dry-run", remote], project, 10, env=env)
-            if dry.stdout.strip() or dry.stderr.strip():
-                fetch = self._run(["git", "fetch", remote], project, timeout_seconds, env=env)
-            else:
-                fetch = CommandResult(command=["git", "fetch", "--skipped"], cwd=str(project), exit_code=0, stdout="Already up to date — fetch skipped.\n")
+            # Fetch exactly once. ``git pull`` would fetch a second time, so the
+            # already-fetched remote branch is applied with a local ff-only merge.
+            fetch = self._run(["git", "fetch", remote, resolved_branch], project, timeout_seconds, env=env)
             steps.append(fetch)
             if fetch.exit_code != 0:
                 raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=fetch.stderr or fetch.stdout or "git fetch failed")
@@ -136,10 +134,10 @@ class RepoService:
                 steps.append(checkout)
                 if checkout.exit_code != 0:
                     raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=checkout.stderr or checkout.stdout or "git checkout failed")
-            pull = self._run(["git", "pull", "--ff-only", remote, resolved_branch], project, timeout_seconds, env=env)
-            steps.append(pull)
-            if pull.exit_code != 0:
-                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=pull.stderr or pull.stdout or "git pull --ff-only failed")
+            merge = self._run(["git", "merge", "--ff-only", f"{remote}/{resolved_branch}"], project, timeout_seconds, env=env)
+            steps.append(merge)
+            if merge.exit_code != 0:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=merge.stderr or merge.stdout or "git merge --ff-only failed")
         else:
             project.parent.mkdir(parents=True, exist_ok=True)
             clone = self._run(["git", "clone", "--branch", resolved_branch, "--single-branch", resolved_repo_url, str(project)], workspace, timeout_seconds, env=env)
@@ -167,13 +165,12 @@ class RepoService:
     def list_custom_modules(self, project_path: str, max_depth: int = 5, include_uninstallable: bool = False) -> list[CustomModuleItem]:
         """Discover custom Odoo modules from repo files, not from the Odoo database.
 
-        Uses a short in-memory cache keyed by manifest count/latest mtime. This
-        keeps repo.prepare → repo.list_custom_modules fast in agent loops while
-        still invalidating as soon as manifests are added or edited.
+        Uses a Git/manifest-state token. Cache hits do not walk the repository;
+        misses perform one manifest scan and reuse those exact results.
         """
         project = self.project(project_path)
-        manifest_count, latest_mtime = self._manifest_cache_stamp(project, max_depth)
-        cache_key = (str(project), max_depth, include_uninstallable, manifest_count, latest_mtime)
+        cache_token = self._module_cache_token(project, max_depth)
+        cache_key = (str(project), max_depth, include_uninstallable, cache_token)
         now = time.monotonic()
         with self._module_cache_lock:
             cached = self._module_cache.get(cache_key)
@@ -211,6 +208,25 @@ class RepoService:
                 self._module_cache.clear()
             self._module_cache[cache_key] = (time.monotonic() + self._module_cache_ttl_seconds, result)
         return list(result)
+
+    def _module_cache_token(self, project: Path, max_depth: int) -> str:
+        """Return a cheap token that invalidates when tracked/untracked manifests change."""
+        if (project / ".git").exists():
+            head = self._run(["git", "rev-parse", "HEAD"], project, 10, env=self._git_env())
+            dirty = self._run(
+                [
+                    "git", "status", "--porcelain=v1", "--untracked-files=all", "--",
+                    ":(glob)**/__manifest__.py", ":(glob)**/__openerp__.py",
+                ],
+                project,
+                15,
+                env=self._git_env(),
+            )
+            if head.exit_code == 0 and dirty.exit_code == 0:
+                raw = f"{head.stdout.strip()}\0{dirty.stdout}\0{max_depth}"
+                return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        count, latest = self._manifest_cache_stamp(project, max_depth)
+        return f"fs:{count}:{latest}"
 
     def _iter_manifest_files(self, project: Path, max_depth: int, skip_dirs: set[str]):
         base_depth = len(project.parts)

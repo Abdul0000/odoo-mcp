@@ -75,6 +75,7 @@ def test_initialize_uses_client_gate_prompt_then_mcp_prompt_is_fetchable_for_eve
 def test_mcp_system_prompt_keeps_required_generic_contract():
     root = Path(__file__).resolve().parents[1]
     text = (root / "MCP_SYSTEM_PROMPT.md").read_text(encoding="utf-8")
+    assert len(text) < 12_000
 
     required_markers = [
         "## COMPOSITE WORKFLOW",

@@ -1,5 +1,7 @@
 import asyncio
+import os
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 
@@ -31,11 +33,14 @@ from odoo_agent_server.routers.tools import (
     _task_description_search_clues,
     _target_edit_policy_rule,
     _safe_unique_python_function_rebase,
+    _safe_module_relative,
     _write_generation_output_schema,
 )
 from odoo_agent_server.config import settings
 from odoo_agent_server.services.coding_session_service import CodingSessionService, CodingWorkspaceService
 from odoo_agent_server.services.git_service import GitService
+from odoo_agent_server.services.verification_proof_service import VerificationProofService
+from odoo_agent_server.routers.workflow import _normalise_safe_deploy_paths
 from odoo_agent_server.schemas import (
     JobRecord,
     JobStatus,
@@ -162,6 +167,88 @@ def test_code_change_continuation_preserves_coding_session():
 
     assert arguments["coding_session_id"] == "codeop-session-001"
     assert arguments["workspace_session_id"] == "workspace-session-001"
+
+
+@pytest.mark.asyncio
+async def test_code_change_wrapper_keeps_event_loop_responsive(monkeypatch):
+    async def blocking_impl(_payload):
+        time.sleep(0.15)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change_impl", blocking_impl)
+    started = time.perf_counter()
+    task = asyncio.create_task(tools_router._workflow_odoo_code_change(_payload("Small code change")))
+    await asyncio.sleep(0.02)
+    heartbeat_elapsed = time.perf_counter() - started
+    result = await task
+
+    assert heartbeat_elapsed < 0.10
+    assert result == {"status": "ok"}
+
+
+def test_nested_module_paths_use_resolved_root_without_changing_technical_name(tmp_path):
+    project = tmp_path / "repo"
+    nested = project / "addons" / "vertical" / "custom_sale"
+    nested.mkdir(parents=True)
+    path = _safe_module_relative("custom_sale", "models/sale.py", "addons/vertical/custom_sale")
+
+    assert path == "addons/vertical/custom_sale/models/sale.py"
+    assert _safe_module_relative("custom_sale", "custom_sale/views/sale.xml", "addons/vertical/custom_sale") == "addons/vertical/custom_sale/views/sale.xml"
+    assert _normalise_safe_deploy_paths(
+        project,
+        "custom_sale",
+        [path],
+        "addons/vertical/custom_sale",
+    ) == [path]
+
+
+def test_module_fingerprint_detects_same_size_change_with_preserved_mtime(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project, modules = _workspace_repo(tmp_path, module_count=1)
+    target = modules["custom_module_1"] / "models" / "record.py"
+    service = CodingSessionService()
+    before = service._module_fingerprint(modules["custom_module_1"])
+    original = target.stat()
+    target.write_text("VALUE = 9\n", encoding="utf-8")
+    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    assert target.stat().st_size == original.st_size
+    assert service._module_fingerprint(modules["custom_module_1"]) != before
+
+
+def test_verification_proof_is_bound_to_exact_working_tree(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project, modules = _workspace_repo(tmp_path, module_count=1)
+    module = modules["custom_module_1"]
+    rel = "custom_module_1/models/record.py"
+    target = project / rel
+    target.write_text("VALUE = 2\n", encoding="utf-8")
+    service = VerificationProofService()
+    proof_id = service.create(
+        project=project,
+        module_name="custom_module_1",
+        module_root_rel="custom_module_1",
+        paths=[rel],
+        verifier_result={"push_blocked": False},
+        accepted=True,
+    )
+    assert service.validate(
+        proof_id,
+        project=project,
+        module_name="custom_module_1",
+        module_root_rel="custom_module_1",
+        paths=[rel],
+    )
+    original = target.stat()
+    target.write_text("VALUE = 3\n", encoding="utf-8")
+    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+    assert service.validate(
+        proof_id,
+        project=project,
+        module_name="custom_module_1",
+        module_root_rel="custom_module_1",
+        paths=[rel],
+    ) is None
 
 
 def _workspace_repo(tmp_path: Path, module_count: int = 6) -> tuple[Path, dict[str, Path]]:
@@ -317,11 +404,12 @@ def test_successful_git_push_runs_nonblocking_workspace_sync(tmp_path, monkeypat
     ).stdout.strip()
     called: dict[str, str] = {}
 
-    def sync_after_push(_service, project_path, pushed_sha=None):
+    def sync_after_push(_service, project_path, pushed_sha=None, changed_paths=None):
         called.update(project_path=project_path, pushed_sha=str(pushed_sha or ""))
-        return {"workspace_count": 0, "checked_modules": 0, "base_sha": pushed_sha}
+        called["changed_paths"] = list(changed_paths or [])
+        return {"status": "scheduled", "base_sha": pushed_sha}
 
-    monkeypatch.setattr(CodingWorkspaceService, "sync_project_after_push", sync_after_push)
+    monkeypatch.setattr(CodingWorkspaceService, "schedule_project_sync", sync_after_push)
     git = GitService()
     monkeypatch.setattr(git, "_project", lambda _path: project.resolve())
     monkeypatch.setattr(
@@ -336,6 +424,8 @@ def test_successful_git_push_runs_nonblocking_workspace_sync(tmp_path, monkeypat
 
     assert result.exit_code == 0
     assert called["project_path"] == str(project.resolve())
+    assert called["changed_paths"]
+    assert "CODING_WORKSPACE_SYNC=" in result.stdout
     assert called["pushed_sha"]
     assert "CODING_WORKSPACE_SYNC=" in result.stdout
 

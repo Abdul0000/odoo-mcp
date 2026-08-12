@@ -79,6 +79,23 @@ def test_running_job_updates_do_not_rewrite_audit_log(tmp_path, monkeypatch):
     assert "job.update" in {event.action for event in store.list_audit()}
 
 
+def test_terminal_jobs_and_artifacts_are_retention_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "job_max_count", 20)
+    monkeypatch.setattr(settings, "artifact_max_count", 20)
+    monkeypatch.setattr(settings, "artifact_max_total_bytes", 1_000_000)
+    store = JsonStore()
+    running = store.create_job(JobRecord(job_type="active", status=JobStatus.running))
+    for index in range(25):
+        store.create_job(JobRecord(job_type=f"terminal-{index}", status=JobStatus.passed))
+        store.create_artifact("test", "retention", f"artifact-{index}")
+
+    jobs = store.list_jobs(limit=100)
+    assert running.id in {job.id for job in jobs}
+    assert len(jobs) <= 21  # active jobs are never evicted to satisfy the terminal-history cap
+    assert len(list(store.artifacts_dir.glob("art_*.json"))) <= 20
+
+
 def test_debug_sessions_are_atomically_isolated_under_concurrent_updates(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
 

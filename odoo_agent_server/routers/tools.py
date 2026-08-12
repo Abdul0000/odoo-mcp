@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ast
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import difflib
 import hashlib
@@ -159,6 +160,7 @@ from ..services.functional_operation_service import FunctionalOperationService
 from ..services.module_test_service import ModuleTestService
 from ..services.existing_target_resolution_service import ExistingTargetResolutionService
 from ..services.coding_session_service import CodingSessionService, CodingWorkspaceService
+from ..services.verification_proof_service import VerificationProofService
 from ..services.background_executor import submit_background
 
 router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency])
@@ -1261,8 +1263,12 @@ def _resolve_code_change_project(payload: OdooCodeChangeRequest) -> tuple[str | 
     return resolved_client_name, str(project_path)
 
 
-def _safe_module_relative(module_name: str, relative_path: str) -> str:
-    """Normalize a user/provider path into <module>/... inside project_path."""
+def _safe_module_relative(
+    module_name: str,
+    relative_path: str,
+    module_root_rel: str | None = None,
+) -> str:
+    """Normalize a provider path into the resolved addon root inside project_path."""
     value = str(relative_path or "").replace("\\", "/").strip()
     if not value or "\x00" in value:
         raise HTTPException(status_code=400, detail="Empty or unsafe relative_path")
@@ -1270,12 +1276,13 @@ def _safe_module_relative(module_name: str, relative_path: str) -> str:
     parts = [part for part in value.split("/") if part and part not in {".", ".."}]
     if not parts:
         raise HTTPException(status_code=400, detail="Empty relative_path")
+    module_root = str(module_root_rel or module_name).replace("\\", "/").strip("/")
+    root_parts = module_root.split("/")
+    if parts[: len(root_parts)] == root_parts:
+        return "/".join(parts)
     if module_name in parts:
-        idx = parts.index(module_name)
-        parts = parts[idx:]
-    elif parts[0] != module_name:
-        parts = [module_name, *parts]
-    return "/".join(parts)
+        parts = parts[parts.index(module_name) + 1 :]
+    return "/".join([*root_parts, *parts])
 
 
 def _ensure_root_module_scaffold(repo: RepoService, project: Path, payload: OdooCodeChangeRequest) -> None:
@@ -1543,8 +1550,8 @@ def _exact_write_context(
     custom_reads: list[dict[str, Any]],
     *,
     payload: OdooCodeChangeRequest | None = None,
-    max_chars: int = 14_000,
-    max_files: int = 12,
+    max_chars: int = 10_000,
+    max_files: int = 8,
 ) -> list[dict[str, Any]]:
     """Return exact source units across all relevant task files within budget."""
     context_patterns: list[str] = []
@@ -3025,13 +3032,41 @@ def _verification_override_decision(
     }
 
 
+_CODING_WORKFLOW_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(1, int(getattr(settings, "coding_workflow_max_workers", 2))),
+    thread_name_prefix="odoo-code-change",
+)
+
+
 async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
+    """Run blocking repository/validator work off the MCP event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _CODING_WORKFLOW_EXECUTOR,
+        lambda: asyncio.run(_workflow_odoo_code_change_impl(payload)),
+    )
+
+
+async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     """Provider-safe composite Odoo code-change workflow.
 
     This is intentionally server-owned to remove MCP provider overhead/confusion:
     provider calls this one tool, the connector performs the v15 custom+core read,
     applies explicit edits, verifies, starts safe deploy, and returns a job_id for jobs.get.
     """
+    workflow_started = time.perf_counter()
+    phase_timings: dict[str, int] = {}
+
+    def phase_done(name: str, started: float) -> None:
+        phase_timings[name] = round((time.perf_counter() - started) * 1000)
+
+    def orchestration_metrics() -> dict[str, Any]:
+        return {
+            "total_ms": round((time.perf_counter() - workflow_started) * 1000),
+            "phases_ms": dict(phase_timings),
+        }
+
+    prepare_started = time.perf_counter()
     resolved_client_name, project_path = _resolve_code_change_project(payload)
     client_name = resolved_client_name or payload.client_name
     repo = RepoService()
@@ -3133,8 +3168,10 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 project_path = str(project)
             else:
                 raise
+    phase_done("repo_prepare", prepare_started)
 
     # 2) Discover/validate module once, with a safe fuzzy resolver for human hints.
+    discovery_started = time.perf_counter()
     _ensure_root_module_scaffold(repo, project, payload)
     modules = repo.list_custom_modules(project_path, max_depth=5, include_uninstallable=False)
     module, module_resolution = _resolve_fuzzy_module(payload, modules)
@@ -3147,6 +3184,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "success_allowed": False,
         }
     effective_module_name = module.module_name
+    phase_done("module_discovery", discovery_started)
     if coding_session_resumed and effective_module_name != str(coding_session.get("module_name") or ""):
         return {
             "status": "coding_session_stale",
@@ -3206,6 +3244,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         target_hint=_target_hint(payload),
     )
     module_dir = project / module.path
+    module_root_rel = module.path
+    workspace_started = time.perf_counter()
     coding_workspace = coding_workspaces.open_or_resume(
         workspace_session_id=payload.workspace_session_id,
         client_name=client_name,
@@ -3228,6 +3268,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "module_count": len(coding_workspace.get("modules") or {}),
         "evicted_module": workspace_activation.get("evicted_module"),
     })
+    phase_done("workspace_activation", workspace_started)
     module_contract, contract_record = _persist_module_contract(
         state_store,
         client_name=client_name,
@@ -3245,11 +3286,33 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         ],
     )
     persisted_requirements = "\n\n--- Additional requirement ---\n\n".join(contract_record.get("requirement_sources") or [])
-    structure_findings = [
-        finding.model_dump(mode="json")
-        for finding in OdooModuleValidator().validate(module_dir, module_contract=module_contract)
-        if finding.severity.value == "error"
-    ]
+    analysis_started = time.perf_counter()
+    cached_workspace_analysis = workspace_module_context.get("analysis_index")
+    cached_validator_findings = (
+        cached_workspace_analysis.get("validator_findings")
+        if isinstance(cached_workspace_analysis, dict)
+        else None
+    )
+    if coding_session_resumed and isinstance(cached_validator_findings, list):
+        reusable_validator_findings = list(cached_validator_findings)
+        structure_findings = [
+            finding for finding in reusable_validator_findings
+            if str(finding.get("severity") or "") == "error"
+        ]
+        steps.append({"step": "workflow.module_validator", "status": "workspace_cache"})
+    else:
+        baseline_findings = OdooModuleValidator().validate(module_dir, module_contract=module_contract)
+        reusable_validator_findings = [
+            finding.model_dump(mode="json")
+            for finding in baseline_findings
+            if finding.severity.value in {"error", "warning"}
+        ]
+        structure_findings = [
+            finding.model_dump(mode="json")
+            for finding in baseline_findings
+            if finding.severity.value == "error"
+        ]
+        steps.append({"step": "workflow.module_validator", "status": "built"})
     manifest_rel = module.manifest_path
     manifest_abs = project / manifest_rel
     steps.append({"step": "repo.list_custom_modules", "status": "ok", "module": effective_module_name, "module_path": module.path, "module_resolution": module_resolution})
@@ -3260,7 +3323,6 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     analysis_index: dict[str, Any] | None = None
     analysis_source_cache: dict[str, dict[str, Any]] = {}
     if not payload.writes and not payload.target_files:
-        cached_workspace_analysis = workspace_module_context.get("analysis_index")
         if isinstance(cached_workspace_analysis, dict):
             analysis_index = dict(cached_workspace_analysis)
             analysis_index["cache_hit"] = True
@@ -3274,6 +3336,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 analysis_goal=payload.task_description,
                 max_files=adaptive_profile["inspection_file_limit"],
                 max_total_chars={"small": 12000, "medium": 18000, "large": 25000}[adaptive_profile["tier"]],
+                validator_findings=reusable_validator_findings,
             )
             coding_workspace = coding_workspaces.store_analysis(
                 str(coding_workspace["id"]),
@@ -3292,15 +3355,17 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "files": analysis_index.get("inventory", {}).get("returned_files", 0),
             "git_sha": analysis_index.get("git_sha"),
         })
+    phase_done("validation_and_index", analysis_started)
+    inspection_started = time.perf_counter()
 
     # 3) Read custom manifest + target/custom files.  This also records gate evidence.
     custom_rel_paths: list[str] = [manifest_rel]
     for raw in payload.target_files:
-        rel = _safe_module_relative(effective_module_name, raw)
+        rel = _safe_module_relative(effective_module_name, raw, module_root_rel)
         if rel not in custom_rel_paths:
             custom_rel_paths.append(rel)
     for write in payload.writes:
-        rel = _safe_module_relative(effective_module_name, write.relative_path)
+        rel = _safe_module_relative(effective_module_name, write.relative_path, module_root_rel)
         if rel not in custom_rel_paths:
             custom_rel_paths.append(rel)
 
@@ -3311,7 +3376,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         patterns = _infer_code_change_search_patterns(payload)
         focused_paths: list[str] = []
         direct_targets = list(dict.fromkeys(
-            _safe_module_relative(effective_module_name, raw)
+            _safe_module_relative(effective_module_name, raw, module_root_rel)
             for raw in payload.target_files
             if str(raw or "").strip()
         ))
@@ -3358,6 +3423,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                     search_patterns=payload.search_patterns,
                     task_type=_normalized_task_type(payload),
                     max_results=min(payload.max_search_matches, 10),
+                    module_fingerprint=str(workspace_module_context.get("module_fingerprint") or "") or None,
                 )
                 search_results.append(graph_search)
                 for match in graph_search.get("matches") or []:
@@ -3400,7 +3466,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     if not payload.writes:
         generated_writes, generated_autopatch_strategy, generated_autopatch_reason = _build_safe_generic_autopatch(project, module.path, payload, custom_rel_paths)
         for write in generated_writes:
-            rel = _safe_module_relative(effective_module_name, write.relative_path)
+            rel = _safe_module_relative(effective_module_name, write.relative_path, module_root_rel)
             if rel not in custom_rel_paths:
                 custom_rel_paths.append(rel)
 
@@ -3482,15 +3548,24 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     # passes; inspection mode keeps the focused search files.
     scope_file_paths = list(custom_file_paths_abs)
     if payload.writes or generated_writes:
-        write_abs = {str((project / _safe_module_relative(effective_module_name, w.relative_path)).resolve()) for w in (payload.writes or generated_writes)}
+        write_abs = {
+            str((project / _safe_module_relative(effective_module_name, w.relative_path, module_root_rel)).resolve())
+            for w in (payload.writes or generated_writes)
+        }
         manifest_resolved = str(manifest_abs.resolve()) if manifest_abs.exists() else ""
         scope_file_paths = [path for path in custom_file_paths_abs if path == manifest_resolved or path in write_abs]
         if not scope_file_paths:
             scope_file_paths = list(custom_file_paths_abs)
 
     frontend_preflight = None
-    frontend_paths = list(dict.fromkeys(custom_rel_paths + [_safe_module_relative(effective_module_name, w.relative_path) for w in payload.writes]))
-    write_rel_paths = [_safe_module_relative(effective_module_name, w.relative_path) for w in (payload.writes or generated_writes)]
+    frontend_paths = list(dict.fromkeys(custom_rel_paths + [
+        _safe_module_relative(effective_module_name, w.relative_path, module_root_rel)
+        for w in payload.writes
+    ]))
+    write_rel_paths = [
+        _safe_module_relative(effective_module_name, w.relative_path, module_root_rel)
+        for w in (payload.writes or generated_writes)
+    ]
     frontend_fast_path = _static_frontend_fast_path(write_rel_paths)
     scope = None
     scope_payload: ScopeAdviceRequest | None = None
@@ -3717,6 +3792,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "module_name": effective_module_name,
             "coding_workspace": coding_workspaces.public_summary(coding_workspace),
             "steps": steps,
+            "orchestration_metrics": orchestration_metrics(),
             "target_resolution": target_resolution_data,
             "clarification_gate": {
                 "required": True,
@@ -3863,6 +3939,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     payload = payload.model_copy(update={"coding_session_id": coding_session_id})
 
     if not writes_to_apply:
+        phase_done("focused_inspection", inspection_started)
         write_context = _exact_write_context(project, custom_reads, payload=payload)
         write_context_text = "\n".join(str(item.get("content") or "") for item in write_context)
         required_identifiers = list(dict.fromkeys(
@@ -4012,6 +4089,19 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 ),
             }
         }, client_name=client_name)
+        inspection_artifact = state_store.create_artifact(
+            "code_change_inspection",
+            "workflow.odoo_code_change",
+            {
+                "custom_reads": custom_read_metadata,
+                "search_results": search_results,
+                "scope_advice": scope.model_dump(mode="json") if scope is not None else None,
+                "frontend_preflight": frontend_preflight.model_dump(mode="json") if frontend_preflight is not None else None,
+                "core_reads": core_reads,
+                "task_profile": _task_profile(payload, frontend_paths),
+                "persisted_requirements": persisted_requirements,
+            },
+        )
         return {
             "status": "needs_writes",
             "message": "INTERNAL_CONTINUATION_REQUIRED: inspection is complete. Build a non-empty writes array from write_generation.contexts, merge it into next_call.arguments, and call workflow.odoo_code_change again. Do not execute the empty continuation or present manual edits to the user.",
@@ -4021,28 +4111,19 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "coding_session": coding_sessions.public_summary(coding_session),
             "coding_workspace": coding_workspaces.public_summary(coding_workspace),
             "steps": steps,
+            "orchestration_metrics": orchestration_metrics(),
             "target_resolution": target_resolution_data,
-            "custom_reads": custom_read_metadata,
-            "search_results": search_results[:10],
+            "inspection_artifact": inspection_artifact,
             "task_type": _normalized_task_type(payload),
             "intent": payload.intent,
             "target_hint": _target_hint(payload),
             "patch_strategy": _normalized_patch_strategy(payload),
             "generated_autopatch_strategy": generated_autopatch_strategy,
-            "generated_autopatch_reason": generated_autopatch_reason,
-            "supported_autopatch_cases": ["style_rule", "text_replace"],
             "workflow_profile": adaptive_profile,
-            "clarification_gate": {"required": False, "reason": "No material unresolved choice detected."},
-            "task_profile": _task_profile(payload, frontend_paths),
             "module_contract": module_contract,
-            "persisted_requirements": persisted_requirements,
             "contract_status": contract_record.get("status", "pending"),
             "repair_required": bool(structure_findings),
             "structure_findings": structure_findings,
-            "recommended_live_verifier": _task_profile(payload, frontend_paths).get("live_verifier"),
-            "scope_advice": scope.model_dump(mode="json") if scope is not None else None,
-            "frontend_preflight": frontend_preflight.model_dump(mode="json") if frontend_preflight is not None else None,
-            "core_reads": core_reads[:30],
             "success_allowed": False,
             "completion_required": True,
             "writes_required": True,
@@ -4096,6 +4177,8 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             },
         }
 
+    phase_done("focused_inspection", inspection_started)
+    write_started = time.perf_counter()
     batch_record, batch_fingerprint, batch_already_staged = _prepare_code_batch(
         state_store,
         client_name=client_name,
@@ -4180,7 +4263,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
     prepared_write_meta: list[dict[str, Any]] = []
     delete_rel_paths: list[str] = []
     for change in writes_for_this_call:
-        rel = _safe_module_relative(effective_module_name, change.relative_path)
+        rel = _safe_module_relative(effective_module_name, change.relative_path, module_root_rel)
         application_mode = "delete" if change.operation == "delete" else "full_content"
         if change.operation == "delete":
             delete_rel_paths.append(rel)
@@ -4328,9 +4411,10 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "status": "replayed" if final_batch_replay else "ok",
         "written_count": 0 if final_batch_replay else len(written_files_abs),
     })
+    phase_done("write_and_checkpoint", write_started)
     if writes_for_this_call:
         session_targets = [
-            _safe_module_relative(effective_module_name, change.relative_path)
+            _safe_module_relative(effective_module_name, change.relative_path, module_root_rel)
             for change in writes_for_this_call
         ]
         coding_workspace = coding_workspaces.refresh_module(
@@ -4479,10 +4563,12 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    verification_started = time.perf_counter()
     qa = self_run(SelfRunRequest(
         project_path=project_path,
         client_name=client_name,
         module_name=effective_module_name,
+        module_root_rel=module_root_rel,
         task_description=(persisted_requirements or payload.task_description)[-20000:],
         create_module=payload.create_module,
         module_contract=module_contract,
@@ -4551,6 +4637,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "authorization_source": override_decision.get("authorization_source"),
             "authorization_case_id": override_decision.get("authorization_case_id"),
         })
+    phase_done("qa_and_core_verification", verification_started)
 
     if (
         verify.push_blocked
@@ -4717,6 +4804,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
             "coding_session": coding_sessions.public_summary(coding_session),
             "coding_workspace": coding_workspaces.public_summary(coding_workspace),
             "steps": steps,
+            "orchestration_metrics": orchestration_metrics(),
             "write_results": write_results,
             "qa": qa_struct,
             "verify_against_core": verify.model_dump(mode="json"),
@@ -4731,13 +4819,23 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         }
 
     commit_message = payload.commit_message or f"Update {effective_module_name}: {payload.task_description[:180]}"
+    verification_proof_id = VerificationProofService().create(
+        project=project,
+        module_name=effective_module_name,
+        module_root_rel=module_root_rel,
+        paths=deploy_paths,
+        verifier_result=verify.model_dump(mode="json"),
+        accepted=bool(not verify.push_blocked or override_decision["accepted"]),
+    )
     deploy_payload = SafeDeployModuleRequest(
         client_name=client_name,
         project_path=project_path,
         module_name=effective_module_name,
+        module_root_rel=module_root_rel,
         commit_message=commit_message,
         paths=deploy_paths,
         run_qa=False,
+        verification_proof_id=verification_proof_id,
         wait_for_result=False,
         wait_timeout_seconds=0,
         upgrade_module=deploy_impact.upgrade_required,
@@ -4845,6 +4943,7 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
         "coding_session": coding_sessions.public_summary(coding_session),
         "coding_workspace": coding_workspaces.public_summary(coding_workspace),
         "steps": steps,
+        "orchestration_metrics": orchestration_metrics(),
         "target_resolution": target_resolution_data,
         "write_results": write_results,
         "generated_autopatch": bool(generated_writes and not payload.writes),

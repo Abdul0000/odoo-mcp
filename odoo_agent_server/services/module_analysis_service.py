@@ -14,6 +14,7 @@ from typing import Any
 
 from ..schemas import Severity
 from .validator_service import OdooModuleValidator
+from .coding_session_service import CodingSessionService
 
 
 class ModuleAnalysisService:
@@ -116,6 +117,7 @@ class ModuleAnalysisService:
         analysis_goal: str,
         max_files: int,
         max_total_chars: int,
+        validator_findings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         all_files = [
             path for path in module_path.rglob("*")
@@ -125,13 +127,9 @@ class ModuleAnalysisService:
             and "static/lib" not in path.relative_to(module_path).as_posix()
         ]
         all_files.sort(key=lambda item: self._priority(item.relative_to(module_path)))
-        stamp = (
-            len(all_files),
-            max((path.stat().st_mtime_ns for path in all_files), default=0),
-            sum(path.stat().st_size for path in all_files),
-        )
+        content_fingerprint = CodingSessionService._module_fingerprint_from_files(module_path, all_files)
         sha = self._git_sha(project)
-        cache_key = (str(module_path.resolve()), sha, stamp, max_files, max_total_chars)
+        cache_key = (str(module_path.resolve()), sha, content_fingerprint, max_files, max_total_chars)
         now = time.monotonic()
         with self._lock:
             cached = self._cache.get(cache_key)
@@ -176,7 +174,15 @@ class ModuleAnalysisService:
                 manifest = parsed if isinstance(parsed, dict) else {}
             except (SyntaxError, ValueError):
                 manifest = {}
-        findings = OdooModuleValidator().validate(module_path)
+        findings = (
+            validator_findings
+            if validator_findings is not None
+            else [
+                item.model_dump(mode="json")
+                for item in OdooModuleValidator().validate(module_path)
+                if item.severity in {Severity.error, Severity.warning}
+            ]
+        )
         result = {
             "status": "analyzed",
             "module_name": module_name,
@@ -194,9 +200,7 @@ class ModuleAnalysisService:
                 "omitted_files": [path.relative_to(module_path).as_posix() for path in all_files[len(evidence):]],
             },
             "architecture": {"python": python_facts, "xml": xml_facts, "csv": csv_facts},
-            "validator_findings": [
-                item.model_dump(mode="json") for item in findings if item.severity in {Severity.error, Severity.warning}
-            ],
+            "validator_findings": findings,
             "source_evidence": evidence,
             "complete_for_analysis": len(evidence) == len(all_files),
             "success_allowed": True,

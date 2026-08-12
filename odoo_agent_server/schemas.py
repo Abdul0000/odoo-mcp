@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 import re
+from pathlib import Path
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -116,8 +117,23 @@ class ArtifactReadRequest(BaseModel):
     max_chars: int = Field(default=12000, ge=1, le=50000, description="Maximum characters to return")
 
 
+def _safe_module_root_rel(value: str | None) -> str | None:
+    if value is None:
+        return None
+    clean = str(value).replace("\\", "/").strip().strip("/")
+    if not clean or "\x00" in clean or any(part in {"", ".", ".."} for part in clean.split("/")):
+        raise ValueError("module_root_rel must be a safe repository-relative addon path")
+    if Path(clean).is_absolute() or clean == ".git" or clean.startswith(".git/"):
+        raise ValueError("module_root_rel must stay inside the repository")
+    return clean
+
+
 class SelfRunRequest(BaseProjectRequest):
     module_name: str = Field(..., description="Custom module folder name inside the repo")
+    module_root_rel: str | None = Field(
+        default=None,
+        description="Resolved repo-relative addon root. Defaults to module_name for root-level addons.",
+    )
     task_description: str = Field(default="", max_length=20000, description="Original task used to enforce requested module features before push.")
     create_module: bool = Field(default=False, description="Whether this task creates a new addon; used by the module contract gate.")
     module_contract: dict[str, Any] = Field(default_factory=dict, description="Persisted project/module requirements merged with the current task contract.")
@@ -141,6 +157,11 @@ class SelfRunRequest(BaseProjectRequest):
         if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
             raise ValueError("module_name contains unsafe characters")
         return value
+
+    @field_validator("module_root_rel")
+    @classmethod
+    def module_root_rel_must_be_safe(cls, value: str | None) -> str | None:
+        return _safe_module_root_rel(value)
 
 
 class SelfRunReport(BaseModel):
@@ -1193,6 +1214,7 @@ class OdooModuleRequest(ApprovalMixin):
 
 class DeployedModuleVerifyRequest(BaseProjectRequest):
     module_name: str = Field(..., description="Custom module folder/name to compare against /home/odoo/src/user")
+    module_root_rel: str | None = Field(default=None, description="Resolved repo-relative addon root; defaults to module_name.")
     paths: list[str] = Field(default_factory=list, description="Repo-relative files to compare. Empty compares module code/XML/assets up to max_files.")
     max_files: int = Field(default=200, ge=1, le=1000, description="Maximum module files to compare when paths is empty")
     include_module_status: bool = Field(default=True, description="Also read live Odoo module installation state")
@@ -1860,11 +1882,20 @@ class CapabilityCheckResult(BaseModel):
 class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
     client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. When omitted, resolves from project_path when possible.")
     module_name: str = Field(..., description="Technical module folder/name to deploy and update")
+    module_root_rel: str | None = Field(
+        default=None,
+        description="Resolved repo-relative addon root. Defaults to module_name for root-level addons.",
+    )
     commit_message: str = Field(..., min_length=3, max_length=300)
     paths: list[str] = Field(default_factory=list, description="Relative paths to add before commit. Empty means git add -A.")
     remote: str = Field(default="origin")
     branch: str | None = Field(default=None, description="Defaults to current branch or TARGET_GIT_BRANCH")
     run_qa: bool = Field(default=True, description="Run qa.self_run by default so deploy failures surface before long Odoo.sh polling. Set False only for an explicit, intentional bypass.")
+    verification_proof_id: str | None = Field(
+        default=None,
+        pattern=r"^vfy_[a-f0-9]{32}$",
+        description="Opaque exact-working-tree proof created by workflow.odoo_code_change.",
+    )
     verification_overridden: bool = Field(default=False, description="Audit flag: pre-push verification was explicitly overridden by an authorized workflow request.")
     verification_override_mode: Literal["strict", "allow_unverified", "force", "none", "irrelevant_only"] = Field(default="strict")
     verification_override_reason: str | None = Field(default=None, max_length=1000)
@@ -1924,6 +1955,16 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
         if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
             raise ValueError("module_name contains unsafe characters")
         return value
+
+    @field_validator("module_root_rel")
+    @classmethod
+    def deployed_module_root_rel_must_be_safe(cls, value: str | None) -> str | None:
+        return _safe_module_root_rel(value)
+
+    @field_validator("module_root_rel")
+    @classmethod
+    def deploy_module_root_rel_must_be_safe(cls, value: str | None) -> str | None:
+        return _safe_module_root_rel(value)
 
 
 class FullVerifyRequest(SelfRunRequest):

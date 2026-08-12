@@ -195,6 +195,7 @@ def ensure_module_exists_or_sync(
     *,
     project_path: str | Path,
     module_name: str,
+    module_root_rel: str | None = None,
     branch: str | None,
     remote: str = "origin",
     git: GitService | None = None,
@@ -209,7 +210,7 @@ def ensure_module_exists_or_sync(
     exploration; callers can fail immediately with the returned clear error.
     """
     project = resolve_allowed_path(str(project_path))
-    module_path = project / module_name
+    module_path = project / (module_root_rel or module_name)
     git = git or GitService()
     resolved_branch = _resolve_branch(project, branch, git)
 
@@ -218,6 +219,7 @@ def ensure_module_exists_or_sync(
         "status": "present",
         "project_path": str(project),
         "module_name": module_name,
+        "module_root_rel": module_root_rel or module_name,
         "module_path": str(module_path),
         "branch": resolved_branch,
         "remote": remote,

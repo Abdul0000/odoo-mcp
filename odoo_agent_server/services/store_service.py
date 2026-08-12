@@ -64,9 +64,12 @@ class JsonStore:
         self.root = settings.state_path
         self.approvals_file = self.root / "approvals.json"
         self.jobs_file = self.root / "jobs.json"
+        self.jobs_dir = self.root / "jobs"
         self.audit_file = self.root / "audit.json"
         self.mutations_file = self.root / "functional_mutations.json"
         self.artifacts_dir = self.root / "artifacts"
+        self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self._migrate_legacy_jobs()
 
     def _read_list(self, path: Path) -> list[dict[str, Any]]:
         with self._lock:
@@ -155,19 +158,29 @@ class JsonStore:
         return record
 
     def create_job(self, job: JobRecord) -> JobRecord:
-        self._update_list(self.jobs_file, lambda rows: rows.append(job.model_dump(mode="json")))
+        self._write_job(job)
+        self._prune_job_files()
         self.log_audit("job.create", job.status.value, job.job_type, {"job_id": job.id})
         return job
 
     def list_jobs(self, limit: int = 100) -> list[JobRecord]:
-        rows = self._read_list(self.jobs_file)
-        return [JobRecord.model_validate(row) for row in rows[-limit:]][::-1]
+        records: list[JobRecord] = []
+        for path in self.jobs_dir.glob("*.json"):
+            try:
+                records.append(JobRecord.model_validate_json(path.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                continue
+        records.sort(key=lambda item: str(item.created_at or ""), reverse=True)
+        return records[:limit]
 
     def get_job(self, job_id: str) -> JobRecord:
-        for row in self._read_list(self.jobs_file):
-            if row.get("id") == job_id:
-                return JobRecord.model_validate(row)
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+        path = self._job_path(job_id)
+        try:
+            return JobRecord.model_validate_json(path.read_text(encoding="utf-8"))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found") from exc
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Job record is unreadable") from exc
 
     def wait_job(self, job_id: str, timeout_seconds: int = 600, poll_interval_seconds: float = 1.0) -> JobRecord:
         """Wait for a job to finish without requiring repeated client/tool calls.
@@ -191,20 +204,65 @@ class JsonStore:
                 time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
 
     def update_job(self, job: JobRecord) -> JobRecord:
-        def update(rows):
-            for index, row in enumerate(rows):
-                if row.get("id") == job.id:
-                    rows[index] = job.model_dump(mode="json")
-                    return
-            rows.append(job.model_dump(mode="json"))
-
-        self._update_list(self.jobs_file, update)
+        self._write_job(job)
+        self._prune_job_files()
         # Running jobs can update on every deployment poll. Auditing every
         # heartbeat rewrites the complete audit JSON and adds no durable value;
         # create and terminal transitions remain audited.
         if job.status not in {JobStatus.queued, JobStatus.running}:
             self.log_audit("job.update", job.status.value, job.job_type, {"job_id": job.id})
         return job
+
+    def _job_path(self, job_id: str) -> Path:
+        value = str(job_id or "")
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", value):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid job_id")
+        return self.jobs_dir / f"{value}.json"
+
+    def _write_job(self, job: JobRecord) -> None:
+        path = self._job_path(job.id)
+        payload = job.model_dump_json(indent=2)
+        with self._file_lock(path):
+            tmp = path.with_suffix(".json.tmp")
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(path)
+
+    def _migrate_legacy_jobs(self) -> None:
+        marker = self.jobs_dir / ".legacy_migrated"
+        if marker.exists():
+            return
+        rows = self._read_list(self.jobs_file)
+        for row in rows:
+            try:
+                job = JobRecord.model_validate(row)
+                if not self._job_path(job.id).exists():
+                    self._write_job(job)
+            except (HTTPException, ValueError, OSError):
+                continue
+        marker.touch(exist_ok=True)
+        self._prune_job_files()
+
+    def _prune_job_files(self) -> None:
+        """Bound terminal history while never evicting queued/running jobs."""
+        maximum = max(20, int(getattr(settings, "job_max_count", 500)))
+        rows: list[tuple[str, Path, str]] = []
+        for path in self.jobs_dir.glob("*.json"):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+                rows.append((str(record.get("created_at") or ""), path, str(record.get("status") or "")))
+            except (OSError, json.JSONDecodeError):
+                continue
+        rows.sort(key=lambda item: item[0])
+        if len(rows) <= maximum:
+            return
+        remove_count = len(rows) - maximum
+        for _created, path, job_status in rows:
+            if remove_count <= 0:
+                break
+            if job_status in {JobStatus.queued.value, JobStatus.running.value}:
+                continue
+            path.unlink(missing_ok=True)
+            remove_count -= 1
 
     def add_step(self, job: JobRecord, step: JobStep) -> JobRecord:
         step.finished_at = step.finished_at or datetime.now(timezone.utc).isoformat()
@@ -348,8 +406,37 @@ class JsonStore:
         path = self.artifacts_dir / f"{artifact_id}.json"
         with self._file_lock(path):
             path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        self._cleanup_artifacts(keep=path)
         self.log_audit("artifact.create", "ok", source_tool, {"artifact_id": artifact_id, "bytes": record["bytes"]})
         return {key: record[key] for key in ("artifact_id", "kind", "source_tool", "created_at", "bytes")}
+
+    def _cleanup_artifacts(self, *, keep: Path | None = None) -> None:
+        """Apply TTL, count, and aggregate-byte retention to artifact sidecars."""
+        if not self.artifacts_dir.exists():
+            return
+        now = time.time()
+        ttl = max(3600, int(getattr(settings, "artifact_ttl_seconds", 604800)))
+        maximum = max(20, int(getattr(settings, "artifact_max_count", 500)))
+        byte_limit = max(1_000_000, int(getattr(settings, "artifact_max_total_bytes", 250_000_000)))
+        entries: list[tuple[float, int, Path]] = []
+        for path in self.artifacts_dir.glob("art_*.json"):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if path != keep and now - stat.st_mtime > ttl:
+                path.unlink(missing_ok=True)
+                continue
+            entries.append((stat.st_mtime, stat.st_size, path))
+        entries.sort(key=lambda item: item[0], reverse=True)
+        total = sum(size for _mtime, size, _path in entries)
+        for index, (_mtime, size, path) in enumerate(entries):
+            if path == keep:
+                continue
+            if index < maximum and total <= byte_limit:
+                continue
+            path.unlink(missing_ok=True)
+            total = max(0, total - size)
 
     def read_artifact(self, artifact_id: str, offset: int = 0, max_chars: int = 12000) -> dict[str, Any]:
         safe_id = re.sub(r"[^a-zA-Z0-9_-]", "", artifact_id)

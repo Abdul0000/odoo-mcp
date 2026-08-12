@@ -47,7 +47,7 @@ def _module_test_strategy(module_path, project_path, requested: str) -> tuple[st
 @router.post("/self-run", response_model=SelfRunReport)
 def self_run(payload: SelfRunRequest) -> SelfRunReport:
     project_path = resolve_allowed_path(payload.project_path)
-    module_path = project_path / payload.module_name
+    module_path = project_path / (payload.module_root_rel or payload.module_name)
 
     findings: list[Finding] = []
     commands = []

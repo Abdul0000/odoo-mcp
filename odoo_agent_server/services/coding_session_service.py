@@ -6,6 +6,8 @@ import re
 import subprocess
 import time
 import zipfile
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from threading import RLock
@@ -18,6 +20,8 @@ from ..config import settings
 
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,128}$")
 _SKIP_PARTS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules"}
+_SKIP_REL_PREFIXES = ("static/lib/",)
+_SKIP_SUFFIXES = (".map", ".pyc")
 
 
 class CodingSessionService:
@@ -30,6 +34,8 @@ class CodingSessionService:
     """
 
     _lock = RLock()
+    _record_locks_guard = RLock()
+    _record_locks: dict[str, RLock] = {}
 
     def __init__(self) -> None:
         self.root = settings.state_path / "coding_sessions"
@@ -221,13 +227,29 @@ class CodingSessionService:
             "expires_at": record.get("expires_at"),
         }
 
-    def _snapshot(self, session_id: str, module_name: str, module: Path) -> dict[str, Any]:
-        files = self._module_files(module)
+    def _snapshot(
+        self,
+        session_id: str,
+        module_name: str,
+        module: Path,
+        module_fingerprint: str | None = None,
+        module_files: list[Path] | None = None,
+    ) -> dict[str, Any]:
+        files = module_files if module_files is not None else self._module_files(module)
         max_files = max(1, int(getattr(settings, "coding_session_bundle_max_files", 2000)))
         max_bytes = max(1, int(getattr(settings, "coding_session_bundle_max_bytes", 50_000_000)))
+        aggregate_limit = (
+            int(getattr(settings, "coding_workspace_max_total_bytes", 500_000_000))
+            if isinstance(self, CodingWorkspaceService)
+            else int(getattr(settings, "coding_session_max_total_bytes", 250_000_000))
+        )
+        max_bytes = min(max_bytes, max(1, aggregate_limit))
         selected: list[Path] = []
         total = 0
         for path in files:
+            rel = path.relative_to(module).as_posix()
+            if rel.startswith(_SKIP_REL_PREFIXES) or path.name.endswith(_SKIP_SUFFIXES):
+                continue
             try:
                 size = path.stat().st_size
             except OSError:
@@ -252,7 +274,7 @@ class CodingSessionService:
                 archived_count += 1
         tmp_path.replace(bundle_path)
         return {
-            "module_fingerprint": self._module_fingerprint_from_files(module, files),
+            "module_fingerprint": module_fingerprint or self._module_fingerprint_from_files(module, files),
             "bundle": {
                 "name": bundle_path.name,
                 "bytes": bundle_path.stat().st_size,
@@ -263,6 +285,7 @@ class CodingSessionService:
         }
 
     def _module_fingerprint(self, module: Path) -> str:
+        """Content-derived module identity; never trust size/mtime alone."""
         return self._module_fingerprint_from_files(module, self._module_files(module))
 
     @staticmethod
@@ -271,10 +294,10 @@ class CodingSessionService:
         for path in files:
             rel = path.relative_to(module).as_posix()
             try:
-                stat = path.stat()
+                data = path.read_bytes()
             except OSError:
                 continue
-            digest.update(f"{rel}\0{stat.st_size}\0{stat.st_mtime_ns}\n".encode("utf-8"))
+            digest.update(rel.encode("utf-8")); digest.update(b"\0"); digest.update(data); digest.update(b"\n")
         return digest.hexdigest()
 
     @staticmethod
@@ -312,6 +335,43 @@ class CodingSessionService:
     def _record_path(self, session_id: str) -> Path:
         safe = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:40]
         return self.root / f"{safe}.json"
+
+    @classmethod
+    def _record_lock(cls, session_id: str) -> RLock:
+        with cls._record_locks_guard:
+            return cls._record_locks.setdefault(session_id, RLock())
+
+    @contextmanager
+    def _record_guard(self, session_id: str):
+        """Per-record in-process and cross-process lock for atomic workspace updates."""
+        lock = self._record_lock(session_id)
+        safe = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:40]
+        lock_root = self.root / ".locks"
+        lock_dir = lock_root / f"{safe}.lock"
+        with lock:
+            lock_root.mkdir(parents=True, exist_ok=True)
+            deadline = time.monotonic() + 30.0
+            while True:
+                try:
+                    lock_dir.mkdir()
+                    break
+                except FileExistsError:
+                    try:
+                        if time.time() - lock_dir.stat().st_mtime > 120:
+                            lock_dir.rmdir()
+                            continue
+                    except OSError:
+                        pass
+                    if time.monotonic() >= deadline:
+                        raise HTTPException(status_code=409, detail="Coding workspace is busy; retry the same continuation.")
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                try:
+                    lock_dir.rmdir()
+                except OSError:
+                    pass
 
     def _bundle_path(self, session_id: str) -> Path:
         safe = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:40]
@@ -380,6 +440,18 @@ class CodingSessionService:
                 path.unlink(missing_ok=True)
                 if _SESSION_ID_RE.fullmatch(session_id):
                     self._bundle_path(session_id).unlink(missing_ok=True)
+            existing = [item for item in records if item[1].exists()]
+            total = sum(int((value.get("bundle") or {}).get("bytes") or 0) for _updated, _path, value in existing)
+            quota = max(10_000_000, int(getattr(settings, "coding_session_max_total_bytes", 250_000_000)))
+            for _updated, path, value in reversed(existing):
+                if total <= quota:
+                    break
+                session_id = str(value.get("id") or "")
+                size = int((value.get("bundle") or {}).get("bytes") or 0)
+                path.unlink(missing_ok=True)
+                if _SESSION_ID_RE.fullmatch(session_id):
+                    self._bundle_path(session_id).unlink(missing_ok=True)
+                total = max(0, total - size)
 
 
 class CodingWorkspaceService(CodingSessionService):
@@ -391,6 +463,10 @@ class CodingWorkspaceService(CodingSessionService):
     tasks in the same checkout. Module entries are revalidated independently,
     so a Git HEAD change does not force unchanged modules to be re-inspected.
     """
+
+    _sync_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="odoo-workspace-sync")
+    _sync_futures_lock = RLock()
+    _sync_futures: set[Future] = set()
 
     def __init__(self) -> None:
         self.root = settings.state_path / "coding_workspaces"
@@ -416,7 +492,7 @@ class CodingWorkspaceService(CodingSessionService):
         )
         self._validate_id(session_id)
         now = time.time()
-        with self._lock:
+        with self._record_guard(session_id):
             record = self._read(session_id, required=False)
             if record and float(record.get("expires_at") or 0) <= now:
                 self._delete_workspace_bundles(record)
@@ -459,14 +535,15 @@ class CodingWorkspaceService(CodingSessionService):
         module_name: str,
         module_path: str,
     ) -> dict[str, Any]:
-        with self._lock:
+        with self._record_guard(workspace_session_id):
             record = self._read(workspace_session_id)
             project = Path(str(record["project_path"])).resolve()
             module = Path(module_path).expanduser().resolve()
             self._validate_module(project, module)
             now = time.time()
             current_sha = self._git_sha(project)
-            current_fingerprint = self._module_fingerprint(module)
+            module_files = self._module_files(module)
+            current_fingerprint = self._module_fingerprint_from_files(module, module_files)
             modules = dict(record.get("modules") or {})
             entry = dict(modules.get(module_name) or {})
             evicted_module: str | None = None
@@ -495,11 +572,14 @@ class CodingWorkspaceService(CodingSessionService):
                     self._workspace_bundle_key(workspace_session_id, module_name),
                     module_name,
                     module,
+                    current_fingerprint,
+                    module_files,
                 )
                 activation_status = "loaded_on_demand" if not entry else "refreshed_source_changed"
                 entry = {
                     "module_name": module_name,
                     "module_path": str(module),
+                    "module_root_rel": module.relative_to(project).as_posix(),
                     "base_sha": current_sha,
                     "module_fingerprint": snapshot["module_fingerprint"],
                     "bundle": snapshot["bundle"],
@@ -535,7 +615,7 @@ class CodingWorkspaceService(CodingSessionService):
         module_name: str,
         analysis_index: dict[str, Any],
     ) -> dict[str, Any]:
-        with self._lock:
+        with self._record_guard(workspace_session_id):
             record = self._read(workspace_session_id)
             modules = dict(record.get("modules") or {})
             if module_name not in modules:
@@ -558,7 +638,7 @@ class CodingWorkspaceService(CodingSessionService):
         module_name: str,
         status_value: str = "refreshed_after_write",
     ) -> dict[str, Any]:
-        with self._lock:
+        with self._record_guard(workspace_session_id):
             record = self._read(workspace_session_id)
             modules = dict(record.get("modules") or {})
             entry = dict(modules.get(module_name) or {})
@@ -594,7 +674,43 @@ class CodingWorkspaceService(CodingSessionService):
             self._write(record)
             return record
 
-    def sync_project_after_push(self, project_path: str, pushed_sha: str | None = None) -> dict[str, Any]:
+    def schedule_project_sync(
+        self,
+        project_path: str,
+        pushed_sha: str | None = None,
+        changed_paths: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Schedule best-effort cache maintenance without delaying a successful push."""
+        future = self._sync_executor.submit(
+            self.sync_project_after_push,
+            project_path,
+            pushed_sha,
+            changed_paths,
+        )
+        with self._sync_futures_lock:
+            self._sync_futures.add(future)
+        future.add_done_callback(self._discard_sync_future)
+        return {"status": "scheduled", "base_sha": pushed_sha, "changed_paths": len(changed_paths or [])}
+
+    @classmethod
+    def _discard_sync_future(cls, future: Future) -> None:
+        with cls._sync_futures_lock:
+            cls._sync_futures.discard(future)
+
+    @classmethod
+    def wait_for_pending_syncs(cls, timeout: float = 10.0) -> None:
+        """Deterministic test/shutdown hook; normal push paths never wait here."""
+        with cls._sync_futures_lock:
+            pending = list(cls._sync_futures)
+        for future in pending:
+            future.result(timeout=timeout)
+
+    def sync_project_after_push(
+        self,
+        project_path: str,
+        pushed_sha: str | None = None,
+        changed_paths: list[str] | None = None,
+    ) -> dict[str, Any]:
         """Rebind every cached module for a checkout after a successful push.
 
         Unchanged modules retain their analysis. A module whose content changed
@@ -608,8 +724,18 @@ class CodingWorkspaceService(CodingSessionService):
         refreshed: list[str] = []
         rebound: list[str] = []
         stale: list[str] = []
-        with self._lock:
-            for path in self.root.glob("*.json"):
+        changed_set = {str(path).replace("\\", "/").strip("/") for path in (changed_paths or []) if str(path).strip()}
+        for path in self.root.glob("*.json"):
+            try:
+                preview = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if str(preview.get("project_path") or "") != str(project):
+                continue
+            workspace_id = str(preview.get("id") or "")
+            if not workspace_id:
+                continue
+            with self._record_guard(workspace_id):
                 try:
                     record = json.loads(path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
@@ -625,12 +751,28 @@ class CodingWorkspaceService(CodingSessionService):
                     checked += 1
                     try:
                         self._validate_module(project, module)
-                        current_fingerprint = self._module_fingerprint(module)
+                        module_root_rel = str(entry.get("module_root_rel") or module.relative_to(project).as_posix()).strip("/")
+                        touched = not changed_set or any(
+                            rel == module_root_rel or rel.startswith(module_root_rel + "/")
+                            for rel in changed_set
+                        )
+                        if not touched:
+                            entry["status"] = "rebound_after_push"
+                            entry["base_sha"] = current_sha
+                            entry["updated_at"] = time.time()
+                            rebound.append(module_name)
+                            modules[module_name] = entry
+                            changed = True
+                            continue
+                        module_files = self._module_files(module)
+                        current_fingerprint = self._module_fingerprint_from_files(module, module_files)
                         if current_fingerprint != str(entry.get("module_fingerprint") or ""):
                             snapshot = self._snapshot(
                                 self._workspace_bundle_key(str(record["id"]), module_name),
                                 module_name,
                                 module,
+                                current_fingerprint,
+                                module_files,
                             )
                             entry["module_fingerprint"] = snapshot["module_fingerprint"]
                             entry["bundle"] = snapshot["bundle"]
@@ -734,3 +876,23 @@ class CodingWorkspaceService(CodingSessionService):
                 continue
             self._delete_workspace_bundles(record)
             path.unlink(missing_ok=True)
+        # Enforce a hard aggregate bundle quota using workspace LRU order.
+        existing = [item for item in records if item[1].exists()]
+        total = sum(
+            int((entry.get("bundle") or {}).get("bytes") or 0)
+            for _updated, _path, record in existing
+            for entry in (record.get("modules") or {}).values()
+            if isinstance(entry, dict)
+        )
+        quota = max(10_000_000, int(getattr(settings, "coding_workspace_max_total_bytes", 500_000_000)))
+        for _updated, path, record in reversed(existing):
+            if total <= quota:
+                break
+            removed = sum(
+                int((entry.get("bundle") or {}).get("bytes") or 0)
+                for entry in (record.get("modules") or {}).values()
+                if isinstance(entry, dict)
+            )
+            self._delete_workspace_bundles(record)
+            path.unlink(missing_ok=True)
+            total = max(0, total - removed)

@@ -158,7 +158,7 @@ def test_search_index_cache_invalidates_when_dirty_file_changes(tmp_path, monkey
     assert third["cached"] is False
 
 
-def test_search_scans_broadly_but_parses_only_bounded_candidates(tmp_path, monkeypatch):
+def test_search_builds_one_universal_module_index(tmp_path, monkeypatch):
     project, module = _build_module(tmp_path)
     unrelated = module / "models" / "unrelated"
     unrelated.mkdir()
@@ -177,7 +177,27 @@ def test_search_scans_broadly_but_parses_only_bounded_candidates(tmp_path, monke
         task_type="python_model",
     )
 
-    assert result["strategy"] == "targeted"
+    assert result["strategy"] == "universal_module_index"
+    assert result["indexed_files"] >= 30
     assert result["scanned_files"] >= 33
-    assert result["indexed_files"] <= 18
-    assert result["indexed_files"] < result["scanned_files"]
+    assert result["indexed_files"] == result["scanned_files"]
+
+
+def test_search_reuses_same_index_for_a_different_query(tmp_path, monkeypatch):
+    project, module = _build_module(tmp_path)
+    monkeypatch.setattr(search_module, "resolve_allowed_path", lambda value: project.resolve())
+    monkeypatch.setattr(settings, "repo_index_enabled", True)
+    monkeypatch.setattr(settings, "pattern_cache_dir", str(tmp_path / "cache"))
+    service = OdooCodeSearchService()
+
+    first = service.search(
+        project_path=str(project), module_path=module.relative_to(project).as_posix(),
+        task_description="Inspect Billing Ready Records", target_hint="Billing Ready Records",
+    )
+    second = service.search(
+        project_path=str(project), module_path=module.relative_to(project).as_posix(),
+        task_description="Inspect the billing action menu", target_hint="billing action",
+    )
+
+    assert first["cached"] is False
+    assert second["cached"] is True

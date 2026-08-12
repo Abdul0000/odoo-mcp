@@ -489,7 +489,7 @@ For every coding task, the MCP agent should start with the repository tools, not
 repo_prepare → repo_list_custom_modules → repo_read → repo_apply_patch_atomic or repo_write_many_smart → git_diff → qa_self_run → workflow_verify_against_core(changed files only) → workflow_safe_deploy_module → workflow_resume_job/jobs_get only when returned as next_call
 ```
 
-`workflow.odoo_code_change` now owns this sequence as a persistent coding session. The first call prepares the checkout, resolves the module/targets, and reads focused custom and installed-source evidence. Its repository workspace creates one SHA-bound uncompressed module ZIP checkpoint and the task session adopts that validated snapshot metadata instead of archiving the same module twice. When a generated-write continuation is required it returns `needs_writes`, focused contexts, `coding_session_id`, and `workspace_session_id`. The continuation passes both IDs unchanged, skips pull/module-wide discovery/core rereads while the Git SHA and module fingerprint are unchanged, rereads only exact write targets for safety, and applies the complete change set through one smart batch transaction. Search/replace resolution happens in memory before mutation; related writes and deletes share rollback protection. QA, core verification, Git, deployment, and module upgrade remain unchanged and server-owned.
+`workflow.odoo_code_change` owns this sequence as a persistent coding session. It resolves the exact repo-relative addon root (including nested addon folders), creates a content-bound module checkpoint once, and returns compact focused write context plus `coding_session_id` and `workspace_session_id`. Continuations reuse the same validated module index, reread exact write targets, and apply one rollback-safe smart batch. Up to five modules stay warm per checkout. Different workspaces no longer share a snapshot lock; post-push cache maintenance is asynchronous and refreshes only modules touched by the pushed commit. Aggregate workspace bytes, artifacts, and terminal jobs are retained under configurable limits. QA, exact-diff core verification, Git, deployment, and module upgrade remain server-owned; safe deploy reuses prior verification only when HEAD and the complete binary working-tree diff still match its opaque proof.
 
 If another process changes Git HEAD or module files, the session returns `coding_session_stale` before applying generated writes. Its clean `next_call` starts a fresh inspection, preventing stale-context edits. Bundles are internal checkpoints under the state directory; they are never committed, pushed, or exposed as arbitrary filesystem paths.
 
@@ -517,6 +517,13 @@ ODOO_AGENT_FAST_WRITE_MAX_FILES=50
 ODOO_AGENT_FAST_WRITE_MAX_BYTES_EACH=500000
 ODOO_AGENT_FAST_WRITE_MAX_TOTAL_BYTES=5000000
 ODOO_AGENT_CODING_SESSION_TTL_SECONDS=3600
+ODOO_AGENT_CODING_SESSION_MAX_TOTAL_BYTES=250000000
+ODOO_AGENT_CODING_WORKSPACE_MAX_MODULES=5
+ODOO_AGENT_CODING_WORKSPACE_MAX_TOTAL_BYTES=500000000
+ODOO_AGENT_CODING_WORKFLOW_MAX_WORKERS=2
+ODOO_AGENT_JOB_MAX_COUNT=500
+ODOO_AGENT_ARTIFACT_TTL_SECONDS=604800
+ODOO_AGENT_ARTIFACT_MAX_TOTAL_BYTES=250000000
 TARGET_GIT_REPO=git@github.com:Abdul0000/test_18.git
 TARGET_GIT_BRANCH=feature_branch
 TARGET_PROJECT_PATH=/workspace/repos/odoo_project

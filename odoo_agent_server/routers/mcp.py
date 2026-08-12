@@ -454,7 +454,7 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
         # link/authenticate at call time instead of failing the connector handshake.
         item = {
             "name": _mcp_safe_tool_name(tool.name),
-            "description": str(tool.description)[:900],
+            "description": str(tool.description)[:500],
             "inputSchema": _remote_compatible_schema(tool_input_schema(tool.name)),
             "annotations": {
                 "readOnlyHint": bool(tool.read_only),
@@ -464,7 +464,37 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
             },
         }
         if output_schema:
-            item["outputSchema"] = _remote_compatible_schema(output_schema)
+            # Provider planning needs the stable control envelope, not every
+            # tool-specific diagnostic branch. Full structured data is still
+            # returned at call time and large results remain artifact-readable.
+            compact_output = {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "message": {"type": "string"},
+                    "job_id": {"type": ["string", "null"]},
+                    "success_allowed": {"type": "boolean"},
+                    "completion_required": {"type": "boolean"},
+                    "next_call": {"type": ["object", "null"], "additionalProperties": True},
+                },
+                "additionalProperties": True,
+            }
+            preserve = {
+                "workflow.odoo_code_change": {"handoff", "coding_session", "coding_workspace", "inspection_artifact", "write_generation"},
+                "workflow.odoo_debug_and_fix": {
+                    "debug_session", "deploy_confirmed", "reproduction_passed", "expected_result_verified",
+                    "claim_status", "truth_gate", "diagnosis", "handoff",
+                },
+                "skills.read": {"name", "description", "content"},
+            }.get(tool.name, set())
+            source_properties = output_schema.get("properties") or {}
+            for key in preserve:
+                if key in source_properties:
+                    property_schema = _remote_compatible_schema(source_properties[key])
+                    if source_properties[key].get("type") != "object":
+                        property_schema.pop("properties", None)
+                    compact_output["properties"][key] = property_schema
+            item["outputSchema"] = compact_output
         return item
     item = {
         "name": _mcp_safe_tool_name(tool.name),

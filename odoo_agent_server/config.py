@@ -72,9 +72,20 @@ class Settings(BaseSettings):
     coding_session_max_count: int = Field(default=20, ge=2, le=200, alias="ODOO_AGENT_CODING_SESSION_MAX_COUNT")
     coding_session_bundle_max_files: int = Field(default=2000, ge=50, le=20000, alias="ODOO_AGENT_CODING_SESSION_BUNDLE_MAX_FILES")
     coding_session_bundle_max_bytes: int = Field(default=50_000_000, ge=1_000_000, le=500_000_000, alias="ODOO_AGENT_CODING_SESSION_BUNDLE_MAX_BYTES")
+    coding_session_max_total_bytes: int = Field(default=250_000_000, ge=10_000_000, le=5_000_000_000, alias="ODOO_AGENT_CODING_SESSION_MAX_TOTAL_BYTES")
     coding_workspace_max_modules: int = Field(default=5, ge=1, le=10, alias="ODOO_AGENT_CODING_WORKSPACE_MAX_MODULES")
     coding_workspace_ttl_seconds: int = Field(default=14400, ge=300, le=86400, alias="ODOO_AGENT_CODING_WORKSPACE_TTL_SECONDS")
     coding_workspace_max_count: int = Field(default=20, ge=2, le=200, alias="ODOO_AGENT_CODING_WORKSPACE_MAX_COUNT")
+    coding_workspace_max_total_bytes: int = Field(
+        default=500_000_000,
+        ge=10_000_000,
+        le=10_000_000_000,
+        alias="ODOO_AGENT_CODING_WORKSPACE_MAX_TOTAL_BYTES",
+    )
+    job_max_count: int = Field(default=500, ge=20, le=5000, alias="ODOO_AGENT_JOB_MAX_COUNT")
+    artifact_ttl_seconds: int = Field(default=604800, ge=3600, le=7776000, alias="ODOO_AGENT_ARTIFACT_TTL_SECONDS")
+    artifact_max_count: int = Field(default=500, ge=20, le=5000, alias="ODOO_AGENT_ARTIFACT_MAX_COUNT")
+    artifact_max_total_bytes: int = Field(default=250_000_000, ge=1_000_000, le=5_000_000_000, alias="ODOO_AGENT_ARTIFACT_MAX_TOTAL_BYTES")
 
     # Fast/correct agent optimisations. These keep strict validation while avoiding
     # repeated full-source scans on every OWL/POS/website task.
@@ -92,6 +103,7 @@ class Settings(BaseSettings):
     # Two workers are the safe minimum: safe-deploy can wait for a nested
     # module-deploy job submitted to the same bounded executor.
     background_max_workers: int = Field(default=2, ge=1, le=4, alias="ODOO_AGENT_BACKGROUND_MAX_WORKERS")
+    coding_workflow_max_workers: int = Field(default=2, ge=1, le=8, alias="ODOO_AGENT_CODING_WORKFLOW_MAX_WORKERS")
     mcp_operation_guard_enabled: bool = Field(default=False, alias="ODOO_AGENT_OPERATION_GUARD_ENABLED")
     # Phase-aware watchdog. It never force-cancels write/deploy/database work.
     # In safe_redirect mode it can time-bound an allowlisted read-only MCP call

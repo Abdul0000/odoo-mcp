@@ -49,7 +49,7 @@ class GitService:
         return self._run(["git", "rev-parse", "HEAD"], self._project(project_path), timeout_seconds)
 
     def head_changed_files(self, project_path: str, timeout_seconds: int = 20) -> CommandResult:
-        return self._run(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"], self._project(project_path), timeout_seconds)
+        return self._run(["git", "diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "HEAD"], self._project(project_path), timeout_seconds)
 
     def diff(self, project_path: str, staged: bool = False, timeout_seconds: int = 30) -> CommandResult:
         command = ["git", "diff", "--cached"] if staged else ["git", "diff"]
@@ -311,9 +311,16 @@ class GitService:
             try:
                 from .coding_session_service import CodingWorkspaceService
 
-                workspace_sync = CodingWorkspaceService().sync_project_after_push(
+                changed_result = self.head_changed_files(str(project))
+                changed_paths = (
+                    [line.strip() for line in (changed_result.stdout or "").splitlines() if line.strip()]
+                    if changed_result.exit_code == 0
+                    else []
+                )
+                workspace_sync = CodingWorkspaceService().schedule_project_sync(
                     str(project),
                     sha,
+                    changed_paths,
                 )
                 result.stdout += "CODING_WORKSPACE_SYNC=" + json.dumps(
                     workspace_sync,

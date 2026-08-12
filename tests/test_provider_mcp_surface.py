@@ -168,6 +168,13 @@ def test_provider_workflow_accepts_up_to_fifty_atomic_writes():
         OdooCodeChangeRequest(module_name="x_module", task_description="Update module XML", writes=[*writes, writes[0]])
 
 
+def test_provider_tool_contract_stays_within_context_budget():
+    import json
+
+    tools = _mcp_tools_list()
+    assert len(json.dumps(tools, ensure_ascii=False)) < 60_000
+
+
 def test_provider_workflow_exposes_safe_large_module_batches():
     tools = _mcp_tools_list()
     workflow = next(tool for tool in tools if tool["name"] == "workflow_odoo_code_change")

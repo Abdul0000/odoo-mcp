@@ -81,6 +81,7 @@ from ..services.syntax_verifier_service import SyntaxVerifierService  # V14+
 from ..services.frontend_pattern_service import FrontendPatternService  # V15
 from ..services.repo_index_service import RepoIndexService  # V16
 from ..services.live_assertion_service import LiveAssertionService
+from ..services.verification_proof_service import VerificationProofService
 from ..services.workflow_guard_service import (
     _RESUMABLE_SAFE_DEPLOY_RESULTS,
     find_blocking_safe_deploy,
@@ -601,7 +602,7 @@ async def full_verify(payload: FullVerifyRequest) -> WorkflowReport:
 
     try:
         project_path = resolve_allowed_path(payload.project_path)
-        module_path = project_path / payload.module_name
+        module_path = project_path / (payload.module_root_rel or payload.module_name)
         step("resolve_project", "passed", {"project_path": str(project_path), "module_path": str(module_path)})
     except Exception as exc:  # noqa: BLE001
         step("resolve_project", "failed", error=str(exc))
@@ -610,7 +611,10 @@ async def full_verify(payload: FullVerifyRequest) -> WorkflowReport:
 
     if payload.clean_pyc:
         try:
-            result = RepoService().clean_pyc(str(project_path), payload.module_name)
+            result = RepoService().clean_pyc(
+                str(project_path),
+                payload.module_root_rel or payload.module_name,
+            )
             step("clean_pyc", "passed", result)
         except Exception as exc:  # noqa: BLE001
             step("clean_pyc", "failed", error=str(exc))
@@ -971,10 +975,17 @@ async def safe_deploy_module(payload: SafeDeployModuleRequest) -> WorkflowReport
     )
 
 
-def _pre_push_verify_files(project: Path, module_name: str, paths: list[str], status_output: str) -> list[str]:
+def _pre_push_verify_files(
+    project: Path,
+    module_name: str,
+    paths: list[str],
+    status_output: str,
+    module_root_rel: str | None = None,
+) -> list[str]:
     """Return completed written module files that must pass pre-push verification."""
     allowed_suffixes = (".py", ".xml", ".js", ".scss", ".css", ".csv", "__manifest__.py")
-    module_prefix = f"{module_name}/"
+    module_root = (module_root_rel or module_name).strip("/")
+    module_prefix = f"{module_root}/"
 
     def status_candidates() -> list[str]:
         found: list[str] = []
@@ -1001,7 +1012,7 @@ def _pre_push_verify_files(project: Path, module_name: str, paths: list[str], st
             targets = [target] if target.is_file() else sorted(p for p in target.rglob("*") if p.is_file()) if target.is_dir() else []
             for file_target in targets:
                 rel_posix = file_target.relative_to(project).as_posix()
-                if not (rel_posix == f"{module_name}/__manifest__.py" or rel_posix.startswith(module_prefix)):
+                if not (rel_posix == f"{module_root}/__manifest__.py" or rel_posix.startswith(module_prefix)):
                     continue
                 if not rel_posix.endswith(allowed_suffixes):
                     continue
@@ -1032,11 +1043,17 @@ def _expected_user_file_hashes(project: Path, verify_files: list[str]) -> dict[s
     return expected
 
 
-def _deployed_compare_files(project: Path, module_name: str, paths: list[str], max_files: int) -> list[str]:
+def _deployed_compare_files(
+    project: Path,
+    module_name: str,
+    paths: list[str],
+    max_files: int,
+    module_root_rel: str | None = None,
+) -> list[str]:
     if paths:
-        return _pre_push_verify_files(project, module_name, paths, "")
+        return _pre_push_verify_files(project, module_name, paths, "", module_root_rel)
     allowed_suffixes = (".py", ".xml", ".js", ".scss", ".css", ".csv", "__manifest__.py")
-    module_path = (project / module_name).resolve()
+    module_path = (project / (module_root_rel or module_name)).resolve()
     if not module_path.is_dir() or not (module_path == project or project in module_path.parents):
         return []
     files: list[str] = []
@@ -1059,7 +1076,13 @@ def verify_deployed_module(payload: DeployedModuleVerifyRequest) -> dict:
     this proves the Odoo.sh user source.
     """
     project = resolve_allowed_path(payload.project_path)
-    compare_files = _deployed_compare_files(project, payload.module_name, payload.paths, payload.max_files)
+    compare_files = _deployed_compare_files(
+        project,
+        payload.module_name,
+        payload.paths,
+        payload.max_files,
+        payload.module_root_rel,
+    )
     expected_hashes = _expected_user_file_hashes(project, compare_files)
     client = ClientResolverService().resolve_client(client_name=payload.client_name, project_path=payload.project_path, require_complete=False)
     odoosh = _odoosh_service_for_client(client)
@@ -1096,7 +1119,12 @@ def verify_deployed_module(payload: DeployedModuleVerifyRequest) -> dict:
 
 
 
-def _infer_registry_fields_from_python(project: Path, module_name: str, verify_files: list[str]) -> dict[str, list[str]]:
+def _infer_registry_fields_from_python(
+    project: Path,
+    module_name: str,
+    verify_files: list[str],
+    module_root_rel: str | None = None,
+) -> dict[str, list[str]]:
     """Infer Odoo model fields from changed Python files for post-upgrade smoke.
 
     This catches the exact class of false success where a field was committed but
@@ -1110,7 +1138,7 @@ def _infer_registry_fields_from_python(project: Path, module_name: str, verify_f
         if file_path.suffix != ".py" or not file_path.is_file() or not (file_path == root or root in file_path.parents):
             continue
         rel = file_path.relative_to(root).as_posix()
-        if not rel.startswith(f"{module_name}/"):
+        if not rel.startswith(f"{module_root_rel or module_name}/"):
             continue
         try:
             tree = ast.parse(file_path.read_text(encoding="utf-8"))
@@ -1194,7 +1222,12 @@ def _verify_registry_fields(fields_by_model: dict[str, list[str]], client=None) 
 
 
 
-def _normalise_safe_deploy_paths(project: Path, module_name: str, paths: list[str]) -> list[str]:
+def _normalise_safe_deploy_paths(
+    project: Path,
+    module_name: str,
+    paths: list[str],
+    module_root_rel: str | None = None,
+) -> list[str]:
     """Validate deploy paths against the exact checkout safe_deploy will commit/push.
 
     This prevents the failure mode where the agent edits one checkout (for example
@@ -1203,6 +1236,7 @@ def _normalise_safe_deploy_paths(project: Path, module_name: str, paths: list[st
     inside the selected project, then they are converted to repo-relative paths.
     """
     clean: list[str] = []
+    module_root = str(module_root_rel or module_name).replace("\\", "/").strip("/")
     seen: set[str] = set()
     for raw in paths or []:
         value = str(raw or "").strip()
@@ -1231,10 +1265,11 @@ def _normalise_safe_deploy_paths(project: Path, module_name: str, paths: list[st
             raise ValueError("Deploy path inside .git is blocked")
         # Safe deploy is module-scoped. Refuse accidental unrelated files unless the
         # caller intentionally passes no paths and lets git add -A capture all changes.
-        if module_name and not (rel == module_name or rel.startswith(f"{module_name}/")):
+        if module_root and not (rel == module_root or rel.startswith(f"{module_root}/")):
             raise ValueError(
                 "DEPLOY_PATH_OUTSIDE_MODULE: safe_deploy_module received a path outside the target module. "
-                f"module_name={module_name}; path={rel}. Use the correct module or split the deploy."
+                f"module_name={module_name}; module_root_rel={module_root}; path={rel}. "
+                "Use the correct module or split the deploy."
             )
         if rel not in seen:
             seen.add(rel)
@@ -1258,7 +1293,12 @@ def _paths_touch_changed_files(deploy_paths: list[str], changed_files: set[str])
     return False
 
 
-def _deploy_request_has_module_changes(module_name: str, deploy_paths: list[str], changed_files: set[str]) -> bool:
+def _deploy_request_has_module_changes(
+    module_name: str,
+    deploy_paths: list[str],
+    changed_files: set[str],
+    module_root_rel: str | None = None,
+) -> bool:
     """Return True when the safe-deploy request has local changes for this module scope.
 
     Empty ``paths`` means the caller did not name a specific file, not that a
@@ -1267,8 +1307,9 @@ def _deploy_request_has_module_changes(module_name: str, deploy_paths: list[str]
     """
     if deploy_paths:
         return _paths_touch_changed_files(deploy_paths, changed_files)
-    module_prefix = module_name.rstrip("/") + "/"
-    return any(rel == module_name or rel.startswith(module_prefix) for rel in changed_files)
+    module_root = (module_root_rel or module_name).rstrip("/")
+    module_prefix = module_root + "/"
+    return any(rel == module_root or rel.startswith(module_prefix) for rel in changed_files)
 
 
 def _safe_deploy_already_deployed_result(
@@ -1735,10 +1776,12 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         return
 
     branch = payload.branch or (client.branch if client else None) or settings.target_git_branch
-    module_path = project_path / payload.module_name
+    module_root_rel = payload.module_root_rel or payload.module_name
+    module_path = project_path / module_root_rel
     checkout_guard = ensure_module_exists_or_sync(
         project_path=project_path,
         module_name=payload.module_name,
+        module_root_rel=module_root_rel,
         branch=branch,
         remote=payload.remote,
         git=git,
@@ -1779,7 +1822,12 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         })
 
     try:
-        deploy_paths = _normalise_safe_deploy_paths(project_path, payload.module_name, payload.paths)
+        deploy_paths = _normalise_safe_deploy_paths(
+            project_path,
+            payload.module_name,
+            payload.paths,
+            module_root_rel,
+        )
     except Exception as exc:  # noqa: BLE001
         _fail("deploy_path_gate", error=str(exc))
         return
@@ -1800,19 +1848,25 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
     if hasattr(git, "changed_files"):
         changed_files_result = git.changed_files(str(project_path))
     else:
-        fallback_paths = deploy_paths or [f"{payload.module_name}/__manifest__.py"]
+        fallback_paths = deploy_paths or [f"{module_root_rel}/__manifest__.py"]
         changed_files_result = CommandResult(command=["git", "changed-files", "legacy-fake"], cwd=str(project_path), exit_code=0, stdout="\n".join(fallback_paths) + "\n")
     if changed_files_result.exit_code != 0:
         _fail("git_changed_files", changed_files_result)
         return
     changed_files = _changed_file_set(changed_files_result)
     _step("git_changed_files", "passed", changed_files_result)
-    no_changes_detected = not _deploy_request_has_module_changes(payload.module_name, deploy_paths, changed_files)
+    no_changes_detected = not _deploy_request_has_module_changes(
+        payload.module_name,
+        deploy_paths,
+        changed_files,
+        module_root_rel,
+    )
     if no_changes_detected:
         try:
             verify_result = verify_deployed_module(DeployedModuleVerifyRequest(
                 project_path=str(project_path),
                 module_name=payload.module_name,
+                module_root_rel=module_root_rel,
                 paths=deploy_paths,
                 include_module_status=False,
                 client_name=client.name if client else payload.client_name,
@@ -1954,6 +2008,7 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         qa_report = self_run(SelfRunRequest(
             project_path=str(project_path),
             module_name=payload.module_name,
+            module_root_rel=module_root_rel,
             run_pytest=True,
             include_git_status=True,
             timeout_seconds=min(payload.timeout_seconds, 600),
@@ -1963,8 +2018,27 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             _fail("qa_self_run", qa_report)
             return
 
-    verify_files = _pre_push_verify_files(project_path, payload.module_name, deploy_paths, status_result.stdout)
-    if verify_files:
+    verify_files = _pre_push_verify_files(
+        project_path,
+        payload.module_name,
+        deploy_paths,
+        status_result.stdout,
+        module_root_rel,
+    )
+    verification_proof = VerificationProofService().validate(
+        payload.verification_proof_id,
+        project=project_path,
+        module_name=payload.module_name,
+        module_root_rel=module_root_rel,
+        paths=deploy_paths,
+    )
+    if verification_proof:
+        _step("verify_against_core_pre_push", "passed", {
+            "status": "reused_exact_diff",
+            "verification_proof_id": payload.verification_proof_id,
+            "message": "Reused the code-change verifier result because HEAD and the complete binary working-tree diff are unchanged.",
+        })
+    elif verify_files:
         verify_result = SyntaxVerifierService().verify(SyntaxVerifyRequest(
             written_files=verify_files,
             fix_cycle=0,
@@ -1987,7 +2061,12 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
             },
         )
     expected_user_hashes = _expected_user_file_hashes(project_path, verify_files)
-    expected_registry_fields = _normalise_expected_registry_fields(payload.expected_registry_fields) or _infer_registry_fields_from_python(project_path, payload.module_name, verify_files)
+    expected_registry_fields = _normalise_expected_registry_fields(payload.expected_registry_fields) or _infer_registry_fields_from_python(
+        project_path,
+        payload.module_name,
+        verify_files,
+        module_root_rel,
+    )
 
     identity_result = git.configure_identity(str(project_path))
     if identity_result.exit_code != 0:
@@ -2374,9 +2453,20 @@ def _run_safe_deploy(payload: SafeDeployModuleRequest, job_id: str) -> None:
         if remote_head.exit_code != 0 or remote_sha != pushed_sha:
             return False
 
-        verify_files = _pre_push_verify_files(project_path, payload.module_name, retry_paths, git.status(str(project_path)).stdout if hasattr(git, "status") else "") or implicated_files
+        verify_files = _pre_push_verify_files(
+            project_path,
+            payload.module_name,
+            retry_paths,
+            git.status(str(project_path)).stdout if hasattr(git, "status") else "",
+            module_root_rel,
+        ) or implicated_files
         expected_user_hashes = _expected_user_file_hashes(project_path, verify_files)
-        expected_registry_fields = _normalise_expected_registry_fields(payload.expected_registry_fields) or _infer_registry_fields_from_python(project_path, payload.module_name, verify_files)
+        expected_registry_fields = _normalise_expected_registry_fields(payload.expected_registry_fields) or _infer_registry_fields_from_python(
+            project_path,
+            payload.module_name,
+            verify_files,
+            module_root_rel,
+        )
         job = store.get_job(job_id)
         job.request["push_started_epoch"] = push_started_epoch
         job.request["last_sha"] = pushed_sha
