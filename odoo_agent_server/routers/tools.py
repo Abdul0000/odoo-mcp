@@ -7808,7 +7808,14 @@ async def _dispatch(name: str, args: dict) -> object:
         watchdog = WorkflowWatchdogService()
         store = JsonStore()
         job = _recover_code_change_job_if_orphaned(store.get_job(req.job_id), store)
-        if req.wait_for_result and job.status in {JobStatus.queued, JobStatus.running}:
+        initial_assessment = watchdog.annotate_job(job)
+        # Once the same phase has crossed its soft deadline, return control to
+        # the agent immediately instead of adding another blocking wait window.
+        if (
+            req.wait_for_result
+            and job.status in {JobStatus.queued, JobStatus.running}
+            and not initial_assessment.watchdog.deadline_exceeded
+        ):
             job = await asyncio.to_thread(
                 store.wait_job,
                 req.job_id,
@@ -8094,6 +8101,9 @@ def _dynamic_tool_output_schema(name: str) -> dict:
                     "protected": {"type": "boolean"},
                     "stalled": {"type": "boolean"},
                     "idle_seconds": {"type": "number", "minimum": 0},
+                    "phase_elapsed_seconds": {"type": "number", "minimum": 0},
+                    "soft_deadline_seconds": {"type": "number", "exclusiveMinimum": 0},
+                    "deadline_exceeded": {"type": "boolean"},
                     "unchanged_observations": {"type": "integer", "minimum": 0},
                     "action": {"type": "string"},
                     "reason": {"type": "string"},
@@ -8122,14 +8132,17 @@ def _dynamic_tool_output_schema(name: str) -> dict:
                         "required": ["type", "instruction"],
                         "additionalProperties": False,
                     },
+                    "agent_instruction": {"type": ["string", "null"], "maxLength": 1000},
                     "poll_after_seconds": {"type": ["integer", "null"]},
                     "cancellation_supported": {"type": "boolean"},
                     "force_cancelled": {"type": "boolean"},
                 },
                 "required": [
                     "status", "phase", "protected", "stalled", "idle_seconds",
+                    "phase_elapsed_seconds", "soft_deadline_seconds", "deadline_exceeded",
                     "unchanged_observations", "action", "reason",
                     "redirect_kind", "next_action",
+                    "agent_instruction",
                     "cancellation_supported", "force_cancelled",
                 ],
                 "additionalProperties": False,

@@ -136,6 +136,17 @@ class WorkflowWatchdogService:
         terminal = job.status not in {JobStatus.queued, JobStatus.running}
         last_activity = self._job_last_activity(job, now, progress)
         idle_seconds = max((now - last_activity).total_seconds(), 0.0)
+        phase_started = self._parse_time((progress or {}).get("phase_started_at"))
+        phase_elapsed_seconds = max(
+            (now - (phase_started or last_activity)).total_seconds(),
+            0.0,
+        )
+        soft_deadline_seconds = float(settings.workflow_watchdog_observation_budget_seconds)
+        deadline_exceeded = (
+            not terminal
+            and phase_started is not None
+            and phase_elapsed_seconds >= soft_deadline_seconds
+        )
 
         fingerprint = self._job_fingerprint(job, progress)
         with self._job_states_lock:
@@ -155,15 +166,35 @@ class WorkflowWatchdogService:
                 }
                 self._prune_job_states()
 
-        stalled = (
-            not terminal
-            and idle_seconds >= settings.workflow_watchdog_observation_budget_seconds
-            and unchanged >= settings.workflow_watchdog_stall_confirmations
+        # A persisted phase timestamp is authoritative: the first poll after the
+        # deadline must escalate. Legacy jobs without phase progress retain the
+        # confirmation guard to avoid false positives from a coarse created_at.
+        stalled = not terminal and (
+            deadline_exceeded
+            if phase_started is not None
+            else (
+                idle_seconds >= soft_deadline_seconds
+                and unchanged >= settings.workflow_watchdog_stall_confirmations
+            )
         )
+        agent_instruction: str | None = None
         if terminal:
             action = "stop_polling"
             reason = "Job is terminal."
             redirect_kind = "none"
+        elif protected and stalled:
+            action = "continue_with_backoff"
+            reason = (
+                "The same protected phase exceeded its 2-minute soft deadline. "
+                "It remains protected from unsafe cancellation."
+            )
+            redirect_kind = "preserve_protected_work"
+            agent_instruction = (
+                "SAME_PHASE_DEADLINE_EXCEEDED: do not wait silently, restart the task, or add optional "
+                "inspection. Poll jobs.get immediately with wait_for_result=false. A live protected "
+                "worker must finish its current atomic operation; an expired worker lease is recovered "
+                "by jobs.get from the persisted checkpoint."
+            )
         elif protected:
             action = "continue_with_backoff"
             reason = "Mutation-capable or unknown work is protected from cancellation."
@@ -172,6 +203,10 @@ class WorkflowWatchdogService:
             action = "switch_strategy"
             reason = "Read-only job exceeded its budget without observable progress."
             redirect_kind = self._job_redirect_kind(job)
+            agent_instruction = (
+                "SAME_PHASE_DEADLINE_EXCEEDED: stop repeating this read-only step and execute "
+                "watchdog.next_action now."
+            )
         else:
             action = "continue"
             reason = "No confirmed stall."
@@ -214,12 +249,22 @@ class WorkflowWatchdogService:
             "protected": protected,
             "stalled": stalled,
             "idle_seconds": round(idle_seconds, 1),
+            "phase_elapsed_seconds": round(phase_elapsed_seconds, 1),
+            "soft_deadline_seconds": soft_deadline_seconds,
+            "deadline_exceeded": deadline_exceeded,
             "unchanged_observations": unchanged,
             "action": action,
             "reason": reason,
             "redirect_kind": redirect_kind,
             "next_action": next_actions.get(redirect_kind),
-            "poll_after_seconds": None if terminal else min(10, max(1, 2 ** min(unchanged, 3))),
+            "agent_instruction": agent_instruction,
+            "poll_after_seconds": (
+                None
+                if terminal
+                else 2
+                if deadline_exceeded
+                else min(10, max(1, 2 ** min(unchanged, 3)))
+            ),
             "cancellation_supported": False,
             "force_cancelled": False,
         }

@@ -1833,6 +1833,9 @@ class WatchdogAssessment(BaseModel):
     protected: bool
     stalled: bool
     idle_seconds: float = Field(ge=0)
+    phase_elapsed_seconds: float = Field(ge=0)
+    soft_deadline_seconds: float = Field(gt=0)
+    deadline_exceeded: bool
     unchanged_observations: int = Field(ge=0)
     action: Literal["continue", "continue_with_backoff", "switch_strategy", "stop_polling"]
     reason: str
@@ -1847,6 +1850,7 @@ class WatchdogAssessment(BaseModel):
         "ask_material_question",
     ] = "none"
     next_action: WatchdogNextAction | None = None
+    agent_instruction: str | None = Field(default=None, max_length=1000)
     poll_after_seconds: int | None = Field(default=None, ge=1, le=10)
     cancellation_supported: bool = False
     force_cancelled: bool = False

@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from odoo_agent_server.config import settings
 from odoo_agent_server.config import Settings
 from odoo_agent_server.main import app
+from odoo_agent_server.routers import tools as tools_router
 from odoo_agent_server.routers.jobs import get_job
 from odoo_agent_server.routers.mcp import _arguments_for_profile, _provider_safe_next_calls
 from odoo_agent_server.routers.tools import tool_output_schema
@@ -93,6 +94,48 @@ def test_deploy_job_remains_protected_when_stale(monkeypatch):
     assert assessment["cancellation_supported"] is False
     assert assessment["action"] == "continue_with_backoff"
     assert assessment["redirect_kind"] == "preserve_protected_work"
+
+
+def test_persisted_protected_phase_escalates_on_first_poll(monkeypatch):
+    old = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat()
+    monkeypatch.setattr(settings, "workflow_watchdog_observation_budget_seconds", 120)
+    job = JobRecord(
+        id="code-phase-deadline-1",
+        job_type="workflow.odoo_code_change",
+        status=JobStatus.running,
+    )
+
+    assessment = WorkflowWatchdogService().assess_job(job, {
+        "current_phase": "write_and_checkpoint",
+        "phase_started_at": old,
+        "last_progress_at": old,
+    })
+
+    assert assessment["stalled"] is True
+    assert assessment["deadline_exceeded"] is True
+    assert assessment["protected"] is True
+    assert assessment["unchanged_observations"] == 0
+    assert assessment["poll_after_seconds"] == 2
+    assert assessment["agent_instruction"].startswith("SAME_PHASE_DEADLINE_EXCEEDED")
+    assert assessment["action"] == "continue_with_backoff"
+
+
+def test_persisted_read_phase_switches_strategy_on_first_poll(monkeypatch):
+    old = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat()
+    monkeypatch.setattr(settings, "workflow_watchdog_observation_budget_seconds", 120)
+    job = JobRecord(id="read-phase-deadline-1", job_type="module_analysis", status=JobStatus.running)
+
+    assessment = WorkflowWatchdogService().assess_job(job, {
+        "current_phase": "focused_target_search",
+        "phase_started_at": old,
+        "last_progress_at": old,
+    })
+
+    assert assessment["stalled"] is True
+    assert assessment["deadline_exceeded"] is True
+    assert assessment["protected"] is False
+    assert assessment["action"] == "switch_strategy"
+    assert assessment["next_action"]["type"] == "use_focused_evidence"
 
 
 def test_stale_read_job_recommends_strategy_switch_without_claiming_cancel(monkeypatch):
@@ -249,10 +292,48 @@ def test_jobs_get_output_schema_advertises_watchdog_contract():
     watchdog = tool_output_schema("jobs.get")["properties"]["watchdog"]
     assert watchdog["additionalProperties"] is False
     assert {"status", "protected", "stalled", "action", "reason"} <= set(watchdog["properties"])
+    assert {"phase_elapsed_seconds", "soft_deadline_seconds", "deadline_exceeded", "agent_instruction"} <= set(watchdog["properties"])
     assert {"redirect_kind", "next_action"} <= set(watchdog["properties"])
     next_action = watchdog["properties"]["next_action"]
     assert next_action["additionalProperties"] is False
     assert set(next_action["required"]) == {"type", "instruction"}
+
+
+@pytest.mark.asyncio
+async def test_jobs_get_skips_blocking_wait_after_phase_deadline(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "workflow_watchdog_observation_budget_seconds", 120)
+    operation_id = "deadline-operation-001"
+    old = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat()
+    store = JsonStore()
+    store.create_job(JobRecord(
+        id="deadline-codejob-001",
+        job_type="workflow.odoo_code_change",
+        status=JobStatus.running,
+        request={
+            "operation_id": operation_id,
+            "owner_instance_id": tools_router._CODING_WORKFLOW_INSTANCE_ID,
+        },
+    ))
+    store.update_workflow_progress(operation_id, {
+        "current_phase": "qa_and_core_verification",
+        "phase_started_at": old,
+        "last_progress_at": old,
+        "terminal": False,
+    })
+
+    def unexpected_wait(*_args, **_kwargs):
+        raise AssertionError("jobs.get must return immediately after the phase deadline")
+
+    monkeypatch.setattr("odoo_agent_server.routers.tools.JsonStore.wait_job", unexpected_wait)
+    response = await tools_router._dispatch("jobs.get", {
+        "job_id": "deadline-codejob-001",
+        "wait_for_result": True,
+        "wait_timeout_seconds": 30,
+    })
+
+    assert response["watchdog"]["deadline_exceeded"] is True
+    assert response["watchdog"]["agent_instruction"].startswith("SAME_PHASE_DEADLINE_EXCEEDED")
 
 
 def test_mcp_watchdog_coexists_with_operation_guard(tmp_path, monkeypatch):
