@@ -113,6 +113,27 @@ def test_provider_validation_errors_are_agent_friendly():
     assert payload["structuredContent"]["error_type"] == "tool_input_invalid"
 
 
+def test_provider_unexpected_errors_are_structured_and_terminal(monkeypatch):
+    async def fail_dispatch(_name, _arguments):
+        raise RuntimeError("connector exploded")
+
+    monkeypatch.setattr("odoo_agent_server.routers.mcp._dispatch", fail_dispatch)
+    client = TestClient(app)
+    response = client.post(
+        "/mcp",
+        headers=_auth(),
+        json=_mcp("tools/call", {"name": "connector_health", "arguments": {}}),
+    )
+    payload = response.json()["result"]
+    structured = payload["structuredContent"]
+    assert payload["isError"] is True
+    assert structured["outcome"] == "failed"
+    assert structured["terminal"] is True
+    assert structured["completion_required"] is False
+    assert structured["success_allowed"] is False
+    assert structured["error_code"] == "RuntimeError"
+
+
 def test_all_rest_tool_names_still_have_safe_mcp_aliases():
     for tool in list_tools(strict_names=False):
         safe = strict_safe_tool_name(tool.name)

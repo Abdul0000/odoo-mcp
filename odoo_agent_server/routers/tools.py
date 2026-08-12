@@ -7712,9 +7712,11 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             }
     elif internal == "artifacts.read":
         properties.update({
-            "artifact_id": {"type": "string"}, "content": {"type": "string"},
-            "offset": {"type": "integer"}, "next_offset": {"type": "integer"},
-            "truncated": {"type": "boolean"},
+            "artifact_id": {"type": "string"}, "kind": {"type": ["string", "null"]},
+            "source_tool": {"type": ["string", "null"]}, "created_at": {"type": ["string", "null"]},
+            "bytes": {"type": "integer"}, "offset": {"type": "integer"},
+            "returned_chars": {"type": "integer"}, "next_offset": {"type": ["integer", "null"]},
+            "text": {"type": "string"},
         })
     return {"type": "object", "properties": properties, "additionalProperties": True}
 

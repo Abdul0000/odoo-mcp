@@ -82,7 +82,7 @@ def test_hidden_direct_tool_call_is_blocked_with_next_action():
     structured = response.json()["result"]["structuredContent"]
     assert structured["status"] == "tool_profile_blocked"
     assert structured["success_allowed"] is False
-    assert structured["next_call"]["tool"] == "workflow.odoo_code_change"
+    assert structured["next_call"]["tool"] == "workflow_odoo_code_change"
 
 
 def test_jobs_get_uses_watchdog_bounded_provider_poll(monkeypatch):

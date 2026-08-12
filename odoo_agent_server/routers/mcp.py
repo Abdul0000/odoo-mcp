@@ -46,15 +46,15 @@ def _dump_any(value: Any) -> Any:
 
 
 def _to_structured_content(result: Any, tool_name: str) -> dict[str, Any]:
-    """MCP's CallToolResult.structuredContent MUST be a JSON object (dict).
+    """Return the server's backward-compatible object response envelope.
 
     Several tools (repo.list, repo.list_custom_modules, jobs.list,
     approvals.list, audit.list, workflow tools returning matches, etc.)
-    naturally return a bare list of Pydantic models. A raw list at the top
-    level fails MCP schema validation with:
+    naturally return a bare list of Pydantic models. Older provider clients
+    used by this connector reject a raw list at the top level with:
         "Input should be a valid dictionary [type=dict_type]"
     Wrap any non-dict result in {"items": [...], "count": N} so every tool
-    call is schema-valid regardless of what the underlying function returns.
+    call stays compatible while newer MCP clients can still consume it as JSON.
     """
     dumped = _dump_any(result)
     if isinstance(dumped, dict):
@@ -95,6 +95,100 @@ def _artifact_next_call(artifact: dict[str, Any], max_chars: int = 12000) -> dic
         "tool": "artifacts.read",
         "arguments": {"artifact_id": artifact["artifact_id"], "offset": 0, "max_chars": max_chars},
     }
+
+
+_CONTROL_SCHEMA_VERSION = "1.0"
+_CONTROL_REQUIRED_FIELDS = [
+    "status",
+    "outcome",
+    "terminal",
+    "completion_required",
+    "success_allowed",
+    "next_call",
+    "input_required",
+    "error",
+]
+
+
+def _ensure_provider_control_envelope(value: Any, *, is_error: bool = False) -> dict[str, Any]:
+    """Add one deterministic provider-facing control contract.
+
+    Existing workflow status values and payload fields stay untouched. The added
+    fields let a remote agent decide whether to continue, ask the user, retry, or
+    stop without interpreting prose. Incomplete job responses receive a safe poll
+    call when the workflow returned a job id but omitted its continuation.
+    """
+    out = dict(value) if isinstance(value, dict) else {"result": value}
+    status_value = out.get("status")
+    status_text = str(status_value or ("failed" if is_error else "ok"))
+    status_key = status_text.strip().lower().replace("-", "_").replace(" ", "_")
+
+    error_like = is_error or any(token in status_key for token in ("failed", "error", "invalid"))
+    blocked_like = any(token in status_key for token in ("blocked", "stale"))
+    input_like = any(token in status_key for token in ("clarification", "authorization", "approval", "input_required"))
+    pending_like = (
+        status_key.startswith("needs_")
+        or any(token in status_key for token in ("running", "queued", "started", "waiting", "pending", "required", "ready_to_deploy"))
+    )
+
+    next_call = out.get("next_call") if isinstance(out.get("next_call"), dict) else None
+    explicit_completion = out.get("completion_required")
+    explicit_success = out.get("success_allowed")
+    if isinstance(explicit_completion, bool):
+        completion_required = explicit_completion
+    else:
+        completion_required = bool(next_call or pending_like or (explicit_success is False and not error_like))
+
+    if completion_required and next_call is None and out.get("job_id"):
+        next_call = {
+            "tool": "jobs.get",
+            "arguments": {
+                "job_id": str(out["job_id"]),
+                "wait_for_result": True,
+                "wait_timeout_seconds": 600,
+            },
+        }
+
+    input_required = bool(out.get("input_required")) or input_like
+    if completion_required and next_call is None:
+        # Never leave a non-terminal response without an executable continuation
+        # or an explicit signal that human input is required.
+        input_required = True
+
+    if error_like:
+        outcome = "failed"
+    elif input_required:
+        outcome = "input_required"
+    elif blocked_like:
+        outcome = "blocked"
+    elif completion_required:
+        outcome = "pending"
+    else:
+        outcome = "success"
+
+    success_allowed = False if completion_required or error_like else (
+        explicit_success if isinstance(explicit_success, bool) else outcome == "success"
+    )
+    error_value = out.get("error")
+    error_code = out.get("error_code") or out.get("error_type")
+    retryable_value = out.get("retryable")
+
+    out.update(
+        {
+            "schema_version": str(out.get("schema_version") or _CONTROL_SCHEMA_VERSION),
+            "status": status_text,
+            "outcome": outcome,
+            "terminal": not completion_required,
+            "completion_required": completion_required,
+            "success_allowed": bool(success_allowed),
+            "next_call": next_call,
+            "input_required": input_required,
+            "error": error_value if error_value is not None else None,
+            "error_code": str(error_code) if error_code is not None else None,
+            "retryable": retryable_value if isinstance(retryable_value, bool) else None,
+        }
+    )
+    return out
 
 
 def _provider_safe_next_calls(value: Any) -> Any:
@@ -139,61 +233,73 @@ def _normalize_remote_structured(value: Any, tool_name: str) -> dict[str, Any]:
     if len(full_json) <= 18000:
         return value if isinstance(value, dict) else {"result": value}
 
-    def normalize(item: Any) -> Any:
+    truncated_any = False
+
+    def normalize(item: Any, *, list_limit: int = 50) -> Any:
+        nonlocal truncated_any
         if hasattr(item, "model_dump"):
             item = item.model_dump(mode="json")
         if isinstance(item, list):
-            normalized_items = [normalize(child) for child in item[:50]]
-            return {
-                "items": normalized_items,
-                "count": len(item),
-                "truncated": len(item) > 50,
-                "next_action": "Re-call the source tool with a narrower limit or filter if more items are needed.",
-            }
+            if len(item) > list_limit:
+                truncated_any = True
+            # Preserve the advertised array type. Metadata is added by the
+            # containing object and the exact payload is retained as an artifact.
+            return [normalize(child) for child in item[:list_limit]]
         if not isinstance(item, dict):
             text = str(item)
             if len(text) <= 8000:
                 return item
-            artifact = store.create_artifact("text", tool_name, text)
-            return {
-                "preview": _preview_text(text, 8000),
-                "truncated": True,
-                "artifact": artifact,
-                "next_call": _artifact_next_call(artifact),
-            }
+            truncated_any = True
+            # Keep scalar fields scalar so outputSchema types remain truthful.
+            return _preview_text(text, 8000)
 
         out: dict[str, Any] = {}
         for key, child in item.items():
-            if key in {"stdout", "stderr", "content", "status"} and isinstance(child, str) and len(child) > 12000:
+            if key in {"stdout", "stderr", "content"} and isinstance(child, str) and len(child) > 12000:
                 artifact = store.create_artifact(key, tool_name, child)
                 out[key] = _preview_text(child, 12000)
                 out[f"{key}_truncated"] = True
                 out[f"{key}_artifact"] = artifact
                 out[f"{key}_next_call"] = _artifact_next_call(artifact)
-            elif key == "result":
-                out[key] = normalize(child)
-            elif key == "steps" and isinstance(child, list):
-                out[key] = [normalize(step) for step in child[:25]]
-                if len(child) > 25:
-                    out["steps_truncated"] = True
+            elif isinstance(child, list):
+                limit = 25 if key == "steps" else 50
+                out[key] = normalize(child, list_limit=limit)
+                if len(child) > limit:
+                    out[f"{key}_count"] = len(child)
+                    out[f"{key}_truncated"] = True
             else:
                 out[key] = normalize(child)
         return out
 
     normalized = normalize(value)
+    if truncated_any and isinstance(normalized, dict):
+        artifact = store.create_artifact("structured", tool_name, value)
+        normalized["truncated"] = True
+        normalized["details_ref"] = artifact
+        normalized["details_next_call"] = _artifact_next_call(artifact)
+        normalized["next_action"] = "Use details_next_call for exact output, or re-call the source tool with a narrower filter."
     normalized_json = json.dumps(normalized, ensure_ascii=False, default=str)
     if isinstance(normalized, dict) and len(normalized_json) <= 24000:
         return normalized
 
     artifact = store.create_artifact("structured", tool_name, value)
-    return {
-        "status": value.get("status", "ok") if isinstance(value, dict) else "ok",
+    source = normalized if isinstance(normalized, dict) else {}
+    compact_keys = {
+        "schema_version", "status", "outcome", "phase", "job_id", "terminal",
+        "completion_required", "success_allowed", "next_call", "input_required",
+        "error", "error_code", "retryable", "deploy_confirmed",
+        "reproduction_passed", "expected_result_verified", "claim_status", "truth_gate",
+    }
+    compact = {key: source[key] for key in compact_keys if key in source}
+    compact.update({
         "truncated": True,
         "preview": _preview_text(full_json, 12000),
         "artifact": artifact,
-        "next_call": _artifact_next_call(artifact),
-        "next_action": "Use artifacts.read for exact output, or repo.search/repo.read_range for focused code inspection.",
-    }
+        "details_ref": artifact,
+        "details_next_call": _artifact_next_call(artifact),
+        "next_action": "Use details_next_call for exact output; preserve next_call for workflow continuation.",
+    })
+    return compact
 
 
 def _arguments_for_profile(tool_name: str, arguments: dict[str, Any], profile: str | None) -> dict[str, Any]:
@@ -510,12 +616,17 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
                 "type": "object",
                 "properties": {
                     "status": {"type": "string"},
+                    "outcome": {"type": "string", "enum": ["success", "pending", "blocked", "failed", "input_required"]},
                     "message": {"type": "string"},
                     "job_id": {"type": ["string", "null"]},
+                    "terminal": {"type": "boolean"},
                     "success_allowed": {"type": "boolean"},
                     "completion_required": {"type": "boolean"},
                     "next_call": {"type": ["object", "null"], "additionalProperties": True},
+                    "input_required": {"type": "boolean"},
+                    "error": {"type": ["string", "object", "null"], "additionalProperties": True},
                 },
+                "required": list(_CONTROL_REQUIRED_FIELDS),
                 "additionalProperties": True,
             }
             preserve = {
@@ -525,6 +636,10 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
                     "claim_status", "truth_gate", "diagnosis", "handoff",
                 },
                 "skills.read": {"name", "description", "content"},
+                "artifacts.read": {
+                    "artifact_id", "kind", "source_tool", "created_at", "bytes",
+                    "offset", "returned_chars", "next_offset", "text",
+                },
             }.get(tool.name, set())
             source_properties = output_schema.get("properties") or {}
             for key in preserve:
@@ -667,6 +782,7 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
         try:
             if profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and internal_name not in _PROVIDER_TOOL_NAMES:
                 guard_structured = McpOperationGuardService().tool_profile_block(internal_name, arguments if isinstance(arguments, dict) else {})
+                guard_structured = _provider_safe_next_calls(_ensure_provider_control_envelope(guard_structured))
                 text = json.dumps(guard_structured, ensure_ascii=False, default=str)
                 return _shell_response(
                     request_id,
@@ -682,6 +798,7 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                 arguments = op_guard.canonicalize_arguments(internal_name, arguments)
                 guarded = op_guard.before_tool_call(internal_name, arguments)
                 if guarded:
+                    guarded = _provider_safe_next_calls(_ensure_provider_control_envelope(guarded))
                     text = json.dumps(guarded, ensure_ascii=False, default=str)
                     return _shell_response(
                         request_id,
@@ -705,9 +822,11 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                 op_guard = McpOperationGuardService()
                 op_guard.after_tool_call(internal_name, arguments, structured if isinstance(structured, dict) else {"result": structured})
                 structured = op_guard.annotate_result(internal_name, arguments, structured if isinstance(structured, dict) else {"result": structured})
-            if profile in {"provider", "claude", "chatgpt", "grok", "qwen"} and internal_name != "artifacts.read":
-                structured = _normalize_remote_structured(structured, internal_name)
-                structured = _provider_safe_next_calls(structured)
+            if profile in {"provider", "claude", "chatgpt", "grok", "qwen"}:
+                structured = _ensure_provider_control_envelope(structured)
+                if internal_name != "artifacts.read":
+                    structured = _normalize_remote_structured(structured, internal_name)
+                structured = _provider_safe_next_calls(_ensure_provider_control_envelope(structured))
             text = json.dumps(structured, ensure_ascii=False, default=str)
             # Context-bloat guard: in long sessions, oversized tool outputs (large diffs,
             # logs, file reads) compound across many calls and slow down/derail the model.
@@ -723,23 +842,44 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
             )
         except ValidationError as exc:
             message = format_tool_validation_error(exc)
+            structured_error = _provider_safe_next_calls(
+                _ensure_provider_control_envelope(
+                    {
+                        "status": "failed",
+                        "error": message,
+                        "error_type": "tool_input_invalid",
+                        "error_code": "tool_input_invalid",
+                        "retryable": False,
+                    },
+                    is_error=True,
+                )
+            )
             return _shell_response(
                 request_id,
                 {
                     "content": [{"type": "text", "text": message}],
-                    "structuredContent": {
-                        "status": "failed",
-                        "error": message,
-                        "error_type": "tool_input_invalid",
-                    },
+                    "structuredContent": structured_error,
                     "isError": True,
                 },
             )
         except Exception as exc:  # noqa: BLE001
+            message = str(exc)
+            structured_error = _provider_safe_next_calls(
+                _ensure_provider_control_envelope(
+                    {
+                        "status": "failed",
+                        "error": message,
+                        "error_code": type(exc).__name__,
+                        "retryable": None,
+                    },
+                    is_error=True,
+                )
+            )
             return _shell_response(
                 request_id,
                 {
-                    "content": [{"type": "text", "text": str(exc)}],
+                    "content": [{"type": "text", "text": message}],
+                    "structuredContent": structured_error,
                     "isError": True,
                 },
             )

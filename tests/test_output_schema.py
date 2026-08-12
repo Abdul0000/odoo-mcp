@@ -1,10 +1,19 @@
+import json
+
 from fastapi.testclient import TestClient
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, validate
 
 from odoo_agent_server.config import settings
 from odoo_agent_server.main import app
-from odoo_agent_server.routers.mcp import _tool_to_mcp, _tools_for_profile
+from odoo_agent_server.routers.mcp import (
+    _ensure_provider_control_envelope,
+    _normalize_remote_structured,
+    _provider_safe_next_calls,
+    _tool_to_mcp,
+    _tools_for_profile,
+)
 from odoo_agent_server.routers.tools import _tool_output_schemas, tool_output_schema
+from odoo_agent_server.services.store_service import JsonStore
 
 
 def test_output_schemas_resolve_for_pydantic_backed_tools():
@@ -63,6 +72,47 @@ def test_all_provider_profiles_expose_output_schema_for_every_tool():
             Draft202012Validator.check_schema(tool["outputSchema"])
 
 
+def test_provider_output_schemas_require_the_shared_control_envelope():
+    required = {
+        "status", "outcome", "terminal", "completion_required", "success_allowed",
+        "next_call", "input_required", "error",
+    }
+    for profile in ("provider", "chatgpt", "claude", "grok", "qwen"):
+        for tool in (_tool_to_mcp(item, profile) for item in _tools_for_profile(profile)):
+            assert required <= set(tool["outputSchema"]["required"])
+
+
+def test_provider_runtime_result_validates_against_advertised_schema(monkeypatch):
+    async def fake_dispatch(_name, _arguments):
+        return {"status": "needs_writes", "success_allowed": False}
+
+    monkeypatch.setattr("odoo_agent_server.routers.mcp._dispatch", fake_dispatch)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.api_token}"}
+    tools = client.post(
+        "/mcp",
+        headers=headers,
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ).json()["result"]["tools"]
+    schema = next(tool["outputSchema"] for tool in tools if tool["name"] == "workflow_odoo_code_change")
+    response = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "workflow_odoo_code_change",
+                "arguments": {"module_name": "x_module", "task_description": "Update the module"},
+            },
+        },
+    )
+    structured = response.json()["result"]["structuredContent"]
+    validate(instance=structured, schema=schema)
+    assert structured["completion_required"] is True
+    assert structured["input_required"] is True
+    assert structured["success_allowed"] is False
+
+
 def test_description_result_field_remains_a_valid_property_schema():
     tool = next(
         _tool_to_mcp(item, "chatgpt")
@@ -75,3 +125,73 @@ def test_description_result_field_remains_a_valid_property_schema():
 def test_job_output_schema_uses_serialization_fields():
     schema = tool_output_schema("jobs.get")
     assert {"deploy_confirmed", "completion_required", "next_call", "terminal_action"} <= set(schema["properties"])
+
+
+def test_large_structured_result_preserves_array_types_and_workflow_continuation(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    original_next_call = {
+        "tool": "jobs.get",
+        "arguments": {"job_id": "job-1", "wait_for_result": True},
+    }
+    source = _ensure_provider_control_envelope(
+        {
+            "status": "running",
+            "job_id": "job-1",
+            "completion_required": True,
+            "success_allowed": False,
+            "next_call": original_next_call,
+            "records": [{"id": index, "value": "x" * 200} for index in range(100)],
+        }
+    )
+
+    normalized = _provider_safe_next_calls(_normalize_remote_structured(source, "jobs.get"))
+
+    assert isinstance(normalized["records"], list)
+    assert len(normalized["records"]) == 50
+    assert normalized["records_count"] == 100
+    assert normalized["records_truncated"] is True
+    assert normalized["next_call"]["tool"] == "jobs_get"
+    assert normalized["next_call"]["arguments"]["job_id"] == "job-1"
+    assert normalized["details_next_call"]["tool"] == "artifacts_read"
+    assert normalized["completion_required"] is True
+    assert normalized["success_allowed"] is False
+    assert normalized["terminal"] is False
+    assert json.dumps(normalized)
+
+
+def test_artifact_read_schema_matches_store_payload_fields():
+    properties = tool_output_schema("artifacts.read")["properties"]
+    assert {
+        "artifact_id", "kind", "source_tool", "created_at", "bytes", "offset",
+        "returned_chars", "next_offset", "text",
+    } <= set(properties)
+    assert "content" not in properties
+    assert "truncated" not in properties
+
+
+def test_provider_artifact_read_result_validates_against_advertised_schema(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    artifact = JsonStore().create_artifact("structured", "test.source", {"value": "exact"})
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {settings.api_token}"}
+    tools = client.post(
+        "/mcp",
+        headers=headers,
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    ).json()["result"]["tools"]
+    schema = next(tool["outputSchema"] for tool in tools if tool["name"] == "artifacts_read")
+    response = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "artifacts_read",
+                "arguments": {"artifact_id": artifact["artifact_id"], "offset": 0, "max_chars": 12000},
+            },
+        },
+    )
+    structured = response.json()["result"]["structuredContent"]
+    validate(instance=structured, schema=schema)
+    assert structured["text"]
+    assert structured["artifact_id"] == artifact["artifact_id"]
