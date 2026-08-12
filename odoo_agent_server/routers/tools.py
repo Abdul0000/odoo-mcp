@@ -3032,19 +3032,56 @@ def _verification_override_decision(
     }
 
 
+_CODING_WORKFLOW_MAX_WORKERS = max(1, int(getattr(settings, "coding_workflow_max_workers", 2)))
+_CODING_WORKFLOW_MAX_QUEUE = max(0, int(getattr(settings, "coding_workflow_max_queue", 2)))
+_CODING_WORKFLOW_ADMISSION_CAPACITY = _CODING_WORKFLOW_MAX_WORKERS + _CODING_WORKFLOW_MAX_QUEUE
+_CODING_WORKFLOW_ADMISSION = threading.BoundedSemaphore(_CODING_WORKFLOW_ADMISSION_CAPACITY)
 _CODING_WORKFLOW_EXECUTOR = ThreadPoolExecutor(
-    max_workers=max(1, int(getattr(settings, "coding_workflow_max_workers", 2))),
+    max_workers=_CODING_WORKFLOW_MAX_WORKERS,
     thread_name_prefix="odoo-code-change",
 )
 
 
 async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
-    """Run blocking repository/validator work off the MCP event loop."""
+    """Run blocking work off-loop with bounded admission and no cancellation."""
+    admission = _CODING_WORKFLOW_ADMISSION
+    if not admission.acquire(blocking=False):
+        return {
+            "status": "workflow_busy",
+            "message": "The bounded coding workflow is at capacity; no work started. Retry this same call after the stated delay.",
+            "retry_after_seconds": 2,
+            "poll_after_seconds": 2,
+            "protected_work_started": False,
+            "success_allowed": False,
+            "completion_required": True,
+        }
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _CODING_WORKFLOW_EXECUTOR,
-        lambda: asyncio.run(_workflow_odoo_code_change_impl(payload)),
-    )
+    submitted_at = time.perf_counter()
+    worker_started_at: list[float] = []
+
+    def run() -> dict[str, Any]:
+        worker_started_at.append(time.perf_counter())
+        try:
+            return asyncio.run(_workflow_odoo_code_change_impl(payload))
+        finally:
+            # Release only after protected work actually finishes. A disconnected
+            # or cancelled caller must not free capacity while its worker remains
+            # active in the background.
+            admission.release()
+
+    try:
+        future = loop.run_in_executor(_CODING_WORKFLOW_EXECUTOR, run)
+    except Exception:
+        admission.release()
+        raise
+    result = await asyncio.shield(future)
+    if isinstance(result, dict):
+        metrics = dict(result.get("orchestration_metrics") or {})
+        started = worker_started_at[0] if worker_started_at else submitted_at
+        metrics["queue_wait_ms"] = round((started - submitted_at) * 1000)
+        metrics["admission_capacity"] = _CODING_WORKFLOW_ADMISSION_CAPACITY
+        result["orchestration_metrics"] = metrics
+    return result
 
 
 async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dict[str, Any]:
@@ -3255,6 +3292,16 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         str(coding_workspace["id"]),
         module_name=effective_module_name,
         module_path=str(module_dir),
+        validated_fingerprint=(
+            str(coding_session.get("module_fingerprint") or "")
+            if coding_session_resumed and coding_session
+            else None
+        ),
+        validated_base_sha=(
+            str(coding_session.get("base_sha") or "")
+            if coding_session_resumed and coding_session
+            else None
+        ),
     )
     coding_workspace = workspace_activation["workspace"]
     workspace_module_context = workspace_activation["module"]

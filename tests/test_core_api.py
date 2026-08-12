@@ -1,3 +1,5 @@
+import json
+
 from fastapi.testclient import TestClient
 
 from odoo_agent_server.main import app
@@ -58,7 +60,7 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
     provider_flow = instructions["provider_flow"]
     skills = instructions["skills"]
 
-    assert len(instructions["rules"]) <= 8
+    assert len(instructions["rules"]) <= 2
     assert "workflow.odoo_code_change" in rules
     assert "hidden repo, Git" in rules
     assert "Pydantic code inside Odoo addons" in rules
@@ -70,6 +72,7 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
     assert skills["mode"] == "on_demand"
     assert skills["list_tool"] == "skills.list"
     assert skills["read_tool"] == "skills.read"
+    assert len(json.dumps(response.json(), ensure_ascii=False)) < 13_000
     assert {
         "odoo-accounting-development",
         "odoo-manufacturing-development",

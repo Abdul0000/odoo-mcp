@@ -175,6 +175,22 @@ def test_provider_tool_contract_stays_within_context_budget():
     assert len(json.dumps(tools, ensure_ascii=False)) < 60_000
 
 
+def test_provider_tool_descriptions_are_complete_and_semantically_compact():
+    tools = {tool["name"]: tool for tool in _mcp_tools_list()}
+    required = {
+        "client_check": "validation passes",
+        "workflow_odoo_code_change": "needs_writes",
+        "workflow_odoo_debug_and_fix": "verified_fixed=true",
+        "workflow_module_install_and_check": "not permission to edit code",
+        "workflow_frontend_visual_implement": "without editing Odoo core",
+    }
+    for name, marker in required.items():
+        description = tools[name]["description"]
+        assert len(description) <= 500
+        assert description.endswith(".")
+        assert marker in description
+
+
 def test_provider_workflow_exposes_safe_large_module_batches():
     tools = _mcp_tools_list()
     workflow = next(tool for tool in tools if tool["name"] == "workflow_odoo_code_change")

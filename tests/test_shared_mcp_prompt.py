@@ -115,6 +115,7 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "odoo.read_group",
         "do not load a development skill or inspect source",
         "workflow.resume_job",
+        "workflow_busy",
         "jobs.get",
         "deploy_confirmed=true",
         "## CODE QUALITY CONTRACT",

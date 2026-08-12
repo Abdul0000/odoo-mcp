@@ -1,6 +1,7 @@
 import asyncio
 import os
 import subprocess
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -45,6 +46,7 @@ from odoo_agent_server.schemas import (
     JobRecord,
     JobStatus,
     CommandResult,
+    DeployedModuleVerifyRequest,
     OdooCodeChangeRequest,
     OdooCodeFileChange,
     OdooDebugAndFixRequest,
@@ -183,7 +185,64 @@ async def test_code_change_wrapper_keeps_event_loop_responsive(monkeypatch):
     result = await task
 
     assert heartbeat_elapsed < 0.10
-    assert result == {"status": "ok"}
+    assert result["status"] == "ok"
+    assert result["orchestration_metrics"]["queue_wait_ms"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_code_change_wrapper_rejects_excess_queue_before_work_starts(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    async def blocking_impl(_payload):
+        started.set()
+        release.wait(timeout=2)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change_impl", blocking_impl)
+    admission = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(tools_router, "_CODING_WORKFLOW_ADMISSION", admission)
+    monkeypatch.setattr(tools_router, "_CODING_WORKFLOW_ADMISSION_CAPACITY", 1)
+    first = asyncio.create_task(tools_router._workflow_odoo_code_change(_payload("First code change")))
+    assert await asyncio.to_thread(started.wait, 1)
+
+    busy = await tools_router._workflow_odoo_code_change(_payload("Second code change"))
+    release.set()
+    completed = await first
+
+    assert completed["status"] == "ok"
+    assert busy["status"] == "workflow_busy"
+    assert busy["protected_work_started"] is False
+    assert busy["retry_after_seconds"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_caller_does_not_release_capacity_before_worker_finishes(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    async def blocking_impl(_payload):
+        started.set()
+        release.wait(timeout=2)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change_impl", blocking_impl)
+    admission = threading.BoundedSemaphore(1)
+    monkeypatch.setattr(tools_router, "_CODING_WORKFLOW_ADMISSION", admission)
+    monkeypatch.setattr(tools_router, "_CODING_WORKFLOW_ADMISSION_CAPACITY", 1)
+    first = asyncio.create_task(tools_router._workflow_odoo_code_change(_payload("Protected code change")))
+    assert await asyncio.to_thread(started.wait, 1)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    busy = await tools_router._workflow_odoo_code_change(_payload("Queued after disconnect"))
+    release.set()
+    assert await asyncio.to_thread(admission.acquire, timeout=1)
+    admission.release()
+
+    assert busy["status"] == "workflow_busy"
+    assert busy["protected_work_started"] is False
 
 
 def test_nested_module_paths_use_resolved_root_without_changing_technical_name(tmp_path):
@@ -200,6 +259,13 @@ def test_nested_module_paths_use_resolved_root_without_changing_technical_name(t
         [path],
         "addons/vertical/custom_sale",
     ) == [path]
+
+    with pytest.raises(ValueError):
+        DeployedModuleVerifyRequest(
+            project_path=str(project),
+            module_name="custom_sale",
+            module_root_rel="../escape",
+        )
 
 
 def test_module_fingerprint_detects_same_size_change_with_preserved_mtime(tmp_path, monkeypatch):
@@ -344,6 +410,66 @@ def test_coding_workspace_reuses_analysis_and_invalidates_it_after_write(tmp_pat
     assert entry["status"] == "refreshed_after_write"
     assert entry["analysis_index"] is None
     assert entry["bundle_version"] == 2
+
+
+def test_resumed_session_reuses_verified_fingerprint_for_workspace_activation(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    project, modules = _workspace_repo(tmp_path, module_count=1)
+    module = modules["custom_module_1"]
+    workspace_service = CodingWorkspaceService()
+    workspace = workspace_service.open_or_resume(
+        workspace_session_id="workspace-scan-reuse-001",
+        client_name="Test 18",
+        project_path=str(project),
+    )
+    activation = workspace_service.activate_module(
+        workspace["id"], module_name="custom_module_1", module_path=str(module)
+    )
+    entry = activation["module"]
+    session_service = CodingSessionService()
+    session_service.open(
+        session_id="codeop-scan-reuse-001",
+        client_name="Test 18",
+        project_path=str(project),
+        module_name="custom_module_1",
+        module_path=str(module),
+        task_description="Reuse exact inspected context",
+        target_files=["custom_module_1/models/record.py"],
+        evidence={},
+        create_bundle=False,
+        workspace_session_id=workspace["id"],
+        snapshot_metadata={
+            "module_fingerprint": entry["module_fingerprint"],
+            "bundle": entry["bundle"],
+        },
+    )
+
+    original = CodingSessionService._module_files
+    scans: list[Path] = []
+
+    def counted_files(module_path: Path) -> list[Path]:
+        scans.append(module_path)
+        return original(module_path)
+
+    monkeypatch.setattr(CodingSessionService, "_module_files", staticmethod(counted_files))
+    resumed = session_service.resume(
+        "codeop-scan-reuse-001",
+        client_name="Test 18",
+        project_path=str(project),
+        task_description="Reuse exact inspected context",
+    )
+    reused = workspace_service.activate_module(
+        workspace["id"],
+        module_name="custom_module_1",
+        module_path=str(module),
+        validated_fingerprint=resumed["module_fingerprint"],
+        validated_base_sha=resumed["base_sha"],
+    )
+
+    assert resumed["valid"] is True
+    assert reused["cache_hit"] is True
+    assert reused["status"] == "cache_hit"
+    assert scans == [module]
 
 
 def test_coding_workspace_syncs_changed_and_unchanged_modules_after_push(tmp_path, monkeypatch):

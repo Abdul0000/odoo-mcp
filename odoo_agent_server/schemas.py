@@ -1229,6 +1229,11 @@ class DeployedModuleVerifyRequest(BaseProjectRequest):
             raise ValueError("module_name contains unsafe characters")
         return value
 
+    @field_validator("module_root_rel")
+    @classmethod
+    def module_root_rel_must_be_safe(cls, value: str | None) -> str | None:
+        return _safe_module_root_rel(value)
+
 
 class OdooSearchReadRequest(BaseModel):
     client_name: str | None = Field(default=None, description="Client name from ODOO_CLIENTS. Required when multiple clients are configured unless the request can be resolved unambiguously.")
@@ -1955,11 +1960,6 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
         if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
             raise ValueError("module_name contains unsafe characters")
         return value
-
-    @field_validator("module_root_rel")
-    @classmethod
-    def deployed_module_root_rel_must_be_safe(cls, value: str | None) -> str | None:
-        return _safe_module_root_rel(value)
 
     @field_validator("module_root_rel")
     @classmethod

@@ -316,6 +316,45 @@ _CHATGPT_QUICK_WAIT_TOOLS = {
     "odoosh.module_update",
 }
 
+
+_PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
+    "client.check": (
+        "Select and validate the configured Odoo client before protected work. Without client_name it lists choices; "
+        "with client_name and validate=true it prepares/verifies checkout, Git, Odoo.sh SSH, Odoo shell, and addons. "
+        "Slow validation returns job_id/next_call; poll jobs.get. Writes, Git, and deploy stay blocked until validation passes."
+    ),
+    "workflow.odoo_code_change": (
+        "Server-owned Odoo code workflow for existing changes or complete new addons. It prepares checkout, resolves the "
+        "module/target, returns focused contexts, applies one complete writes set, runs QA/core verification, and starts "
+        "safe deploy. On needs_writes, preserve coding_session_id/workspace_session_id and call once with generated writes. "
+        "Poll the returned job; running or pushed alone is not success. On workflow_busy, wait retry_after_seconds and retry unchanged."
+    ),
+    "workflow.odoo_debug_and_fix": (
+        "Bounded runtime-debug workflow. It collects redacted evidence, diagnoses the exact failure, routes focused writes "
+        "through workflow.odoo_code_change, and replays an immutable assertion after deployment. Preserve debug/session IDs "
+        "and continue returned calls. Claim fixed only when truth_gate.verified_fixed=true."
+    ),
+    "workflow.module_install_and_check": (
+        "Fast path for an explicit module install, upgrade, or install-and-fix request. It starts the guarded Odoo job and "
+        "returns job_id/next_call for jobs.get. Repair source only from its concrete traceback or dependency error; an "
+        "uninstallable registry state alone is not permission to edit code."
+    ),
+    "workflow.frontend_visual_implement": (
+        "Odoo visual workflow for POS/OWL/dashboard/website/backend UI assets and styling. It generates deterministic "
+        "SCSS/SVG/XML/JS writes, reads native context, verifies, and uses safe deploy. Use create_module=true only for a new "
+        "standalone root addon; otherwise modify the validated custom addon without editing Odoo core."
+    ),
+}
+
+
+def _provider_tool_description(tool) -> str:
+    """Return a complete semantic description without cutting a sentence mid-word."""
+    description = _PROVIDER_COMPACT_TOOL_DESCRIPTIONS.get(tool.name) or " ".join(str(tool.description).split())
+    if len(description) <= 500:
+        return description
+    compact = description[:497].rsplit(" ", 1)[0].rstrip(" ,;:")
+    return compact + "."
+
 _REMOTE_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 
 
@@ -454,7 +493,7 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
         # link/authenticate at call time instead of failing the connector handshake.
         item = {
             "name": _mcp_safe_tool_name(tool.name),
-            "description": str(tool.description)[:500],
+            "description": _provider_tool_description(tool),
             "inputSchema": _remote_compatible_schema(tool_input_schema(tool.name)),
             "annotations": {
                 "readOnlyHint": bool(tool.read_only),

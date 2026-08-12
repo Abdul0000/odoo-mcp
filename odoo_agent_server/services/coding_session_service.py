@@ -534,6 +534,8 @@ class CodingWorkspaceService(CodingSessionService):
         *,
         module_name: str,
         module_path: str,
+        validated_fingerprint: str | None = None,
+        validated_base_sha: str | None = None,
     ) -> dict[str, Any]:
         with self._record_guard(workspace_session_id):
             record = self._read(workspace_session_id)
@@ -542,11 +544,28 @@ class CodingWorkspaceService(CodingSessionService):
             self._validate_module(project, module)
             now = time.time()
             current_sha = self._git_sha(project)
-            module_files = self._module_files(module)
-            current_fingerprint = self._module_fingerprint_from_files(module, module_files)
             modules = dict(record.get("modules") or {})
             entry = dict(modules.get(module_name) or {})
             evicted_module: str | None = None
+
+            # A resumed coding session has just byte-hashed this exact module and
+            # checked its HEAD. Reuse that trusted result when the workspace entry
+            # describes the same module instead of immediately reading every file
+            # a second time. New tasks and stale/missing entries still perform the
+            # full content-derived scan below.
+            trusted_current = bool(
+                validated_fingerprint
+                and validated_base_sha == current_sha
+                and entry
+                and str(entry.get("module_path") or "") == str(module)
+                and str(entry.get("module_fingerprint") or "") == validated_fingerprint
+            )
+            module_files: list[Path] | None = None
+            if trusted_current:
+                current_fingerprint = str(validated_fingerprint)
+            else:
+                module_files = self._module_files(module)
+                current_fingerprint = self._module_fingerprint_from_files(module, module_files)
 
             if entry and (
                 str(entry.get("module_path") or "") == str(module)

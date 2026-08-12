@@ -491,6 +491,8 @@ repo_prepare → repo_list_custom_modules → repo_read → repo_apply_patch_ato
 
 `workflow.odoo_code_change` owns this sequence as a persistent coding session. It resolves the exact repo-relative addon root (including nested addon folders), creates a content-bound module checkpoint once, and returns compact focused write context plus `coding_session_id` and `workspace_session_id`. Continuations reuse the same validated module index, reread exact write targets, and apply one rollback-safe smart batch. Up to five modules stay warm per checkout. Different workspaces no longer share a snapshot lock; post-push cache maintenance is asynchronous and refreshes only modules touched by the pushed commit. Aggregate workspace bytes, artifacts, and terminal jobs are retained under configurable limits. QA, exact-diff core verification, Git, deployment, and module upgrade remain server-owned; safe deploy reuses prior verification only when HEAD and the complete binary working-tree diff still match its opaque proof.
 
+Coding work runs off the MCP event loop with bounded admission. `ODOO_AGENT_CODING_WORKFLOW_MAX_WORKERS` controls active workflows and `ODOO_AGENT_CODING_WORKFLOW_MAX_QUEUE` controls accepted waiting calls; excess calls return `workflow_busy` before protected work starts and can be retried after the returned delay.
+
 If another process changes Git HEAD or module files, the session returns `coding_session_stale` before applying generated writes. Its clean `next_call` starts a fresh inspection, preventing stale-context edits. Bundles are internal checkpoints under the state directory; they are never committed, pushed, or exposed as arbitrary filesystem paths.
 
 Each repository also receives a durable `workspace_session_id`. It retains at most five independently fingerprinted module contexts, loads a module only when a task requests it, and evicts the least recently used module when full. A task's `coding_session_id` remains strict to that exact task/module; the workspace ID may be carried to a different module in the same checkout. Writes immediately resnapshot only the active module and invalidate its cached analysis. After a successful Git push, unchanged cached modules are rebound to the new HEAD without rereading, while changed modules are resnapshotted and invalidated. Workspace cache maintenance is best-effort metadata and cannot block Git, QA, deployment, or upgrade.
@@ -521,6 +523,7 @@ ODOO_AGENT_CODING_SESSION_MAX_TOTAL_BYTES=250000000
 ODOO_AGENT_CODING_WORKSPACE_MAX_MODULES=5
 ODOO_AGENT_CODING_WORKSPACE_MAX_TOTAL_BYTES=500000000
 ODOO_AGENT_CODING_WORKFLOW_MAX_WORKERS=2
+ODOO_AGENT_CODING_WORKFLOW_MAX_QUEUE=2
 ODOO_AGENT_JOB_MAX_COUNT=500
 ODOO_AGENT_ARTIFACT_TTL_SECONDS=604800
 ODOO_AGENT_ARTIFACT_MAX_TOTAL_BYTES=250000000
