@@ -465,6 +465,13 @@ class OdooCodeChangeRequest(BaseModel):
     total_batches: int = Field(default=1, ge=1, le=20, description="Total local write batches. Only the final batch can reach full QA/deploy.")
     commit_message: str | None = Field(default=None, max_length=300, description="Commit message for safe deploy. Defaults to a concise message from task_description.")
     auto_deploy: bool = Field(default=True, description="After successful write/diff/QA/core-verify, start workflow.safe_deploy_module in background and return jobs.get next_call")
+    wait_for_result: bool = Field(
+        default=True,
+        description=(
+            "Internal/REST compatibility mode. Provider MCP calls force this false so the connector "
+            "returns a durable job immediately and transport timeouts cannot replay the workflow."
+        ),
+    )
     force_new_deploy: bool = Field(
         default=False,
         description=(
@@ -1743,11 +1750,13 @@ class JobRecord(BaseModel):
     @computed_field  # type: ignore[misc]
     @property
     def completion_required(self) -> bool:
-        """True while a connector-owned long-running workflow needs polling."""
-        return self.job_type in {"safe_deploy_module", "workflow.module_test", "client_validation"} and self.status in {
-            JobStatus.queued,
-            JobStatus.running,
-        }
+        """True while any connector-owned background job needs polling.
+
+        Job lifecycle is defined by status, not by an allowlist of job types.
+        New background workflows therefore inherit correct polling semantics
+        without requiring another schema change.
+        """
+        return self.status in {JobStatus.queued, JobStatus.running}
 
     @computed_field  # type: ignore[misc]
     @property

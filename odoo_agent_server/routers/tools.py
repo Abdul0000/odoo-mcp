@@ -3215,20 +3215,133 @@ _CODING_WORKFLOW_EXECUTOR = ThreadPoolExecutor(
     max_workers=_CODING_WORKFLOW_MAX_WORKERS,
     thread_name_prefix="odoo-code-change",
 )
+_CODING_WORKFLOW_JOB_LOCK = threading.Lock()
+_CODING_WORKFLOW_JOB_STALE_SECONDS = 3600
+
+
+def _code_change_async_fingerprint(payload: OdooCodeChangeRequest) -> str:
+    data = payload.model_dump(mode="json", exclude_none=True)
+    data.pop("wait_for_result", None)
+    return hashlib.sha256(
+        json.dumps(data, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _code_change_job_result(job: JobRecord, *, operation_id: str, reused: bool) -> dict[str, Any]:
+    if job.status not in {JobStatus.queued, JobStatus.running} and isinstance(job.result, dict):
+        result = dict(job.result)
+        result.setdefault("job_id", job.id)
+        result.setdefault("operation_id", operation_id)
+        result["async_job_reused"] = reused
+        return result
+    return {
+        "status": "running",
+        "state_class": "running",
+        "message": "The durable code-change operation is running. Poll jobs.get; do not submit the task again.",
+        "job_id": job.id,
+        "operation_id": operation_id,
+        "async_job_reused": reused,
+        "protected_work_started": True,
+        "completion_required": True,
+        "success_allowed": False,
+        "poll_after_seconds": 2,
+        "next_call": job.next_call,
+    }
+
+
+def _start_or_reuse_code_change_job(payload: OdooCodeChangeRequest) -> dict[str, Any]:
+    """Persist provider work before execution and deduplicate transport retries."""
+    store = JsonStore()
+    operation_id = WorkflowProgressService.operation_id(payload)
+    fingerprint = _code_change_async_fingerprint(payload)
+    job_id = f"codejob-{fingerprint[:40]}"
+    now = datetime.now(timezone.utc)
+
+    with _CODING_WORKFLOW_JOB_LOCK:
+        try:
+            candidate = store.get_job(job_id)
+        except HTTPException as exc:
+            if exc.status_code != 404:
+                raise
+            candidate = None
+        if candidate is not None:
+            if candidate.status in {JobStatus.queued, JobStatus.running}:
+                try:
+                    created = datetime.fromisoformat(candidate.created_at.replace("Z", "+00:00"))
+                    created = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+                    stale = (now - created).total_seconds() > _CODING_WORKFLOW_JOB_STALE_SECONDS
+                except (TypeError, ValueError):
+                    stale = True
+                if stale:
+                    store.finish_job(candidate, JobStatus.failed, {
+                        "status": "operation_interrupted",
+                        "state_class": "failed",
+                        "error": "The previous connector process ended before this durable operation reached a terminal result.",
+                        "operation_id": operation_id,
+                        "success_allowed": False,
+                        "completion_required": False,
+                    })
+                    candidate = None
+            if candidate is not None:
+                return _code_change_job_result(candidate, operation_id=operation_id, reused=True)
+
+        job = store.create_job(JobRecord(
+            id=job_id,
+            job_type="workflow.odoo_code_change",
+            status=JobStatus.running,
+            request={
+                "operation_id": operation_id,
+                "request_fingerprint": fingerprint,
+                "client_name": payload.client_name,
+                "project_path": payload.project_path,
+                "module_name": payload.module_name,
+            },
+        ))
+
+    synchronous_payload = payload.model_copy(update={"wait_for_result": True})
+
+    def _background() -> None:
+        worker_store = JsonStore()
+        try:
+            result = asyncio.run(_workflow_odoo_code_change(synchronous_payload))
+            worker_store.finish_job(worker_store.get_job(job.id), JobStatus.passed, result)
+        except BaseException as exc:  # noqa: BLE001
+            worker_store.finish_job(worker_store.get_job(job.id), JobStatus.failed, {
+                "status": "failed",
+                "state_class": "failed",
+                "error": str(getattr(exc, "detail", exc)),
+                "error_code": type(exc).__name__,
+                "operation_id": operation_id,
+                "success_allowed": False,
+                "completion_required": False,
+            })
+
+    submit_background(_background)
+    return _code_change_job_result(job, operation_id=operation_id, reused=False)
 
 
 async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     """Run blocking work off-loop with bounded admission and no cancellation."""
+    if not payload.wait_for_result:
+        return _start_or_reuse_code_change_job(payload)
+
     admission = _CODING_WORKFLOW_ADMISSION
     if not admission.acquire(blocking=False):
+        retry_arguments = payload.model_dump(mode="json", exclude_none=True)
         return {
             "status": "workflow_busy",
+            "state_class": "action_required",
             "message": "The bounded coding workflow is at capacity; no work started. Retry this same call after the stated delay.",
+            "operation_id": WorkflowProgressService.operation_id(payload),
             "retry_after_seconds": 2,
             "poll_after_seconds": 2,
             "protected_work_started": False,
             "success_allowed": False,
             "completion_required": True,
+            "next_call": {
+                "tool": "workflow.odoo_code_change",
+                "arguments": retry_arguments,
+            },
         }
     loop = asyncio.get_running_loop()
     submitted_at = time.perf_counter()
@@ -3451,13 +3564,21 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         module_dir_from_contract = (project / module_path).resolve()
         manifest_from_contract = (project / manifest_path).resolve()
         if not module_dir_from_contract.is_dir() or not manifest_from_contract.is_file():
+            refresh_arguments = payload.model_dump(mode="json", exclude_none=True)
+            refresh_arguments.pop("coding_session_id", None)
+            refresh_arguments.pop("writes", None)
             return {
                 "status": "coding_session_stale",
+                "state_class": "action_required",
                 "message": "The validated module or manifest is no longer present; no write was applied.",
                 "reason": "validated_module_layout_changed",
                 "writes_blocked": True,
                 "success_allowed": False,
                 "completion_required": True,
+                "next_call": {
+                    "tool": "workflow.odoo_code_change",
+                    "arguments": refresh_arguments,
+                },
             }
         module = CustomModuleItem(
             module_name=str(validated_write_contract["module_name"]),
@@ -3485,8 +3606,13 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     effective_module_name = module.module_name
     phase_done("module_discovery", discovery_started)
     if coding_session_resumed and effective_module_name != str(coding_session.get("module_name") or ""):
+        refresh_arguments = payload.model_dump(mode="json", exclude_none=True)
+        refresh_arguments.pop("coding_session_id", None)
+        refresh_arguments.pop("writes", None)
+        refresh_arguments["module_name"] = effective_module_name
         return {
             "status": "coding_session_stale",
+            "state_class": "action_required",
             "message": "The resumed coding session belongs to a different module; no write was applied.",
             "client_name": client_name,
             "project_path": project_path,
@@ -3495,6 +3621,10 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
             "writes_blocked": True,
             "success_allowed": False,
             "completion_required": True,
+            "next_call": {
+                "tool": "workflow.odoo_code_change",
+                "arguments": refresh_arguments,
+            },
         }
     deploy_diagnostics = state_store.load_session_state(client_name).get("module_deploy_diagnostics") or {}
     deploy_diagnostic = deploy_diagnostics.get(effective_module_name) if isinstance(deploy_diagnostics, dict) else None
@@ -4209,8 +4339,15 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         functional_verification_passed=payload.functional_verification_passed,
     )
     if failure_guard.get("blocked"):
+        debug_operation_id = _code_operation_id(
+            payload,
+            client_name=client_name,
+            project_path=project_path,
+            module_name=effective_module_name,
+        )
         return {
             "status": "investigation_required",
+            "state_class": "action_required",
             "message": (
                 "The same user-visible issue remains after two technically successful attempts. "
                 "Further writes are blocked until the execution flow and runtime state are investigated."
@@ -4239,6 +4376,18 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
             "success_allowed": False,
             "completion_required": True,
             "writes_blocked": True,
+            "next_call": {
+                "tool": "workflow.odoo_debug_and_fix",
+                "arguments": {
+                    "client_name": client_name,
+                    "project_path": project_path,
+                    "module_name": effective_module_name,
+                    "issue_description": payload.task_description,
+                    "expected_result": "The originally requested behavior passes an independent runtime verification after deployment.",
+                    "operation_id": debug_operation_id,
+                    "action": "start",
+                },
+            },
         }
 
     writes_to_apply = list(payload.writes or generated_writes)
@@ -5210,6 +5359,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         )
         return {
             "status": "ready_to_deploy",
+            "state_class": "input_required",
             "message": "Requested change passed scoped verification. auto_deploy=false, so no deploy job was started.",
             "client_name": client_name,
             "project_path": project_path,
@@ -5229,6 +5379,25 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
             "handoff": handoff,
             "success_allowed": False,
             "completion_required": True,
+            "input_required": True,
+            "input_request": {
+                "kind": "authorization",
+                "field": "auto_deploy",
+                "prompt": "Authorize deployment of the already verified change.",
+                "required_value": True,
+            },
+            "next_call": {
+                "tool": "workflow.odoo_code_change",
+                "arguments": {
+                    **payload.model_dump(mode="json", exclude_none=True),
+                    "client_name": client_name,
+                    "project_path": project_path,
+                    "module_name": effective_module_name,
+                    "coding_session_id": coding_session_id,
+                    "auto_deploy": True,
+                },
+                "required_generated_arguments": ["auto_deploy"],
+            },
         }
 
     commit_message = payload.commit_message or f"Update {effective_module_name}: {payload.task_description[:180]}"
@@ -5288,6 +5457,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         )
         return {
             "status": "deploy_blocked",
+            "state_class": "action_required",
             "message": "Code was written and verified, but safe deploy was blocked by client validation.",
             "client_name": client_name,
             "project_path": project_path,
@@ -5307,6 +5477,25 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
             "module_upgraded": False,
             "visible_claim_allowed": False,
             "allowed_summary": "Code was written and verified, but not pushed/deployed/upgraded. Fix the deploy validation blocker, then rerun with auto_deploy=true.",
+            "next_call": {
+                "tool": "client.check",
+                "arguments": {
+                    "client_name": client_name,
+                    "validate": True,
+                    "force_refresh": True,
+                },
+            },
+            "resume_call": {
+                "tool": "workflow.odoo_code_change",
+                "arguments": {
+                    **payload.model_dump(mode="json", exclude_none=True),
+                    "client_name": client_name,
+                    "project_path": project_path,
+                    "module_name": effective_module_name,
+                    "coding_session_id": coding_session_id,
+                    "auto_deploy": True,
+                },
+            },
         }
     job_id = deploy_struct.get("job_id") if isinstance(deploy_struct, dict) else None
     coding_session = coding_sessions.mark(coding_session_id, "deploying", deploy_job_id=job_id)
@@ -7558,9 +7747,15 @@ def _dynamic_tool_output_schema(name: str) -> dict:
     internal = internal_tool_name(name)
     properties: dict[str, Any] = {
         "status": {"type": "string", "description": "Tool or workflow status."},
+        "state_class": {
+            "type": "string",
+            "enum": ["succeeded", "running", "action_required", "input_required", "failed", "blocked"],
+            "description": "Explicit lifecycle class; providers must not infer it from status prose.",
+        },
         "message": {"type": "string", "description": "Human-readable outcome or next-step explanation."},
         "error": {"type": "string", "description": "Error detail when the operation failed."},
         "next_call": {"type": "object", "description": "Exact follow-up tool call; null or absent when terminal.", "additionalProperties": True},
+        "input_request": {"type": "object", "description": "Exact structured human input contract when state_class=input_required.", "additionalProperties": True},
     }
 
     if internal == "connector.health":

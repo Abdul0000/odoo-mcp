@@ -97,39 +97,125 @@ def _artifact_next_call(artifact: dict[str, Any], max_chars: int = 12000) -> dic
     }
 
 
-_CONTROL_SCHEMA_VERSION = "1.0"
+_CONTROL_SCHEMA_VERSION = "2.0"
 _CONTROL_REQUIRED_FIELDS = [
     "status",
+    "state_class",
     "outcome",
     "terminal",
     "completion_required",
     "success_allowed",
     "next_call",
     "input_required",
+    "input_request",
     "error",
 ]
 
+_CONTROL_STATE_CLASSES = {
+    "succeeded",
+    "running",
+    "action_required",
+    "input_required",
+    "failed",
+    "blocked",
+}
+_ACTIVE_JOB_STATUSES = {"queued", "running", "started", "pending", "active"}
+_HUMAN_INPUT_STATUSES = {
+    "needs_clarification",
+    "clarification_required",
+    "verification_authorization_required",
+    "authorization_required",
+    "approval_required",
+    "ready_to_deploy",
+    "input_required",
+}
+_SUCCESS_STATUSES = {
+    "ok",
+    "passed",
+    "success",
+    "succeeded",
+    "completed",
+    "verified",
+    "ready",
+}
+
+
+def _lift_nested_control(out: dict[str, Any]) -> dict[str, Any]:
+    """Lift a wrapped job/workflow continuation to the provider boundary.
+
+    Older Odoo result models store the real lifecycle under ``result``.  A
+    provider must see that lifecycle at the top level; otherwise a started job
+    looks like a terminal ``ok``/``failed`` response and polling stops.
+    """
+    nested = out.get("result")
+    if not isinstance(nested, dict):
+        return out
+    control_keys = {
+        "state_class", "completion_required", "success_allowed", "terminal",
+        "next_call", "input_required", "input_request", "retryable",
+    }
+    nested_lifecycle = str(nested.get("status") or nested.get("job_status") or "").strip().lower()
+    if not control_keys.intersection(nested) and nested_lifecycle not in {
+        *_ACTIVE_JOB_STATUSES, "passed", "warning", "failed",
+    }:
+        return out
+
+    lifted = dict(out)
+    wrapper_status = str(lifted.get("status") or "")
+    lifted.setdefault("wrapper_status", wrapper_status or None)
+    nested_status = nested.get("status") or nested.get("job_status")
+    if nested_status:
+        lifted["status"] = nested_status
+    for key in (
+        "state_class", "completion_required", "success_allowed", "terminal",
+        "next_call", "input_required", "input_request", "retryable",
+        "retry_after_seconds", "poll_after_seconds", "job_id",
+    ):
+        if key in nested:
+            lifted[key] = nested[key]
+    if nested.get("error") is not None:
+        lifted["error"] = nested["error"]
+    elif nested.get("completion_required") is True:
+        notice = lifted.get("error")
+        if notice:
+            lifted["wrapper_notice"] = notice
+        lifted["error"] = None
+    return lifted
+
+
+def _build_input_request(out: dict[str, Any], next_call: dict[str, Any] | None) -> dict[str, Any]:
+    existing = out.get("input_request")
+    if isinstance(existing, dict):
+        request = dict(existing)
+        request.setdefault("resume_call", next_call)
+        return request
+    gate = out.get("clarification_gate")
+    if isinstance(gate, dict):
+        return {
+            "kind": "clarification",
+            "field": "clarification_answer",
+            "prompt": str(gate.get("question") or out.get("message") or "Clarification is required."),
+            "reason": gate.get("reason"),
+            "resume_call": next_call,
+        }
+    required = []
+    if isinstance(next_call, dict):
+        required = list(next_call.get("required_generated_arguments") or [])
+    return {
+        "kind": "authorization" if "authoriz" in str(out.get("status") or "").lower() else "user_input",
+        "field": required[0] if len(required) == 1 else None,
+        "required_fields": required,
+        "prompt": str(out.get("message") or "User input is required to continue."),
+        "resume_call": next_call,
+    }
+
 
 def _ensure_provider_control_envelope(value: Any, *, is_error: bool = False) -> dict[str, Any]:
-    """Add one deterministic provider-facing control contract.
-
-    Existing workflow status values and payload fields stay untouched. The added
-    fields let a remote agent decide whether to continue, ask the user, retry, or
-    stop without interpreting prose. Incomplete job responses receive a safe poll
-    call when the workflow returned a job id but omitted its continuation.
-    """
-    out = dict(value) if isinstance(value, dict) else {"result": value}
+    """Add one explicit, invariant provider-facing lifecycle contract."""
+    out = _lift_nested_control(dict(value) if isinstance(value, dict) else {"result": value})
     status_value = out.get("status")
     status_text = str(status_value or ("failed" if is_error else "ok"))
     status_key = status_text.strip().lower().replace("-", "_").replace(" ", "_")
-
-    error_like = is_error or any(token in status_key for token in ("failed", "error", "invalid"))
-    blocked_like = any(token in status_key for token in ("blocked", "stale"))
-    input_like = any(token in status_key for token in ("clarification", "authorization", "approval", "input_required"))
-    pending_like = (
-        status_key.startswith("needs_")
-        or any(token in status_key for token in ("running", "queued", "started", "waiting", "pending", "required", "ready_to_deploy"))
-    )
 
     next_call = out.get("next_call") if isinstance(out.get("next_call"), dict) else None
     explicit_completion = out.get("completion_required")
@@ -137,7 +223,7 @@ def _ensure_provider_control_envelope(value: Any, *, is_error: bool = False) -> 
     if isinstance(explicit_completion, bool):
         completion_required = explicit_completion
     else:
-        completion_required = bool(next_call or pending_like or (explicit_success is False and not error_like))
+        completion_required = bool(next_call or status_key in _ACTIVE_JOB_STATUSES)
 
     if completion_required and next_call is None and out.get("job_id"):
         next_call = {
@@ -149,26 +235,53 @@ def _ensure_provider_control_envelope(value: Any, *, is_error: bool = False) -> 
             },
         }
 
-    input_required = bool(out.get("input_required")) or input_like
-    if completion_required and next_call is None:
-        # Never leave a non-terminal response without an executable continuation
-        # or an explicit signal that human input is required.
-        input_required = True
+    input_required = bool(out.get("input_required")) or isinstance(out.get("input_request"), dict) or status_key in _HUMAN_INPUT_STATUSES
+    explicit_state = str(out.get("state_class") or "").strip().lower()
+    if explicit_state not in _CONTROL_STATE_CLASSES:
+        explicit_state = ""
 
-    if error_like:
-        outcome = "failed"
-    elif input_required:
-        outcome = "input_required"
-    elif blocked_like:
-        outcome = "blocked"
+    if explicit_state:
+        state_class = explicit_state
+    elif completion_required and input_required:
+        state_class = "input_required"
+    elif completion_required and next_call:
+        called_tool = internal_tool_name(str(next_call.get("tool") or ""))
+        state_class = "running" if called_tool == "jobs.get" or status_key in _ACTIVE_JOB_STATUSES else "action_required"
     elif completion_required:
-        outcome = "pending"
+        # A non-terminal state without either a callable continuation or a
+        # structured input request is unsafe. Close it as a blocker instead of
+        # making the model guess or ask a vague question.
+        state_class = "blocked"
+    elif is_error or status_key in {"failed", "error", "invalid"}:
+        state_class = "failed"
+    elif explicit_success is False or status_key == "warning":
+        state_class = "blocked"
+    elif explicit_success is True or status_key in _SUCCESS_STATUSES:
+        state_class = "succeeded"
     else:
-        outcome = "success"
+        # Plain read tools use domain-specific statuses. A completed tool call
+        # with no error, no continuation, and no negative success gate is a
+        # successful terminal result.
+        state_class = "succeeded"
 
-    success_allowed = False if completion_required or error_like else (
-        explicit_success if isinstance(explicit_success, bool) else outcome == "success"
-    )
+    if state_class in {"running", "action_required"} and next_call is None:
+        state_class = "blocked"
+    completion_required = state_class in {"running", "action_required", "input_required"}
+    terminal = not completion_required
+    input_required = state_class == "input_required"
+    input_request = _build_input_request(out, next_call) if input_required else None
+    if terminal and next_call is not None:
+        out.setdefault("recovery_call", next_call)
+        next_call = None
+    outcome = {
+        "succeeded": "success",
+        "running": "pending",
+        "action_required": "pending",
+        "input_required": "input_required",
+        "failed": "failed",
+        "blocked": "blocked",
+    }[state_class]
+    success_allowed = bool(state_class == "succeeded" and explicit_success is not False)
     error_value = out.get("error")
     error_code = out.get("error_code") or out.get("error_type")
     retryable_value = out.get("retryable")
@@ -177,12 +290,14 @@ def _ensure_provider_control_envelope(value: Any, *, is_error: bool = False) -> 
         {
             "schema_version": str(out.get("schema_version") or _CONTROL_SCHEMA_VERSION),
             "status": status_text,
+            "state_class": state_class,
             "outcome": outcome,
-            "terminal": not completion_required,
+            "terminal": terminal,
             "completion_required": completion_required,
-            "success_allowed": bool(success_allowed),
+            "success_allowed": success_allowed,
             "next_call": next_call,
             "input_required": input_required,
+            "input_request": input_request,
             "error": error_value if error_value is not None else None,
             "error_code": str(error_code) if error_code is not None else None,
             "retryable": retryable_value if isinstance(retryable_value, bool) else None,
@@ -285,9 +400,9 @@ def _normalize_remote_structured(value: Any, tool_name: str) -> dict[str, Any]:
     artifact = store.create_artifact("structured", tool_name, value)
     source = normalized if isinstance(normalized, dict) else {}
     compact_keys = {
-        "schema_version", "status", "outcome", "phase", "job_id", "terminal",
+        "schema_version", "status", "state_class", "outcome", "phase", "job_id", "operation_id", "terminal",
         "completion_required", "success_allowed", "next_call", "input_required",
-        "error", "error_code", "retryable", "deploy_confirmed",
+        "input_request", "resume_call", "error", "error_code", "retryable", "deploy_confirmed",
         "reproduction_passed", "expected_result_verified", "claim_status", "truth_gate",
     }
     compact = {key: source[key] for key in compact_keys if key in source}
@@ -304,6 +419,13 @@ def _normalize_remote_structured(value: Any, tool_name: str) -> dict[str, Any]:
 
 def _arguments_for_profile(tool_name: str, arguments: dict[str, Any], profile: str | None) -> dict[str, Any]:
     adjusted = dict(arguments)
+
+    if tool_name == "workflow.odoo_code_change" and profile in {"provider", "claude", "chatgpt", "grok", "qwen"}:
+        # The composite workflow performs repository, QA, and deployment I/O and
+        # must not hold one provider HTTP request open. The server persists the
+        # operation before returning, so a transport retry reuses the same job.
+        adjusted["wait_for_result"] = False
+        return adjusted
 
     if tool_name == "workflow.safe_deploy_module":
         # Hybrid safety contract for MCP browser clients (Grok/ChatGPT/Claude/Qwen):
@@ -431,9 +553,9 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
     ),
     "workflow.odoo_code_change": (
         "Server-owned Odoo code workflow for existing changes or complete new addons. It prepares checkout, resolves the "
-        "module/target, returns focused contexts, applies one complete writes set, runs QA/core verification, and starts "
-        "safe deploy. On needs_writes, preserve coding_session_id/workspace_session_id and call once with generated writes. "
-        "Poll the returned job; running or pushed alone is not success. On workflow_busy, wait retry_after_seconds and retry unchanged."
+        "module/target, returns a durable operation_id/job_id immediately, applies one complete writes set, runs QA/core "
+        "verification, and starts safe deploy. Poll jobs.get. A transport retry with identical arguments reuses the same job "
+        "and must not replay work. On needs_writes, preserve coding_session_id/workspace_session_id and call once with writes."
     ),
     "workflow.odoo_debug_and_fix": (
         "Bounded runtime-debug workflow. It collects redacted evidence, diagnoses the exact failure, routes focused writes "
@@ -616,15 +738,17 @@ def _tool_to_mcp(tool, profile: str | None = None) -> dict[str, Any]:
                 "type": "object",
                 "properties": {
                     "status": {"type": "string"},
-                    "outcome": {"type": "string", "enum": ["success", "pending", "blocked", "failed", "input_required"]},
+                    "state_class": {"type": "string"},
+                    "outcome": {"type": "string"},
                     "message": {"type": "string"},
                     "job_id": {"type": ["string", "null"]},
                     "terminal": {"type": "boolean"},
                     "success_allowed": {"type": "boolean"},
                     "completion_required": {"type": "boolean"},
-                    "next_call": {"type": ["object", "null"], "additionalProperties": True},
+                    "next_call": {"type": ["object", "null"]},
                     "input_required": {"type": "boolean"},
-                    "error": {"type": ["string", "object", "null"], "additionalProperties": True},
+                    "input_request": {"type": ["object", "null"]},
+                    "error": {"type": ["string", "object", "null"]},
                 },
                 "required": list(_CONTROL_REQUIRED_FIELDS),
                 "additionalProperties": True,

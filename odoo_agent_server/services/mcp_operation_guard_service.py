@@ -458,27 +458,30 @@ class McpOperationGuardService:
             return self._find_job_id(result)
         return None
 
-    def _next_call(self, op: dict[str, Any]) -> dict[str, Any]:
+    def _next_call(self, op: dict[str, Any]) -> dict[str, Any] | None:
         phase = str((op or {}).get("phase") or "discovery")
         if phase == "poll":
             job_id = op.get("job_id")
             return {"tool": "jobs.get", "arguments": {"job_id": job_id, "wait_for_result": True, "wait_timeout_seconds": 600, "poll_interval_seconds": 1.0}}
         if phase == "final":
-            return {"tool": "final_answer", "arguments_hint": "Report only verified facts; do not claim visible UI unless browser verification passed."}
+            return None
         return {
             "tool": "workflow.odoo_code_change",
             "arguments_hint": "Continue the current composite code-change workflow; source reads, verification, Git, and deploy are server-owned.",
         }
 
-    def _guard_payload(self, *, status: str, message: str, operation: dict[str, Any], next_call: dict[str, Any]) -> dict[str, Any]:
+    def _guard_payload(self, *, status: str, message: str, operation: dict[str, Any], next_call: dict[str, Any] | None) -> dict[str, Any]:
+        terminal = str((operation or {}).get("phase") or "") == "final"
         return {
             "status": status,
+            "state_class": "blocked" if terminal else "action_required",
             "message": message,
             "phase": (operation or {}).get("phase"),
             "operation_id": (operation or {}).get("operation_id"),
-            "completion_required": True,
+            "completion_required": not terminal,
             "success_allowed": False,
-            "tool_exit_allowed": False,
+            "tool_exit_allowed": terminal,
+            "terminal_action": "stop_and_summarize" if terminal else None,
             "next_call": next_call,
         }
 

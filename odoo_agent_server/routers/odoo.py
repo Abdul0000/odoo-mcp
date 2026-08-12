@@ -140,6 +140,7 @@ def _background_job_response(store: JsonStore, job: JobRecord, payload: OdooModu
                 "job_id": job.id,
                 "job_status": job.status.value,
                 "status": "running",
+                "state_class": "running",
                 "finished": False,
                 "message": f"{started_message} This is not a confirmed deployment. Poll jobs.get until terminal passed/failed.",
                 "completion_required": True,

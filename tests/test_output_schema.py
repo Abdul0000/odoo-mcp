@@ -13,6 +13,7 @@ from odoo_agent_server.routers.mcp import (
     _tools_for_profile,
 )
 from odoo_agent_server.routers.tools import _tool_output_schemas, tool_output_schema
+from odoo_agent_server.schemas import JobRecord, JobStatus, OdooResult
 from odoo_agent_server.services.store_service import JsonStore
 
 
@@ -108,9 +109,77 @@ def test_provider_runtime_result_validates_against_advertised_schema(monkeypatch
     )
     structured = response.json()["result"]["structuredContent"]
     validate(instance=structured, schema=schema)
-    assert structured["completion_required"] is True
-    assert structured["input_required"] is True
+    assert structured["state_class"] == "blocked"
+    assert structured["completion_required"] is False
+    assert structured["input_required"] is False
     assert structured["success_allowed"] is False
+
+
+def test_control_envelope_classifies_terminal_and_active_states_without_status_substrings():
+    cases = [
+        ({"status": "module_not_found", "success_allowed": False}, "blocked", True),
+        ({"status": "debug_implemented_unverified", "success_allowed": False}, "blocked", True),
+        ({"status": "debug_max_cycles_reached", "success_allowed": False}, "blocked", True),
+        ({"status": "batch_verification_failed", "completion_required": True,
+          "next_call": {"tool": "workflow.odoo_code_change", "arguments": {}}}, "action_required", False),
+        ({"status": "needs_clarification", "completion_required": True,
+          "next_call": {"tool": "workflow.odoo_code_change", "required_generated_arguments": ["clarification_answer"]}},
+         "input_required", False),
+    ]
+    for source, expected_state, expected_terminal in cases:
+        result = _ensure_provider_control_envelope(source)
+        assert result["state_class"] == expected_state
+        assert result["terminal"] is expected_terminal
+        assert result["completion_required"] is (not expected_terminal)
+        assert result["success_allowed"] is False
+
+
+def test_generic_running_and_warning_jobs_have_consistent_lifecycle_contract():
+    running = _ensure_provider_control_envelope(
+        JobRecord(job_type="odoo.module.deploy", status=JobStatus.running).model_dump(mode="json")
+    )
+    assert running["state_class"] == "running"
+    assert running["terminal"] is False
+    assert running["next_call"]["tool"] == "jobs.get"
+
+    warning = _ensure_provider_control_envelope(
+        JobRecord(job_type="new.future.job", status=JobStatus.warning).model_dump(mode="json")
+    )
+    assert warning["state_class"] == "blocked"
+    assert warning["terminal"] is True
+    assert warning["success_allowed"] is False
+
+
+def test_nested_async_odoo_result_lifts_poll_contract_to_top_level():
+    wrapped = OdooResult(
+        status="failed",
+        error="Background job started but is not complete.",
+        result={
+            "status": "running",
+            "job_id": "install-job",
+            "completion_required": True,
+            "success_allowed": False,
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": "install-job"}},
+        },
+    )
+    result = _ensure_provider_control_envelope(wrapped.model_dump(mode="json"))
+    assert result["state_class"] == "running"
+    assert result["job_id"] == "install-job"
+    assert result["terminal"] is False
+    assert result["next_call"]["arguments"]["job_id"] == "install-job"
+    assert result["error"] is None
+
+
+def test_nonterminal_state_without_call_or_input_closes_as_blocker():
+    result = _ensure_provider_control_envelope({
+        "status": "investigation_required",
+        "state_class": "action_required",
+        "completion_required": True,
+        "success_allowed": False,
+    })
+    assert result["state_class"] == "blocked"
+    assert result["terminal"] is True
+    assert result["input_required"] is False
 
 
 def test_description_result_field_remains_a_valid_property_schema():

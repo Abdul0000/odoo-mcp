@@ -103,7 +103,9 @@ def test_grok_operation_guard_blocks_tools_after_terminal_pass(tmp_path, monkeyp
     blocked = svc.before_tool_call("repo.write", base | {"relative_path": "x/views/a.xml"})
     assert blocked is not None
     assert blocked["status"] == "final_guard"
-    assert blocked["next_call"]["tool"] == "final_answer"
+    assert blocked["next_call"] is None
+    assert blocked["completion_required"] is False
+    assert blocked["terminal_action"] == "stop_and_summarize"
 
 
 def test_functional_operations_bypass_code_phase_guard(tmp_path, monkeypatch):

@@ -251,6 +251,38 @@ def test_provider_install_fast_path_dispatches_without_planning(monkeypatch):
     assert captured["arguments"]["module_name"] == "iot_device_management"
 
 
+def test_provider_code_change_forces_durable_nonblocking_execution(monkeypatch):
+    captured = {}
+
+    async def fake_dispatch(name, arguments):
+        captured.update(name=name, arguments=arguments)
+        return {
+            "status": "running",
+            "job_id": "code-job",
+            "completion_required": True,
+            "success_allowed": False,
+            "next_call": {"tool": "jobs.get", "arguments": {"job_id": "code-job"}},
+        }
+
+    monkeypatch.setattr("odoo_agent_server.routers.mcp._dispatch", fake_dispatch)
+    response = TestClient(app).post(
+        "/mcp",
+        headers={"Authorization": f"Bearer {settings.api_token}"},
+        json={
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "workflow_odoo_code_change",
+                "arguments": {"module_name": "x_module", "task_description": "Update the module"},
+            },
+        },
+    )
+    assert response.status_code == 200
+    assert captured["name"] == "workflow.odoo_code_change"
+    assert captured["arguments"]["wait_for_result"] is False
+
+
 def test_provider_workflow_preserves_long_module_requirements():
     request = OdooCodeChangeRequest(
         module_name="x_module",

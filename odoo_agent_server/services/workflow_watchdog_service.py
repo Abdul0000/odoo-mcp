@@ -88,6 +88,7 @@ class WorkflowWatchdogService:
             elapsed = max(time.monotonic() - started, 0.0)
             return {
                 "status": "watchdog_redirect",
+                "state_class": "blocked",
                 "phase": "read_only_operation",
                 "protected": False,
                 "stalled": True,
@@ -105,6 +106,8 @@ class WorkflowWatchdogService:
                 "cancellation_requested": True,
                 "force_cancelled": False,
                 "success_allowed": False,
+                "completion_required": False,
+                "terminal_action": "stop_and_summarize",
             }
 
     def annotate_job(self, job: JobRecord) -> JobRecordWithWatchdog:

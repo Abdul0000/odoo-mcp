@@ -47,6 +47,7 @@ from odoo_agent_server.services.coding_session_service import CodingSessionServi
 from odoo_agent_server.services.git_service import GitService
 from odoo_agent_server.services.verification_proof_service import VerificationProofService
 from odoo_agent_server.services.workflow_progress_service import WorkflowProgressService
+from odoo_agent_server.services.store_service import JsonStore
 from odoo_agent_server.routers.workflow import _normalise_safe_deploy_paths
 from odoo_agent_server.schemas import (
     JobRecord,
@@ -215,6 +216,31 @@ async def test_code_change_wrapper_keeps_event_loop_responsive(monkeypatch, tmp_
     assert result["workflow_progress"]["current_phase"] == "completed"
     recent = WorkflowProgressService.summary()["recent"]
     assert recent[0]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_provider_code_change_persists_and_reuses_identical_timeout_retry(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    submitted = []
+    monkeypatch.setattr(tools_router, "submit_background", submitted.append)
+    payload = _payload(
+        "Durable provider change",
+        operation_id="provider-timeout-001",
+        wait_for_result=False,
+    )
+
+    first = await tools_router._workflow_odoo_code_change(payload)
+    second = await tools_router._workflow_odoo_code_change(payload)
+
+    assert first["status"] == "running"
+    assert first["job_id"] == second["job_id"]
+    assert first["operation_id"] == "provider-timeout-001"
+    assert second["async_job_reused"] is True
+    assert len(submitted) == 1
+    stored = JsonStore().get_job(first["job_id"])
+    assert stored.job_type == "workflow.odoo_code_change"
+    assert stored.request["operation_id"] == "provider-timeout-001"
+    assert stored.completion_required is True
 
 
 @pytest.mark.asyncio
