@@ -72,6 +72,34 @@ def test_initialize_uses_client_gate_prompt_then_mcp_prompt_is_fetchable_for_eve
         assert fetched_mcp.json()["result"]["messages"][0]["content"]["text"] == expected_mcp
 
 
+def test_provider_prompts_use_callable_remote_tool_names():
+    root = Path(__file__).resolve().parents[1]
+    main_prompt = (root / "MCP_SYSTEM_PROMPT.md").read_text(encoding="utf-8")
+    client_prompt = (root / "CLIENT_CHECK_SYSTEM_PROMPT.md").read_text(encoding="utf-8")
+
+    for marker in (
+        "skills_list", "skills_read", "workflow_odoo_code_change",
+        "workflow_odoo_debug_and_fix", "workflow_module_analyze",
+        "workflow_module_test", "workflow_module_install_and_check",
+        "workflow_frontend_visual_implement", "workflow_resume_job",
+        "odoo_query", "odoo_search_read", "odoo_read_group", "jobs_get",
+    ):
+        assert marker in main_prompt
+    assert "client_check" in client_prompt
+    assert "jobs_get" in client_prompt
+
+    for unsafe in (
+        "skills.list", "skills.read", "workflow.odoo_code_change",
+        "workflow.odoo_debug_and_fix", "workflow.module_analyze",
+        "workflow.module_test", "workflow.module_install_and_check",
+        "workflow.frontend_visual_implement", "workflow.resume_job",
+        "odoo.query", "odoo.search_read", "odoo.read_group", "jobs.get",
+    ):
+        assert f"`{unsafe}" not in main_prompt
+    assert "`client.check" not in client_prompt
+    assert "`jobs.get" not in client_prompt
+
+
 def test_mcp_system_prompt_keeps_required_generic_contract():
     root = Path(__file__).resolve().parents[1]
     text = (root / "MCP_SYSTEM_PROMPT.md").read_text(encoding="utf-8")
@@ -80,8 +108,8 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
     required_markers = [
         "## COMPOSITE WORKFLOW",
         "## ON-DEMAND SKILLS",
-        "skills.list",
-        "skills.read",
+        "skills_list",
+        "skills_read",
         "odoo-website-development",
         "odoo-pos-development",
         "odoo-accounting-development",
@@ -106,17 +134,17 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "odoo-upgrade-migration",
         "odoo-ai-mcp-development",
         "single primary-owner recommendation",
-        "workflow.odoo_code_change",
-        "workflow.module_analyze",
-        "workflow.module_install_and_check",
-        "workflow.frontend_visual_implement",
-        "odoo.query",
-        "odoo.search_read",
-        "odoo.read_group",
+        "workflow_odoo_code_change",
+        "workflow_module_analyze",
+        "workflow_module_install_and_check",
+        "workflow_frontend_visual_implement",
+        "odoo_query",
+        "odoo_search_read",
+        "odoo_read_group",
         "do not load a development skill or inspect source",
-        "workflow.resume_job",
+        "workflow_resume_job",
         "workflow_busy",
-        "jobs.get",
+        "jobs_get",
         "deploy_confirmed=true",
         "## CODE QUALITY CONTRACT",
         "production-ready, task-scoped code",
@@ -128,10 +156,16 @@ def test_mcp_system_prompt_keeps_required_generic_contract():
         "dependency-ordered local batches",
         "Odoo-native addon tests",
         "pinned validated client identity",
-        "## MAXIMUM CAPABILITY, CALIBRATED EXECUTION",
-        "full extent of your task-relevant intelligence",
-        "shortest safe path",
-        "continue inspecting after sufficient evidence exists",
+        "## EXECUTION KERNEL",
+        "decisive, evidence-bound, scope-locked, and outcome-driven",
+        "minimum sufficient evidence",
+        "lock scope and stop inspecting or re-planning",
+        "one focused inspection, one complete write set",
+        "one deployment cycle when enabled",
+        "Never repeat a completed phase",
+        "Stop immediately on verified terminal success",
+        "omit it for a new task",
+        "locks the canonical inspected task",
         "## VIEW AND XML GATE",
         "unexpected multiple matches",
         "Studio/database overlays",

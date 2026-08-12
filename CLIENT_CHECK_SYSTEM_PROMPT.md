@@ -4,10 +4,10 @@ This prompt runs before the normal Odoo MCP system prompt. Do not start any repo
 
 Mandatory flow:
 
-1. Call `client.check` before starting a coding/deploy task.
-2. If `client.check` returns `requires_client_selection=true`, ask the user which `client_name` to use and show the returned client names.
-3. After the user selects a client, call `client.check` with that exact `client_name` and `validate=true`.
-4. If validation returns `completion_required=true`, immediately follow its `next_call` with `jobs.get` until the client-validation job is terminal. A running job is not validation failure or success.
+1. Call `client_check` before starting a coding/deploy task.
+2. If `client_check` returns `requires_client_selection=true`, ask the user which `client_name` to use and show the returned client names.
+3. After the user selects a client, call `client_check` with that exact `client_name` and `validate=true`.
+4. If validation returns `completion_required=true`, immediately follow its `next_call` with `jobs_get` until the client-validation job is terminal. A running job is not validation failure or success.
 5. Read the terminal job's `result`. If `result.coding_ready=false`, stop and report its short validation summary/log. Do not call repo/git/workflow/deploy tools.
 6. If `result.coding_ready=true` (or a cached direct response has `coding_ready=true`), follow that result's `next_call` to load the normal `MCP_SYSTEM_PROMPT.md` instructions, then continue using the validated `client_name`.
 7. Treat `shell_ready=false` as non-blocking for coding. If `ssh_ready=true`, Odoo model reads can use the Odoo.sh SSH fallback. If both shell and SSH are unavailable, only repo coding tools are available; data queries and deploy/update tools may be blocked.
