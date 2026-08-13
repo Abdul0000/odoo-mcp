@@ -33,6 +33,16 @@ _GENERIC_IDENTIFIERS = {
     "modify", "rename", "fix", "adjust", "remove", "hide", "show", "replace",
     "inherit", "existing",
 }
+_EXACT_TECHNICAL_IDENTIFIER = re.compile(
+    r"(?:/[A-Za-z0-9_./{}:-]+|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)"
+)
+_EMBEDDED_TECHNICAL_IDENTIFIER = re.compile(
+    r"(?<![\w])(?:"
+    r"/[A-Za-z0-9_./{}:-]+|"
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+|"
+    r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+"
+    r")(?![\w])"
+)
 
 
 class ExistingTargetResolutionService:
@@ -290,21 +300,26 @@ class ExistingTargetResolutionService:
         raw: list[str] = []
         if hint.identifier:
             raw.append(hint.identifier)
-        if target_hint:
-            raw.append(target_hint)
         for key in ("target", "identifier", "field", "method", "xml_id", "route", "template", "selector", "model"):
             value = change_request.get(key)
             if isinstance(value, str):
                 raw.append(value)
-        raw.extend(re.findall(r"[`'\"]([^`'\"]{2,120})[`'\"]", task))
-        raw.extend(re.findall(
-            r"(?<![\w])(?:"
-            r"/[A-Za-z0-9_./{}:-]+|"
-            r"[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+|"
-            r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+"
-            r")",
-            task,
+        # A descriptive hint may contain the exact symbol plus prose, for
+        # example "aba.recon.match.line invoice_id / Bill linkage". Never use
+        # that entire sentence as an Odoo identifier. Prefer embedded snake-
+        # case symbols (usually fields/methods), then routes and dotted names.
+        combined = "\n".join(filter(None, (target_hint, task)))
+        embedded = list(dict.fromkeys(_EMBEDDED_TECHNICAL_IDENTIFIER.findall(combined)))
+        embedded.sort(key=lambda value: (
+            0 if "_" in value and "." not in value and not value.startswith("/") else
+            1 if value.startswith("/") else
+            2,
+            combined.find(value),
         ))
+        raw.extend(embedded)
+        if target_hint and _EXACT_TECHNICAL_IDENTIFIER.fullmatch(target_hint.strip()):
+            raw.append(target_hint)
+        raw.extend(re.findall(r"[`'\"]([^`'\"]{2,120})[`'\"]", task))
         result: list[str] = []
         for value in raw:
             value = value.strip()

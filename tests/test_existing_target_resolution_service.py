@@ -307,6 +307,43 @@ def test_broad_free_text_does_not_invent_a_technical_identifier(tmp_path):
     assert result.writes_blocked is False
 
 
+def test_descriptive_target_hint_prefers_embedded_field_identifier(tmp_path):
+    project, module, paths = _module(tmp_path, {
+        "models/recon_session.py": (
+            "from odoo import fields, models\n"
+            "class ReconMatchLine(models.Model):\n"
+            "    _name = 'aba.recon.match.line'\n"
+            "    invoice_id = fields.Many2one('account.move')\n"
+        ),
+    })
+    task = (
+        "Fix existing field invoice_id on aba.recon.match.line so the Bill links "
+        "to the existing invoice."
+    )
+
+    result = ExistingTargetResolutionService().resolve(
+        project=project,
+        module_path=module,
+        module_name="sample",
+        task_description=task,
+        target_hint="aba.recon.match.line invoice_id / Bill linkage for existing created invoices",
+        intent="fix_bug",
+        task_type="python_model",
+        change_request={},
+        hint=OdooTargetResolutionHint(),
+        candidate_paths=paths,
+        planned_paths=[],
+        client=None,
+        create_module=False,
+    )
+
+    assert result.identifier == "invoice_id"
+    assert result.model == "aba.recon.match.line"
+    assert result.kind == "field"
+    assert result.writes_blocked is False
+    assert result.edit_policy.strategy == "direct_edit"
+
+
 def test_qa_acronym_does_not_become_an_odoo_target(tmp_path):
     project, module, paths = _module(tmp_path, {
         "models/job.py": "from odoo import models\nclass Job(models.Model):\n    _name = 'sample.job'\n",

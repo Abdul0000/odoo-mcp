@@ -3,6 +3,7 @@ from odoo_agent_server.routers.workflow import smart_tool_router
 from odoo_agent_server.services.frontend_pattern_service import FrontendPatternService
 from odoo_agent_server.routers.tools import (
     _adaptive_workflow_profile,
+    _focused_scope_file_paths,
     _looks_like_frontend_code_change,
     _material_clarification,
 )
@@ -117,6 +118,45 @@ def test_mixed_module_routes_from_changed_file_not_module_name():
     )
     assert not _looks_like_frontend_code_change(payload, ["website_pos_payment_mix/controllers/main.py"])
     assert _looks_like_frontend_code_change(payload, ["website_pos_payment_mix/static/src/js/payment_form.js"])
+
+
+def test_backend_task_ignores_incidental_static_search_matches():
+    payload = OdooCodeChangeRequest(
+        module_name="aba_recon_v2",
+        task_description="Fix invoice_id on aba.recon.match.line without changing payment behavior",
+        task_type="python_model",
+        target_files=["aba_recon_v2/models/recon_session.py"],
+    )
+
+    assert not _looks_like_frontend_code_change(payload, [
+        "aba_recon_v2/models/recon_session.py",
+        "aba_recon_v2/static/src/js/recon_session_autorun.js",
+        "aba_recon_v2/static/src/xml/ReconGrid.xml",
+    ])
+
+
+def test_scope_uses_explicit_task_files_not_broad_search_evidence(tmp_path):
+    project = tmp_path / "repo"
+    module = project / "aba_recon_v2"
+    model = module / "models" / "recon_session.py"
+    view = module / "views" / "recon_match_line_views.xml"
+    manifest = module / "__manifest__.py"
+    static = module / "static" / "src" / "js" / "unrelated.js"
+    for path in (model, view, manifest, static):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# fixture\n", encoding="utf-8")
+
+    selected, focused = _focused_scope_file_paths(
+        project=project,
+        module_name="aba_recon_v2",
+        module_root_rel="aba_recon_v2",
+        custom_file_paths=[str(path) for path in (manifest, model, view, static)],
+        target_files=["models/recon_session.py", "views/recon_match_line_views.xml"],
+        writes=[],
+    )
+
+    assert focused is True
+    assert selected == [str(model.resolve()), str(view.resolve())]
 
 
 def test_backend_xml_view_does_not_trigger_frontend_preflight():

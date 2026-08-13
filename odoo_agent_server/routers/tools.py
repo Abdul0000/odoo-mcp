@@ -2732,20 +2732,32 @@ def _looks_like_frontend_code_change(payload: OdooCodeChangeRequest, rel_paths: 
     Website/payment words alone are not enough: controller/model Python changes
     must not trigger dozens of JS/OWL/POS reads.
     """
-    profile = _task_profile(payload, rel_paths)
+    # Trust an explicitly frontend task type, but do not let unrelated files
+    # discovered during broad source search rewrite a backend task profile.
+    profile = _task_profile(payload, [])
     if profile.get("frontend"):
         return True
 
     normalized_paths = [str(path).lower().replace("\\", "/") for path in rel_paths]
-    if any(path.endswith((".js", ".scss", ".css")) for path in normalized_paths):
-        return True
-    if any(
-        path.endswith(".xml")
-        and any(marker in path for marker in ("/static/src/", "/static/", "/qweb/", "/templates/"))
+    frontend_file = any(
+        path.endswith((".js", ".scss", ".css"))
+        or (
+            path.endswith(".xml")
+            and any(marker in path for marker in ("/static/src/", "/static/", "/qweb/", "/templates/"))
+        )
         for path in normalized_paths
-    ):
+    )
+    backend_file = any(
+        path.endswith(".py")
+        or (path.endswith(".xml") and not any(marker in path for marker in ("/static/src/", "/static/", "/qweb/", "/templates/")))
+        for path in normalized_paths
+    )
+    # Focused backend inspection can discover unrelated static files from the
+    # same addon. Mixed evidence is not a frontend change unless frontend work
+    # is explicit in the task profile or supplied writes. A frontend-only
+    # target remains authoritative for callers that classified it broadly.
+    if frontend_file and not backend_file:
         return True
-
     text = " ".join([
         payload.task_description or "", payload.intent or "", payload.target_hint or "",
     ]).lower()
@@ -2755,6 +2767,35 @@ def _looks_like_frontend_code_change(payload: OdooCodeChangeRequest, rel_paths: 
         "payment form js",
     )
     return any(marker in text for marker in strong_markers)
+
+
+def _focused_scope_file_paths(
+    *,
+    project: Path,
+    module_name: str,
+    module_root_rel: str,
+    custom_file_paths: list[str],
+    target_files: list[str],
+    writes: list[OdooCodeFileChange],
+) -> tuple[list[str], bool]:
+    """Select only explicit task/write files for adaptive scope analysis.
+
+    Search evidence may contain many unrelated files from the same addon. It
+    must not turn a one-model fix into a module-wide dependency/frontend scan.
+    """
+    available = {str(Path(path).resolve()): str(Path(path).resolve()) for path in custom_file_paths}
+    requested: list[str] = []
+    raw_paths = [str(item) for item in target_files]
+    raw_paths.extend(str(write.relative_path) for write in writes)
+    for raw in raw_paths:
+        try:
+            relative = _safe_module_relative(module_name, raw, module_root_rel)
+            resolved = str((project / relative).resolve())
+        except (HTTPException, OSError, ValueError):
+            continue
+        if resolved in available and resolved not in requested:
+            requested.append(resolved)
+    return (requested, True) if requested else (list(custom_file_paths), False)
 
 
 def _static_frontend_fast_path(rel_paths: list[str]) -> bool:
@@ -4231,22 +4272,20 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     # supplied target file made focused controller fixes scan unrelated models
     # and escalate to L3/L4. Keep the manifest plus exact write files on write
     # passes; inspection mode keeps the focused search files.
-    scope_file_paths = list(custom_file_paths_abs)
-    if payload.writes or generated_writes:
-        write_abs = {
-            str((project / _safe_module_relative(effective_module_name, w.relative_path, module_root_rel)).resolve())
-            for w in (payload.writes or generated_writes)
-        }
-        manifest_resolved = str(manifest_abs.resolve()) if manifest_abs.exists() else ""
-        scope_file_paths = [path for path in custom_file_paths_abs if path == manifest_resolved or path in write_abs]
-        if not scope_file_paths:
-            scope_file_paths = list(custom_file_paths_abs)
+    scope_file_paths, focused_scope = _focused_scope_file_paths(
+        project=project,
+        module_name=effective_module_name,
+        module_root_rel=module_root_rel,
+        custom_file_paths=custom_file_paths_abs,
+        target_files=payload.target_files,
+        writes=list(payload.writes or generated_writes),
+    )
 
     frontend_preflight = None
-    frontend_paths = list(dict.fromkeys(custom_rel_paths + [
-        _safe_module_relative(effective_module_name, w.relative_path, module_root_rel)
-        for w in payload.writes
-    ]))
+    frontend_paths = [
+        str(Path(path).resolve().relative_to(project.resolve())).replace("\\", "/")
+        for path in scope_file_paths
+    ]
     write_rel_paths = [
         _safe_module_relative(effective_module_name, w.relative_path, module_root_rel)
         for w in (payload.writes or generated_writes)
@@ -4300,8 +4339,19 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     # common dependency manifests are read with /home/odoo/src/odoo/addons priority.
     existing_scope_paths = {item.path for item in scope.instructions} if scope is not None else set()
     extra_core_reads: list[str] = []
-    for dep in ([] if frontend_fast_path or coding_session_resumed else _parse_manifest_depends(manifest_abs)):
+    fallback_dependencies = (
+        []
+        if frontend_fast_path or coding_session_resumed or focused_scope
+        else _parse_manifest_depends(manifest_abs)
+    )
+    for dep in fallback_dependencies:
         if dep == effective_module_name:
+            continue
+        if any(
+            Path(str(path)).name == "__manifest__.py"
+            and Path(str(path)).parent.name == dep
+            for path in existing_scope_paths
+        ):
             continue
         try:
             found = find_core_file(FindCoreFileRequest(module_name=dep, file_type="manifest", keyword=dep, client_name=client_name))
