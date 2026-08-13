@@ -13,7 +13,6 @@ from fastapi import HTTPException
 
 from odoo_agent_server.routers import tools as tools_router
 from odoo_agent_server.services import live_assertion_service
-from odoo_agent_server.services import odoo_code_search_service as code_search_module
 from odoo_agent_server.services.odoosh_service import OdooShService
 from odoo_agent_server.routers.tools import (
     _build_safe_generic_autopatch,
@@ -262,7 +261,6 @@ async def test_inspect_only_routes_to_read_only_analyzer_without_durable_job(mon
 def test_human_feature_label_resolves_module_from_unique_source_evidence(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "repo_index_enabled", False)
     project = tmp_path / "repo"
-    monkeypatch.setattr(code_search_module, "resolve_allowed_path", lambda _value: project.resolve())
     target = project / "feature_reports"
     unrelated = project / "other_custom"
     (target / "views").mkdir(parents=True)
@@ -291,8 +289,68 @@ def test_human_feature_label_resolves_module_from_unique_source_evidence(monkeyp
     module, resolution, targets = _resolve_module_from_source_evidence(project, modules, payload)
 
     assert module.module_name == "feature_reports"
-    assert resolution["strategy"] == "source_evidence"
+    assert resolution["strategy"] == "literal_source_evidence"
     assert targets[0] == "views/top_ten.xml"
+
+
+def test_human_feature_label_rejects_relationship_only_false_positive(monkeypatch, tmp_path):
+    project = tmp_path / "repo"
+    first = project / "rethink_bh_connector"
+    second = project / "tebra_integration"
+    (first / "security").mkdir(parents=True)
+    (second / "views").mkdir(parents=True)
+    (first / "security" / "ir.model.access.csv").write_text(
+        "id,name,model_id:id,group_id:id,perm_read\n"
+        "access_x,x,model_rethink_appointment,base.group_user,1\n",
+        encoding="utf-8",
+    )
+    (second / "views" / "insurance.xml").write_text(
+        "<odoo><record id='insurance' model='ir.ui.view'>"
+        "<field name='name'>Insurance Collection</field></record></odoo>",
+        encoding="utf-8",
+    )
+    modules = [
+        SimpleNamespace(module_name="rethink_bh_connector", path="rethink_bh_connector"),
+        SimpleNamespace(module_name="tebra_integration", path="tebra_integration"),
+    ]
+    payload = ModuleAnalyzeRequest(
+        module_name="custom top ten report",
+        analysis_goal="Read the custom Top Ten report",
+        search_patterns=["Top Ten", "top_ten"],
+    )
+
+    module, resolution, targets = _resolve_module_from_source_evidence(project, modules, payload)
+
+    assert module is None
+    assert targets == []
+    assert resolution["strategy"] == "source_not_found"
+    assert resolution["candidates"] == []
+
+
+def test_human_feature_label_returns_ambiguous_for_equal_literal_matches(monkeypatch, tmp_path):
+    project = tmp_path / "repo"
+    modules = []
+    for name in ("report_alpha", "report_beta"):
+        root = project / name / "views"
+        root.mkdir(parents=True)
+        (root / "top_ten.xml").write_text(
+            "<odoo><record id='top_ten' model='ir.ui.view'>"
+            "<field name='name'>Top Ten</field></record></odoo>",
+            encoding="utf-8",
+        )
+        modules.append(SimpleNamespace(module_name=name, path=name))
+    payload = ModuleAnalyzeRequest(
+        module_name="custom top ten report",
+        analysis_goal="Read Top Ten",
+        search_patterns=["Top Ten"],
+    )
+
+    module, resolution, targets = _resolve_module_from_source_evidence(project, modules, payload)
+
+    assert module is None
+    assert targets == []
+    assert resolution["strategy"] == "source_ambiguous"
+    assert [item["module"] for item in resolution["candidates"]] == ["report_alpha", "report_beta"]
 
 
 @pytest.mark.asyncio

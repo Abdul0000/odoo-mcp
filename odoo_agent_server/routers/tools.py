@@ -1964,56 +1964,95 @@ def _resolve_module_from_source_evidence(
     modules: list[Any],
     payload: ModuleAnalyzeRequest,
 ) -> tuple[Any | None, dict[str, Any], list[str]]:
-    """Resolve a human feature/report label from bounded custom-source indexes."""
-    combined = " ".join(filter(None, [
-        payload.module_name,
-        payload.module_hint,
-        payload.analysis_goal,
-        *payload.search_patterns,
-    ]))
-    task_type = "report" if re.search(r"\breport\b", combined, flags=re.IGNORECASE) else "auto"
-    candidates: list[tuple[float, Any, dict[str, Any]]] = []
-    search = OdooCodeSearchService()
+    """Resolve a human feature label only from literal custom-source evidence.
+
+    Relationship expansion is intentionally excluded here: it is valuable once
+    an owner is known, but common XML/CSV relations can produce huge scores in
+    unrelated addons and must never decide module ownership.
+    """
+    generic_patterns = {
+        "addon", "custom", "data", "file", "form", "model", "module",
+        "odoo", "report", "template", "view",
+    }
+    literal_patterns = [
+        pattern
+        for pattern in ModuleAnalysisService._normalise_patterns(payload.search_patterns)
+        if pattern not in generic_patterns
+    ]
+    if not literal_patterns:
+        for raw in (payload.module_hint, payload.module_name):
+            value = str(raw or "").strip().strip("`\"'").casefold()
+            if len(value) >= 4 and value not in literal_patterns:
+                literal_patterns.append(value)
+    candidates: list[tuple[int, Any, dict[str, Any]]] = []
     for item in modules[:50]:
+        module_path = (project / str(item.path)).resolve()
         try:
-            result = search.search(
-                project_path=str(project),
-                module_path=str(item.path),
-                task_description=payload.analysis_goal,
-                target_hint=payload.module_hint or payload.module_name,
-                search_patterns=list(payload.search_patterns),
-                task_type=task_type,
-                max_results=3,
-            )
-        except Exception:  # noqa: BLE001 - one malformed addon must not block discovery
+            module_path.relative_to(project.resolve())
+        except (OSError, ValueError):
             continue
-        matches = list(result.get("matches") or [])
+        matches: list[dict[str, Any]] = []
+        scanned_files = 0
+        for path in sorted(module_path.rglob("*")):
+            if (
+                not path.is_file()
+                or path.suffix.lower() not in ModuleAnalysisService._extensions
+                or is_ignored_source_path(path.relative_to(module_path).parts)
+            ):
+                continue
+            scanned_files += 1
+            if scanned_files > 2000:
+                break
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")[:500_000]
+            except OSError:
+                continue
+            rel = path.relative_to(module_path).as_posix()
+            rel_folded = rel.casefold()
+            content_folded = content.casefold()
+            path_hits = [pattern for pattern in literal_patterns if pattern in rel_folded]
+            content_hits = [pattern for pattern in literal_patterns if pattern in content_folded]
+            matched = list(dict.fromkeys([*path_hits, *content_hits]))
+            if not matched:
+                continue
+            score = (len(path_hits) * 100) + (len(content_hits) * 25)
+            matches.append({
+                "path": f"{str(item.path).replace('\\', '/').strip('/')}/{rel}",
+                "score": score,
+                "path_hits": path_hits,
+                "content_hits": content_hits,
+                "matched_patterns": matched,
+            })
+        matches.sort(key=lambda match: (-int(match["score"]), str(match["path"])))
         if not matches:
             continue
-        top_score = float(matches[0].get("score") or 0)
+        top_score = int(matches[0].get("score") or 0)
+        total_literal_hits = sum(
+            len(match.get("path_hits") or []) + len(match.get("content_hits") or [])
+            for match in matches
+        )
         candidates.append((top_score, item, {
             "module": item.module_name,
             "path": str(item.path),
-            "score": round(top_score, 3),
-            "confidence": result.get("confidence"),
-            "matches": [
-                {
-                    "path": match.get("path"),
-                    "score": match.get("score"),
-                    "lines": match.get("lines") or [],
-                    "reasons": match.get("reasons") or [],
-                }
-                for match in matches[:3]
-            ],
+            "score": top_score,
+            "literal_hits": total_literal_hits,
+            "matches": matches[:5],
         }))
     candidates.sort(key=lambda row: (-row[0], str(row[1].module_name)))
     if not candidates:
-        return None, {"strategy": "source_not_found", "candidates": []}, []
+        return None, {
+            "strategy": "source_not_found",
+            "reason": "No literal path or source-content match was found.",
+            "literal_patterns": literal_patterns,
+            "candidates": [],
+        }, []
     best_score, best, best_meta = candidates[0]
     second_score = candidates[1][0] if len(candidates) > 1 else 0.0
-    if best_score < 50 or (len(candidates) > 1 and best_score - second_score < 15):
+    if len(candidates) > 1 and best_score == second_score:
         return None, {
             "strategy": "source_ambiguous",
+            "reason": "Multiple addons have equally strong literal matches.",
+            "literal_patterns": literal_patterns,
             "candidates": [meta for _, _, meta in candidates[:5]],
         }, []
     module_prefix = str(best.path).replace("\\", "/").strip("/") + "/"
@@ -2027,9 +2066,10 @@ def _resolve_module_from_source_evidence(
     return best, {
         "requested": payload.module_name,
         "resolved": best.module_name,
-        "strategy": "source_evidence",
-        "score": round(best_score, 3),
-        "score_margin": round(best_score - second_score, 3),
+        "strategy": "literal_source_evidence",
+        "score": best_score,
+        "score_margin": best_score - second_score,
+        "literal_patterns": literal_patterns,
         "candidates": [meta for _, _, meta in candidates[:5]],
     }, target_paths
 
