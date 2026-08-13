@@ -163,3 +163,68 @@ def test_module_analysis_cache_is_selector_aware_and_rejects_escaped_targets(tmp
     assert cached["cache_hit"] is True
     assert different["cache_hit"] is False
     assert escaped["selection"]["target_files_invalid"] == ["../secret.py"]
+
+
+def test_module_analysis_downranks_demo_noise_and_reserves_architecture_files(tmp_path):
+    project, module = _build_module(tmp_path)
+    (module / "data").mkdir()
+    for index in range(12):
+        (module / "data" / f"classroom_demo_{index}.xml").write_text(
+            f"<odoo><record id='classroom_{index}' model='iot.device'/></odoo>",
+            encoding="utf-8",
+        )
+    device = module / "models" / "device.py"
+    device.write_text(device.read_text(encoding="utf-8") + "\nCLASSROOM = 'Classroom'\n", encoding="utf-8")
+
+    result = ModuleAnalysisService().analyze(
+        project=project,
+        module_path=module,
+        module_name="iot_device_management",
+        analysis_goal="Analyze Classroom",
+        max_files=15,
+        max_total_chars=12000,
+        search_patterns=["Classroom"],
+    )
+
+    selected = result["selection"]["selected_files"]
+    assert selected[0] == "models/device.py"
+    assert "__manifest__.py" in selected
+    assert sum(path.startswith("data/") for path in selected) < 10
+    assert "Classroom" in result["source_evidence"][0]["content"]
+
+
+def test_module_analysis_discovers_direct_dependent_ui_owner(tmp_path):
+    project, module = _build_module(tmp_path)
+    portal = project / "iot_operations_portal"
+    (portal / "views").mkdir(parents=True)
+    (portal / "__manifest__.py").write_text(
+        "{'name': 'IoT Portal', 'depends': ['iot_device_management'], 'data': ['views/device_views.xml']}",
+        encoding="utf-8",
+    )
+    (portal / "views" / "device_views.xml").write_text(
+        "<odoo><record id='action_devices' model='ir.actions.act_window'>"
+        "<field name='res_model'>iot.device</field></record></odoo>",
+        encoding="utf-8",
+    )
+    candidates = [
+        type("Module", (), {"module_name": "iot_device_management", "path": "iot_device_management"})(),
+        type("Module", (), {"module_name": "iot_operations_portal", "path": "iot_operations_portal"})(),
+    ]
+
+    result = ModuleAnalysisService().analyze(
+        project=project,
+        module_path=module,
+        module_name="iot_device_management",
+        analysis_goal="Analyze iot.device",
+        max_files=15,
+        max_total_chars=12000,
+        target_files=["models/device.py"],
+        search_patterns=["iot.device"],
+        module_candidates=candidates,
+    )
+
+    contract = result["feature_contract"]
+    assert contract["early_stop_reached"] is True
+    assert contract["live_verification_needed"] is False
+    assert contract["related_modules"][0]["module_name"] == "iot_operations_portal"
+    assert contract["related_modules"][0]["reference_files"][0]["role"] == "ui"

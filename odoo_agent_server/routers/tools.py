@@ -45,6 +45,7 @@ from ..schemas import (
     OdooDebugAndFixRequest,
     OdooDebugEvidenceRecord,
     OdooFailureDiagnosis,
+    OdooFeatureInspectRequest,
     OdooOperationHandoff,
     OdooTargetResolutionHint,
     OdooTargetResolutionResult,
@@ -669,6 +670,17 @@ _TOOL_DESCRIPTORS = [
         title="Upgrade Odoo module", description="[LEGACY] Direct button_immediate_upgrade — use odoo.module_deploy instead", requires_approval=True, deprecated=True),
     ToolDescriptor(name="odoo.search_read",
         title="Query Odoo records", description="Run Odoo search_read safely. Uses Odoo.sh SSH first, then HTTPS JSON-RPC read-only fallback when SSH is refused/unavailable for a client.", read_only=True),
+    ToolDescriptor(
+        name="odoo.feature_inspect",
+        title="Inspect live Odoo feature",
+        description=(
+            "OPTIONAL LIVE CHECK after source analysis. Inspect up to 10 exact technical models, business fields, "
+            "selections, views, actions, menus, ACLs, rules and counts in one Odoo.sh SSH/Odoo-shell startup. "
+            "Use instead of multiple parallel odoo.search_read calls; do not call when source evidence already "
+            "answers the question and the user did not request installed/live state."
+        ),
+        read_only=True,
+    ),
     ToolDescriptor(name="odoo.read_group",
         title="Aggregate Odoo records", description="Return live grouped counts, sums, averages, minima, or maxima with safe read_group. Example: account.move customer invoices grouped by state.", read_only=True),
     ToolDescriptor(
@@ -936,6 +948,7 @@ _TOOL_INPUT_MODELS = {
     "odoo.module_install": OdooModuleRequest,
     "odoo.module_update": OdooModuleRequest,
     "odoo.search_read": OdooSearchReadRequest,
+    "odoo.feature_inspect": OdooFeatureInspectRequest,
     "odoo.read_group": OdooReadGroupRequest,
     "odoo.record_create": OdooRecordCreateRequest,
     "odoo.record_write": OdooRecordWriteRequest,
@@ -3323,12 +3336,26 @@ def _workflow_module_analyze(payload: ModuleAnalyzeRequest) -> dict[str, Any]:
         max_total_chars=payload.max_total_chars,
         target_files=[*payload.target_files, *source_targets],
         search_patterns=payload.search_patterns,
+        module_candidates=modules,
     )
     result.update({
         "client_name": effective_client_name,
         "project_path": str(project),
         "module_resolution": resolution,
     })
+    if payload.live_verify:
+        live_models = payload.live_models or list((result.get("feature_contract") or {}).get("technical_identifiers") or [])
+        if not live_models:
+            result["live_verification"] = {
+                "status": "skipped",
+                "reason": "No exact technical models were resolved from the focused source evidence.",
+                "ssh_shell_startups": 0,
+            }
+        else:
+            live = OdooService(client).feature_inspect(live_models[:10], timeout_seconds=60)
+            result["live_verification"] = live.model_dump(mode="json")
+            result["feature_contract"]["live_verification_needed"] = False
+            result["feature_contract"]["live_verified"] = live.status == "ok"
     return result
 
 def _is_installability_repair_request(payload: OdooCodeChangeRequest) -> bool:
@@ -8234,6 +8261,16 @@ async def _dispatch(name: str, args: dict) -> object:
             client_name=req.client_name,
         )
         return data.get("odoo") if data.get("status") == "ok" else OdooResult(status="failed", result=data, error=data.get("message") or "Odoo search_read failed")
+    if name == "odoo.feature_inspect":
+        req = OdooFeatureInspectRequest.model_validate(args)
+        client = _resolve_query_client(req.client_name)
+        return await asyncio.to_thread(
+            _odoo_service_for_client(client).feature_inspect,
+            req.models,
+            req.sample_fields,
+            req.sample_limit,
+            req.timeout_seconds,
+        )
     if name == "odoo.read_group":
         req = OdooReadGroupRequest.model_validate(args)
         data = await asyncio.to_thread(_read_group_via_shell, req)

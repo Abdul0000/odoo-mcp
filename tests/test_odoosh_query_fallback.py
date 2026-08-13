@@ -172,6 +172,49 @@ def test_odoosh_read_group_returns_live_invoice_state_counts(monkeypatch):
     assert result.result[1] == {"state": "posted", "state_count": 21}
 
 
+def test_feature_inspect_uses_one_shell_for_models_ui_and_security(monkeypatch):
+    client = ResolvedClient(
+        name="ClientA",
+        repo="https://github.com/ClientA/ClientA.git",
+        branch="22-06-2026",
+        path="/workspace/repos/ClientA",
+        odoosh_db_name="client-a-db",
+        odoosh_ssh_host="host",
+        odoosh_ssh_user="34342188",
+        odoosh_ssh_private_key_b64="ZmFrZQ==",
+        odoosh_odoo_path="/home/odoo/src/odoo",
+        odoosh_user_addons_path="/home/odoo/src/user",
+    )
+    calls = []
+
+    def fake_run_shell(self, remote_script, timeout_seconds=60):
+        calls.append(remote_script)
+        assert "ir.model.fields" in remote_script
+        assert "ir.actions.act_window" in remote_script
+        assert "ir.model.access" in remote_script
+        return CommandResult(
+            command=["ssh"],
+            cwd="odoosh:ssh",
+            exit_code=0,
+            stdout=(
+                'MCP_ODOOSH_FEATURE_JSON:{"status":"ok","result":'
+                '{"models":[{"model":"school.facility.room"}],"business_fields":[],"views":[],'
+                '"actions":[],"menus":[],"access":[],"rules":[],"selections":[],'
+                '"record_counts":{"school.facility.room":0},"samples":{},"model_errors":{}}}\n'
+            ),
+        )
+
+    monkeypatch.setattr(OdooShService, "run_shell", fake_run_shell)
+    result = OdooShService(client).feature_inspect(
+        ["school.facility.room", "school.facility.booking"],
+        timeout_seconds=60,
+    )
+
+    assert result.status == "ok"
+    assert len(calls) == 1
+    assert result.result["record_counts"]["school.facility.room"] == 0
+
+
 def test_provider_read_group_dispatches_safe_customer_invoice_aggregation(monkeypatch):
     class FakeOdoo:
         def read_group(self, model, domain, fields, groupby, lazy, context, timeout_seconds):

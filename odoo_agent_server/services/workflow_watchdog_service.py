@@ -21,6 +21,7 @@ _CANCELLABLE_TOOLS = {
     "workflow.module_analyze",
     "odoo.query",
     "odoo.search_read",
+    "odoo.feature_inspect",
     "odoo.read_group",
     "artifacts.read",
     "jobs.list",

@@ -820,7 +820,7 @@ class ModuleAnalyzeRequest(BaseModel):
     module_name: str = Field(..., description="Custom addon technical name or safe human hint")
     module_hint: str | None = Field(default=None, max_length=200, description="Optional alternate addon hint")
     analysis_goal: str = Field(default="Explain architecture, use cases, and practical gaps", min_length=3, max_length=4000)
-    max_files: int = Field(default=50, ge=5, le=50, description="Maximum relevant module files to return")
+    max_files: int = Field(default=15, ge=5, le=50, description="Maximum relevant files; default 15 suits low-memory hosts")
     max_total_chars: int = Field(default=12000, ge=4000, le=12000, description="Bounded source evidence character budget")
     search_patterns: list[str] = Field(
         default_factory=list,
@@ -831,6 +831,11 @@ class ModuleAnalyzeRequest(BaseModel):
         default_factory=list,
         max_length=20,
         description="Authoritative module-relative files selected first.",
+    )
+    live_verify: bool = False
+    live_models: list[str] = Field(
+        default_factory=list,
+        max_length=10,
     )
 
     @property
@@ -846,6 +851,18 @@ class ModuleAnalyzeRequest(BaseModel):
         if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
             raise ValueError("module_name contains unsafe characters")
         return value
+
+    @field_validator("live_models")
+    @classmethod
+    def live_models_must_be_safe(cls, values: list[str]) -> list[str]:
+        ordered: list[str] = []
+        for value in values:
+            value = str(value or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.]+", value):
+                raise ValueError(f"Invalid Odoo model name: {value!r}")
+            if value not in ordered:
+                ordered.append(value)
+        return ordered
 
 
 
@@ -1268,6 +1285,44 @@ class OdooSearchReadRequest(BaseModel):
     offset: int = Field(default=0, ge=0)
     order: str | None = Field(default=None, description="Optional Odoo order string, e.g. 'create_date desc'")
     context: dict[str, Any] | None = Field(default=None, description="Optional Odoo context passed to search_read")
+
+
+class OdooFeatureInspectRequest(BaseModel):
+    """One-shell, read-only live registry inspection for a bounded feature."""
+    client_name: str | None = Field(default=None, description="Selected ODOO_CLIENTS entry")
+    models: list[str] = Field(..., min_length=1, max_length=10, description="Exact technical models resolved from source analysis")
+    sample_fields: dict[str, list[str]] = Field(
+        default_factory=dict,
+        description="Optional explicitly projected business fields per model; samples are omitted when empty",
+    )
+    sample_limit: int = Field(default=0, ge=0, le=10, description="Maximum sample records per model; zero disables record reads")
+    timeout_seconds: int = Field(default=60, ge=15, le=180)
+
+    @field_validator("models")
+    @classmethod
+    def feature_models_must_be_safe(cls, values: list[str]) -> list[str]:
+        ordered: list[str] = []
+        for value in values:
+            value = str(value or "").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.]+", value):
+                raise ValueError(f"Invalid Odoo model name: {value!r}")
+            if value not in ordered:
+                ordered.append(value)
+        return ordered
+
+    @field_validator("sample_fields")
+    @classmethod
+    def feature_sample_fields_must_be_safe(cls, value: dict[str, list[str]]) -> dict[str, list[str]]:
+        if len(value) > 10:
+            raise ValueError("sample_fields supports at most 10 models")
+        cleaned: dict[str, list[str]] = {}
+        for model, fields in value.items():
+            if not re.fullmatch(r"[A-Za-z0-9_.]+", str(model)):
+                raise ValueError(f"Invalid Odoo model name: {model!r}")
+            if len(fields) > 20 or any(not re.fullmatch(r"[A-Za-z0-9_]+", str(field)) for field in fields):
+                raise ValueError("Each sample field list must contain at most 20 safe field names")
+            cleaned[str(model)] = list(dict.fromkeys(str(field) for field in fields))
+        return cleaned
 
 
 class OdooReadGroupRequest(BaseModel):

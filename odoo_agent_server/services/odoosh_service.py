@@ -1235,6 +1235,120 @@ class OdooShService:
             groupby=groupby, lazy=lazy,
         )
 
+    def feature_inspect(
+        self,
+        models: list[str],
+        sample_fields: dict[str, list[str]] | None = None,
+        sample_limit: int = 0,
+        timeout_seconds: int = 60,
+    ) -> OdooResult:
+        """Inspect multiple feature models in one Odoo shell/SSH connection."""
+        if not self._db_name():
+            return OdooResult(status="failed", error="ODOOSH_DB_NAME/odoosh_db_name is not configured for feature inspection.")
+        safe_models = list(dict.fromkeys(str(value) for value in models))[:10]
+        if not safe_models or any(not re.fullmatch(r"[A-Za-z0-9_.]+", value) for value in safe_models):
+            return OdooResult(status="failed", error="Feature inspection requires 1-10 exact technical model names.")
+        safe_sample_fields: dict[str, list[str]] = {}
+        for model, fields in (sample_fields or {}).items():
+            if model not in safe_models:
+                continue
+            safe = [str(field) for field in fields if re.fullmatch(r"[A-Za-z0-9_]+", str(field))]
+            safe_sample_fields[model] = list(dict.fromkeys(safe))[:20]
+        payload = {
+            "models": safe_models,
+            "sample_fields": safe_sample_fields,
+            "sample_limit": max(0, min(int(sample_limit or 0), 10)),
+        }
+        payload_b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+        safe_db = shlex.quote(self._db_name() or "")
+        odoo_path = shlex.quote(self._odoo_path())
+        marker = "MCP_ODOOSH_FEATURE_JSON:"
+        script = (
+            "set +e; "
+            f"{self._addons_path_shell_setup()}"
+            f"cd {odoo_path}; "
+            f"./odoo-bin shell -d {safe_db} --addons-path=\"$MCP_ADDONS_PATH\" --no-http --log-level=error <<'PY'\n"
+            "import base64, datetime, json, traceback\n"
+            f"payload = json.loads(base64.b64decode({payload_b64!r}).decode('utf-8'))\n"
+            f"marker = {marker!r}\n"
+            "def norm(value):\n"
+            "    if isinstance(value, (datetime.date, datetime.datetime)):\n"
+            "        return value.isoformat()\n"
+            "    if isinstance(value, tuple):\n"
+            "        return [norm(v) for v in value]\n"
+            "    if isinstance(value, list):\n"
+            "        return [norm(v) for v in value]\n"
+            "    if isinstance(value, dict):\n"
+            "        return {str(k): norm(v) for k, v in value.items()}\n"
+            "    if isinstance(value, bytes):\n"
+            "        return value.decode('utf-8', 'replace')\n"
+            "    return value\n"
+            "try:\n"
+            "    names = payload['models']\n"
+            "    meta = env['ir.model'].sudo().search_read([('model', 'in', names)], ['name', 'model'], limit=20, order='model')\n"
+            "    existing = [row['model'] for row in meta]\n"
+            "    excluded = {'id','display_name','create_uid','create_date','write_uid','write_date','__last_update'}\n"
+            "    prefixes = ('message_', 'activity_', 'website_', 'rating_', 'my_activity_')\n"
+            "    fields = env['ir.model.fields'].sudo().search_read(\n"
+            "        [('model', 'in', existing)],\n"
+            "        ['model','name','field_description','ttype','relation','required','readonly','store','index'],\n"
+            "        limit=500, order='model,name')\n"
+            "    fields = [row for row in fields if row['name'] not in excluded and not row['name'].startswith(prefixes)]\n"
+            "    bounded_fields, field_counts = [], {}\n"
+            "    for row in fields:\n"
+            "        count = field_counts.get(row['model'], 0)\n"
+            "        if count < 20:\n"
+            "            bounded_fields.append(row)\n"
+            "            field_counts[row['model']] = count + 1\n"
+            "    fields = bounded_fields\n"
+            "    views = env['ir.ui.view'].sudo().search_read([('model', 'in', existing)], ['name','model','type','inherit_id','priority','active'], limit=100, order='model,priority,id')\n"
+            "    actions = env['ir.actions.act_window'].sudo().search_read([('res_model', 'in', existing)], ['name','res_model','view_mode','domain','context'], limit=100, order='res_model,name')\n"
+            "    action_refs = ['ir.actions.act_window,%s' % row['id'] for row in actions]\n"
+            "    menus = env['ir.ui.menu'].sudo().search_read([('action', 'in', action_refs)], ['name','parent_id','action','groups_id','sequence','active'], limit=100, order='sequence,id') if action_refs else []\n"
+            "    access = env['ir.model.access'].sudo().search_read([('model_id.model', 'in', existing)], ['name','model_id','group_id','perm_read','perm_write','perm_create','perm_unlink','active'], limit=100, order='name')\n"
+            "    rules = env['ir.rule'].sudo().search_read([('model_id.model', 'in', existing)], ['name','model_id','groups','domain_force','active','perm_read','perm_write','perm_create','perm_unlink'], limit=100, order='name')\n"
+            "    selection_fields = env['ir.model.fields'].sudo().search([('model', 'in', existing), ('ttype', '=', 'selection')])\n"
+            "    selections = env['ir.model.fields.selection'].sudo().search_read([('field_id', 'in', selection_fields.ids)], ['field_id','value','name','sequence'], limit=300, order='field_id,sequence,id')\n"
+            "    counts, samples, errors = {}, {}, {}\n"
+            "    for name in existing:\n"
+            "        try:\n"
+            "            counts[name] = env[name].sudo().search_count([])\n"
+            "            wanted = payload.get('sample_fields', {}).get(name) or []\n"
+            "            if payload.get('sample_limit') and wanted:\n"
+            "                samples[name] = env[name].sudo().search_read([], wanted, limit=payload['sample_limit'])\n"
+            "        except Exception as exc:\n"
+            "            errors[name] = str(exc)\n"
+            "    result = {'execution': {'ssh_shell_startups': 1, 'business_field_limit_per_model': 20}, 'models': meta, 'missing_models': [n for n in names if n not in existing], 'business_fields': fields, 'views': views, 'actions': actions, 'menus': menus, 'access': access, 'rules': rules, 'selections': selections, 'record_counts': counts, 'samples': samples, 'model_errors': errors}\n"
+            "    print(marker + json.dumps({'status': 'ok', 'result': norm(result)}, ensure_ascii=False))\n"
+            "except Exception as exc:\n"
+            "    print(marker + json.dumps({'status': 'failed', 'error': str(exc), 'traceback': traceback.format_exc()[-4000:]}, ensure_ascii=False))\n"
+            "PY\n"
+        )
+        command = self.run_shell(script, timeout_seconds=max(15, min(int(timeout_seconds), 180)))
+        payload_line = ""
+        for line in reversed((command.stdout or "").splitlines()):
+            if line.startswith(marker):
+                payload_line = line[len(marker):]
+                break
+        if not payload_line:
+            return OdooResult(
+                status="failed",
+                database=self._db_name(),
+                error=(command.stderr or command.stdout or "Feature inspection returned no parseable result.")[-4000:],
+            )
+        try:
+            parsed = json.loads(payload_line)
+        except Exception as exc:
+            return OdooResult(status="failed", database=self._db_name(), error=f"Could not parse feature inspection JSON: {exc}")
+        if parsed.get("status") != "ok" or command.exit_code != 0:
+            return OdooResult(
+                status="failed",
+                database=self._db_name(),
+                error=parsed.get("error") or command.stderr or "Feature inspection failed.",
+                result={"payload": parsed},
+            )
+        return OdooResult(status="ok", database=self._db_name(), result=parsed.get("result") or {})
+
     def _dependency_guard(self, module_name: str) -> CommandResult | None:
         try:
             from .odoo_service import OdooService

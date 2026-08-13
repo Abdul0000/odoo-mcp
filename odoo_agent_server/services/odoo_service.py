@@ -119,6 +119,28 @@ class OdooService:
             result={"ssh_attempt": ssh_result.model_dump(mode="json"), "https_jsonrpc_attempt": https_result.model_dump(mode="json")},
         )
 
+    def feature_inspect(
+        self,
+        models: list[str],
+        sample_fields: dict[str, list[str]] | None = None,
+        sample_limit: int = 0,
+        timeout_seconds: int = 60,
+    ) -> OdooResult:
+        """Run a compact multi-model registry/UI/security inspection in one SSH shell."""
+        try:
+            return self._ssh().feature_inspect(
+                models,
+                sample_fields=sample_fields,
+                sample_limit=sample_limit,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return OdooResult(
+                status="failed",
+                database=self._database(),
+                error=f"Odoo SSH feature inspection failed before execution: {exc}",
+            )
+
 
     def execute_kw(self, model: str, method: str, args: list | None = None, kwargs: dict | None = None, superuser: bool = False) -> OdooResult:
         """Compatibility wrapper for old callers/tests; executed through Odoo shell only."""

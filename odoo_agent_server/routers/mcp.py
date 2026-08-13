@@ -569,6 +569,9 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
         "through workflow.odoo_code_change, and replays an immutable assertion after deployment. Preserve debug/session IDs "
         "and continue returned calls. Claim fixed only when truth_gate.verified_fixed=true."
     ),
+    "workflow.module_analyze": (
+        "One-pass read-only addon analysis with bounded evidence, dependent-module references, early stop, and optional one-shell live verification."
+    ),
     "workflow.module_install_and_check": (
         "Fast path for an explicit module install, upgrade, or install-and-fix request. It starts the guarded Odoo job and "
         "returns job_id/next_call for jobs.get. Repair source only from its concrete traceback or dependency error; an "

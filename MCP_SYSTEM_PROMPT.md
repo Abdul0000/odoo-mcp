@@ -37,7 +37,8 @@ Classify once and use one lane:
 - Read-only live data: do not load a development skill or inspect source. Use `odoo_query`, `odoo_search_read`, or `odoo_read_group`.
 - Functional records/flows: use `odoo-functional-flow-testing`, separate from code/deploy. Preserve request IDs and require read-back `verified=true` and `success_allowed=true`.
 - Runtime/repeated defect: use `workflow_odoo_debug_and_fix`; deterministic edits stay in code-change. Preserve IDs/contexts. Only trusted evidence bound to that session proves the result.
-- Read-only module explanation: call `workflow_module_analyze` once and answer from returned source evidence. Do not pre-call it before code-change.
+- Read-only module explanation: call `workflow_module_analyze` once and answer from returned source evidence. Respect its early-stop contract and dependent-module references; do not pre-call it before code-change.
+- Live feature verification is conditional, not a default follow-up. Only when the user requests installed/live proof, call `workflow_module_analyze` with `live_verify=true`; it batches exact resolved models into one SSH/Odoo-shell call. Never fan out multiple `odoo_search_read` calls for registry/view/ACL checks.
 - Complete module test: load `odoo-test-development`, call `workflow_module_test`, then poll `jobs_get`. This lane never edits or deploys.
 - Explicit install/upgrade/check: call `workflow_module_install_and_check`, then poll. Repair only from a concrete traceback/dependency error.
 

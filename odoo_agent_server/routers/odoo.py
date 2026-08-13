@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter
 
 from ..auth import AuthDependency
-from ..schemas import CommandResult, JobRecord, JobStatus, OdooModuleRequest, OdooReadGroupRequest, OdooResult, OdooSearchReadRequest
+from ..schemas import CommandResult, JobRecord, JobStatus, OdooFeatureInspectRequest, OdooModuleRequest, OdooReadGroupRequest, OdooResult, OdooSearchReadRequest
 from ..services.approval_service import ApprovalService
 from ..services.odoo_service import OdooService
 from ..services.odoosh_service import OdooShService
@@ -415,6 +415,18 @@ def odoo_module_deploy(payload: OdooModuleRequest) -> OdooResult:
 def odoo_search_read(payload: OdooSearchReadRequest) -> OdooResult:
     client = ClientResolverService().resolve_client(client_name=payload.client_name, require_complete=True) if payload.client_name else ClientResolverService().resolve_client(require_complete=False)
     return _odoo_service_for_client(client).search_read(payload.model, payload.domain, payload.fields, payload.limit, payload.offset, payload.order, payload.context)
+
+
+@router.post("/feature-inspect", response_model=OdooResult)
+def odoo_feature_inspect(payload: OdooFeatureInspectRequest) -> OdooResult:
+    """Inspect related models/UI/security with one Odoo.sh shell startup."""
+    client = ClientResolverService().resolve_client(client_name=payload.client_name, require_complete=True) if payload.client_name else ClientResolverService().resolve_client(require_complete=False)
+    return _odoo_service_for_client(client).feature_inspect(
+        payload.models,
+        sample_fields=payload.sample_fields,
+        sample_limit=payload.sample_limit,
+        timeout_seconds=payload.timeout_seconds,
+    )
 
 
 @router.post("/read-group", response_model=OdooResult)
