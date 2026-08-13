@@ -123,6 +123,100 @@ def _model_to_filename_hints(model: str) -> list[str]:
     return [parts, last]
 
 
+def _focused_python_scope_content(content: str, identifiers: Sequence[str]) -> tuple[str, bool]:
+    """Return only exact Python source units relevant to resolved identifiers.
+
+    Large Odoo model files commonly contain several models and dozens of
+    unrelated relational fields. Scanning the whole file makes one field edit
+    look like a module-wide L3/L4 change. Keep the containing model identity
+    (``_name``/``_inherit``/``_inherits``) and the exact matched field/method.
+    Fall back to the complete file whenever no exact AST match is available.
+    """
+    clean = list(dict.fromkeys(
+        str(value or "").strip()
+        for value in identifiers
+        if str(value or "").strip()
+    ))[:20]
+    if not clean:
+        return content, False
+    simple = {
+        value
+        for value in clean
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value)
+    }
+    dotted = {
+        value
+        for value in clean
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+", value)
+    }
+    if not simple and not dotted:
+        return content, False
+    try:
+        tree = ast.parse(content)
+    except (SyntaxError, ValueError):
+        return content, False
+    lines = content.splitlines(keepends=True)
+    snippets: list[str] = []
+    seen: set[tuple[int, int]] = set()
+
+    def source(node: ast.AST) -> str:
+        start = max(1, int(getattr(node, "lineno", 1)))
+        decorators = getattr(node, "decorator_list", []) or []
+        if decorators:
+            start = min(start, *(int(getattr(item, "lineno", start)) for item in decorators))
+        end = max(start, int(getattr(node, "end_lineno", start)))
+        key = (start, end)
+        if key in seen:
+            return ""
+        seen.add(key)
+        return "".join(lines[start - 1:end])
+
+    def assigned_names(node: ast.AST) -> set[str]:
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        return {target.id for target in targets if isinstance(target, ast.Name)}
+
+    for class_node in (node for node in tree.body if isinstance(node, ast.ClassDef)):
+        matched_units: list[ast.AST] = []
+        identity_units: list[ast.AST] = []
+        model_identity_match = False
+        for node in class_node.body:
+            names = assigned_names(node)
+            if names & {"_name", "_inherit", "_inherits"}:
+                identity_units.append(node)
+                for value in ast.walk(node):
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                        if value.value in dotted:
+                            model_identity_match = True
+            if names & simple:
+                matched_units.append(node)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in simple:
+                matched_units.append(node)
+        if not matched_units and not model_identity_match and class_node.name not in simple:
+            continue
+        header_end = int(getattr(class_node, "lineno", 1))
+        snippets.append("".join(lines[header_end - 1:header_end]))
+        for node in identity_units:
+            value = source(node)
+            if value:
+                snippets.append(value)
+        if matched_units:
+            for node in matched_units:
+                value = source(node)
+                if value:
+                    snippets.append(value)
+        else:
+            value = source(class_node)
+            if value:
+                snippets.append(value)
+
+    focused = "\n".join(item.rstrip("\r\n") for item in snippets if item).strip()
+    return (focused + "\n", True) if focused else (content, False)
+
+
 class CoreFinderService:
     """Find Odoo core source files across the /home/odoo/src tree.
 
@@ -280,6 +374,7 @@ class CoreFinderService:
         task_description: str,
         search_roots: Sequence[str] | None = None,
         client_name: str | None = None,
+        focus_identifiers: Sequence[str] | None = None,
     ) -> ScopeAdviceResult:
         """Analyse custom module files and return adaptive mandatory read instructions.
 
@@ -318,10 +413,20 @@ class CoreFinderService:
         has_computed_or_relational = False
         has_irmodel = False
 
+        focus_used = False
+        clean_focus = list(dict.fromkeys(
+            str(value or "").strip()
+            for value in (focus_identifiers or [])
+            if str(value or "").strip()
+        ))[:20]
         for fpath in custom_file_paths:
             content = self._safe_read(fpath, max_bytes=300000)
             if not content:
                 continue
+
+            if fpath.endswith(".py") and clean_focus:
+                content, applied = _focused_python_scope_content(content, clean_focus)
+                focus_used = focus_used or applied
 
             if fpath.endswith("__manifest__.py") or fpath.endswith("__openerp__.py"):
                 for dep in self._extract_manifest_dependencies(content):
@@ -477,6 +582,8 @@ class CoreFinderService:
             instructions=instructions,
             mandatory_count=sum(1 for i in instructions if i.mandatory),
             total_count=len(instructions),
+            focus_applied=focus_used,
+            focus_identifiers=clean_focus if focus_used else [],
             warning=(
                 "MANDATORY DUAL READ: Execute ALL mandatory instructions before writing code. "
                 "Push is BLOCKED until workflow.verify_against_core succeeds."

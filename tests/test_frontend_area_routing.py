@@ -6,6 +6,7 @@ from odoo_agent_server.routers.tools import (
     _focused_scope_file_paths,
     _looks_like_frontend_code_change,
     _material_clarification,
+    _scope_focus_identifiers,
 )
 
 
@@ -157,6 +158,30 @@ def test_scope_uses_explicit_task_files_not_broad_search_evidence(tmp_path):
 
     assert focused is True
     assert selected == [str(model.resolve()), str(view.resolve())]
+
+
+def test_scope_focus_prefers_exact_field_inside_descriptive_target_hint():
+    payload = OdooCodeChangeRequest(
+        module_name="aba_recon_v2",
+        task_description="Recover the existing Bill link safely",
+        task_type="python_model",
+        target_hint="aba.recon.match.line invoice_id / Bill linkage for existing created invoices",
+    )
+
+    assert _scope_focus_identifiers(payload)[:2] == [
+        "aba.recon.match.line",
+        "invoice_id",
+    ]
+
+
+def test_module_wide_request_does_not_narrow_scope_to_incidental_symbols():
+    payload = OdooCodeChangeRequest(
+        module_name="aba_recon_v2",
+        task_description="Complete module-wide redesign including invoice_id",
+        task_type="python_model",
+    )
+
+    assert _scope_focus_identifiers(payload) == []
 
 
 def test_backend_xml_view_does_not_trigger_frontend_preflight():

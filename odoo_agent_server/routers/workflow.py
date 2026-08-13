@@ -2778,6 +2778,7 @@ def scope_advice(payload: ScopeAdviceRequest) -> ScopeAdviceResult:
         task_description=payload.task_description,
         search_roots=payload.search_roots or None,
         client_name=payload.client_name,
+        focus_identifiers=payload.focus_identifiers,
     )
     PreWriteGateService().record_scope_advice(result, payload)
     return result

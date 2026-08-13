@@ -1040,7 +1040,21 @@ def _write_contract_fixture(tmp_path):
             "reason": "Edit the existing custom owner.",
         },
     )
+    payload = OdooCodeChangeRequest(
+        project_path=str(project),
+        module_name="custom_sale",
+        task_description="Update existing action_confirm method",
+        coding_session_id="codeop-contract-001",
+        writes=[OdooCodeFileChange(
+            relative_path="custom_sale/models/sale_order.py",
+            search="VALUE = 1",
+            replace="VALUE = 2",
+            count=1,
+        )],
+        auto_deploy=False,
+    )
     contract = _build_validated_write_contract(
+        payload=payload,
         project=project,
         module_name="custom_sale",
         module_path="custom_sale",
@@ -1060,19 +1074,6 @@ def _write_contract_fixture(tmp_path):
         "status": "ready_to_write",
         "evidence": {"write_contract": contract},
     }
-    payload = OdooCodeChangeRequest(
-        project_path=str(project),
-        module_name="custom_sale",
-        task_description="Update existing action_confirm method",
-        coding_session_id="codeop-contract-001",
-        writes=[OdooCodeFileChange(
-            relative_path="custom_sale/models/sale_order.py",
-            search="VALUE = 1",
-            replace="VALUE = 2",
-            count=1,
-        )],
-        auto_deploy=False,
-    )
     return project, dependency, resolution, contract, session, payload
 
 
@@ -1093,6 +1094,42 @@ def test_validated_write_contract_reuses_target_and_detects_dependency_change(tm
     resumed, stale_reason = _validated_session_write_contract(session, payload, project)
     assert resumed is None
     assert stale_reason.startswith("inspected_dependency_changed:")
+
+
+def test_validated_write_contract_rejects_material_task_change(tmp_path):
+    project, _dependency, _resolution, _contract, session, payload = _write_contract_fixture(tmp_path)
+    changed = payload.model_copy(update={
+        "task_description": "Modify a different method on another model",
+    })
+
+    resumed, stale_reason = _validated_session_write_contract(session, changed, project)
+
+    assert resumed is None
+    assert stale_reason == "validated_task_contract_changed"
+
+
+def test_workflow_failure_metadata_separates_checkout_and_transport_failures():
+    missing = tools_router._workflow_failure_metadata(
+        RuntimeError("Project path not found: /workspace/repos/missing"),
+        {"current_phase": "repo_prepare"},
+    )
+    transport = tools_router._workflow_failure_metadata(
+        TimeoutError("SSH connection timed out"),
+        {"current_phase": "core_source_read"},
+    )
+
+    assert missing == {
+        "failure_origin": "missing_context",
+        "failure_stage": "repo_prepare",
+        "retryable": False,
+        "next_strategy": "load_exact_source",
+    }
+    assert transport == {
+        "failure_origin": "provider_transport",
+        "failure_stage": "core_source_read",
+        "retryable": True,
+        "next_strategy": "retry_provider_bounded",
+    }
 
 
 def test_validated_write_contract_rejects_out_of_phase_replay(tmp_path):

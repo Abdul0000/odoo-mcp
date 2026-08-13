@@ -173,7 +173,7 @@ router = APIRouter(prefix="/tools", tags=["tools"], dependencies=[AuthDependency
 _STRICT_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 _CLIENT_VALIDATION_START_LOCK = threading.Lock()
 _CLIENT_VALIDATION_STALE_SECONDS = 900
-_VALIDATED_WRITE_CONTRACT_VERSION = 1
+_VALIDATED_WRITE_CONTRACT_VERSION = 2
 
 
 def strict_safe_tool_name(name: str) -> str:
@@ -1706,8 +1706,38 @@ def _sha256_path(path: Path) -> str | None:
         return None
 
 
+def _workflow_task_contract(
+    payload: OdooCodeChangeRequest,
+    *,
+    module_name: str,
+    target_resolution: dict[str, Any],
+    inspected_paths: list[str],
+) -> dict[str, Any]:
+    """Build the small immutable task identity carried into the write pass."""
+    normalized_task = re.sub(r"\s+", " ", payload.task_description.strip())
+    target = {
+        key: target_resolution.get(key)
+        for key in ("mode", "kind", "identifier", "model")
+    }
+    identity = {
+        "version": 1,
+        "module_name": module_name,
+        "task_sha256": hashlib.sha256(normalized_task.encode("utf-8")).hexdigest(),
+        "task_type": _normalized_task_type(payload),
+        "intent": payload.intent,
+        "target": target,
+        "scope_mode": "module" if target.get("kind") == "module_scope" else "focused",
+        "inspected_paths": sorted(dict.fromkeys(inspected_paths)),
+    }
+    identity["contract_sha256"] = hashlib.sha256(
+        json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return identity
+
+
 def _build_validated_write_contract(
     *,
+    payload: OdooCodeChangeRequest,
     project: Path,
     module_name: str,
     module_path: str,
@@ -1737,6 +1767,12 @@ def _build_validated_write_contract(
         for item in custom_reads
         if item.get("status") == "read" and item.get("relative_path")
     ))
+    task_contract = _workflow_task_contract(
+        payload,
+        module_name=module_name,
+        target_resolution=target_resolution,
+        inspected_paths=inspected_paths,
+    )
     raw = {
         "version": _VALIDATED_WRITE_CONTRACT_VERSION,
         "module_name": module_name,
@@ -1747,6 +1783,7 @@ def _build_validated_write_contract(
         "validator_findings": validator_findings,
         "inspected_paths": inspected_paths,
         "external_evidence": external_evidence,
+        "task_contract": task_contract,
     }
     signature_payload = json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str)
     raw["signature"] = hashlib.sha256(signature_payload.encode("utf-8")).hexdigest()
@@ -1799,6 +1836,17 @@ def _validated_session_write_contract(
         return None, "validated_target_contract_invalid"
     if resolution.writes_blocked:
         return None, "validated_target_contract_blocks_writes"
+    task_contract = contract.get("task_contract")
+    if not isinstance(task_contract, dict):
+        return None, "validated_task_contract_missing"
+    expected_task_contract = _workflow_task_contract(
+        payload,
+        module_name=str(contract.get("module_name") or ""),
+        target_resolution=resolution.model_dump(mode="json"),
+        inspected_paths=list(contract.get("inspected_paths") or []),
+    )
+    if task_contract.get("contract_sha256") != expected_task_contract.get("contract_sha256"):
+        return None, "validated_task_contract_changed"
     for item in contract.get("external_evidence") or []:
         path = Path(str(item.get("path") or "")).expanduser().resolve()
         if _sha256_path(path) != str(item.get("sha256") or ""):
@@ -2798,6 +2846,50 @@ def _focused_scope_file_paths(
     return (requested, True) if requested else (list(custom_file_paths), False)
 
 
+def _scope_focus_identifiers(payload: OdooCodeChangeRequest) -> list[str]:
+    """Return exact technical symbols that may safely constrain scope advice.
+
+    Scope discovery is intentionally broad when the user asks for a complete
+    module/redesign. For a surgical task, structured target fields and exact
+    snake-case/dotted identifiers take precedence over descriptive prose.
+    """
+    text = " ".join(filter(None, (
+        payload.task_description,
+        payload.target_hint,
+        payload.intent,
+    )))
+    if payload.create_module or re.search(
+        r"\b(?:module[- ]wide|whole module|entire module|full module|complete (?:module )?redesign|all files)\b",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return []
+
+    values: list[str] = []
+
+    def add(value: Any) -> None:
+        candidate = str(value or "").strip().strip("`'\"")
+        if not candidate or candidate in values:
+            return
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", candidate):
+            if "_" not in candidate and candidate.lower() in _TASK_CLUE_STOPWORDS:
+                return
+            values.append(candidate)
+        elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+", candidate):
+            values.append(candidate)
+
+    add(payload.target_resolution.identifier)
+    add(payload.target_resolution.model)
+    for key in ("field", "method", "identifier", "xml_id", "route", "template", "model"):
+        add((payload.change_request or {}).get(key))
+    for candidate in re.findall(
+        r"(?<![\w])(?:[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)(?![\w])",
+        text,
+    ):
+        add(candidate)
+    return values[:20]
+
+
 def _static_frontend_fast_path(rel_paths: list[str]) -> bool:
     paths = [str(path).lower().replace("\\", "/") for path in rel_paths if str(path).strip()]
     return bool(paths) and all(
@@ -3284,6 +3376,35 @@ def _code_change_async_fingerprint(payload: OdooCodeChangeRequest) -> str:
     ).hexdigest()
 
 
+def _workflow_failure_metadata(exc: BaseException, progress: dict[str, Any] | None) -> dict[str, Any]:
+    """Classify connector failures without conflating them with Odoo code."""
+    detail = str(getattr(exc, "detail", exc) or "")
+    lowered = detail.lower()
+    stage = str((progress or {}).get("current_phase") or "unknown")
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) or "timed out" in lowered or "timeout" in lowered:
+        origin = "provider_transport" if any(token in lowered for token in ("ssh", "http", "json-rpc", "network")) else "connector_pipeline"
+        retryable = True
+        strategy = "retry_provider_bounded" if origin == "provider_transport" else "resume_connector"
+    elif any(token in lowered for token in ("project path not found", "module not found", "missing checkout")):
+        origin = "missing_context"
+        retryable = False
+        strategy = "load_exact_source"
+    elif any(token in lowered for token in ("ambiguous", "clarification", "multiple targets")):
+        origin = "missing_context"
+        retryable = False
+        strategy = "ask_material_question"
+    else:
+        origin = "connector_pipeline"
+        retryable = False
+        strategy = "resume_connector"
+    return {
+        "failure_origin": origin,
+        "failure_stage": stage,
+        "retryable": retryable,
+        "next_strategy": strategy,
+    }
+
+
 def _code_change_resume_metadata(job: JobRecord) -> dict[str, Any]:
     """Build a client-carried recovery token without relying on local job state."""
     if job.job_type != "workflow.odoo_code_change":
@@ -3510,6 +3631,10 @@ def _start_or_reuse_code_change_job(payload: OdooCodeChangeRequest) -> dict[str,
             result = asyncio.run(_workflow_odoo_code_change(synchronous_payload))
             worker_store.finish_job(worker_store.get_job(job.id), JobStatus.passed, result)
         except BaseException as exc:  # noqa: BLE001
+            failure_metadata = _workflow_failure_metadata(
+                exc,
+                worker_store.get_workflow_progress(operation_id),
+            )
             worker_store.finish_job(worker_store.get_job(job.id), JobStatus.failed, {
                 "status": "failed",
                 "state_class": "failed",
@@ -3518,6 +3643,7 @@ def _start_or_reuse_code_change_job(payload: OdooCodeChangeRequest) -> dict[str,
                 "operation_id": operation_id,
                 "success_allowed": False,
                 "completion_required": False,
+                **failure_metadata,
             })
         finally:
             heartbeat_stop.set()
@@ -4301,14 +4427,15 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
             custom_file_paths=scope_file_paths,
             task_description=payload.task_description,
             client_name=client_name,
+            focus_identifiers=_scope_focus_identifiers(payload),
         )
         if cached_evidence and cached_evidence.get("scope"):
             from ..schemas import ScopeAdviceResult
             scope = ScopeAdviceResult.model_validate(cached_evidence["scope"])
-            steps.append({"step": "workflow.scope_advice", "status": "cached", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level)})
+            steps.append({"step": "workflow.scope_advice", "status": "cached", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level), "focus_applied": scope.focus_applied})
         else:
             scope = scope_advice(scope_payload)
-            steps.append({"step": "workflow.scope_advice", "status": "ok", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level)})
+            steps.append({"step": "workflow.scope_advice", "status": "ok", "mandatory_count": scope.mandatory_count, "reached_level": str(scope.reached_level.value if hasattr(scope.reached_level, "value") else scope.reached_level), "focus_applied": scope.focus_applied})
 
     frontend_preflight_payload: FrontendPatternPreflightRequest | None = None
     if _looks_like_frontend_code_change(payload, frontend_paths):
@@ -4656,6 +4783,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
             coding_session_id.encode("utf-8")
         ).hexdigest()[:24]
     write_contract = validated_write_contract or _build_validated_write_contract(
+        payload=payload,
         project=project,
         module_name=effective_module_name,
         module_path=module.path,
@@ -4676,6 +4804,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         "module_contract": module_contract,
         "structure_findings": structure_findings,
         "write_contract": write_contract,
+        "task_contract": write_contract.get("task_contract"),
     }
     session_target_files = [
         str(r.get("relative_path"))
@@ -4911,6 +5040,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
             "steps": steps,
             "orchestration_metrics": orchestration_metrics(),
             "target_resolution": target_resolution_data,
+            "task_contract": write_contract.get("task_contract"),
             "inspection_artifact": inspection_artifact,
             "task_type": _normalized_task_type(payload),
             "intent": payload.intent,
@@ -8035,6 +8165,10 @@ def _dynamic_tool_output_schema(name: str) -> dict:
         },
         "message": {"type": "string", "description": "Human-readable outcome or next-step explanation."},
         "error": {"type": "string", "description": "Error detail when the operation failed."},
+        "failure_origin": {"type": "string", "description": "Classified origin of a failed operation."},
+        "failure_stage": {"type": "string", "description": "Exact workflow phase where failure occurred."},
+        "retryable": {"type": "boolean", "description": "Whether repeating through the returned strategy is safe."},
+        "next_strategy": {"type": "string", "description": "Bounded recovery strategy for a classified failure."},
         "next_call": {"type": "object", "description": "Exact follow-up tool call; null or absent when terminal.", "additionalProperties": True},
         "input_request": {"type": "object", "description": "Exact structured human input contract when state_class=input_required.", "additionalProperties": True},
         "resume_token": {"type": "string", "description": "Signed client-carried continuation token for ephemeral-server recovery."},
@@ -8088,6 +8222,7 @@ def _dynamic_tool_output_schema(name: str) -> dict:
             "write_generation": {"type": "object", "additionalProperties": True},
             "module_structure_complete": {"type": "boolean"},
             "module_contract": {"type": "object", "additionalProperties": True},
+            "task_contract": {"type": "object", "additionalProperties": True},
             "persisted_requirements": {"type": "string"},
             "contract_status": {"type": "string"}, "repair_required": {"type": "boolean"},
             "repair_attempts": {"type": "integer"}, "structure_findings": {"type": "array", "items": {"type": "object", "additionalProperties": True}},

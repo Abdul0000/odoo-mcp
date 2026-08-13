@@ -54,6 +54,27 @@ _SAFE_PHASE_TOKENS = {
     "artifact",
     "skill",
 }
+_SAFE_CODE_CHANGE_PHASES = {
+    "module_discovery",
+    "validation_and_index",
+    "focused_inspection",
+    "focused_target_search",
+    "custom_source_read",
+    "scope_resolution",
+    "core_source_read",
+    "target_resolution",
+}
+_PROTECTED_CODE_CHANGE_PHASES = {
+    "queued",
+    "starting",
+    "repo_prepare",
+    "workspace_activation",
+    "write_and_checkpoint",
+    "qa_and_core_verification",
+    "commit_and_push",
+    "deploying",
+    "completed",
+}
 _WORKFLOW_PROGRESS_UNSET = object()
 
 
@@ -289,7 +310,21 @@ class WorkflowWatchdogService:
         self._job_states.pop(oldest, None)
 
     def _job_is_protected(self, job: JobRecord, phase: str) -> bool:
-        text = f"{job.job_type} {phase}".lower()
+        normalized_phase = str(phase or "").strip().lower()
+        # The composite job name contains ``code_change`` and previously made
+        # every phase look mutation-capable. Classify its persisted phase first
+        # so a stalled scope/search/read step can redirect while actual
+        # write/commit/deploy work remains protected.
+        if job.job_type == "workflow.odoo_code_change":
+            if normalized_phase in _SAFE_CODE_CHANGE_PHASES:
+                return False
+            if normalized_phase in _PROTECTED_CODE_CHANGE_PHASES:
+                return True
+        if any(token in normalized_phase for token in _PROTECTED_PHASE_TOKENS):
+            return True
+        if any(token in normalized_phase for token in _SAFE_PHASE_TOKENS):
+            return False
+        text = str(job.job_type or "").lower()
         if any(token in text for token in _PROTECTED_PHASE_TOKENS):
             return True
         if any(token in text for token in _SAFE_PHASE_TOKENS):

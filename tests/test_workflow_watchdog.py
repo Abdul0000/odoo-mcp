@@ -138,6 +138,33 @@ def test_persisted_read_phase_switches_strategy_on_first_poll(monkeypatch):
     assert assessment["next_action"]["type"] == "use_focused_evidence"
 
 
+def test_code_change_scope_phase_is_read_only_but_write_phase_stays_protected(monkeypatch):
+    old = (datetime.now(timezone.utc) - timedelta(minutes=3)).isoformat()
+    monkeypatch.setattr(settings, "workflow_watchdog_observation_budget_seconds", 120)
+    job = JobRecord(
+        id="code-scope-deadline-1",
+        job_type="workflow.odoo_code_change",
+        status=JobStatus.running,
+    )
+    service = WorkflowWatchdogService()
+
+    scope = service.assess_job(job, {
+        "current_phase": "scope_resolution",
+        "phase_started_at": old,
+        "last_progress_at": old,
+    })
+    write = service.assess_job(job, {
+        "current_phase": "write_and_checkpoint",
+        "phase_started_at": old,
+        "last_progress_at": old,
+    })
+
+    assert scope["protected"] is False
+    assert scope["action"] == "switch_strategy"
+    assert write["protected"] is True
+    assert write["action"] == "continue_with_backoff"
+
+
 def test_stale_read_job_recommends_strategy_switch_without_claiming_cancel(monkeypatch):
     now = datetime.now(timezone.utc)
     old = (now - timedelta(minutes=10)).isoformat()

@@ -2423,6 +2423,15 @@ class ScopeAdviceRequest(BaseModel):
         default="",
         description="Brief description of the coding task (used for logging only)",
     )
+    focus_identifiers: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description=(
+            "Exact fields, methods, models, XML IDs, routes, or symbols already resolved for this task. "
+            "When present, Python scope analysis is limited to the matching source units plus their "
+            "model identity instead of scanning unrelated classes in a large file."
+        ),
+    )
     search_roots: list[str] = Field(
         default_factory=list,
         description="Override search roots. Defaults to odoo/addons → enterprise → user fallback.",
@@ -2443,6 +2452,14 @@ class ScopeAdviceResult(BaseModel):
     )
     mandatory_count: int = Field(0, description="Number of mandatory (blocking) instructions")
     total_count: int = Field(0, description="Total instructions including optional")
+    focus_applied: bool = Field(
+        False,
+        description="True when exact identifiers constrained analysis to matching source units.",
+    )
+    focus_identifiers: list[str] = Field(
+        default_factory=list,
+        description="Exact identifiers used to constrain adaptive scope analysis.",
+    )
     warning: str = Field(
         "",
         description="Always-present warning: push blocked until verify_against_core passes",
