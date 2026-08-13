@@ -13,6 +13,7 @@ from fastapi import HTTPException
 
 from odoo_agent_server.routers import tools as tools_router
 from odoo_agent_server.services import live_assertion_service
+from odoo_agent_server.services import odoo_code_search_service as code_search_module
 from odoo_agent_server.services.odoosh_service import OdooShService
 from odoo_agent_server.routers.tools import (
     _build_safe_generic_autopatch,
@@ -35,6 +36,7 @@ from odoo_agent_server.routers.tools import (
     _rank_core_directory_files,
     _rank_core_required_paths,
     _resolve_fuzzy_module,
+    _resolve_module_from_source_evidence,
     _prepare_code_batch,
     _restore_coding_session_task,
     _save_code_operation_handoff,
@@ -67,6 +69,7 @@ from odoo_agent_server.schemas import (
     OdooDebugRecordAssertion,
     OdooDebugRuntimeReplay,
     OdooResult,
+    ModuleAnalyzeRequest,
     OdooTargetResolutionResult,
 )
 
@@ -222,6 +225,74 @@ async def test_code_change_wrapper_keeps_event_loop_responsive(monkeypatch, tmp_
     assert result["workflow_progress"]["current_phase"] == "completed"
     recent = WorkflowProgressService.summary()["recent"]
     assert recent[0]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_inspect_only_routes_to_read_only_analyzer_without_durable_job(monkeypatch):
+    captured = {}
+
+    def analyze(request):
+        captured["request"] = request
+        return {"status": "analyzed", "source_evidence": [{"path": "models/order.py"}]}
+
+    monkeypatch.setattr(tools_router, "_workflow_module_analyze", analyze)
+    monkeypatch.setattr(
+        tools_router,
+        "_start_or_reuse_code_change_job",
+        lambda _payload: pytest.fail("inspect_only must not start a durable code-change job"),
+    )
+    payload = _payload(
+        "Read the exact custom report implementation",
+        patch_strategy="inspect_only",
+        intent="inspect",
+        target_files=["models/order.py"],
+        search_patterns=["Top Ten"],
+        wait_for_result=False,
+    )
+
+    result = await tools_router._workflow_odoo_code_change(payload)
+
+    assert result["status"] == "analyzed"
+    assert result["route"] == "read_only_module_analysis"
+    assert result["side_effects"]["files_modified"] is False
+    assert captured["request"].target_files == ["models/order.py"]
+    assert captured["request"].search_patterns == ["Top Ten"]
+
+
+def test_human_feature_label_resolves_module_from_unique_source_evidence(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "repo_index_enabled", False)
+    project = tmp_path / "repo"
+    monkeypatch.setattr(code_search_module, "resolve_allowed_path", lambda _value: project.resolve())
+    target = project / "feature_reports"
+    unrelated = project / "other_custom"
+    (target / "views").mkdir(parents=True)
+    (unrelated / "views").mkdir(parents=True)
+    (target / "__manifest__.py").write_text("{'name': 'Feature Reports'}", encoding="utf-8")
+    (unrelated / "__manifest__.py").write_text("{'name': 'Other Custom'}", encoding="utf-8")
+    (target / "views" / "top_ten.xml").write_text(
+        "<odoo><record id='top_ten' model='ir.ui.view'>"
+        "<field name='name'>Custom Top Ten Report</field></record></odoo>",
+        encoding="utf-8",
+    )
+    (unrelated / "views" / "other.xml").write_text(
+        "<odoo><record id='other' model='ir.ui.view'><field name='name'>Other</field></record></odoo>",
+        encoding="utf-8",
+    )
+    modules = [
+        SimpleNamespace(module_name="feature_reports", path="feature_reports"),
+        SimpleNamespace(module_name="other_custom", path="other_custom"),
+    ]
+    payload = ModuleAnalyzeRequest(
+        module_name="custom top ten report",
+        analysis_goal="Read the custom Top Ten report",
+        search_patterns=["Top Ten"],
+    )
+
+    module, resolution, targets = _resolve_module_from_source_evidence(project, modules, payload)
+
+    assert module.module_name == "feature_reports"
+    assert resolution["strategy"] == "source_evidence"
+    assert targets[0] == "views/top_ten.xml"
 
 
 @pytest.mark.asyncio

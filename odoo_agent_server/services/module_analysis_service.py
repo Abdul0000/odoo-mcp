@@ -62,6 +62,122 @@ class ModuleAnalysisService:
         return content[:half] + f"\n...[{omitted} chars omitted]...\n" + content[-half:], True
 
     @staticmethod
+    def _normalise_target(module_path: Path, raw: str) -> str | None:
+        """Return one safe module-relative target path."""
+        value = str(raw or "").strip().replace("\\", "/")
+        if not value:
+            return None
+        if value.startswith("/") or re.match(r"^[A-Za-z]:/", value):
+            return None
+        while value.startswith("./"):
+            value = value[2:]
+        if any(part == ".." for part in value.split("/")):
+            return None
+        prefixes = {module_path.name, module_path.as_posix().rstrip("/").split("/")[-1]}
+        first, separator, remainder = value.partition("/")
+        if separator and first in prefixes:
+            value = remainder
+        candidate = (module_path / value).resolve()
+        try:
+            return candidate.relative_to(module_path.resolve()).as_posix()
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _normalise_patterns(patterns: list[str] | None) -> list[str]:
+        values: list[str] = []
+        for raw in patterns or []:
+            value = str(raw or "").strip().strip("`\"'").casefold()
+            if len(value) >= 2 and value not in values:
+                values.append(value)
+        return values[:25]
+
+    def _select_files(
+        self,
+        *,
+        module_path: Path,
+        all_files: list[Path],
+        max_files: int,
+        target_files: list[str] | None,
+        search_patterns: list[str] | None,
+    ) -> tuple[list[Path], dict[str, dict[str, Any]], dict[str, Any], dict[Path, str]]:
+        """Select explicit targets first, then exact search hits, then architecture files."""
+        by_relative = {
+            path.relative_to(module_path).as_posix(): path
+            for path in all_files
+        }
+        requested: list[str] = []
+        invalid: list[str] = []
+        for raw in target_files or []:
+            normalized = self._normalise_target(module_path, raw)
+            if normalized and normalized not in requested:
+                requested.append(normalized)
+            elif str(raw or "").strip() and str(raw) not in invalid:
+                invalid.append(str(raw))
+
+        resolved = [value for value in requested if value in by_relative]
+        missing = [value for value in requested if value not in by_relative]
+        patterns = self._normalise_patterns(search_patterns)
+        metadata: dict[str, dict[str, Any]] = {
+            value: {"selected_by": "explicit_target", "matched_patterns": []}
+            for value in resolved
+        }
+        content_cache: dict[Path, str] = {}
+        ranked_matches: list[tuple[int, tuple[int, str], Path, list[str]]] = []
+        explicit_set = set(resolved)
+        if patterns:
+            for path in all_files:
+                rel = path.relative_to(module_path).as_posix()
+                if rel in explicit_set:
+                    continue
+                try:
+                    content = path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                content_cache[path] = content
+                rel_folded = rel.casefold()
+                content_folded = content.casefold()
+                path_hits = [pattern for pattern in patterns if pattern in rel_folded]
+                content_hits = [pattern for pattern in patterns if pattern in content_folded]
+                matched = list(dict.fromkeys([*path_hits, *content_hits]))
+                if matched:
+                    score = (len(path_hits) * 100) + (len(content_hits) * 25)
+                    ranked_matches.append((score, self._priority(path.relative_to(module_path)), path, matched))
+
+        ranked_matches.sort(key=lambda item: (-item[0], item[1]))
+        selected: list[Path] = [by_relative[value] for value in resolved]
+        for _, _, path, matched in ranked_matches:
+            if path not in selected:
+                selected.append(path)
+                metadata[path.relative_to(module_path).as_posix()] = {
+                    "selected_by": "search_match",
+                    "matched_patterns": matched,
+                }
+        for path in all_files:
+            if path not in selected:
+                selected.append(path)
+                metadata[path.relative_to(module_path).as_posix()] = {
+                    "selected_by": "architecture_priority",
+                    "matched_patterns": [],
+                }
+        selected = selected[:max_files]
+        selected_rel = {path.relative_to(module_path).as_posix() for path in selected}
+        selection = {
+            "target_files_requested": requested,
+            "target_files_resolved": resolved,
+            "target_files_missing": missing,
+            "target_files_invalid": invalid,
+            "search_patterns": patterns,
+            "search_matched_files": [
+                path.relative_to(module_path).as_posix()
+                for _, _, path, _ in ranked_matches
+            ],
+            "selected_files": [path.relative_to(module_path).as_posix() for path in selected],
+            "explicit_targets_omitted_by_limit": [value for value in resolved if value not in selected_rel],
+        }
+        return selected, metadata, selection, content_cache
+
+    @staticmethod
     def _python_facts(path: str, content: str) -> dict[str, Any]:
         facts: dict[str, Any] = {"path": path, "models": [], "classes": [], "methods": [], "routes": []}
         try:
@@ -117,6 +233,8 @@ class ModuleAnalysisService:
         analysis_goal: str,
         max_files: int,
         max_total_chars: int,
+        target_files: list[str] | None = None,
+        search_patterns: list[str] | None = None,
         validator_findings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         all_files = [
@@ -129,7 +247,16 @@ class ModuleAnalysisService:
         all_files.sort(key=lambda item: self._priority(item.relative_to(module_path)))
         content_fingerprint = CodingSessionService._module_fingerprint_from_files(module_path, all_files)
         sha = self._git_sha(project)
-        cache_key = (str(module_path.resolve()), sha, content_fingerprint, max_files, max_total_chars)
+        normalized_targets = tuple(
+            value
+            for value in (self._normalise_target(module_path, raw) for raw in target_files or [])
+            if value
+        )
+        normalized_patterns = tuple(self._normalise_patterns(search_patterns))
+        cache_key = (
+            str(module_path.resolve()), sha, content_fingerprint, max_files,
+            max_total_chars, normalized_targets, normalized_patterns,
+        )
         now = time.monotonic()
         with self._lock:
             cached = self._cache.get(cache_key)
@@ -139,7 +266,13 @@ class ModuleAnalysisService:
                 result["analysis_goal"] = analysis_goal
                 return result
 
-        selected = all_files[:max_files]
+        selected, selection_metadata, selection, content_cache = self._select_files(
+            module_path=module_path,
+            all_files=all_files,
+            max_files=max_files,
+            target_files=target_files,
+            search_patterns=search_patterns,
+        )
         evidence: list[dict[str, Any]] = []
         python_facts: list[dict[str, Any]] = []
         xml_facts: list[dict[str, Any]] = []
@@ -149,11 +282,19 @@ class ModuleAnalysisService:
             if remaining <= 0:
                 break
             rel = path.relative_to(module_path).as_posix()
-            content = path.read_text(encoding="utf-8", errors="replace")
+            content = content_cache.get(path)
+            if content is None:
+                content = path.read_text(encoding="utf-8", errors="replace")
             files_left = max(1, len(selected) - index)
             budget = min(4000, max(300, remaining // files_left))
             preview, truncated = self._preview(content, budget)
-            evidence.append({"path": rel, "size": len(content), "truncated": truncated, "content": preview})
+            evidence.append({
+                "path": rel,
+                "size": len(content),
+                "truncated": truncated,
+                "content": preview,
+                **selection_metadata.get(rel, {}),
+            })
             remaining -= len(preview)
             if path.suffix.lower() == ".py":
                 python_facts.append(self._python_facts(rel, content))
@@ -183,6 +324,13 @@ class ModuleAnalysisService:
                 if item.severity in {Severity.error, Severity.warning}
             ]
         )
+        returned_paths = {item["path"] for item in evidence}
+        selection["selected_files"] = [item["path"] for item in evidence]
+        selection["explicit_targets_omitted_by_budget"] = [
+            value
+            for value in selection["target_files_resolved"]
+            if value not in returned_paths
+        ]
         result = {
             "status": "analyzed",
             "module_name": module_name,
@@ -197,8 +345,13 @@ class ModuleAnalysisService:
             "inventory": {
                 "total_relevant_files": len(all_files),
                 "returned_files": len(evidence),
-                "omitted_files": [path.relative_to(module_path).as_posix() for path in all_files[len(evidence):]],
+                "omitted_files": [
+                    path.relative_to(module_path).as_posix()
+                    for path in all_files
+                    if path.relative_to(module_path).as_posix() not in returned_paths
+                ],
             },
+            "selection": selection,
             "architecture": {"python": python_facts, "xml": xml_facts, "csv": csv_facts},
             "validator_findings": findings,
             "source_evidence": evidence,

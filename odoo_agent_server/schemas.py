@@ -822,8 +822,16 @@ class ModuleAnalyzeRequest(BaseModel):
     analysis_goal: str = Field(default="Explain architecture, use cases, and practical gaps", min_length=3, max_length=4000)
     max_files: int = Field(default=50, ge=5, le=50, description="Maximum relevant module files to return")
     max_total_chars: int = Field(default=12000, ge=4000, le=12000, description="Bounded source evidence character budget")
-    search_patterns: list[str] = Field(default_factory=list, max_length=10)
-    target_files: list[str] = Field(default_factory=list, max_length=20)
+    search_patterns: list[str] = Field(
+        default_factory=list,
+        max_length=10,
+        description="Exact labels or identifiers ranked before generic files.",
+    )
+    target_files: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description="Authoritative module-relative files selected first.",
+    )
 
     @property
     def task_description(self) -> str:

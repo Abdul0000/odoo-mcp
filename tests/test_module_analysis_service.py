@@ -85,3 +85,81 @@ def test_module_analysis_cache_invalidates_on_file_change(tmp_path):
     device.write_text(device.read_text(encoding="utf-8") + "\n# changed\n", encoding="utf-8")
     third = service.analyze(**args)
     assert third["cache_hit"] is False
+
+
+def test_module_analysis_prioritizes_explicit_target_and_search_match(tmp_path):
+    project, module = _build_module(tmp_path)
+    reports = module / "reports"
+    reports.mkdir()
+    report = reports / "custom_top_ten.py"
+    report.write_text(
+        "from odoo import models\n"
+        "class CustomTopTen(models.AbstractModel):\n"
+        "    _name = 'report.iot.top_ten'\n"
+        "    _description = 'Custom Top Ten Report'\n",
+        encoding="utf-8",
+    )
+
+    result = ModuleAnalysisService().analyze(
+        project=project,
+        module_path=module,
+        module_name="iot_device_management",
+        analysis_goal="Read the custom Top Ten report",
+        max_files=5,
+        max_total_chars=12000,
+        target_files=["iot_device_management/reports/custom_top_ten.py"],
+        search_patterns=["Top Ten", "top_ten"],
+    )
+
+    evidence = result["source_evidence"]
+    assert evidence[0]["path"] == "reports/custom_top_ten.py"
+    assert evidence[0]["selected_by"] == "explicit_target"
+    assert result["selection"]["target_files_resolved"] == ["reports/custom_top_ten.py"]
+    assert "reports/custom_top_ten.py" not in result["inventory"]["omitted_files"]
+
+
+def test_module_analysis_search_hit_precedes_architecture_defaults(tmp_path):
+    project, module = _build_module(tmp_path)
+    reports = module / "reports"
+    reports.mkdir()
+    (reports / "ranking.py").write_text(
+        "TITLE = 'Custom Top Ten Report'\n",
+        encoding="utf-8",
+    )
+
+    result = ModuleAnalysisService().analyze(
+        project=project,
+        module_path=module,
+        module_name="iot_device_management",
+        analysis_goal="Locate the report",
+        max_files=5,
+        max_total_chars=12000,
+        search_patterns=["Top Ten"],
+    )
+
+    assert result["source_evidence"][0]["path"] == "reports/ranking.py"
+    assert result["source_evidence"][0]["selected_by"] == "search_match"
+    assert result["selection"]["search_matched_files"] == ["reports/ranking.py"]
+
+
+def test_module_analysis_cache_is_selector_aware_and_rejects_escaped_targets(tmp_path):
+    project, module = _build_module(tmp_path)
+    service = ModuleAnalysisService()
+    base = dict(
+        project=project,
+        module_path=module,
+        module_name="iot_device_management",
+        analysis_goal="Focused read",
+        max_files=5,
+        max_total_chars=12000,
+    )
+
+    first = service.analyze(**base, target_files=["models/device.py"])
+    cached = service.analyze(**base, target_files=["models/device.py"])
+    different = service.analyze(**base, target_files=["views/device_views.xml"])
+    escaped = service.analyze(**base, target_files=["../secret.py"])
+
+    assert first["cache_hit"] is False
+    assert cached["cache_hit"] is True
+    assert different["cache_hit"] is False
+    assert escaped["selection"]["target_files_invalid"] == ["../secret.py"]

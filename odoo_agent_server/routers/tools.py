@@ -368,10 +368,9 @@ _TOOL_DESCRIPTORS = [
         name="workflow.module_analyze",
         title="Analyze custom module fast",
         description=(
-            "DIRECT READ-ONLY FAST PATH for explaining a custom addon's architecture, behavior, use cases, "
-            "security, workflows, and practical gaps. Reads the cached local checkout once, prioritizes manifest/init/models/controllers/security/views/data/tests, "
-            "returns bounded source evidence plus parsed architecture and validator gaps, and caches by Git SHA + file stamp. "
-            "Never prepares/pulls the repo, reads Odoo core/Odoo.sh, runs QA, deploys, or retries broad inspection."
+            "Fast read-only custom-addon analysis. Exact target_files rank first, search matches second, "
+            "and architecture files last. Resolves a unique human feature/report label from custom source. "
+            "Returns bounded cached evidence; never writes, pulls, runs QA, or deploys."
         ),
         read_only=True,
     ),
@@ -1960,6 +1959,81 @@ def _resolve_fuzzy_module(payload: OdooCodeChangeRequest, modules: list[Any]) ->
     return None, {"requested": requested, "strategy": "not_found", "candidates": [meta for _, _, meta in candidates[:5]]}
 
 
+def _resolve_module_from_source_evidence(
+    project: Path,
+    modules: list[Any],
+    payload: ModuleAnalyzeRequest,
+) -> tuple[Any | None, dict[str, Any], list[str]]:
+    """Resolve a human feature/report label from bounded custom-source indexes."""
+    combined = " ".join(filter(None, [
+        payload.module_name,
+        payload.module_hint,
+        payload.analysis_goal,
+        *payload.search_patterns,
+    ]))
+    task_type = "report" if re.search(r"\breport\b", combined, flags=re.IGNORECASE) else "auto"
+    candidates: list[tuple[float, Any, dict[str, Any]]] = []
+    search = OdooCodeSearchService()
+    for item in modules[:50]:
+        try:
+            result = search.search(
+                project_path=str(project),
+                module_path=str(item.path),
+                task_description=payload.analysis_goal,
+                target_hint=payload.module_hint or payload.module_name,
+                search_patterns=list(payload.search_patterns),
+                task_type=task_type,
+                max_results=3,
+            )
+        except Exception:  # noqa: BLE001 - one malformed addon must not block discovery
+            continue
+        matches = list(result.get("matches") or [])
+        if not matches:
+            continue
+        top_score = float(matches[0].get("score") or 0)
+        candidates.append((top_score, item, {
+            "module": item.module_name,
+            "path": str(item.path),
+            "score": round(top_score, 3),
+            "confidence": result.get("confidence"),
+            "matches": [
+                {
+                    "path": match.get("path"),
+                    "score": match.get("score"),
+                    "lines": match.get("lines") or [],
+                    "reasons": match.get("reasons") or [],
+                }
+                for match in matches[:3]
+            ],
+        }))
+    candidates.sort(key=lambda row: (-row[0], str(row[1].module_name)))
+    if not candidates:
+        return None, {"strategy": "source_not_found", "candidates": []}, []
+    best_score, best, best_meta = candidates[0]
+    second_score = candidates[1][0] if len(candidates) > 1 else 0.0
+    if best_score < 50 or (len(candidates) > 1 and best_score - second_score < 15):
+        return None, {
+            "strategy": "source_ambiguous",
+            "candidates": [meta for _, _, meta in candidates[:5]],
+        }, []
+    module_prefix = str(best.path).replace("\\", "/").strip("/") + "/"
+    target_paths = []
+    for match in best_meta["matches"]:
+        value = str(match.get("path") or "").replace("\\", "/").strip("/")
+        if value.startswith(module_prefix):
+            value = value[len(module_prefix):]
+        if value:
+            target_paths.append(value)
+    return best, {
+        "requested": payload.module_name,
+        "resolved": best.module_name,
+        "strategy": "source_evidence",
+        "score": round(best_score, 3),
+        "score_margin": round(best_score - second_score, 3),
+        "candidates": [meta for _, _, meta in candidates[:5]],
+    }, target_paths
+
+
 def _style_value(style: dict[str, Any], *names: str) -> str | None:
     for name in names:
         if name in style and style[name] not in {None, ""}:
@@ -3171,6 +3245,20 @@ def _workflow_module_analyze(payload: ModuleAnalyzeRequest) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail=f"Existing checkout not found: {project}")
     modules = repo.list_custom_modules(str(project), max_depth=5, include_uninstallable=True)
     module, resolution = _resolve_fuzzy_module(payload, modules)
+    source_targets: list[str] = []
+    if not module:
+        module, source_resolution, source_targets = _resolve_module_from_source_evidence(
+            project,
+            modules,
+            payload,
+        )
+        if module:
+            resolution = source_resolution
+        else:
+            resolution = {
+                **resolution,
+                "source_resolution": source_resolution,
+            }
     if not module:
         return {
             "status": "module_ambiguous" if resolution.get("strategy") == "ambiguous_duplicate_module" else "module_not_found",
@@ -3193,6 +3281,8 @@ def _workflow_module_analyze(payload: ModuleAnalyzeRequest) -> dict[str, Any]:
         analysis_goal=payload.analysis_goal,
         max_files=payload.max_files,
         max_total_chars=payload.max_total_chars,
+        target_files=[*payload.target_files, *source_targets],
+        search_patterns=payload.search_patterns,
     )
     result.update({
         "client_name": effective_client_name,
@@ -3720,8 +3810,47 @@ def _start_or_reuse_code_change_job(payload: OdooCodeChangeRequest) -> dict[str,
     return _code_change_job_result(job, operation_id=operation_id, reused=False)
 
 
+def _is_explicit_read_only_inspection(payload: OdooCodeChangeRequest) -> bool:
+    return (
+        str(payload.patch_strategy or "").strip().lower() == "inspect_only"
+        and not payload.writes
+        and not payload.create_module
+    )
+
+
+def _inspect_only_module_analysis_request(payload: OdooCodeChangeRequest) -> ModuleAnalyzeRequest:
+    return ModuleAnalyzeRequest(
+        client_name=payload.client_name,
+        project_path=payload.project_path,
+        module_name=payload.module_name,
+        module_hint=payload.module_hint,
+        analysis_goal=payload.task_description,
+        max_files=max(10, min(30, len(payload.target_files) + 10)),
+        max_total_chars=12000,
+        search_patterns=list(payload.search_patterns),
+        target_files=list(payload.target_files),
+    )
+
+
 async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     """Run blocking work off-loop with bounded admission and no cancellation."""
+    if _is_explicit_read_only_inspection(payload):
+        result = await asyncio.to_thread(
+            _workflow_module_analyze,
+            _inspect_only_module_analysis_request(payload),
+        )
+        if isinstance(result, dict):
+            result.update({
+                "routed_from": "workflow.odoo_code_change",
+                "route": "read_only_module_analysis",
+                "side_effects": {
+                    "files_modified": False,
+                    "commit_created": False,
+                    "push_started": False,
+                    "deployment_started": False,
+                },
+            })
+        return result
     if not payload.wait_for_result:
         started = _start_or_reuse_code_change_job(payload)
         if started.get("state_class") != "running" or not started.get("job_id"):
