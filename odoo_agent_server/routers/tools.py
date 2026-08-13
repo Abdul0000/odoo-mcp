@@ -2005,6 +2005,8 @@ def _resolve_module_from_source_evidence(
         except (OSError, ValueError):
             continue
         matches: list[dict[str, Any]] = []
+        declared_models: set[str] = set()
+        backend_patterns: set[str] = set()
         scanned_files = 0
         for path in sorted(module_path.rglob("*")):
             if (
@@ -2028,6 +2030,23 @@ def _resolve_module_from_source_evidence(
             matched = list(dict.fromkeys([*path_hits, *content_hits]))
             if not matched:
                 continue
+            relative_parts = path.relative_to(module_path).parts
+            is_backend_source = (
+                path.suffix.lower() == ".py"
+                and bool(relative_parts)
+                and relative_parts[0] in {"models", "controllers", "controller", "wizard", "wizards"}
+            )
+            if is_backend_source:
+                backend_patterns.update(matched)
+                for pattern in matched:
+                    if "." not in pattern or not re.fullmatch(r"[a-z0-9_.]+", pattern):
+                        continue
+                    declaration = re.compile(
+                        rf"\b_name\s*=\s*(['\"])\s*{re.escape(pattern)}\s*\1",
+                        re.IGNORECASE,
+                    )
+                    if declaration.search(content):
+                        declared_models.add(pattern)
             score = (len(path_hits) * 100) + (len(content_hits) * 25)
             matches.append({
                 "path": f"{str(item.path).replace('\\', '/').strip('/')}/{rel}",
@@ -2049,6 +2068,10 @@ def _resolve_module_from_source_evidence(
             "path": str(item.path),
             "score": top_score,
             "literal_hits": total_literal_hits,
+            "ownership_evidence": {
+                "declared_models": sorted(declared_models),
+                "backend_patterns": sorted(backend_patterns),
+            },
             "matches": matches[:5],
         }))
     candidates.sort(key=lambda row: (-row[0], str(row[1].module_name)))
@@ -2061,13 +2084,42 @@ def _resolve_module_from_source_evidence(
         }, []
     best_score, best, best_meta = candidates[0]
     second_score = candidates[1][0] if len(candidates) > 1 else 0.0
-    if len(candidates) > 1 and best_score == second_score:
+    declaration_coverage = [
+        (
+            len((meta.get("ownership_evidence") or {}).get("declared_models") or []),
+            score,
+            item,
+            meta,
+        )
+        for score, item, meta in candidates
+    ]
+    max_declaration_coverage = max(row[0] for row in declaration_coverage)
+    owner_resolved = False
+    if max_declaration_coverage:
+        declaring = [row for row in declaration_coverage if row[0] == max_declaration_coverage]
+        if len(declaring) != 1:
+            return None, {
+                "strategy": "source_ambiguous",
+                "reason": "Multiple addons declare equally strong technical-model ownership.",
+                "literal_patterns": literal_patterns,
+                "candidates": [meta for _, _, meta in candidates[:5]],
+            }, []
+        _, best_score, best, best_meta = declaring[0]
+        owner_resolved = True
+    elif len(candidates) > 1 and best_score == second_score:
         return None, {
             "strategy": "source_ambiguous",
-            "reason": "Multiple addons have equally strong literal matches.",
+            "reason": "Multiple addons have equally strong literal matches without unique ownership evidence.",
             "literal_patterns": literal_patterns,
             "candidates": [meta for _, _, meta in candidates[:5]],
         }, []
+    runner_up_score = max(
+        (score for score, item, _ in candidates if item is not best),
+        default=0,
+    )
+    ordered_candidate_meta = [best_meta] + [
+        meta for _, item, meta in candidates if item is not best
+    ]
     module_prefix = str(best.path).replace("\\", "/").strip("/") + "/"
     target_paths = []
     for match in best_meta["matches"]:
@@ -2079,11 +2131,15 @@ def _resolve_module_from_source_evidence(
     return best, {
         "requested": payload.module_name,
         "resolved": best.module_name,
-        "strategy": "literal_source_evidence",
+        "strategy": (
+            "literal_source_owner_evidence"
+            if owner_resolved
+            else "literal_source_evidence"
+        ),
         "score": best_score,
-        "score_margin": best_score - second_score,
+        "score_margin": best_score - runner_up_score,
         "literal_patterns": literal_patterns,
-        "candidates": [meta for _, _, meta in candidates[:5]],
+        "candidates": ordered_candidate_meta[:5],
     }, target_paths
 
 

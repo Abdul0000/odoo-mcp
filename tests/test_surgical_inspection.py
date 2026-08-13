@@ -353,6 +353,45 @@ def test_human_feature_label_returns_ambiguous_for_equal_literal_matches(monkeyp
     assert [item["module"] for item in resolution["candidates"]] == ["report_alpha", "report_beta"]
 
 
+def test_human_feature_label_prefers_model_owner_over_dependent_ui_match(tmp_path):
+    project = tmp_path / "repo"
+    owner = project / "school_management"
+    portal = project / "school_operations_portal"
+    (owner / "models").mkdir(parents=True)
+    (portal / "views").mkdir(parents=True)
+    (owner / "models" / "facilities.py").write_text(
+        "from odoo import fields, models\n"
+        "class SchoolFacilityRoom(models.Model):\n"
+        "    _name = 'school.facility.room'\n"
+        "    room_type = fields.Selection([('classroom', 'Classroom')])\n",
+        encoding="utf-8",
+    )
+    (portal / "views" / "facilities.xml").write_text(
+        "<odoo><record id='action_school_ops_rooms' model='ir.actions.act_window'>"
+        "<field name='res_model'>school.facility.room</field>"
+        "<field name='name'>Classroom</field></record></odoo>",
+        encoding="utf-8",
+    )
+    modules = [
+        SimpleNamespace(module_name="school_management", path="school_management"),
+        SimpleNamespace(module_name="school_operations_portal", path="school_operations_portal"),
+    ]
+    payload = ModuleAnalyzeRequest(
+        module_name="school",
+        analysis_goal="Analyze Classroom",
+        search_patterns=["Classroom", "school.facility.room", "action_school_ops_rooms"],
+    )
+
+    module, resolution, targets = _resolve_module_from_source_evidence(project, modules, payload)
+
+    assert module.module_name == "school_management"
+    assert resolution["strategy"] == "literal_source_owner_evidence"
+    assert resolution["candidates"][0]["ownership_evidence"]["declared_models"] == [
+        "school.facility.room"
+    ]
+    assert targets == ["models/facilities.py"]
+
+
 @pytest.mark.asyncio
 async def test_provider_code_change_persists_and_reuses_identical_timeout_retry(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
