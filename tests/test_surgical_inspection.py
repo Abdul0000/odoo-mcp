@@ -6,8 +6,10 @@ import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 
 from odoo_agent_server.routers import tools as tools_router
 from odoo_agent_server.services import live_assertion_service
@@ -32,6 +34,7 @@ from odoo_agent_server.routers.tools import (
     _inline_write_contexts,
     _rank_core_directory_files,
     _rank_core_required_paths,
+    _resolve_fuzzy_module,
     _prepare_code_batch,
     _restore_coding_session_task,
     _save_code_operation_handoff,
@@ -597,6 +600,41 @@ def test_nested_module_paths_use_resolved_root_without_changing_technical_name(t
             module_name="custom_sale",
             module_root_rel="../escape",
         )
+
+
+@pytest.mark.parametrize(
+    "unsafe_path",
+    [
+        "models/../views/x.xml",
+        "/tmp/x.py",
+        "C:/temp/x.py",
+        "backup/custom_sale/models/x.py",
+    ],
+)
+def test_module_relative_path_rejects_ambiguous_or_absolute_inputs(unsafe_path):
+    with pytest.raises(HTTPException) as excinfo:
+        _safe_module_relative("custom_sale", unsafe_path, "addons/vertical/custom_sale")
+
+    assert excinfo.value.status_code == 400
+
+
+def test_duplicate_exact_module_names_are_not_silently_selected():
+    payload = OdooCodeChangeRequest(
+        module_name="custom_sale",
+        task_description="Change the custom sale model",
+    )
+    modules = [
+        SimpleNamespace(module_name="custom_sale", path="addons/custom_sale"),
+        SimpleNamespace(module_name="custom_sale", path="vendor/custom_sale"),
+    ]
+
+    resolved, details = _resolve_fuzzy_module(payload, modules)
+
+    assert resolved is None
+    assert details["strategy"] == "ambiguous_duplicate_module"
+    assert [item["path"] for item in details["candidates"]] == [
+        "addons/custom_sale", "vendor/custom_sale"
+    ]
 
 
 def test_module_fingerprint_detects_same_size_change_with_preserved_mtime(tmp_path, monkeypatch):

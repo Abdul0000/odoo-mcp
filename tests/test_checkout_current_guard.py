@@ -353,3 +353,29 @@ def test_checkout_guard_blocks_unpushed_local_commit(tmp_path, monkeypatch):
     assert result["status"] == "local_ahead"
     assert result["ahead"] == 1
     assert "refusing to bundle" in result["error"]
+
+
+def test_nested_relative_path_resolves_manifest_owner(tmp_path):
+    project = tmp_path / "repo"
+    module = project / "addons" / "vertical" / "custom_sale"
+    (module / "models").mkdir(parents=True)
+    (module / "__manifest__.py").write_text("{'name': 'Custom Sale'}\n", encoding="utf-8")
+
+    resolved = checkout_guard_service.module_name_from_relative_path(
+        "addons/vertical/custom_sale/models/sale.py",
+        str(project),
+    )
+
+    assert resolved == "custom_sale"
+
+
+def test_nested_missing_relative_path_uses_odoo_source_directory_boundary(tmp_path):
+    project = tmp_path / "repo"
+    project.mkdir()
+
+    resolved = checkout_guard_service.module_name_from_relative_path(
+        "addons/vertical/custom_sale/models/new_file.py",
+        str(project),
+    )
+
+    assert resolved == "custom_sale"

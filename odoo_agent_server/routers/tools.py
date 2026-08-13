@@ -132,6 +132,11 @@ from ..services.client_resolver_service import ClientResolverService
 from ..services.client_gate_service import ClientGateService
 from ..services.odoo_service import OdooService
 from ..services.odoo_code_search_service import OdooCodeSearchService
+from ..services.module_path_service import (
+    canonical_module_relative_path,
+    is_ignored_source_path,
+    source_ownership,
+)
 from ..services.odoosh_service import OdooShService
 from ..services.browser_cdp_service import CdpBrowserService
 from ..services.repo_service import RepoService
@@ -1288,20 +1293,10 @@ def _safe_module_relative(
     module_root_rel: str | None = None,
 ) -> str:
     """Normalize a provider path into the resolved addon root inside project_path."""
-    value = str(relative_path or "").replace("\\", "/").strip()
-    if not value or "\x00" in value:
-        raise HTTPException(status_code=400, detail="Empty or unsafe relative_path")
-    value = value.lstrip("/")
-    parts = [part for part in value.split("/") if part and part not in {".", ".."}]
-    if not parts:
-        raise HTTPException(status_code=400, detail="Empty relative_path")
-    module_root = str(module_root_rel or module_name).replace("\\", "/").strip("/")
-    root_parts = module_root.split("/")
-    if parts[: len(root_parts)] == root_parts:
-        return "/".join(parts)
-    if module_name in parts:
-        parts = parts[parts.index(module_name) + 1 :]
-    return "/".join([*root_parts, *parts])
+    try:
+        return canonical_module_relative_path(module_name, relative_path, module_root_rel)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _ensure_root_module_scaffold(repo: RepoService, project: Path, payload: OdooCodeChangeRequest) -> None:
@@ -1522,13 +1517,17 @@ def _contract_candidate_paths(
 
     ranked: list[tuple[float, str]] = []
     for path in module_dir.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in {".py", ".js", ".xml", ".csv"}:
+        if not path.is_file() or path.suffix.lower() not in {".py", ".js", ".xml", ".csv", ".scss", ".css"}:
+            continue
+        try:
+            path.resolve().relative_to(module_dir.resolve())
+        except (OSError, ValueError):
             continue
         relative = path.relative_to(project).as_posix()
         module_relative = path.relative_to(module_dir).as_posix()
-        if any(part in {"__pycache__", ".pytest_cache", "node_modules", "static/lib"} for part in path.parts):
+        if is_ignored_source_path(path.relative_to(module_dir).parts):
             continue
-        content = path.read_text(encoding="utf-8", errors="ignore").lower()
+        content = path.read_text(encoding="utf-8", errors="ignore")[:500_000].lower()
         path_lower = module_relative.lower()
         score = 0.0
         for pattern in patterns:
@@ -1910,9 +1909,19 @@ def _resolve_fuzzy_module(payload: OdooCodeChangeRequest, modules: list[Any]) ->
     custom-module list.
     """
     requested = str(payload.module_name or "").strip()
-    exact = next((item for item in modules if item.module_name == requested), None)
-    if exact:
+    exact_matches = [item for item in modules if item.module_name == requested]
+    if len(exact_matches) == 1:
+        exact = exact_matches[0]
         return exact, {"requested": requested, "resolved": exact.module_name, "strategy": "exact", "score": 1.0}
+    if len(exact_matches) > 1:
+        return None, {
+            "requested": requested,
+            "strategy": "ambiguous_duplicate_module",
+            "candidates": [
+                {"module": item.module_name, "path": str(getattr(item, "path", "")), "score": 1.0}
+                for item in exact_matches
+            ],
+        }
 
     hint_parts = [requested, payload.module_hint or "", payload.task_description or ""]
     hint_parts.extend(str(p or "") for p in payload.search_patterns)
@@ -1946,7 +1955,7 @@ def _resolve_fuzzy_module(payload: OdooCodeChangeRequest, modules: list[Any]) ->
     if candidates:
         best_score, best, best_meta = candidates[0]
         second_score = candidates[1][0] if len(candidates) > 1 else 0.0
-        if best_score >= 0.72 and (best_score - second_score >= 0.08 or best_score >= 0.9):
+        if best_score >= 0.72 and (len(candidates) == 1 or best_score - second_score >= 0.08):
             return best, {"requested": requested, "resolved": best.module_name, "strategy": "fuzzy", "score": round(best_score, 3), "candidates": [meta for _, _, meta in candidates[:5]]}
     return None, {"requested": requested, "strategy": "not_found", "candidates": [meta for _, _, meta in candidates[:5]]}
 
@@ -1973,9 +1982,37 @@ def _css_style_declarations(style: dict[str, Any]) -> list[str]:
     return declarations
 
 
-def _focused_search(repo: RepoService, project_path: str, module_path: str, patterns: list[str], max_matches: int) -> tuple[list[dict[str, Any]], list[str], dict[str, list[int]]]:
+def _focused_search(
+    repo: RepoService,
+    project_path: str,
+    module_path: str,
+    patterns: list[str],
+    max_matches: int,
+    task_type: str = "auto",
+) -> tuple[list[dict[str, Any]], list[str], dict[str, list[int]]]:
     """Exact-first, low-noise search for inspect/autopatch mode."""
     preferred_suffixes = (".xml", ".scss", ".css", ".js", ".py")
+    task = str(task_type or "auto").lower()
+    primary_suffixes = {
+        "python_model": (".py",),
+        "controller": (".py",),
+        "xml_view": (".xml",),
+        "qweb_template": (".xml",),
+        "report": (".xml", ".py"),
+        "js_owl": (".js", ".xml"),
+        "pos_owl": (".js", ".xml"),
+        "js_report": (".js", ".xml"),
+        "scss_css": (".scss", ".css"),
+        "style": (".scss", ".css", ".xml"),
+    }.get(task, preferred_suffixes)
+
+    def suffix_rank(raw_path: str) -> int:
+        lowered = raw_path.lower()
+        for index, suffix in enumerate(primary_suffixes):
+            if lowered.endswith(suffix):
+                return index
+        return len(primary_suffixes) + (0 if lowered.endswith(preferred_suffixes) else 1)
+
     search_results: list[dict[str, Any]] = []
     rel_paths: list[str] = []
     seen_paths: set[str] = set()
@@ -1984,12 +2021,13 @@ def _focused_search(repo: RepoService, project_path: str, module_path: str, patt
         try:
             result = repo.search(project_path, pattern, module_path, max(1, min(max_matches, 25)), 24, False)
             matches = result.get("matches", []) or []
-            # Keep exact/template/style files first; avoid pulling large controllers/js unless needed.
+            # Rank the owning source type first; XML references must not outrank
+            # Python declarations for model tasks (and vice versa for view work).
             matches = sorted(
                 matches,
                 key=lambda m: (
-                    0 if str(m.get("path", "")).endswith((".xml", ".scss", ".css")) else 1,
-                    1 if "/controllers/" in str(m.get("path", "")) else 0,
+                    suffix_rank(str(m.get("path", ""))),
+                    1 if task != "controller" and "/controllers/" in str(m.get("path", "")) else 0,
                     str(m.get("path", "")),
                     int(m.get("line") or 0),
                 ),
@@ -2009,8 +2047,12 @@ def _focused_search(repo: RepoService, project_path: str, module_path: str, patt
                     line = int(match.get("line") or 0)
                     if line > 0 and line not in match_lines.setdefault(rel, []):
                         match_lines[rel].append(line)
-            # Exact visible text found in XML/CSS is usually enough for inspection.
-            if rel_paths and any(pattern.lower() in str(m.get("text", "")).lower() for m in matches):
+            # Stop only after an exact match in the task's primary source type.
+            if any(
+                str(m.get("path", "")).lower().endswith(primary_suffixes)
+                and pattern.lower() in str(m.get("text", "")).lower()
+                for m in matches
+            ):
                 break
         except Exception as exc:  # noqa: BLE001
             search_results.append({"pattern": pattern, "status": "failed", "error": str(exc)})
@@ -2843,7 +2885,17 @@ def _focused_scope_file_paths(
             continue
         if resolved in available and resolved not in requested:
             requested.append(resolved)
-    return (requested, True) if requested else (list(custom_file_paths), False)
+    if requested:
+        return requested, True
+    if raw_paths:
+        # An explicit missing/new file must not broaden a surgical task into a
+        # module-wide scan. Keep only manifest evidence until the target exists.
+        manifests = [
+            path for path in custom_file_paths
+            if Path(path).name in {"__manifest__.py", "__openerp__.py"}
+        ]
+        return manifests, True
+    return list(custom_file_paths), False
 
 
 def _scope_focus_identifiers(payload: OdooCodeChangeRequest) -> list[str]:
@@ -3121,7 +3173,12 @@ def _workflow_module_analyze(payload: ModuleAnalyzeRequest) -> dict[str, Any]:
     module, resolution = _resolve_fuzzy_module(payload, modules)
     if not module:
         return {
-            "status": "module_not_found",
+            "status": "module_ambiguous" if resolution.get("strategy") == "ambiguous_duplicate_module" else "module_not_found",
+            "message": (
+                "Multiple addon directories use the requested technical module name; specify the exact module root before continuing."
+                if resolution.get("strategy") == "ambiguous_duplicate_module"
+                else "No custom addon matched the supplied module hint."
+            ),
             "project_path": str(project),
             "module_resolution": resolution,
             "available_modules": [item.module_name for item in modules[:50]],
@@ -3962,9 +4019,15 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         modules = repo.list_custom_modules(project_path, max_depth=5, include_uninstallable=False)
         module, module_resolution = _resolve_fuzzy_module(payload, modules)
     if not module:
+        ambiguous_module = module_resolution.get("strategy") == "ambiguous_duplicate_module"
         return {
             "status": "failed",
-            "error": f"Custom module not found from hint: {payload.module_name}",
+            "error": (
+                f"Multiple custom module directories use technical name '{payload.module_name}'. "
+                "Select the exact discovered module root; no file was read or written."
+                if ambiguous_module
+                else f"Custom module not found from hint: {payload.module_name}"
+            ),
             "module_resolution": module_resolution,
             "available_modules": [item.module_name for item in modules[:50]],
             "success_allowed": False,
@@ -4216,6 +4279,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     # Inspect/autopatch mode uses exact-first focused search to avoid huge noisy reads.
     search_results: list[dict[str, Any]] = []
     focused_match_lines: dict[str, list[int]] = {}
+    direct_targets: list[str] = []
     if not payload.writes:
         phase_started("focused_target_search")
         patterns = _infer_code_change_search_patterns(payload)
@@ -4235,7 +4299,14 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
                     focused_paths.append(target_rel)
                 if not patterns:
                     continue
-                target_results, _, target_lines = _focused_search(repo, project_path, target_rel, patterns, payload.max_search_matches)
+                target_results, _, target_lines = _focused_search(
+                    repo,
+                    project_path,
+                    target_rel,
+                    patterns,
+                    payload.max_search_matches,
+                    _normalized_task_type(payload),
+                )
                 search_results.extend(target_results)
                 for rel, lines in target_lines.items():
                     for line in lines:
@@ -4286,10 +4357,19 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         # Odoo graph cannot produce confident target files.
         graph_result = next((item for item in search_results if item.get("engine") in {"module_analysis_cache", "odoo_code_graph"}), {})
         discovery_ok = bool(direct_targets and focused_paths) or (
-            bool(focused_paths) and float(graph_result.get("confidence") or 0) >= 0.45
+            bool(focused_paths)
+            and float(graph_result.get("confidence") or 0) >= 0.45
+            and not bool(graph_result.get("fallback_required"))
         )
         if not discovery_ok:
-            lexical_results, lexical_paths, lexical_lines = _focused_search(repo, project_path, module.path, patterns, payload.max_search_matches)
+            lexical_results, lexical_paths, lexical_lines = _focused_search(
+                repo,
+                project_path,
+                module.path,
+                patterns,
+                payload.max_search_matches,
+                _normalized_task_type(payload),
+            )
             search_results.extend(lexical_results)
             for rel in lexical_paths:
                 if rel not in focused_paths:
@@ -4327,7 +4407,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     )
     phase_started("custom_source_read")
     for rel in list(dict.fromkeys(custom_rel_paths))[:custom_read_limit]:
-        target = project / rel
+        target = repo.target(project_path, rel)
         if not target.exists() or not target.is_file():
             custom_reads.append({"relative_path": rel, "status": "missing"})
             continue
@@ -4581,6 +4661,50 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         "required_candidates": len(list(dict.fromkeys(mandatory_paths))),
         "selected_required": len(ranked_mandatory_paths),
         "selection": "relevance_ranked",
+    })
+    hybrid_custom_matches = next(
+        (item.get("matches") or [] for item in search_results if item.get("engine") == "odoo_code_graph"),
+        [],
+    )
+    hybrid_by_path = {
+        str(item.get("path") or ""): item
+        for item in hybrid_custom_matches
+        if item.get("path")
+    }
+    hybrid_custom_paths = list(hybrid_by_path)
+    if not hybrid_custom_paths:
+        hybrid_custom_paths = [
+            str(item.get("relative_path") or "")
+            for item in custom_reads
+            if item.get("status") == "read"
+            and item.get("relative_path")
+            and Path(str(item.get("relative_path"))).name not in {"__manifest__.py", "__openerp__.py"}
+        ]
+    search_results.append({
+        "engine": "hybrid_odoo_file_finder",
+        "status": "ok",
+        "module_root": module_root_rel,
+        "primary_files": [
+            {
+                "path": path,
+                "ownership": "client_custom",
+                "writable": True,
+                "confidence": hybrid_by_path.get(path, {}).get("confidence", 1.0 if path in direct_targets else None),
+                "role": hybrid_by_path.get(path, {}).get("role", "primary" if path in direct_targets else "candidate"),
+            }
+            for path in hybrid_custom_paths[:5]
+        ],
+        "installed_source_files": [
+            {
+                "path": str(item.get("path") or ""),
+                "ownership": source_ownership(str(item.get("path") or ""), project),
+                "writable": False,
+            }
+            for item in core_reads
+            if item.get("status") == "read" and item.get("path")
+        ],
+        "channels": ["direct_path", "cached_module_index", "symbol_graph", "scoped_lexical", "installed_source_scope"],
+        "write_policy": "Only client_custom files are writable; installed core, Enterprise, and related source are evidence only.",
     })
     cache = dict(evidence_cache) if isinstance(evidence_cache, dict) else {}
     cache[evidence_signature] = {

@@ -62,7 +62,7 @@ def _preview(payload: object) -> dict[str, object]:
 
 
 def _ensure_known_relative_module_current(project_path: str, relative_path: str) -> None:
-    module_name = module_name_from_relative_path(relative_path)
+    module_name = module_name_from_relative_path(relative_path, project_path)
     if not module_name:
         return
     resolver = ClientResolverService()

@@ -6,6 +6,7 @@ from typing import Any
 from ..config import settings
 from ..schemas import JobStatus
 from .git_service import GitService
+from .module_path_service import module_name_for_repo_relative
 from .path_service import resolve_allowed_path
 from .store_service import JsonStore
 
@@ -313,11 +314,22 @@ def maybe_ensure_known_module_current(
     )
 
 
-def module_name_from_relative_path(relative_path: str) -> str | None:
+def module_name_from_relative_path(relative_path: str, project_path: str | None = None) -> str | None:
+    if project_path:
+        resolved = module_name_for_repo_relative(Path(project_path), relative_path)
+        if resolved:
+            return resolved
     value = str(relative_path or "").replace("\\", "/").strip("/")
     if not value or value.startswith("."):
         return None
-    first = value.split("/", 1)[0]
+    parts = value.split("/")
+    source_dirs = {"models", "views", "controllers", "security", "wizard", "wizards", "report", "reports", "data", "demo", "static", "tests"}
+    for index, part in enumerate(parts):
+        if part in source_dirs and index > 0:
+            return parts[index - 1]
+    if parts[-1] in {"__manifest__.py", "__openerp__.py", "__init__.py"} and len(parts) > 1:
+        return parts[-2]
+    first = parts[0]
     if not first or first in {"..", ".git"}:
         return None
     return first

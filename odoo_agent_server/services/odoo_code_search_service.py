@@ -19,10 +19,10 @@ from fastapi import HTTPException, status
 from ..config import settings
 from .path_service import resolve_allowed_path
 from .coding_session_service import CodingSessionService
+from .module_path_service import is_ignored_source_path
 
 
 _CODE_SUFFIXES = {".py", ".xml", ".js", ".scss", ".css", ".csv"}
-_SKIP_DIRS = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".venv", "venv", "node_modules", "static/lib"}
 _WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{1,120}")
 _QUOTED_RE = re.compile(r"[`\"']([^`\"'\r\n]{2,180})[`\"']")
 _TECHNICAL_RE = re.compile(r"(?<![\w.-])([.#]?[A-Za-z_][\w-]*(?:\.[A-Za-z_][\w-]*)+|[A-Za-z_][\w]*_[A-Za-z0-9_]+)(?![\w-])")
@@ -86,6 +86,14 @@ class OdooCodeSearchService:
         index, cached = self._load_or_build(project, module, fingerprint)
         ranked = self._rank(index.get("documents") or [], project, clues, task_type, max_results)
         top_score = float(ranked[0]["score"]) if ranked else 0.0
+        second_score = float(ranked[1]["score"]) if len(ranked) > 1 else 0.0
+        score_margin = max(0.0, top_score - second_score)
+        resolution_status = (
+            "not_found" if not ranked
+            else "ambiguous" if len(ranked) > 1 and score_margin < 10
+            else "high_confidence" if top_score >= 80
+            else "candidate"
+        )
         return {
             "status": "ok",
             "engine": "odoo_code_graph",
@@ -96,10 +104,14 @@ class OdooCodeSearchService:
             "matches": ranked,
             "count": len(ranked),
             "confidence": round(min(1.0, top_score / 100.0), 3),
+            "score_margin": round(score_margin, 3),
+            "resolution_status": resolution_status,
             "indexed_files": len(index.get("documents") or []),
             "scanned_files": int(index.get("scanned_files") or 0),
-            "strategy": "universal_module_index",
+            "strategy": "hybrid_ranked_module_index",
+            "channels": ["symbol_graph", "path_match", "label_value", "bounded_relationship_expansion"],
             "index_truncated": bool(index.get("truncated")),
+            "fallback_required": bool(index.get("truncated")) or resolution_status in {"not_found", "ambiguous"},
         }
 
     @staticmethod
@@ -157,7 +169,11 @@ class OdooCodeSearchService:
         entries: list[dict[str, Any]] = []
         truncated = False
         for path in sorted(module.rglob("*")):
-            if not path.is_file() or any(part in _SKIP_DIRS for part in path.parts):
+            if not path.is_file() or is_ignored_source_path(path.relative_to(module).parts):
+                continue
+            try:
+                path.resolve().relative_to(module)
+            except (OSError, ValueError):
                 continue
             if path.suffix.lower() not in _CODE_SUFFIXES and path.name != "__manifest__.py":
                 continue
@@ -351,7 +367,11 @@ class OdooCodeSearchService:
                 for symbol in symbols:
                     symbol_norm = _normal(symbol.get("name"))
                     if norm == symbol_norm:
-                        score += 75 if technical else 60
+                        score += (75 if technical else 60) + self._symbol_task_bonus(
+                            str(symbol.get("kind") or ""),
+                            path,
+                            task_type,
+                        )
                         lines.add(int(symbol.get("line") or 1))
                         _append_unique(reasons, f"exact {symbol.get('kind')}: {symbol.get('name')}", limit=8)
                     elif len(norm) >= 4 and (norm in symbol_norm or symbol_norm in norm):
@@ -426,20 +446,46 @@ class OdooCodeSearchService:
                 break
         ranked = list(existing.values())
 
-        for item in ranked:
+        ranked = sorted(ranked, key=lambda item: (-item["score"], item["path"]))[: max(1, min(max_results, 10))]
+        top_score = float(ranked[0]["score"]) if ranked else 0.0
+        for index, item in enumerate(ranked):
             if not item["lines"]:
                 item["lines"] = self._find_lines(project / item["path"], clues)
             item["lines"] = item["lines"][:12]
             item.pop("symbols", None)
             item["confidence"] = round(min(1.0, float(item["score"]) / 100.0), 3)
-        return sorted(ranked, key=lambda item: (-item["score"], item["path"]))[: max(1, min(max_results, 10))]
+            item["ownership"] = "client_custom"
+            item["writable"] = True
+            item["role"] = "primary" if index == 0 or float(item["score"]) >= top_score - 10 else "supporting"
+        return ranked
+
+    @staticmethod
+    def _symbol_task_bonus(kind: str, path: str, task_type: str) -> int:
+        """Prefer owning definitions over references for the active task type."""
+        task = str(task_type or "auto").lower()
+        lowered = path.lower()
+        if task == "python_model" and kind in {"model", "method", "field", "class"}:
+            return 30
+        if task == "controller" and kind in {"route", "method", "class"}:
+            return 35 if "/controllers/" in lowered else 15
+        if task in {"xml_view", "qweb_template", "report"} and kind.startswith(("xml_", "owl_")):
+            return 30
+        if task in {"js_owl", "pos_owl", "js_report"} and kind in {
+            "js_class", "js_function", "owl_template", "registry_key", "patch_key"
+        }:
+            return 30
+        if task in {"scss_css", "style"} and kind == "selector":
+            return 30
+        return 0
 
     @staticmethod
     def _task_type_bonus(path: str, task_type: str) -> int:
         lowered = path.lower()
         task = str(task_type or "auto").lower()
-        if task in {"python_model", "controller"} and lowered.endswith(".py"):
+        if task == "python_model" and lowered.endswith(".py"):
             return 15
+        if task == "controller" and lowered.endswith(".py"):
+            return 25 if "/controllers/" in lowered else 8
         if task in {"xml_view", "qweb_template", "report"} and lowered.endswith(".xml"):
             return 15
         if task in {"js_owl", "pos_owl", "js_report"} and lowered.endswith(".js"):
@@ -473,7 +519,16 @@ class OdooCodeSearchService:
         files = [
             path for path in sorted(module.rglob("*"))
             if path.is_file()
-            and not any(part in _SKIP_DIRS for part in path.parts)
+            and not is_ignored_source_path(path.relative_to(module).parts)
+            and OdooCodeSearchService._inside_module(path, module)
             and (path.suffix.lower() in _CODE_SUFFIXES or path.name == "__manifest__.py")
         ]
         return CodingSessionService._module_fingerprint_from_files(module, files)
+
+    @staticmethod
+    def _inside_module(path: Path, module: Path) -> bool:
+        try:
+            path.resolve().relative_to(module.resolve())
+            return True
+        except (OSError, ValueError):
+            return False

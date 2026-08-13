@@ -28,6 +28,7 @@ from pathlib import Path
 
 from . import core_sync_service
 from .client_resolver_service import ClientResolverService
+from .module_path_service import is_ignored_source_path
 from ..schemas import (
     CoreFileMatch,
     FindCoreFileResult,
@@ -240,6 +241,7 @@ class CoreFinderService:
         subdirs = _FILETYPE_SUBDIRS.get(file_type, [])
         kw_lower = keyword.lower()
         all_matches: list[CoreFileMatch] = []
+        content_fallbacks: list[tuple[int, str, Path, Path]] = []
 
         for priority, root in roots:
             root_path = Path(root)
@@ -253,9 +255,32 @@ class CoreFinderService:
                 if file_type == "manifest":
                     if abs_path.name != "__manifest__.py":
                         continue
-                elif kw_lower not in name_lower:
+                elif not self._extension_matches(abs_path, file_type):
                     continue
-                if file_type != "manifest" and not self._extension_matches(abs_path, file_type):
+                elif kw_lower not in name_lower:
+                    content_fallbacks.append((priority, root, root_path, abs_path))
+                    continue
+                try:
+                    size = abs_path.stat().st_size
+                except OSError:
+                    size = 0
+                all_matches.append(CoreFileMatch(
+                    path=str(abs_path),
+                    relative_path=str(abs_path.relative_to(root_path)),
+                    root=root,
+                    priority=priority,
+                    size=size,
+                ))
+
+        # Filename lookup is the fast lane. Only when it finds nothing, use a
+        # bounded exact-symbol/content fallback across Community + Enterprise.
+        if not all_matches and file_type != "manifest" and kw_lower:
+            searched_per_root: dict[str, int] = {}
+            for priority, root, root_path, abs_path in content_fallbacks:
+                if searched_per_root.get(root, 0) >= 200:
+                    continue
+                searched_per_root[root] = searched_per_root.get(root, 0) + 1
+                if not self._content_symbol_match(abs_path, keyword, file_type):
                     continue
                 try:
                     size = abs_path.stat().st_size
@@ -716,15 +741,25 @@ class CoreFinderService:
                         results.append(sub_path)
                     else:
                         for current, dirs, files in os.walk(sub_path):
-                            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"__pycache__", ".git"}]
-                            for fname in files:
+                            current_path = Path(current)
+                            dirs[:] = sorted(
+                                d for d in dirs
+                                if not d.startswith(".")
+                                and not is_ignored_source_path((current_path / d).relative_to(module_dir).parts)
+                            )
+                            for fname in sorted(files):
                                 results.append(Path(current) / fname)
             if not results:
                 subdirs = []
         if not subdirs:
             for current, dirs, files in os.walk(module_dir):
-                dirs[:] = [d for d in dirs if not d.startswith(".") and d not in {"__pycache__", ".git"}]
-                for fname in files:
+                current_path = Path(current)
+                dirs[:] = sorted(
+                    d for d in dirs
+                    if not d.startswith(".")
+                    and not is_ignored_source_path((current_path / d).relative_to(module_dir).parts)
+                )
+                for fname in sorted(files):
                     results.append(Path(current) / fname)
         return results
 
@@ -740,6 +775,30 @@ class CoreFinderService:
         if file_type == "static":
             return ext in {".js", ".css", ".scss", ".xml", ".html", ".png", ".svg"}
         return True
+
+    @staticmethod
+    def _content_symbol_match(path: Path, keyword: str, file_type: str) -> bool:
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")[:500_000]
+        except OSError:
+            return False
+        escaped = re.escape(str(keyword or "").strip())
+        if not escaped:
+            return False
+        if file_type in {"model", "wizard", "controller"}:
+            patterns = (
+                rf"\b(?:async\s+def|def|class)\s+{escaped}\b",
+                rf"(?m)^\s*{escaped}\s*=\s*fields\.",
+                rf"[\"']{escaped}[\"']",
+            )
+        elif file_type in {"view", "report", "data"}:
+            patterns = (
+                rf"\b(?:id|name|model|ref|t-name|t-call)=[\"'][^\"']*{escaped}[^\"']*[\"']",
+                rf"<field\b[^>]*\bname=[\"']{escaped}[\"']",
+            )
+        else:
+            patterns = (escaped,)
+        return any(re.search(pattern, content, flags=re.I) for pattern in patterns)
 
     @staticmethod
     def _quick_content_check(path: Path, patterns: list[re.Pattern], peek_bytes: int = 4096) -> bool:

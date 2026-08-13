@@ -177,7 +177,7 @@ def test_search_builds_one_universal_module_index(tmp_path, monkeypatch):
         task_type="python_model",
     )
 
-    assert result["strategy"] == "universal_module_index"
+    assert result["strategy"] == "hybrid_ranked_module_index"
     assert result["indexed_files"] >= 30
     assert result["scanned_files"] >= 33
     assert result["indexed_files"] == result["scanned_files"]
@@ -201,3 +201,48 @@ def test_search_reuses_same_index_for_a_different_query(tmp_path, monkeypatch):
 
     assert first["cached"] is False
     assert second["cached"] is True
+
+
+def test_search_skips_vendored_static_lib_and_marks_custom_ownership(tmp_path, monkeypatch):
+    project, module = _build_module(tmp_path)
+    vendor = module / "static" / "lib" / "vendor"
+    vendor.mkdir(parents=True)
+    for index in range(25):
+        (vendor / f"noise_{index}.js").write_text(
+            f'const billing_code_id = "vendor-{index}";\n', encoding="utf-8"
+        )
+    monkeypatch.setattr(search_module, "resolve_allowed_path", lambda value: project.resolve())
+    monkeypatch.setattr(settings, "repo_index_enabled", False)
+
+    result = OdooCodeSearchService().search(
+        project_path=str(project),
+        module_path=module.relative_to(project).as_posix(),
+        task_description="Change billing_code_id on Billing Ready Records",
+        target_hint="billing_code_id",
+        task_type="python_model",
+    )
+
+    assert result["indexed_files"] == 3
+    assert all("/static/lib/" not in f"/{item['path']}" for item in result["matches"])
+    assert result["matches"][0]["ownership"] == "client_custom"
+    assert result["matches"][0]["writable"] is True
+    assert result["matches"][0]["role"] == "primary"
+
+
+def test_python_task_ranks_field_definition_before_xml_reference(tmp_path, monkeypatch):
+    project, module = _build_module(tmp_path)
+    monkeypatch.setattr(search_module, "resolve_allowed_path", lambda value: project.resolve())
+    monkeypatch.setattr(settings, "repo_index_enabled", False)
+
+    result = OdooCodeSearchService().search(
+        project_path=str(project),
+        module_path=module.relative_to(project).as_posix(),
+        task_description="Change the billing_code_id field logic",
+        target_hint="billing_code_id",
+        task_type="python_model",
+    )
+
+    assert result["matches"][0]["path"].endswith("models/billing/billing_ready.py")
+    assert result["channels"] == [
+        "symbol_graph", "path_match", "label_value", "bounded_relationship_expansion"
+    ]

@@ -554,7 +554,7 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
         "Slow validation returns job_id/next_call; poll jobs.get. Writes, Git, and deploy stay blocked until validation passes."
     ),
     "workflow.odoo_code_change": (
-        "Server-owned Odoo code workflow for existing changes or complete new addons. It prepares checkout, resolves the "
+        "Odoo code workflow for existing changes or complete new addons. It prepares checkout, resolves the "
         "module/target, persists a durable operation before work, applies one complete writes set, runs QA/core verification, "
         "and starts safe deploy. Short work returns directly; long work returns operation_id/job_id for jobs.get. An identical "
         "transport retry reuses the same job. On needs_writes, preserve coding_session_id/workspace_session_id and add writes."

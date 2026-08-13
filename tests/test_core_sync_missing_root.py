@@ -43,3 +43,24 @@ def test_list_module_files_syncs_when_search_root_does_not_exist(tmp_path, monke
 
     assert result.found is True
     assert result.total_found == 1
+
+
+def test_find_core_file_uses_bounded_symbol_fallback_across_enterprise(tmp_path):
+    enterprise = tmp_path / "home" / "odoo" / "src" / "enterprise"
+    models = enterprise / "sale" / "models"
+    models.mkdir(parents=True)
+    target = models / "sale_order.py"
+    target.write_text(
+        "class SaleOrder:\n    def _compute_enterprise_margin(self):\n        return 1\n",
+        encoding="utf-8",
+    )
+
+    result = CoreFinderService().find_core_file(
+        "sale",
+        "model",
+        "_compute_enterprise_margin",
+        search_roots=[str(enterprise)],
+    )
+
+    assert result.total_found == 1
+    assert result.best_match == str(target)

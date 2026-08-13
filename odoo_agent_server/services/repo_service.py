@@ -18,6 +18,7 @@ from ..config import mask_repo_url, settings
 from ..schemas import CommandResult, CustomModuleItem, FileContent, FileListItem, RepoCleanPycResult, RepoPrepareResult
 from .client_resolver_service import ClientResolverService
 from .path_service import resolve_allowed_path
+from .module_path_service import is_ignored_source_path
 from .lock_service import RepoLockService
 from .odoo_package_wiring_service import OdooPackageWiringService
 
@@ -184,6 +185,10 @@ class RepoService:
             "src/odoo", "src/enterprise", "static/lib",
         }
         for manifest in self._iter_manifest_files(project, max_depth, skip_dirs):
+            try:
+                manifest.resolve().relative_to(project)
+            except (OSError, ValueError):
+                continue
             meta = self._read_manifest_metadata(manifest)
             installable = meta.get("installable")
             if installable is False and not include_uninstallable:
@@ -201,7 +206,7 @@ class RepoService:
                     application=meta.get("application") if isinstance(meta.get("application"), bool) else None,
                 )
             )
-        result = sorted(modules, key=lambda item: item.module_name)
+        result = sorted(modules, key=lambda item: (item.module_name, item.path))
         with self._module_cache_lock:
             # Keep the cache bounded so long-running connector processes do not grow unbounded.
             if len(self._module_cache) > 32:
@@ -234,12 +239,12 @@ class RepoService:
             current_path = Path(current)
             rel_parts = current_path.relative_to(project).parts if current_path != project else ()
             depth = len(current_path.parts) - base_depth
-            dirs[:] = [
+            dirs[:] = sorted(
                 d for d in dirs
                 if d not in skip_dirs
                 and "/".join((*rel_parts, d)) not in skip_dirs
                 and depth < max_depth
-            ]
+            )
             if "__manifest__.py" in files and depth <= max_depth:
                 yield current_path / "__manifest__.py"
 
@@ -382,9 +387,12 @@ class RepoService:
         }
 
     def _iter_search_files(self, root: Path):
-        skip_dirs = {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "node_modules", ".venv", "venv", "env", "static/lib"}
         for current, dirs, files in os.walk(root):
-            dirs[:] = sorted(d for d in dirs if d not in skip_dirs)
+            current_path = Path(current)
+            dirs[:] = sorted(
+                d for d in dirs
+                if not is_ignored_source_path((current_path / d).relative_to(root).parts)
+            )
             for filename in sorted(files):
                 yield Path(current) / filename
 

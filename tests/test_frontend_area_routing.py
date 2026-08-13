@@ -160,6 +160,28 @@ def test_scope_uses_explicit_task_files_not_broad_search_evidence(tmp_path):
     assert selected == [str(model.resolve()), str(view.resolve())]
 
 
+def test_missing_explicit_target_keeps_scope_on_manifest_only(tmp_path):
+    project = tmp_path / "repo"
+    module = project / "aba_recon_v2"
+    manifest = module / "__manifest__.py"
+    unrelated = module / "models" / "unrelated.py"
+    unrelated.parent.mkdir(parents=True)
+    manifest.write_text("{'name': 'ABA'}\n", encoding="utf-8")
+    unrelated.write_text("VALUE = 1\n", encoding="utf-8")
+
+    selected, focused = _focused_scope_file_paths(
+        project=project,
+        module_name="aba_recon_v2",
+        module_root_rel="aba_recon_v2",
+        custom_file_paths=[str(manifest), str(unrelated)],
+        target_files=["models/new_target.py"],
+        writes=[],
+    )
+
+    assert focused is True
+    assert selected == [str(manifest)]
+
+
 def test_scope_focus_prefers_exact_field_inside_descriptive_target_hint():
     payload = OdooCodeChangeRequest(
         module_name="aba_recon_v2",
