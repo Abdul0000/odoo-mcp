@@ -31,8 +31,6 @@ from ..schemas import (
 # Regex helpers
 # ---------------------------------------------------------------------------
 _FIELD_NAME_RE     = re.compile(r'^\s{4,}(\w+)\s*=\s*fields\.', re.MULTILINE)
-_INHERIT_RE        = re.compile(r'_inherit\s*=\s*([^\n#]+)')
-_MODEL_LITERAL_RE  = re.compile(r'["\']([A-Za-z_][A-Za-z0-9_]*\.[A-Za-z0-9_.]+)["\']')
 _DEPENDS_PY_RE     = re.compile(r'depends\(\[([^\]]+)\]\)')
 _COMODEL_RE        = re.compile(r'(?:comodel_name\s*=\s*["\']([^"\']+)["\']|fields\.(?:Many2one|One2many|Many2many)\s*\(\s*["\']([^"\']+)["\'])')
 _RELATED_RE        = re.compile(r'related\s*=\s*["\']([^"\']+)["\']')
@@ -166,9 +164,64 @@ def _extract_core_field_names(core_content: str) -> set[str]:
     return {m.group(1) for m in _FIELD_NAME_RE.finditer(core_content)}
 
 
-def _extract_model_literals(raw: str) -> list[str]:
-    """Extract Odoo model strings from scalar or list/tuple assignments."""
-    return [m.group(1) for m in _MODEL_LITERAL_RE.finditer(raw)]
+def _python_model_class_units(content: str) -> list[dict[str, Any]]:
+    """Return class-local Odoo model metadata for safe static verification.
+
+    A Python file can declare several unrelated models.  Treating every field
+    in the file as belonging to every ``_inherit`` target creates false
+    positives, especially for new models that only mix in ``mail.thread``.
+    """
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+
+    lines = content.splitlines(keepends=True)
+    units: list[dict[str, Any]] = []
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        source = "".join(lines[node.lineno - 1:int(node.end_lineno or node.lineno)])
+        model_name: str | None = None
+        inherit_models: list[str] = []
+        local_fields: set[str] = set()
+        for statement in node.body:
+            if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+            names = [target.id for target in targets if isinstance(target, ast.Name)]
+            value = statement.value
+            if "_name" in names:
+                try:
+                    literal = ast.literal_eval(value)
+                except (ValueError, TypeError):
+                    literal = None
+                if isinstance(literal, str):
+                    model_name = literal
+            if "_inherit" in names:
+                try:
+                    literal = ast.literal_eval(value)
+                except (ValueError, TypeError):
+                    literal = None
+                values = literal if isinstance(literal, (list, tuple)) else [literal]
+                inherit_models.extend(item for item in values if isinstance(item, str))
+            if names and isinstance(value, ast.Call):
+                function = value.func
+                if (
+                    isinstance(function, ast.Attribute)
+                    and isinstance(function.value, ast.Name)
+                    and function.value.id == "fields"
+                ):
+                    local_fields.update(names)
+        if model_name or inherit_models:
+            units.append({
+                "class_name": node.name,
+                "model_name": model_name,
+                "inherit_models": list(dict.fromkeys(inherit_models)),
+                "local_fields": local_fields,
+                "source": source,
+            })
+    return units
 
 
 def _find_core_view_content(model_name: str, client_name: str | None = None) -> str:
@@ -667,54 +720,63 @@ class SyntaxVerifierService:
 
     def _verify_python_model(self, file_path: str, content: str, client_name: str | None = None) -> list[VerifyFinding]:
         findings: list[VerifyFinding] = []
-        inherit_models: list[str] = []
-        for m in _INHERIT_RE.finditer(content):
-            inherit_models.extend(_extract_model_literals(m.group(1)))
+        model_units = _python_model_class_units(content)
+        inherit_detected = False
 
-        if "pos.config" in inherit_models and _LOAD_POS_DATA_FIELDS_METHOD_RE.search(content):
-            findings.append(VerifyFinding(
-                file=file_path,
-                severity=VerifySeverity.CRITICAL,
-                check="pos_config_no_load_pos_data_fields",
-                message="pos.config must never define or override _load_pos_data_fields().",
-                fix_hint=(
-                    "Read the installed Odoo point_of_sale source and load pos.config fields through "
-                    "the version's supported POS loader/session mechanism. Do not add "
-                    "_load_pos_data_fields() to pos.config."
-                ),
-            ))
+        for unit in model_units:
+            class_source = str(unit["source"])
+            inherit_models = list(unit["inherit_models"])
+            inherit_detected = inherit_detected or bool(inherit_models)
+            local_fields = set(unit["local_fields"])
+            inherited_fields: set[str] = set()
 
-        for model_name in inherit_models:
-            core_content = _find_core_model_content(model_name, client_name=client_name)
-            core_fields: set[str] = set()
-            if not core_content:
+            if "pos.config" in inherit_models and _LOAD_POS_DATA_FIELDS_METHOD_RE.search(class_source):
                 findings.append(VerifyFinding(
                     file=file_path,
-                    severity=VerifySeverity.WARNING,
-                    check="inherit_model_found",
-                    message=f"_inherit '{model_name}' — core model source not found in /home/odoo/src/*. Cannot cross-check fields.",
-                    fix_hint=f"Run workflow.find_core_file('{model_name.split('.')[0]}', 'model', '{model_name.split('.')[-1]}') manually.",
+                    severity=VerifySeverity.CRITICAL,
+                    check="pos_config_no_load_pos_data_fields",
+                    message="pos.config must never define or override _load_pos_data_fields().",
+                    fix_hint=(
+                        "Read the installed Odoo point_of_sale source and load pos.config fields through "
+                        "the version's supported POS loader/session mechanism. Do not add "
+                        "_load_pos_data_fields() to pos.config."
+                    ),
                 ))
-            else:
-                core_fields = _extract_core_field_names(core_content)
-                for dep_m in _DEPENDS_PY_RE.finditer(content):
+
+            for model_name in inherit_models:
+                core_content = _find_core_model_content(model_name, client_name=client_name)
+                if not core_content:
+                    findings.append(VerifyFinding(
+                        file=file_path,
+                        severity=VerifySeverity.WARNING,
+                        check="inherit_model_found",
+                        message=f"_inherit '{model_name}' — core model source not found in /home/odoo/src/*. Cannot cross-check fields.",
+                        fix_hint=f"Run workflow.find_core_file('{model_name.split('.')[0]}', 'model', '{model_name.split('.')[-1]}') manually.",
+                    ))
+                else:
+                    inherited_fields.update(_extract_core_field_names(core_content))
+
+            allowed_fields = local_fields | inherited_fields
+            inherited_label = ", ".join(inherit_models)
+            if inherit_models and inherited_fields:
+                for dep_m in _DEPENDS_PY_RE.finditer(class_source):
                     raw = dep_m.group(1)
                     field_refs = [s.strip().strip("'\"") for s in raw.split(",")]
                     for ref in field_refs:
                         first_field = ref.split(".")[0] if "." in ref else ref
-                        if first_field and first_field not in core_fields:
+                        if first_field and first_field not in allowed_fields:
                             findings.append(VerifyFinding(
                                 file=file_path,
                                 severity=VerifySeverity.CRITICAL,
                                 check="depends_field_exists",
-                                message=f"depends(['{ref}']) — field '{first_field}' not found in core model '{model_name}'.",
+                                message=f"depends(['{ref}']) — field '{first_field}' not found in local fields or inherited model(s) '{inherited_label}'.",
                                 fix_hint=(
-                                    f"Core fields available: {sorted(list(core_fields))[:20]}... "
-                                    "Re-read core model with repo.read and use only real field names."
+                                    f"Available fields: {sorted(allowed_fields)[:20]}... "
+                                    "Re-read the owning model and installed parent source before changing the dependency."
                                 ),
                             ))
 
-            for cm_m in _COMODEL_RE.finditer(content):
+            for cm_m in _COMODEL_RE.finditer(class_source):
                 comodel = cm_m.group(1) or cm_m.group(2) or ""
                 if "." in comodel:
                     comodel_module = comodel.split(".")[0]
@@ -736,21 +798,21 @@ class SyntaxVerifierService:
                             ),
                         ))
 
-            for rel_m in _RELATED_RE.finditer(content):
+            for rel_m in _RELATED_RE.finditer(class_source):
                 chain = rel_m.group(1)
                 first_field = chain.split(".")[0]
-                if first_field and core_fields and first_field not in core_fields:
+                if first_field and inherit_models and inherited_fields and first_field not in allowed_fields:
                     findings.append(VerifyFinding(
                         file=file_path,
                         severity=VerifySeverity.CRITICAL,
                         check="related_field_exists",
-                        message=f"related='{chain}' — first field '{first_field}' not found in core model '{model_name}'.",
-                        fix_hint=f"Valid starting fields in '{model_name}': {sorted(list(core_fields))[:15]}",
+                        message=f"related='{chain}' — first field '{first_field}' not found in local fields or inherited model(s) '{inherited_label}'.",
+                        fix_hint=f"Valid starting fields: {sorted(allowed_fields)[:15]}",
                     ))
 
-            compute_methods_used = {m.group(1) for m in _COMPUTE_RE.finditer(content)}
+            compute_methods_used = {m.group(1) for m in _COMPUTE_RE.finditer(class_source)}
             for method_name in compute_methods_used:
-                if method_name and f"def {method_name}" not in content:
+                if method_name and f"def {method_name}" not in class_source:
                     findings.append(VerifyFinding(
                         file=file_path,
                         severity=VerifySeverity.CRITICAL,
@@ -759,7 +821,7 @@ class SyntaxVerifierService:
                         fix_hint=f"Add the missing compute method 'def {method_name}(self):' to the model class.",
                     ))
 
-        if not inherit_models:
+        if not inherit_detected:
             findings.append(VerifyFinding(
                 file=file_path,
                 severity=VerifySeverity.INFO,

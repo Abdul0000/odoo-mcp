@@ -1415,6 +1415,50 @@ def test_exact_custom_model_and_view_scope_skips_installed_source_fanout(tmp_pat
     ) is True
 
 
+def test_cached_analysis_keeps_only_strong_prescription_target_cluster():
+    analysis = {
+        "source_evidence": [
+            {
+                "path": "models/clinic_patient.py",
+                "content": "_name = 'clinic.patient'\nnote = fields.Text(string='Notes')\n",
+            },
+            {
+                "path": "views/clinic_patient_views.xml",
+                "content": '<field name="model">clinic.patient</field><field name="note"/>',
+            },
+            {
+                "path": "models/clinic_prescription.py",
+                "content": "_name = 'clinic.prescription'\ninstructions = fields.Text()\n",
+            },
+            {
+                "path": "views/clinic_prescription_views.xml",
+                "content": '<field name="model">clinic.prescription</field><form string="Prescription"/>',
+            },
+            {
+                "path": "__manifest__.py",
+                "content": "'views/clinic_prescription_views.xml'",
+            },
+        ],
+    }
+    payload = OdooCodeChangeRequest(
+        module_name="clinic_management",
+        task_description="Add a Notes notebook page to Prescriptions.",
+        search_patterns=["prescription", "prescriptions", "clinic.prescription"],
+        task_type="xml_view",
+        target_hint="Prescriptions model and form view",
+        auto_deploy=False,
+    )
+
+    targets = _analysis_index_target_paths(analysis, payload)
+
+    assert targets == [
+        "views/clinic_prescription_views.xml",
+        "models/clinic_prescription.py",
+    ]
+    assert not any("patient" in path for path in targets)
+    assert "__manifest__.py" not in targets
+
+
 def test_exact_core_extension_still_requires_installed_source_scope(tmp_path):
     project = tmp_path / "repo"
     model = project / "custom_sale" / "models" / "sale_order.py"

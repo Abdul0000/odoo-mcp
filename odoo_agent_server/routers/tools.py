@@ -1503,7 +1503,18 @@ def _analysis_index_target_paths(analysis: dict[str, Any] | None, payload: OdooC
         if score > 0:
             ranked.append((score, path))
     ranked.sort(key=lambda row: (-row[0], row[1]))
-    return [path for _, path in ranked[:8]]
+    if not ranked:
+        return []
+    # Keep the strong target cluster only.  Low-score matches such as a common
+    # requested field label in an unrelated model must not expand a surgical
+    # task back into a module-wide read.
+    best_score = ranked[0][0]
+    minimum_score = max(3.0, best_score * 0.55)
+    return [
+        path for score, path in ranked
+        if score >= minimum_score
+        and Path(path).name not in {"__manifest__.py", "__openerp__.py"}
+    ][:4]
 
 
 def _contract_candidate_paths(
@@ -4702,7 +4713,11 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         for rel in focused_paths[: adaptive_profile["inspection_file_limit"]]:
             if rel and rel not in custom_rel_paths:
                 custom_rel_paths.append(rel)
-        if not direct_targets:
+        if not direct_targets and (
+            not focused_paths
+            or adaptive_profile["full_module"]
+            or "tests" in (module_contract.get("required_layers") or [])
+        ):
             for rel in _contract_candidate_paths(project, module.path, payload, module_contract):
                 if rel and rel not in custom_rel_paths:
                     custom_rel_paths.append(rel)
@@ -4800,12 +4815,13 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     # supplied target file made focused controller fixes scan unrelated models
     # and escalate to L3/L4. Keep the manifest plus exact write files on write
     # passes; inspection mode keeps the focused search files.
+    discovered_target_files = payload.target_files or focused_paths
     scope_file_paths, focused_scope = _focused_scope_file_paths(
         project=project,
         module_name=effective_module_name,
         module_root_rel=module_root_rel,
         custom_file_paths=custom_file_paths_abs,
-        target_files=payload.target_files,
+        target_files=discovered_target_files,
         writes=list(payload.writes or generated_writes),
     )
 
@@ -4823,7 +4839,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         project=project,
         module_name=effective_module_name,
         module_root_rel=module_root_rel,
-        target_files=payload.target_files,
+        target_files=discovered_target_files,
         writes=list(payload.writes or generated_writes),
     )
     scope = None
