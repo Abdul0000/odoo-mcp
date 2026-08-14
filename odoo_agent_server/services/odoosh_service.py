@@ -925,6 +925,38 @@ class OdooShService:
         stdout = "MCP_ERROR_PACK\n" + json.dumps(pack, indent=2) + "\n\nTRACEBACK_BLOCKS\n" + base.stdout
         return base.model_copy(update={"command": ["odoosh.error_pack", str(tail_lines)], "stdout": stdout[-20000:]})
 
+    def correlated_logs(self, correlation_id: str, tail_lines: int = 150) -> CommandResult:
+        """Return only correlation-marker lines plus ERROR/CRITICAL tracebacks."""
+        marker = str(correlation_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{3,80}", marker):
+            return CommandResult(
+                command=["odoosh.correlated_logs"], cwd="odoosh:ssh", exit_code=2,
+                stderr="correlation_id must be a safe 3-80 character identifier",
+            )
+        safe_lines = max(100, min(int(tail_lines or 150), 2000))
+        quoted_marker = shlex.quote(marker)
+        script = (
+            "set +e; marker=" + quoted_marker + "; "
+            "for f in ~/logs/*.log; do [ -f \"$f\" ] || continue; "
+            f"tail -n {safe_lines} \"$f\" | awk -v file=\"$f\" -v marker=\"$marker\" '"
+            "function emit(line) { if (!emitted) { print \"__ODOO_MCP_LOG_FILE__:\" file; emitted=1 } print line } "
+            "index($0, marker) { emit($0); next } "
+            "/Traceback \\(most recent call last\\)/ { in_trace=1; emit($0); next } "
+            "in_trace && /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9][[:space:]]/ { in_trace=0 } "
+            "in_trace { emit($0); next } "
+            "/(^|[[:space:]])(ERROR|CRITICAL)([[:space:]:]|$)/ { emit($0) }'; "
+            "done; exit 0"
+        )
+        result = self.run_shell(script, timeout_seconds=45)
+        if result.exit_code != 0:
+            return result
+        lines = (result.stdout or "").splitlines()
+        bounded = "\n".join(lines[-150:])
+        return result.model_copy(update={
+            "command": ["odoosh.correlated_logs", marker, str(safe_lines)],
+            "stdout": bounded[-20000:] or "No correlated marker or fresh error lines found.",
+        })
+
 
     def search_read(
         self,
@@ -1218,6 +1250,132 @@ class OdooShService:
             database=self._db_name(),
             result=parsed,
             error=None if parsed["passed"] else str(parsed.get("error") or "Runtime replay emitted fresh errors.")[:4000],
+        )
+
+    def report_replay(self, replay: dict, *, correlation_id: str) -> OdooResult:
+        """Render one exact report action read-only and assert its PDF artifact."""
+        if not self._db_name():
+            return OdooResult(status="failed", error="ODOOSH_DB_NAME/odoosh_db_name is not configured for report replay.")
+        report_xml_id = str(replay.get("report_xml_id") or "").strip()
+        if report_xml_id and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_.]*", report_xml_id):
+            return OdooResult(status="failed", error="Invalid report_xml_id for report replay.")
+        record_ids = replay.get("record_ids") or []
+        if not isinstance(record_ids, list) or not record_ids or len(record_ids) > 20 or any(not isinstance(value, int) or value <= 0 for value in record_ids):
+            return OdooResult(status="failed", error="Report replay requires 1-20 positive record IDs.")
+
+        payload = {**replay, "correlation_id": correlation_id}
+        payload_b64 = base64.b64encode(json.dumps(payload, ensure_ascii=False).encode("utf-8")).decode("ascii")
+        safe_db = shlex.quote(self._db_name() or "")
+        odoo_path = shlex.quote(self._odoo_path())
+        marker = "MCP_REPORT_REPLAY_JSON:"
+        begin_marker = f"MCP_REPORT_REPLAY_BEGIN:{correlation_id}"
+        script = (
+            "set +e; "
+            f"{self._addons_path_shell_setup()}"
+            f"cd {odoo_path}; "
+            f"./odoo-bin shell -d {safe_db} --addons-path=\"$MCP_ADDONS_PATH\" --no-http --log-level=error <<'PY'\n"
+            "import base64, hashlib, io, json, re, traceback\n"
+            f"payload = json.loads(base64.b64decode({payload_b64!r}).decode('utf-8'))\n"
+            f"marker = {marker!r}\n"
+            f"print({begin_marker!r}, flush=True)\n"
+            "try:\n"
+            "    action_value = None\n"
+            "    trigger = payload.get('trigger') or {}\n"
+            "    if trigger:\n"
+            "        records = env[trigger['model']].browse(trigger['record_ids']).exists()\n"
+            "        if set(records.ids) != set(trigger['record_ids']):\n"
+            "            raise ValueError('Report trigger records not found')\n"
+            "        if trigger.get('user_id'):\n"
+            "            records = records.with_user(int(trigger['user_id']))\n"
+            "        if trigger.get('company_id'):\n"
+            "            records = records.with_company(int(trigger['company_id']))\n"
+            "        records = records.with_context(**(trigger.get('context') or {}), odoo_mcp_correlation_id=payload['correlation_id'])\n"
+            "        action_value = getattr(records, trigger['method'])(*(trigger.get('args') or []), **(trigger.get('kwargs') or {}))\n"
+            "    report_ref = payload.get('report_xml_id')\n"
+            "    render_data = payload.get('data') or {}\n"
+            "    if isinstance(action_value, dict):\n"
+            "        report_ref = report_ref or action_value.get('report_name')\n"
+            "        render_data = action_value.get('data') or render_data\n"
+            "    if not report_ref:\n"
+            "        raise ValueError('The trigger did not return a renderable report action')\n"
+            "    report_model = env['ir.actions.report']\n"
+            "    if payload.get('user_id'):\n"
+            "        report_model = report_model.with_user(int(payload['user_id']))\n"
+            "    if payload.get('company_id'):\n"
+            "        report_model = report_model.with_company(int(payload['company_id']))\n"
+            "    report_model = report_model.with_context(**(payload.get('context') or {}), odoo_mcp_correlation_id=payload['correlation_id'])\n"
+            "    pdf, _fmt = report_model._render_qweb_pdf(report_ref, res_ids=payload['record_ids'], data=render_data)\n"
+            "    reader_cls = None\n"
+            "    try:\n"
+            "        from pypdf import PdfReader as reader_cls\n"
+            "    except ImportError:\n"
+            "        from PyPDF2 import PdfReader as reader_cls\n"
+            "    reader = reader_cls(io.BytesIO(pdf))\n"
+            "    text = re.sub(r'\\s+', ' ', ' '.join((page.extract_text() or '') for page in reader.pages)).strip()\n"
+            "    candidate = text if payload.get('case_sensitive') else text.casefold()\n"
+            "    required = payload.get('required_text') or []\n"
+            "    forbidden = payload.get('forbidden_text') or []\n"
+            "    def present(fragment):\n"
+            "        value = fragment if payload.get('case_sensitive') else fragment.casefold()\n"
+            "        return value in candidate\n"
+            "    required_checks = {value: present(value) for value in required}\n"
+            "    forbidden_checks = {value: not present(value) for value in forbidden}\n"
+            "    pages = len(reader.pages)\n"
+            "    page_ok = (payload.get('expected_pages_min') is None or pages >= payload['expected_pages_min']) and (payload.get('expected_pages_max') is None or pages <= payload['expected_pages_max'])\n"
+            "    checks_passed = all(required_checks.values()) and all(forbidden_checks.values()) and page_ok\n"
+            "    data = {'status': 'ok', 'action_executed': True, 'committed': False, 'report_ref': report_ref, 'page_count': pages, 'pdf_bytes': len(pdf), 'pdf_sha256': hashlib.sha256(pdf).hexdigest(), 'required_text': required_checks, 'forbidden_text': forbidden_checks, 'page_count_ok': page_ok, 'artifact_assertion_passed': checks_passed}\n"
+            "except Exception as exc:\n"
+            "    data = {'status': 'failed', 'action_executed': True, 'committed': False, 'artifact_assertion_passed': False, 'error': str(exc), 'traceback': traceback.format_exc()[-8000:]}\n"
+            "finally:\n"
+            "    env.cr.rollback()\n"
+            "print(marker + json.dumps(data, ensure_ascii=False), flush=True)\n"
+            "PY\n"
+        )
+        result = self.run_shell(script, timeout_seconds=max(10, min(int(replay.get("timeout_seconds") or 180), 600)))
+        payload_line = next((line[len(marker):] for line in reversed((result.stdout or "").splitlines()) if line.startswith(marker)), "")
+        if not payload_line:
+            return OdooResult(status="failed", database=self._db_name(), error=(result.stderr or result.stdout or "Report replay returned no parseable result.")[-4000:])
+        try:
+            parsed = json.loads(payload_line)
+        except Exception as exc:
+            return OdooResult(status="failed", database=self._db_name(), error=f"Could not parse report replay JSON: {exc}")
+        begin_at = (result.stdout or "").find(begin_marker)
+        result_at = (result.stdout or "").find(marker, max(begin_at, 0))
+        action_output = (
+            (result.stdout or "")[begin_at + len(begin_marker):result_at]
+            if begin_at >= 0 and result_at >= 0
+            else ""
+        )
+        shell_blocks = self._extract_error_blocks(
+            "\n".join(filter(None, (action_output, result.stderr or "")))
+        )
+        correlated = self.correlated_logs(correlation_id, 150)
+        correlated_text = "\n".join(
+            line for line in (correlated.stdout or "").splitlines()
+            if line and "No correlated marker" not in line
+        )
+        correlated_blocks = [
+            block for block in self._extract_error_blocks(correlated_text)
+            if correlation_id in block
+        ]
+        fresh_blocks = list(dict.fromkeys([*shell_blocks, *correlated_blocks]))
+        parsed["fresh_errors"] = fresh_blocks[-10:]
+        parsed["fresh_error_count"] = len(fresh_blocks)
+        parsed["correlated_log_lines"] = [
+            line for line in correlated_text.splitlines() if correlation_id in line
+        ][-50:]
+        parsed["correlation_id"] = correlation_id
+        parsed["passed"] = bool(
+            parsed.get("status") == "ok"
+            and parsed.get("artifact_assertion_passed") is True
+            and result.exit_code == 0
+            and not fresh_blocks
+        )
+        return OdooResult(
+            status="ok" if parsed["passed"] else "failed",
+            database=self._db_name(),
+            result=parsed,
+            error=None if parsed["passed"] else str(parsed.get("error") or "Report artifact assertion failed.")[:4000],
         )
 
     def read_group(

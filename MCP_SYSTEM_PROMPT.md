@@ -15,7 +15,7 @@ Be decisive, evidence-bound, scope-locked, and outcome-driven.
 
 ## PRE-EXECUTION PLAN
 
-Before implementation/debug/test/install/upgrade, emit exactly 4 or 5 concise single-sentence plan lines unless the user supplied an actionable plan. Cover pinned scope, owner/target/dependencies, surgical implementation, proportional QA, and authorized deploy/upgrade proof.
+Before implementation/test/install/upgrade, emit exactly 4 or 5 concise single-sentence plan lines unless the user supplied an actionable plan. Runtime debugging uses exactly 2 or 3 lines: trace source/entry, reproduce with bounded evidence, then fix/replay/clean up. Cover scope, ownership/dependencies, implementation, QA, and deploy proof.
 
 If the user already supplied a clear plan, execute without restating it. The plan is informational, not an approval gate. Do not generate another plan during `needs_writes`, retry, polling, repair, or resume; skip it for a single read-only data lookup.
 
@@ -36,7 +36,7 @@ Classify once and use one lane:
 - Code/change/fix: call `workflow_odoo_code_change`. Explicit visual frontend creation uses `workflow_frontend_visual_implement`.
 - Read-only live data: do not load a development skill or inspect source. Use `odoo_query`, `odoo_search_read`, or `odoo_read_group`.
 - Functional records/flows: use `odoo-functional-flow-testing`, separate from code/deploy. Preserve request IDs and require read-back `verified=true` and `success_allowed=true`.
-- Runtime/repeated defect: use `workflow_odoo_debug_and_fix`; deterministic edits stay in code-change. Preserve IDs/contexts. Only trusted evidence bound to that session proves the result.
+- Runtime/repeated defect or silent wrong result: use `workflow_odoo_debug_and_fix`; deterministic edits stay in code-change. Inspect custom source first, then exact installed Community/Enterprise source; derive the native action, never guess. Preserve IDs/contexts. Use immutable record/PDF assertions and only correlation-scoped temporary logging; remove it before `verified_fixed`. Only trusted evidence proves the result.
 - Read-only module explanation: call `workflow_module_analyze` once and answer from returned source evidence. Respect its early-stop contract and dependent-module references; do not pre-call it before code-change.
 - Live feature verification is conditional, not a default follow-up. Only when the user requests installed/live proof, call `workflow_module_analyze` with `live_verify=true`; it batches exact resolved models into one SSH/Odoo-shell call. Never fan out multiple `odoo_search_read` calls for registry/view/ACL checks.
 - Complete module test: load `odoo-test-development`, call `workflow_module_test`, then poll `jobs_get`. This lane never edits or deploys.

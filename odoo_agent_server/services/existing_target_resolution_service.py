@@ -95,7 +95,12 @@ class ExistingTargetResolutionService:
         started = time.monotonic()
         mode = self._mode(hint, task_description, intent, create_module)
         clues = self._clues(hint, target_hint, task_description, change_request)
-        identifier = hint.identifier or (clues[0] if clues else None)
+        identifier = self._authoritative_identifier(
+            hint,
+            target_hint,
+            task_description,
+            change_request,
+        )
         kind = self._kind(
             hint,
             identifier,
@@ -277,6 +282,53 @@ class ExistingTargetResolutionService:
         if _NEW_WORDS.search(text):
             return "new"
         return "existing" if hint.identifier else "auto"
+
+    @staticmethod
+    def _authoritative_identifier(
+        hint: OdooTargetResolutionHint,
+        target_hint: str | None,
+        task: str,
+        change_request: dict[str, Any],
+    ) -> str | None:
+        """Return only an explicitly asserted technical target.
+
+        Bare snake_case tokens in evidence are useful search clues, but they may
+        be local variables, fixture names, or QA labels.  They must never become
+        the object-level write gate's target unless the caller structured,
+        labelled, quoted, or explicitly hinted them.
+        """
+        if hint.identifier:
+            return hint.identifier.strip()
+        for key in ("target", "identifier", "field", "method", "xml_id", "route", "template", "selector", "model"):
+            value = change_request.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        explicit_hint = str(target_hint or "").strip()
+        if explicit_hint:
+            if _EXACT_TECHNICAL_IDENTIFIER.fullmatch(explicit_hint):
+                return explicit_hint
+            embedded = list(dict.fromkeys(_EMBEDDED_TECHNICAL_IDENTIFIER.findall(explicit_hint)))
+            if len(embedded) == 1:
+                return embedded[0]
+
+        task_context = strip_vcs_target_context(task)
+        labelled = re.search(
+            r"\b(?:field|method|xml[_ -]?id|model|route|template|view|action|button)\b"
+            r"\s*(?:=|:|named\s+|called\s+)?\s*[`'\"]?"
+            r"(/[A-Za-z0-9_./{}:-]+|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*|[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+)"
+            r"[`'\"]?",
+            task_context,
+            re.I,
+        )
+        if labelled:
+            return labelled.group(1)
+        quoted = [
+            value.strip()
+            for value in re.findall(r"[`'\"]([^`'\"]{2,120})[`'\"]", task_context)
+            if _EXACT_TECHNICAL_IDENTIFIER.fullmatch(value.strip())
+        ]
+        return quoted[0] if len(set(quoted)) == 1 else None
 
     @staticmethod
     def _is_module_scope(

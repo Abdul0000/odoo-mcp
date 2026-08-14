@@ -70,9 +70,11 @@ from odoo_agent_server.schemas import (
     OdooDebugAndFixRequest,
     OdooFailureDiagnosis,
     OdooDebugRecordAssertion,
+    OdooDebugReportReplay,
     OdooDebugRuntimeReplay,
     OdooResult,
     ModuleAnalyzeRequest,
+    OdooTargetResolutionHint,
     OdooTargetResolutionResult,
 )
 
@@ -2434,6 +2436,127 @@ def test_runtime_replay_requires_explicit_mutation_authorization_and_assertion()
         _debug_payload("Download action raises an error", runtime_replay=replay)
 
 
+def test_report_replay_requires_read_only_discriminating_contract():
+    with pytest.raises(ValueError, match="text or page-count"):
+        OdooDebugReportReplay(
+            report_xml_id="account.action_report_invoice",
+            record_ids=[7],
+        )
+
+    trigger = OdooDebugRuntimeReplay(
+        model="account.report",
+        record_ids=[7],
+        method="action_print_pdf",
+        commit=False,
+    )
+    replay = OdooDebugReportReplay(
+        record_ids=[7],
+        trigger=trigger,
+        required_text=["Patient"],
+        forbidden_text=["Insurance Company", "Grand Total"],
+        expected_pages_max=2,
+    )
+
+    payload = _debug_payload("Patient PDF contains unrelated sections", report_replay=replay)
+    assert payload.report_replay.trigger.commit is False
+
+
+def test_report_truth_gate_accepts_failed_baseline_and_clean_passing_artifact(tmp_path):
+    session = {
+        "project_path": str(tmp_path),
+        "deploy_confirmed": True,
+        "report_replay": {"record_ids": [7]},
+        "baseline_report_replay": {
+            "action_executed": True,
+            "passed": False,
+            "fresh_error_count": 0,
+        },
+        "replay_report_replay": {
+            "action_executed": True,
+            "passed": True,
+            "fresh_error_count": 0,
+        },
+        "evidence_ledger": [],
+    }
+
+    truth = tools_router._debug_truth_gate(session)
+
+    assert truth["verified_fixed"] is True
+    assert truth["report_baseline_discriminating"] is True
+    assert truth["report_replay_passed"] is True
+
+
+def test_debug_truth_gate_blocks_remaining_temporary_instrumentation(tmp_path):
+    target = tmp_path / "custom_sale" / "models" / "report.py"
+    target.parent.mkdir(parents=True)
+    target.write_text("_logger.info('ODOO_MCP_DEBUG:dbg-pdf')\n", encoding="utf-8")
+    session = {
+        "project_path": str(tmp_path),
+        "deploy_confirmed": True,
+        "report_replay": {"record_ids": [7]},
+        "baseline_report_replay": {"action_executed": True, "passed": False},
+        "replay_report_replay": {"action_executed": True, "passed": True, "fresh_error_count": 0},
+        "instrumentation_ever_used": True,
+        "instrumentation_marker": "ODOO_MCP_DEBUG:dbg-pdf",
+        "instrumentation_paths": ["custom_sale/models/report.py"],
+    }
+
+    blocked = tools_router._debug_truth_gate(session)
+    assert blocked["verified_fixed"] is False
+    assert blocked["instrumentation_cleanup_passed"] is False
+
+    target.write_text("# functional fix; temporary logger removed\n", encoding="utf-8")
+    clean = tools_router._debug_truth_gate(session)
+    assert clean["verified_fixed"] is True
+
+    target.unlink()
+    missing = tools_router._debug_truth_gate(session)
+    assert missing["verified_fixed"] is False
+    assert missing["instrumentation_cleanup"]["missing_paths"] == ["custom_sale/models/report.py"]
+
+
+def test_debug_inspection_uses_module_scope_not_evidence_local_variable(monkeypatch):
+    _prepare_debug_workflow(monkeypatch)
+    captured = {}
+
+    async def fake_code_change(payload):
+        captured["payload"] = payload
+        return {"status": "needs_writes", "write_generation": {"contexts": []}}
+
+    monkeypatch.setattr(tools_router, "_workflow_odoo_code_change", fake_code_change)
+    result = asyncio.run(tools_router._workflow_odoo_debug_and_fix(
+        _debug_payload(
+            "Patient PDF still includes unrelated sections",
+            action="start",
+            runtime_evidence=["selected_section=False while selected_section appeared in three frames"],
+        )
+    ))
+
+    assert result["status"] == "debug_needs_writes"
+    assert captured["payload"].change_request["scope"] == "module"
+    assert captured["payload"].target_hint is None
+    assert "selected_section" in captured["payload"].task_description
+    assert len(result["debug_session"]["debug_plan"]) == 3
+
+
+def test_target_resolver_treats_bare_evidence_identifier_as_search_context_only():
+    resolver = tools_router.ExistingTargetResolutionService()
+    hint = OdooTargetResolutionHint()
+
+    assert resolver._authoritative_identifier(
+        hint,
+        None,
+        "Runtime evidence says selected_section was false in local state.",
+        {},
+    ) is None
+    assert resolver._authoritative_identifier(
+        hint,
+        None,
+        "Fix method: action_print_pdf after source inspection.",
+        {},
+    ) == "action_print_pdf"
+
+
 def test_runtime_replay_target_is_immutable_after_debug_start(monkeypatch):
     _prepare_debug_workflow(monkeypatch)
 
@@ -2561,6 +2684,99 @@ def test_odoosh_runtime_replay_rejects_fresh_error_even_when_method_returns(monk
 
     assert result.status == "failed"
     assert result.result["passed"] is False
+    assert result.result["fresh_error_count"] == 1
+
+
+def test_odoosh_report_replay_returns_bounded_artifact_proof(monkeypatch):
+    service = OdooShService()
+    monkeypatch.setattr(service, "_db_name", lambda: "test_db")
+    monkeypatch.setattr(service, "_odoo_path", lambda: "/home/odoo/src/odoo")
+    monkeypatch.setattr(service, "_addons_path_shell_setup", lambda: "")
+    captured = {}
+
+    def fake_run_shell(script, timeout_seconds=60):
+        captured["script"] = script
+        return CommandResult(
+            command=["ssh"],
+            cwd="odoosh:ssh",
+            exit_code=0,
+            stdout=(
+                "MCP_REPORT_REPLAY_BEGIN:dbg-pdf\n"
+                "MCP_REPORT_REPLAY_JSON:"
+                '{"status":"ok","action_executed":true,"committed":false,'
+                '"page_count":2,"pdf_bytes":2048,"pdf_sha256":"abc",'
+                '"required_text":{"Patient":true},'
+                '"forbidden_text":{"Insurance Company":true,"Grand Total":true},'
+                '"page_count_ok":true,"artifact_assertion_passed":true}\n'
+            ),
+        )
+
+    monkeypatch.setattr(service, "run_shell", fake_run_shell)
+    monkeypatch.setattr(
+        service,
+        "correlated_logs",
+        lambda correlation_id, tail_lines=150: CommandResult(
+            command=["odoosh.correlated_logs"], cwd="odoosh:ssh", exit_code=0,
+            stdout="2026-08-14 10:00:00 ERROR old unrelated request failed",
+        ),
+    )
+
+    result = service.report_replay(
+        {
+            "report_xml_id": "custom_sale.patient_report",
+            "record_ids": [7],
+            "required_text": ["Patient"],
+            "forbidden_text": ["Insurance Company", "Grand Total"],
+            "expected_pages_max": 2,
+        },
+        correlation_id="dbg-pdf",
+    )
+
+    assert result.status == "ok"
+    assert result.result["passed"] is True
+    assert result.result["page_count"] == 2
+    assert "text" not in result.result
+    assert "finally:\n    env.cr.rollback()" in captured["script"]
+
+
+def test_odoosh_report_replay_rejects_error_with_exact_correlation_marker(monkeypatch):
+    service = OdooShService()
+    monkeypatch.setattr(service, "_db_name", lambda: "test_db")
+    monkeypatch.setattr(service, "_odoo_path", lambda: "/home/odoo/src/odoo")
+    monkeypatch.setattr(service, "_addons_path_shell_setup", lambda: "")
+    monkeypatch.setattr(
+        service,
+        "run_shell",
+        lambda script, timeout_seconds=60: CommandResult(
+            command=["ssh"], cwd="odoosh:ssh", exit_code=0,
+            stdout=(
+                "MCP_REPORT_REPLAY_BEGIN:dbg-pdf\n"
+                "MCP_REPORT_REPLAY_JSON:"
+                '{"status":"ok","action_executed":true,"committed":false,'
+                '"page_count":1,"pdf_bytes":100,"pdf_sha256":"abc",'
+                '"artifact_assertion_passed":true}\n'
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        service,
+        "correlated_logs",
+        lambda correlation_id, tail_lines=150: CommandResult(
+            command=["odoosh.correlated_logs"], cwd="odoosh:ssh", exit_code=0,
+            stdout="2026-08-14 10:01:00 ERROR ODOO_MCP_DEBUG:dbg-pdf composite mismatch",
+        ),
+    )
+
+    result = service.report_replay(
+        {
+            "report_xml_id": "custom_sale.patient_report",
+            "record_ids": [7],
+            "required_text": ["Patient"],
+        },
+        correlation_id="dbg-pdf",
+    )
+
+    assert result.status == "failed"
     assert result.result["fresh_error_count"] == 1
 
 

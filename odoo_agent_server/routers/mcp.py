@@ -565,9 +565,7 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
         "current checkout, source, target, QA, and deploy gates before any mutation."
     ),
     "workflow.odoo_debug_and_fix": (
-        "Bounded runtime-debug workflow. It collects redacted evidence, diagnoses the exact failure, routes focused writes "
-        "through workflow.odoo_code_change, and replays an immutable assertion after deployment. Preserve debug/session IDs "
-        "and continue returned calls. Claim fixed only when truth_gate.verified_fixed=true."
+        "Source-first debugger for errors and silent wrong results. Preserve IDs and returned calls; claim fixed only when truth_gate.verified_fixed=true."
     ),
     "workflow.module_analyze": (
         "One-pass read-only addon analysis with bounded evidence, dependent-module references, early stop, and optional one-shell live verification."
@@ -671,6 +669,7 @@ def _remote_compatible_schema(schema: dict[str, Any]) -> dict[str, Any]:
             definition_name = ref.rsplit("/", 1)[-1]
             if definition_name in {
                 "OdooDebugRecordAssertion",
+                "OdooDebugReportReplay",
                 "OdooDebugRuntimeReplay",
                 "OdooDynamicFlowStep",
             }:
@@ -683,11 +682,11 @@ def _remote_compatible_schema(schema: dict[str, Any]) -> dict[str, Any]:
             if len(non_null) == 1:
                 base = clean(non_null[0])
                 if "description" in value and isinstance(base, dict):
-                    base.setdefault("description", " ".join(str(value["description"]).split())[:80])
+                    base.setdefault("description", " ".join(str(value["description"]).split())[:36])
                 return base
             return {
                 "type": "string",
-                "description": " ".join(str(value.get("description", "JSON value")).split())[:80],
+                "description": " ".join(str(value.get("description", "JSON value")).split())[:36],
             }
 
         out: dict[str, Any] = {}
@@ -698,7 +697,7 @@ def _remote_compatible_schema(schema: dict[str, Any]) -> dict[str, Any]:
                 # Tool descriptions carry the workflow contract. Field docs only
                 # need a compact hint; long examples materially inflate every
                 # tools/list response and the provider's planning context.
-                out[key] = " ".join(str(child).split())[:80]
+                out[key] = " ".join(str(child).split())[:36]
                 continue
             if key == "additionalProperties":
                 # Keep strict false, but drop complex schemas under additionalProperties.

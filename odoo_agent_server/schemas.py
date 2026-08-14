@@ -631,6 +631,79 @@ class OdooDebugRuntimeReplay(BaseModel):
         return self
 
 
+class OdooDebugReportReplay(BaseModel):
+    """Read-only rendering contract for one exact Odoo report scenario."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    report_xml_id: str | None = Field(
+        default=None,
+        description="Exact ir.actions.report XML ID; optional when trigger returns the report action.",
+    )
+    record_ids: list[int] = Field(..., min_length=1, max_length=20, description="Exact records rendered by the report.")
+    trigger: OdooDebugRuntimeReplay | None = Field(
+        default=None,
+        description="Optional read-only public method returning the exact report action used by the UI.",
+    )
+    data: dict[str, Any] = Field(default_factory=dict, description="Bounded report options/data passed to the native renderer.")
+    context: dict[str, Any] = Field(default_factory=dict, description="Bounded UI-equivalent Odoo context.")
+    user_id: int | None = Field(default=None, ge=1)
+    company_id: int | None = Field(default=None, ge=1)
+    required_text: list[str] = Field(default_factory=list, max_length=20)
+    forbidden_text: list[str] = Field(default_factory=list, max_length=20)
+    expected_pages_min: int | None = Field(default=None, ge=1, le=500)
+    expected_pages_max: int | None = Field(default=None, ge=1, le=500)
+    case_sensitive: bool = False
+    timeout_seconds: int = Field(default=180, ge=10, le=600)
+
+    @field_validator("report_xml_id")
+    @classmethod
+    def report_xml_id_must_be_safe(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_.]*", value):
+            raise ValueError("report_xml_id must be an exact safe external ID")
+        return value
+
+    @field_validator("record_ids")
+    @classmethod
+    def report_record_ids_must_be_unique(cls, values: list[int]) -> list[int]:
+        if any(int(value) <= 0 for value in values) or len(set(values)) != len(values):
+            raise ValueError("record_ids must contain unique positive IDs")
+        return values
+
+    @field_validator("required_text", "forbidden_text")
+    @classmethod
+    def report_text_checks_must_be_bounded(cls, values: list[str]) -> list[str]:
+        clean: list[str] = []
+        for value in values:
+            fragment = re.sub(r"\s+", " ", str(value or "")).strip()
+            if not fragment or len(fragment) > 500:
+                raise ValueError("report text checks must contain 1-500 characters")
+            if fragment not in clean:
+                clean.append(fragment)
+        return clean
+
+    @model_validator(mode="after")
+    def report_replay_must_be_read_only_and_discriminating(self):
+        if self.report_xml_id is None and self.trigger is None:
+            raise ValueError("report replay requires report_xml_id or an exact trigger method")
+        if self.trigger is not None and self.trigger.commit:
+            raise ValueError("report trigger must be read-only (commit=false)")
+        if not any((self.required_text, self.forbidden_text, self.expected_pages_min, self.expected_pages_max)):
+            raise ValueError("report replay requires a text or page-count assertion")
+        if (
+            self.expected_pages_min is not None
+            and self.expected_pages_max is not None
+            and self.expected_pages_min > self.expected_pages_max
+        ):
+            raise ValueError("expected_pages_min cannot exceed expected_pages_max")
+        if len(repr((self.data, self.context))) > 20_000:
+            raise ValueError("report data/context exceed the 20,000 character limit")
+        return self
+
+
 class OdooDebugRecordAssertion(BaseModel):
     """Immutable read-only live-Odoo assertion used before and after a fix."""
 
@@ -707,7 +780,8 @@ class OdooDebugEvidenceRecord(BaseModel):
     kind: Literal[
         "runtime_log", "traceback", "manual_observation", "code_inspection",
         "write_scope", "qa", "deploy", "module_upgrade", "baseline_assertion",
-        "replay_assertion", "runtime_replay", "recovery",
+        "replay_assertion", "runtime_replay", "artifact_replay", "correlated_log",
+        "native_source", "instrumentation_cleanup", "recovery",
     ]
     source: Literal["client", "odoo_mcp", "odoo_live", "job_store"]
     summary: str = Field(..., max_length=8000)
@@ -747,6 +821,10 @@ class OdooDebugAndFixRequest(BaseModel):
     runtime_replay: OdooDebugRuntimeReplay | None = Field(
         default=None,
         description="Optional authorized SSH/Odoo-shell record-method replay used before and after deployment.",
+    )
+    report_replay: OdooDebugReportReplay | None = Field(
+        default=None,
+        description="Optional read-only PDF replay and artifact assertion for silent report-output defects.",
     )
     writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=50, description="Exact writes generated from returned debug/code context.")
     job_id: str | None = Field(default=None, max_length=64, description="Safe-deploy job currently owned by this debug session.")
@@ -808,6 +886,8 @@ class OdooDebugAndFixRequest(BaseModel):
 
     @model_validator(mode="after")
     def runtime_replay_requires_acceptance_assertion(self):
+        if self.runtime_replay is not None and self.report_replay is not None:
+            raise ValueError("configure one exact replay scenario: runtime_replay or report_replay")
         if self.runtime_replay is not None and self.verification_assertion is None:
             raise ValueError("runtime_replay requires verification_assertion for independent database proof")
         return self
