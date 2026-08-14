@@ -1580,6 +1580,91 @@ def _exact_model_target_cluster(
     return list(dict.fromkeys([*exact, *ranked_paths]))[:4]
 
 
+def _new_model_scaffold_target_paths(
+    project: Path,
+    module_root_rel: str,
+    payload: OdooCodeChangeRequest,
+) -> list[str]:
+    """Return deterministic wiring and new-file paths for an exact new model."""
+    resolution = payload.target_resolution
+    mode = str(getattr(resolution, "mode", "auto") or "auto")
+    kind = str(getattr(resolution, "kind", "auto") or "auto")
+    model = str(getattr(resolution, "model", None) or getattr(resolution, "identifier", None) or "").strip()
+    if mode != "new" or kind != "model" or not re.fullmatch(
+        r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+", model
+    ):
+        return []
+
+    module_dir = (project / module_root_rel).resolve()
+    stem = model.replace(".", "_")
+    menu_candidates = sorted((module_dir / "views").glob("*menu*.xml")) if (module_dir / "views").is_dir() else []
+    menu_path = (
+        menu_candidates[0].relative_to(project).as_posix()
+        if menu_candidates
+        else f"{module_root_rel.rstrip('/')}/views/{stem}_menus.xml"
+    )
+    return list(dict.fromkeys([
+        f"{module_root_rel.rstrip('/')}/__manifest__.py",
+        f"{module_root_rel.rstrip('/')}/models/__init__.py",
+        f"{module_root_rel.rstrip('/')}/security/ir.model.access.csv",
+        menu_path,
+        f"{module_root_rel.rstrip('/')}/models/{stem}.py",
+        f"{module_root_rel.rstrip('/')}/views/{stem}_views.xml",
+    ]))
+
+
+def _new_model_scaffold_is_self_contained(
+    *,
+    project: Path,
+    module_root_rel: str,
+    payload: OdooCodeChangeRequest,
+    target_files: list[str],
+) -> bool:
+    """Skip installed-source fan-out for a locally closed new-model scaffold."""
+    expected = _new_model_scaffold_target_paths(project, module_root_rel, payload)
+    if not expected:
+        return False
+    normalized_targets = {
+        str(path).replace("\\", "/").lstrip("./")
+        for path in target_files
+        if str(path).strip()
+    }
+    if not set(expected).issubset(normalized_targets):
+        return False
+
+    resolution = payload.target_resolution
+    target_model = str(getattr(resolution, "model", None) or getattr(resolution, "identifier", None) or "")
+    module_dir = (project / module_root_rel).resolve()
+    owned_models: set[str] = set()
+    models_dir = module_dir / "models"
+    if models_dir.is_dir():
+        for path in models_dir.rglob("*.py"):
+            try:
+                source = path.read_text(encoding="utf-8", errors="replace")[:500_000]
+            except OSError:
+                continue
+            owned_models.update(re.findall(
+                r"\b_name\s*=\s*['\"]([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)['\"]",
+                source,
+            ))
+
+    task_text = " ".join(filter(None, (
+        payload.task_description,
+        payload.intent,
+        payload.target_hint,
+        json.dumps(payload.change_request, ensure_ascii=False, sort_keys=True, default=str),
+    ))).lower()
+    referenced_models = set(re.findall(
+        r"\b[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+\b",
+        task_text,
+    ))
+    referenced_models = {
+        model for model in referenced_models
+        if not model.startswith(("ir.", "base.", "fields.", "models."))
+    }
+    return referenced_models.issubset(owned_models | {target_model})
+
+
 def _contract_candidate_paths(
     project: Path,
     module_path: str,
@@ -4684,6 +4769,18 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
             for raw in payload.target_files
             if str(raw or "").strip()
         ))
+        if not direct_targets:
+            direct_targets = _new_model_scaffold_target_paths(project, module.path, payload)
+            if direct_targets:
+                search_results.append({
+                    "engine": "new_model_scaffold",
+                    "status": "ok",
+                    "target_count": len(direct_targets),
+                    "paths": direct_targets,
+                })
+                for rel in direct_targets:
+                    if rel not in custom_rel_paths:
+                        custom_rel_paths.append(rel)
         if direct_targets:
             search_results.append({"engine": "direct_target", "status": "ok", "target_count": len(direct_targets)})
             for target_rel in direct_targets[:50]:
@@ -4884,7 +4981,7 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
     # supplied target file made focused controller fixes scan unrelated models
     # and escalate to L3/L4. Keep the manifest plus exact write files on write
     # passes; inspection mode keeps the focused search files.
-    discovered_target_files = payload.target_files or focused_paths
+    discovered_target_files = payload.target_files or direct_targets or focused_paths
     scope_file_paths, focused_scope = _focused_scope_file_paths(
         project=project,
         module_name=effective_module_name,
@@ -4910,6 +5007,14 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         module_root_rel=module_root_rel,
         target_files=discovered_target_files,
         writes=list(payload.writes or generated_writes),
+    ) or _new_model_scaffold_is_self_contained(
+        project=project,
+        module_root_rel=module_root_rel,
+        payload=payload,
+        target_files=[
+            *discovered_target_files,
+            *[str(write.relative_path) for write in (payload.writes or generated_writes)],
+        ],
     )
     scope = None
     scope_payload: ScopeAdviceRequest | None = None

@@ -31,6 +31,8 @@ from odoo_agent_server.routers.tools import (
     _exact_write_context,
     _exact_custom_targets_are_self_contained,
     _exact_model_target_cluster,
+    _new_model_scaffold_is_self_contained,
+    _new_model_scaffold_target_paths,
     _focused_search,
     _infer_code_change_search_patterns,
     _inline_write_contexts,
@@ -1509,6 +1511,63 @@ def test_exact_model_target_cluster_keeps_treatment_model_and_primary_view(tmp_p
         "models/clinic_treatment.py",
         "views/clinic_treatment_views.xml",
     ]
+
+
+def test_new_model_scaffold_targets_exact_wiring_and_skips_core_fanout(tmp_path):
+    project = tmp_path / "repo"
+    module = project / "clinic_management"
+    (module / "models").mkdir(parents=True)
+    (module / "views").mkdir()
+    (module / "security").mkdir()
+    (module / "__manifest__.py").write_text("{'name': 'Clinic'}\n", encoding="utf-8")
+    (module / "models" / "__init__.py").write_text("from . import clinic_patient\n", encoding="utf-8")
+    (module / "models" / "clinic_patient.py").write_text(
+        "from odoo import models\nclass Patient(models.Model):\n    _name = 'clinic.patient'\n",
+        encoding="utf-8",
+    )
+    (module / "models" / "clinic_doctor.py").write_text(
+        "from odoo import models\nclass Doctor(models.Model):\n    _name = 'clinic.doctor'\n",
+        encoding="utf-8",
+    )
+    (module / "security" / "ir.model.access.csv").write_text(
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n",
+        encoding="utf-8",
+    )
+    (module / "views" / "clinic_menus.xml").write_text(
+        '<odoo><menuitem id="menu_clinic_root" name="Clinic"/></odoo>\n',
+        encoding="utf-8",
+    )
+    payload = OdooCodeChangeRequest(
+        module_name="clinic_management",
+        task_description=(
+            "Add a new clinic.test model with patient_id linked to clinic.patient and "
+            "doctor_id linked to clinic.doctor, list and form views, ACL, action, and menu."
+        ),
+        target_resolution={
+            "mode": "new",
+            "kind": "model",
+            "identifier": "clinic.test",
+            "model": "clinic.test",
+            "require_live": False,
+        },
+    )
+
+    targets = _new_model_scaffold_target_paths(project, "clinic_management", payload)
+
+    assert targets == [
+        "clinic_management/__manifest__.py",
+        "clinic_management/models/__init__.py",
+        "clinic_management/security/ir.model.access.csv",
+        "clinic_management/views/clinic_menus.xml",
+        "clinic_management/models/clinic_test.py",
+        "clinic_management/views/clinic_test_views.xml",
+    ]
+    assert _new_model_scaffold_is_self_contained(
+        project=project,
+        module_root_rel="clinic_management",
+        payload=payload,
+        target_files=targets,
+    ) is True
 
 
 def test_exact_core_extension_still_requires_installed_source_scope(tmp_path):

@@ -402,11 +402,11 @@ class OdooModuleValidator:
 
         view_types = [
             view_type for view_type, terms in (
-                ("list", ("list view", "tree view", "tree,", "tree (")),
+                ("list", ("list view", "list and form", "list/form", "list,form", "tree view", "tree,", "tree (")),
                 ("form", ("form view", "detail view")),
                 ("search", ("search view", "advanced filtering")),
                 ("kanban", ("kanban",)),
-                ("menu", ("menu item", "menu items", "menus")),
+                ("menu", ("menu", "menu item", "menu items", "menus")),
                 ("action", ("window action", "ir.actions.act_window", "actions and menus")),
             ) if any(
                 OdooModuleValidator._contract_term_is_positive(lowered, term)
@@ -418,8 +418,8 @@ class OdooModuleValidator:
 
         layers = [
             layer for layer, terms in (
-                ("models", ("data model", "models", "all python models", "model:")),
-                ("security", ("security", "access rights", "record rule", "user group")),
+                ("models", ("data model", "models", "all python models", "model:", "new model", "model with")),
+                ("security", ("security", "access rights", "record rule", "user group", "acl", "ir.model.access")),
                 ("views", ("xml view", "views", "all xml views", "list view", "form view", "kanban")),
                 ("dashboard", ("dashboard",)),
                 ("demo", ("demo data",)),
@@ -443,7 +443,13 @@ class OdooModuleValidator:
         ):
             layers.append("report")
 
-        models = sorted(set(re.findall(r"(?im)^\s*#{2,4}\s*Model:\s*`([^`]+)`", text)))
+        models = set(re.findall(r"(?im)^\s*#{2,4}\s*Model:\s*`([^`]+)`", text))
+        models.update(re.findall(
+            r"\b(?:add|create|implement|introduce)\s+(?:a\s+|an\s+|the\s+)?(?:new\s+)?"
+            r"([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)\s+model\b",
+            lowered,
+        ))
+        models = sorted(models)
         routes: set[str] = set()
         for quoted in re.findall(r"`([^`]+)`", text):
             if quoted.startswith("/"):

@@ -371,6 +371,17 @@ def test_positive_layer_after_preservation_clause_is_still_requested():
     assert "security" in contract["required_layers"]
 
 
+def test_new_model_menu_prompt_builds_complete_small_feature_contract():
+    contract = OdooModuleValidator.requested_contract(
+        "Add a new clinic.test model with five fields, an internal-user ACL via "
+        "ir.model.access, list and form views, a window action, and a Tests menu."
+    )
+
+    assert contract["required_models"] == ["clinic.test"]
+    assert {"models", "security", "views"} <= set(contract["required_layers"])
+    assert {"list", "form", "menu", "action"} <= set(contract["required_view_types"])
+
+
 def test_session_note_contract_blocks_structural_only_implementation(tmp_path):
     module = tmp_path / "rethink"
     (module / "models").mkdir(parents=True)
