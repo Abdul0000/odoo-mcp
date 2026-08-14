@@ -166,7 +166,10 @@ from ..services.module_analysis_service import ModuleAnalysisService
 from ..services.live_assertion_service import LiveAssertionService
 from ..services.functional_operation_service import FunctionalOperationService
 from ..services.module_test_service import ModuleTestService
-from ..services.existing_target_resolution_service import ExistingTargetResolutionService
+from ..services.existing_target_resolution_service import (
+    ExistingTargetResolutionService,
+    strip_vcs_target_context,
+)
 from ..services.coding_session_service import CodingSessionService, CodingWorkspaceService
 from ..services.verification_proof_service import VerificationProofService
 from ..services.background_executor import submit_background
@@ -1426,7 +1429,7 @@ def _task_description_search_clues(description: str, *, limit: int = 10) -> list
     safe exact-search inputs. Generic prose is deliberately ignored so repository
     inspection stays focused and deterministic.
     """
-    text = str(description or "")
+    text = strip_vcs_target_context(description)
     candidates: list[str] = []
     patterns = (
         r"`([^`\r\n]{2,160})`",
@@ -3081,6 +3084,72 @@ def _focused_scope_file_paths(
     return list(custom_file_paths), False
 
 
+def _exact_custom_targets_are_self_contained(
+    *,
+    project: Path,
+    module_name: str,
+    module_root_rel: str,
+    target_files: list[str],
+    writes: list[OdooCodeFileChange],
+) -> bool:
+    """Recognise small exact custom-file edits that need no installed-source fan-out.
+
+    This is deliberately conservative.  A Python extension class without its
+    own ``_name`` or an XML/QWeb inheritance reference still takes the normal
+    Core/Enterprise inspection path.  A client-owned model declaring ``_name``
+    may include standard mixins without turning a local field/view edit into a
+    broad parent-model scan.
+    """
+    raw_paths = [str(item) for item in target_files if str(item).strip()]
+    raw_paths.extend(str(write.relative_path) for write in writes if str(write.relative_path).strip())
+    raw_paths = list(dict.fromkeys(raw_paths))
+    if not raw_paths or len(raw_paths) > 3:
+        return False
+
+    supported = False
+    for raw in raw_paths:
+        try:
+            relative = _safe_module_relative(module_name, raw, module_root_rel)
+            path = (project / relative).resolve()
+            path.relative_to((project / module_root_rel).resolve())
+        except (HTTPException, OSError, ValueError):
+            return False
+        if not path.is_file() or path.suffix.lower() not in {".py", ".xml"}:
+            return False
+        text = path.read_text(encoding="utf-8", errors="replace")
+        supported = True
+        if path.suffix.lower() == ".py":
+            try:
+                tree = ast.parse(text)
+            except SyntaxError:
+                return False
+            for node in tree.body:
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                attributes = {
+                    target.id
+                    for statement in node.body
+                    if isinstance(statement, ast.Assign)
+                    for target in statement.targets
+                    if isinstance(target, ast.Name)
+                }
+                if "_inherits" in attributes:
+                    return False
+                if "_inherit" in attributes and "_name" not in attributes:
+                    return False
+        else:
+            for match in re.finditer(
+                r"\b(?:inherit_id|t-call|t-inherit)\s*=\s*['\"]([^'\"]+)['\"]|"
+                r"<field\b[^>]*\bname\s*=\s*['\"]inherit_id['\"][^>]*\bref\s*=\s*['\"]([^'\"]+)['\"]",
+                text,
+                flags=re.I,
+            ):
+                reference = next((value for value in match.groups() if value), "")
+                if "." in reference and reference.split(".", 1)[0] != module_name:
+                    return False
+    return supported
+
+
 def _scope_focus_identifiers(payload: OdooCodeChangeRequest) -> list[str]:
     """Return exact technical symbols that may safely constrain scope advice.
 
@@ -3089,7 +3158,7 @@ def _scope_focus_identifiers(payload: OdooCodeChangeRequest) -> list[str]:
     snake-case/dotted identifiers take precedence over descriptive prose.
     """
     text = " ".join(filter(None, (
-        payload.task_description,
+        strip_vcs_target_context(payload.task_description),
         payload.target_hint,
         payload.intent,
     )))
@@ -4633,9 +4702,10 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         for rel in focused_paths[: adaptive_profile["inspection_file_limit"]]:
             if rel and rel not in custom_rel_paths:
                 custom_rel_paths.append(rel)
-        for rel in _contract_candidate_paths(project, module.path, payload, module_contract):
-            if rel and rel not in custom_rel_paths:
-                custom_rel_paths.append(rel)
+        if not direct_targets:
+            for rel in _contract_candidate_paths(project, module.path, payload, module_contract):
+                if rel and rel not in custom_rel_paths:
+                    custom_rel_paths.append(rel)
 
     generated_writes: list[OdooCodeFileChange] = []
     generated_autopatch_strategy: str | None = None
@@ -4749,10 +4819,47 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
         for w in (payload.writes or generated_writes)
     ]
     frontend_fast_path = _static_frontend_fast_path(write_rel_paths)
+    exact_custom_scope = _exact_custom_targets_are_self_contained(
+        project=project,
+        module_name=effective_module_name,
+        module_root_rel=module_root_rel,
+        target_files=payload.target_files,
+        writes=list(payload.writes or generated_writes),
+    )
     scope = None
     scope_payload: ScopeAdviceRequest | None = None
     if frontend_fast_path:
         steps.append({"step": "workflow.scope_advice", "status": "skipped", "reason": "static frontend fast path"})
+    elif exact_custom_scope:
+        from ..schemas import ScopeAdviceResult, ScopeLevel
+        scope_payload = ScopeAdviceRequest(
+            custom_module_name=effective_module_name,
+            custom_file_paths=scope_file_paths,
+            task_description=payload.task_description,
+            client_name=client_name,
+            focus_identifiers=_scope_focus_identifiers(payload),
+        )
+        scope = ScopeAdviceResult(
+            custom_module=effective_module_name,
+            reached_level=ScopeLevel.L0,
+            instructions=[],
+            mandatory_count=0,
+            total_count=0,
+            focus_applied=True,
+            focus_identifiers=scope_payload.focus_identifiers,
+            warning=(
+                "Exact client-owned files are self-contained; installed-source fan-out is not required. "
+                "Normal QA, registry, upgrade, and deployment verification remain mandatory."
+            ),
+        )
+        gate.record_scope_advice(scope, scope_payload)
+        steps.append({
+            "step": "workflow.scope_advice",
+            "status": "skipped_exact_custom_scope",
+            "mandatory_count": 0,
+            "reached_level": "L0",
+            "focus_applied": True,
+        })
     else:
         scope_payload = ScopeAdviceRequest(
             custom_module_name=effective_module_name,

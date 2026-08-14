@@ -463,6 +463,37 @@ def test_module_wide_redesign_does_not_treat_module_name_as_single_field(tmp_pat
     assert result.live_checked is False
 
 
+def test_git_branch_name_is_not_resolved_as_an_odoo_target(tmp_path):
+    project, module, paths = _module(tmp_path, {
+        "models/clinic_patient.py": (
+            "from odoo import fields, models\n"
+            "class ClinicPatient(models.Model):\n"
+            "    _name = 'clinic.patient'\n"
+            "    note = fields.Text()\n"
+        ),
+    })
+
+    result = ExistingTargetResolutionService().resolve(
+        project=project,
+        module_path=module,
+        module_name="sample",
+        task_description="Add a Notes notebook page and push to test_18.",
+        target_hint=None,
+        intent=None,
+        task_type="xml_view",
+        change_request={},
+        hint=OdooTargetResolutionHint(),
+        candidate_paths=paths,
+        planned_paths=["sample/models/clinic_patient.py"],
+        client=None,
+        create_module=False,
+    )
+
+    assert result.identifier is None
+    assert result.status == "scope_verified"
+    assert result.writes_blocked is False
+
+
 def test_new_target_collision_blocks_but_absent_target_proceeds(tmp_path):
     project, module, paths = _module(tmp_path, {
         "models/res_partner.py": (

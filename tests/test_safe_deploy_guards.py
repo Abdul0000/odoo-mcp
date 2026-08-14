@@ -17,7 +17,7 @@ from odoo_agent_server.services.odoosh_service import OdooShService
 from odoo_agent_server.services.repo_service import RepoService
 from odoo_agent_server.services.store_service import JsonStore
 from odoo_agent_server.services.workflow_guard_service import safe_deploy_shell_block
-from odoo_agent_server.routers.workflow import _pre_push_verify_files
+from odoo_agent_server.routers.workflow import _infer_registry_fields_from_python, _pre_push_verify_files
 from odoo_agent_server.routers import tools, workflow
 
 
@@ -62,6 +62,28 @@ def _init_repo(path):
     (path / "README.md").write_text("ok\n", encoding="utf-8")
     subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
     subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.local", "commit", "-m", "init"], cwd=path, check=True, capture_output=True, text=True)
+
+
+def test_registry_field_inference_prefers_explicit_name_over_mixin_inherit(tmp_path):
+    project = tmp_path / "repo"
+    source = project / "clinic_management" / "models" / "clinic_patient.py"
+    source.parent.mkdir(parents=True)
+    source.write_text(
+        "from odoo import fields, models\n\n"
+        "class ClinicPatient(models.Model):\n"
+        "    _name = 'clinic.patient'\n"
+        "    _inherit = ['mail.thread', 'mail.activity.mixin']\n"
+        "    note = fields.Text()\n",
+        encoding="utf-8",
+    )
+
+    inferred = _infer_registry_fields_from_python(
+        project,
+        "clinic_management",
+        [str(source)],
+    )
+
+    assert inferred == {"clinic.patient": ["note"]}
 
 
 def test_safe_deploy_starter_failure_returns_report(monkeypatch, tmp_path):

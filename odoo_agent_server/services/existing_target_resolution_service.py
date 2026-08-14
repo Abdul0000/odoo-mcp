@@ -43,6 +43,24 @@ _EMBEDDED_TECHNICAL_IDENTIFIER = re.compile(
     r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+"
     r")(?![\w])"
 )
+_VCS_TARGET_CONTEXT = re.compile(
+    r"\b(?:git\s+)?(?:branch|checkout|target\s+branch)\s*[:=]?\s*[`'\"]?"
+    r"[A-Za-z0-9][A-Za-z0-9._/-]*[`'\"]?|"
+    r"\b(?:push(?:\s+(?:it|code))?|deploy)\s+(?:to|on)\s+(?:the\s+)?(?:branch\s+)?[`'\"]?"
+    r"[A-Za-z0-9][A-Za-z0-9._/-]*[`'\"]?",
+    re.I,
+)
+
+
+def strip_vcs_target_context(text: str) -> str:
+    """Remove Git routing phrases before extracting Odoo identifiers.
+
+    Branches frequently look like valid Odoo snake-case symbols (for example
+    ``test_18``).  They remain available to Git/client resolution through the
+    original payload, but must never participate in model/field/view target
+    resolution.
+    """
+    return _VCS_TARGET_CONTEXT.sub(" ", str(text or ""))
 
 
 class ExistingTargetResolutionService:
@@ -308,7 +326,9 @@ class ExistingTargetResolutionService:
         # example "aba.recon.match.line invoice_id / Bill linkage". Never use
         # that entire sentence as an Odoo identifier. Prefer embedded snake-
         # case symbols (usually fields/methods), then routes and dotted names.
-        combined = "\n".join(filter(None, (target_hint, task)))
+        target_context = str(target_hint or "")
+        task_context = strip_vcs_target_context(task)
+        combined = "\n".join(filter(None, (target_context, task_context)))
         embedded = list(dict.fromkeys(_EMBEDDED_TECHNICAL_IDENTIFIER.findall(combined)))
         embedded.sort(key=lambda value: (
             0 if "_" in value and "." not in value and not value.startswith("/") else
@@ -319,7 +339,7 @@ class ExistingTargetResolutionService:
         raw.extend(embedded)
         if target_hint and _EXACT_TECHNICAL_IDENTIFIER.fullmatch(target_hint.strip()):
             raw.append(target_hint)
-        raw.extend(re.findall(r"[`'\"]([^`'\"]{2,120})[`'\"]", task))
+        raw.extend(re.findall(r"[`'\"]([^`'\"]{2,120})[`'\"]", task_context))
         result: list[str] = []
         for value in raw:
             value = value.strip()
@@ -367,7 +387,10 @@ class ExistingTargetResolutionService:
         value = change_request.get("model")
         if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.]+", value):
             return value
-        models = re.findall(r"\b[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+\b", task)
+        models = re.findall(
+            r"\b[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+\b",
+            strip_vcs_target_context(task),
+        )
         for model in models:
             if model != identifier and not model.startswith(("ir.ui.", "ir.actions.")):
                 return model

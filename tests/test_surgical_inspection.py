@@ -29,6 +29,7 @@ from odoo_agent_server.routers.tools import (
     _detect_debug_surface,
     _redact_debug_text,
     _exact_write_context,
+    _exact_custom_targets_are_self_contained,
     _focused_search,
     _infer_code_change_search_patterns,
     _inline_write_contexts,
@@ -1378,6 +1379,133 @@ def test_write_context_overflow_preserves_complete_units_for_artifact():
     assert complete is False
     assert inline == [contexts[0]]
     assert contexts[1]["content"] == "x" * 6000
+
+
+def test_exact_custom_model_and_view_scope_skips_installed_source_fanout(tmp_path):
+    project = tmp_path / "repo"
+    model = project / "clinic_management" / "models" / "clinic_patient.py"
+    view = project / "clinic_management" / "views" / "clinic_patient_views.xml"
+    model.parent.mkdir(parents=True)
+    view.parent.mkdir(parents=True)
+    model.write_text(
+        "from odoo import fields, models\n"
+        "class ClinicPatient(models.Model):\n"
+        "    _name = 'clinic.patient'\n"
+        "    _inherit = ['mail.thread', 'mail.activity.mixin']\n"
+        "    name = fields.Char()\n",
+        encoding="utf-8",
+    )
+    view.write_text(
+        "<odoo><record id=\"clinic_patient_form\" model=\"ir.ui.view\">"
+        "<field name=\"model\">clinic.patient</field>"
+        "<field name=\"arch\" type=\"xml\"><form><sheet/></form></field>"
+        "</record></odoo>",
+        encoding="utf-8",
+    )
+
+    assert _exact_custom_targets_are_self_contained(
+        project=project,
+        module_name="clinic_management",
+        module_root_rel="clinic_management",
+        target_files=[
+            "clinic_management/models/clinic_patient.py",
+            "clinic_management/views/clinic_patient_views.xml",
+        ],
+        writes=[],
+    ) is True
+
+
+def test_exact_core_extension_still_requires_installed_source_scope(tmp_path):
+    project = tmp_path / "repo"
+    model = project / "custom_sale" / "models" / "sale_order.py"
+    model.parent.mkdir(parents=True)
+    model.write_text(
+        "from odoo import models\n"
+        "class SaleOrder(models.Model):\n"
+        "    _inherit = 'sale.order'\n",
+        encoding="utf-8",
+    )
+
+    assert _exact_custom_targets_are_self_contained(
+        project=project,
+        module_name="custom_sale",
+        module_root_rel="custom_sale",
+        target_files=["custom_sale/models/sale_order.py"],
+        writes=[],
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_exact_custom_two_file_workflow_avoids_broad_scope_call(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
+    monkeypatch.setattr(settings, "allowed_roots_raw", str(tmp_path))
+    project = tmp_path / "repo"
+    module = project / "clinic_management"
+    model = module / "models" / "clinic_patient.py"
+    view = module / "views" / "clinic_patient_views.xml"
+    model.parent.mkdir(parents=True)
+    view.parent.mkdir(parents=True)
+    (module / "__init__.py").write_text("from . import models\n", encoding="utf-8")
+    (model.parent / "__init__.py").write_text("from . import clinic_patient\n", encoding="utf-8")
+    (module / "__manifest__.py").write_text(
+        "{'name': 'Clinic', 'version': '18.0.1.0.0', 'depends': ['mail'], "
+        "'data': ['views/clinic_patient_views.xml']}\n",
+        encoding="utf-8",
+    )
+    model.write_text(
+        "from odoo import fields, models\n"
+        "class ClinicPatient(models.Model):\n"
+        "    _name = 'clinic.patient'\n"
+        "    _inherit = ['mail.thread', 'mail.activity.mixin']\n"
+        "    name = fields.Char()\n",
+        encoding="utf-8",
+    )
+    view.write_text(
+        "<odoo><record id=\"clinic_patient_form\" model=\"ir.ui.view\">"
+        "<field name=\"name\">clinic.patient.form</field>"
+        "<field name=\"model\">clinic.patient</field>"
+        "<field name=\"arch\" type=\"xml\"><form><sheet/></form></field>"
+        "</record></odoo>",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init"], cwd=project, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=project, check=True)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=project, check=True, capture_output=True)
+    monkeypatch.setattr(
+        tools_router.ClientResolverService,
+        "resolve_client",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        tools_router,
+        "scope_advice",
+        lambda *_args, **_kwargs: pytest.fail("exact self-contained targets called broad scope advice"),
+    )
+
+    result = await tools_router._workflow_odoo_code_change_impl(OdooCodeChangeRequest(
+        project_path=str(project),
+        module_name="clinic_management",
+        task_description=(
+            "Add a Notes notebook page with a note field. Preserve existing security and push to test_18."
+        ),
+        task_type="xml_view",
+        target_files=[
+            "clinic_management/models/clinic_patient.py",
+            "clinic_management/views/clinic_patient_views.xml",
+        ],
+        auto_deploy=False,
+    ))
+
+    assert result["status"] == "needs_writes"
+    scope_step = next(step for step in result["steps"] if step["step"] == "workflow.scope_advice")
+    core_step = next(step for step in result["steps"] if step["step"] == "repo.read_core")
+    custom_step = next(step for step in result["steps"] if step["step"] == "repo.read_custom")
+    assert scope_step["status"] == "skipped_exact_custom_scope"
+    assert core_step["count"] == 0
+    assert custom_step["count"] == 3
+    assert result["target_resolution"]["identifier"] is None
 
 
 @pytest.mark.asyncio

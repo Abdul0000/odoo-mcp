@@ -332,6 +332,43 @@ class OdooModuleValidator:
         )
 
     @staticmethod
+    def _contract_term_is_positive(text: str, term: str) -> bool:
+        """Return whether a contract term is requested, not merely preserved.
+
+        Task prompts commonly lock scope with phrases such as ``preserve
+        security`` or ``no changes to actions``.  Those references describe a
+        non-goal and must not manufacture a required module layer.  The nearest
+        directive in the same clause wins, so ``preserve security and add a
+        form view`` still requests the view.
+        """
+        directive = re.compile(
+            r"\b(?:"
+            r"preserve|keep|retain|leave|avoid|without|"
+            r"do\s+not|don't|must\s+not|no|no\s+changes?\s+(?:to|in)|"
+            r"add|create|implement|include|require|update|modify|change|build"
+            r")\b",
+            re.I,
+        )
+        negative = re.compile(
+            r"^(?:preserve|keep|retain|leave|avoid|without|do\s+not|don't|must\s+not|no|no\s+changes?)$",
+            re.I,
+        )
+        for match in re.finditer(re.escape(term), text, flags=re.I):
+            clause_start = max(
+                text.rfind(separator, 0, match.start())
+                for separator in (".", ";", "\n")
+            ) + 1
+            prefix = text[clause_start:match.start()]
+            directives = list(directive.finditer(prefix))
+            if directives and negative.match(directives[-1].group(0).strip()):
+                continue
+            suffix = text[match.end():match.end() + 50]
+            if re.match(r"\s+(?:must\s+remain\s+)?(?:unchanged|unmodified|as[- ]is)\b", suffix, re.I):
+                continue
+            return True
+        return False
+
+    @staticmethod
     def requested_contract(task_description: str, create_module: bool = False) -> dict:
         text = str(task_description or "")
         lowered = text.lower()
@@ -347,7 +384,7 @@ class OdooModuleValidator:
             ("wizard", ("wizard",)),
         )
         for package, terms in package_rules:
-            if any(term in lowered for term in terms):
+            if any(OdooModuleValidator._contract_term_is_positive(lowered, term) for term in terms):
                 packages.append(package)
         # Arbitrary technical package names requested as folders/directories
         # are part of the contract; this is not limited to known Odoo folders.
@@ -371,7 +408,10 @@ class OdooModuleValidator:
                 ("kanban", ("kanban",)),
                 ("menu", ("menu item", "menu items", "menus")),
                 ("action", ("window action", "ir.actions.act_window", "actions and menus")),
-            ) if any(term in lowered for term in terms)
+            ) if any(
+                OdooModuleValidator._contract_term_is_positive(lowered, term)
+                for term in terms
+            )
         ]
         if "menu" in view_types and any(view_type in view_types for view_type in ("list", "form", "kanban")):
             view_types.append("action")
@@ -387,14 +427,20 @@ class OdooModuleValidator:
                 ("controllers", ("controller", "endpoint", "route")),
                 ("handlers", ("iot_handlers", "interface", "driver")),
                 ("wizard", ("wizard",)),
-            ) if any(term in lowered for term in terms)
+            ) if any(
+                OdooModuleValidator._contract_term_is_positive(lowered, term)
+                for term in terms
+            )
         ]
         if tests_explicitly_requested:
             if "tests" not in packages:
                 packages.append("tests")
             if "tests" not in layers:
                 layers.append("tests")
-        if re.search(r"\breports?\b", lowered):
+        if any(
+            OdooModuleValidator._contract_term_is_positive(lowered, term)
+            for term in ("report", "reports")
+        ):
             layers.append("report")
 
         models = sorted(set(re.findall(r"(?im)^\s*#{2,4}\s*Model:\s*`([^`]+)`", text)))

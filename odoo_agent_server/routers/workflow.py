@@ -1147,22 +1147,32 @@ def _infer_registry_fields_from_python(
         for node in tree.body:
             if not isinstance(node, ast.ClassDef):
                 continue
-            model_name: str | None = None
+            explicit_name: str | None = None
+            inherited_names: list[str] = []
             for stmt in node.body:
                 if not isinstance(stmt, ast.Assign):
                     continue
                 targets = [target.id for target in stmt.targets if isinstance(target, ast.Name)]
                 if not targets:
                     continue
-                if any(target in {"_inherit", "_name"} for target in targets):
-                    value = stmt.value
-                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
-                        model_name = value.value
-                    elif isinstance(value, (ast.List, ast.Tuple)):
-                        names = [elt.value for elt in value.elts if isinstance(elt, ast.Constant) and isinstance(elt.value, str)]
-                        if names:
-                            model_name = names[0]
-                    continue
+                value = stmt.value
+                names: list[str] = []
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    names = [value.value]
+                elif isinstance(value, (ast.List, ast.Tuple)):
+                    names = [
+                        elt.value
+                        for elt in value.elts
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                    ]
+                if "_name" in targets and names:
+                    explicit_name = names[0]
+                if "_inherit" in targets and names:
+                    inherited_names.extend(names)
+            # A class with both _name and mixin _inherit owns its fields on the
+            # explicit model.  Only pure extension classes attach fields to the
+            # inherited model.
+            model_name = explicit_name or (inherited_names[0] if inherited_names else None)
             if not model_name:
                 continue
             for stmt in node.body:

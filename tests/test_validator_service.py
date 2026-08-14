@@ -349,6 +349,28 @@ def test_session_note_pass_gate_does_not_require_a_new_tests_package():
     assert contract["tests_explicitly_requested"] is False
 
 
+def test_preserved_layers_are_not_inferred_as_requested_deliverables():
+    contract = OdooModuleValidator.requested_contract(
+        "Add the Notes field and form view. Preserve existing security, access rights, "
+        "record rules, actions, menus, controllers, and reports unchanged."
+    )
+
+    assert "views" in contract["required_layers"]
+    assert "security" not in contract["required_layers"]
+    assert "controllers" not in contract["required_layers"]
+    assert "report" not in contract["required_layers"]
+    assert "action" not in contract["required_view_types"]
+    assert "menu" not in contract["required_view_types"]
+
+
+def test_positive_layer_after_preservation_clause_is_still_requested():
+    contract = OdooModuleValidator.requested_contract(
+        "Preserve current security and add access rights for the new model."
+    )
+
+    assert "security" in contract["required_layers"]
+
+
 def test_session_note_contract_blocks_structural_only_implementation(tmp_path):
     module = tmp_path / "rethink"
     (module / "models").mkdir(parents=True)
