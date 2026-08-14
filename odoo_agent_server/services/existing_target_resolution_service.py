@@ -448,7 +448,12 @@ class ExistingTargetResolutionService:
                     identifier=identifier, role=symbol["role"], model=symbol.get("model"),
                     owner=owner, source=source,
                 ))
-            if lowered:
+            # Plain-text fallback is useful only for unstructured targets that
+            # do not have a reliable parser.  Structured Odoo targets must be
+            # proved by AST/XML/JS symbols above.  Otherwise a new field such
+            # as ``note`` collides with comments, labels, or prose in unrelated
+            # installed sources (for example mail.thread documentation).
+            if lowered and requested_kind in {"other", "component", "config", "record"}:
                 for line_no, line in enumerate(text.splitlines(), 1):
                     for clue, clue_lower in lowered:
                         if re.search(rf"(?<![\w.]){re.escape(clue_lower)}(?![\w.])", line.lower()) and not any(

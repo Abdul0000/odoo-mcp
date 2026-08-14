@@ -519,6 +519,41 @@ def test_new_target_collision_blocks_but_absent_target_proceeds(tmp_path):
     assert absent.writes_blocked is False
 
 
+def test_new_field_ignores_unrelated_installed_source_prose(tmp_path):
+    project, module, custom_paths = _module(tmp_path, {
+        "models/clinic_treatment.py": (
+            "from odoo import fields, models\n"
+            "class ClinicTreatment(models.Model):\n"
+            "    _name = 'clinic.treatment'\n"
+            "    name = fields.Char()\n"
+        ),
+    })
+    mail_thread = (
+        tmp_path / "home" / "odoo" / "src" / "odoo" / "addons" /
+        "mail" / "models" / "mail_thread.py"
+    )
+    mail_thread.parent.mkdir(parents=True)
+    mail_thread.write_text(
+        "class MailThread:\n"
+        "    help_text = 'Post a note in the chatter'\n",
+        encoding="utf-8",
+    )
+
+    result = _resolve(
+        project,
+        module,
+        [*custom_paths, mail_thread],
+        mode="new",
+        kind="field",
+        identifier="note",
+        model="clinic.treatment",
+    )
+
+    assert result.status == "source_verified_live_unverified"
+    assert result.writes_blocked is False
+    assert result.matches == []
+
+
 def test_live_field_lookup_is_bounded_and_cached(monkeypatch, tmp_path):
     project, module, paths = _module(tmp_path, {
         "models/res_partner.py": (

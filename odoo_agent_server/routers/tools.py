@@ -1517,6 +1517,69 @@ def _analysis_index_target_paths(analysis: dict[str, Any] | None, payload: OdooC
     ][:4]
 
 
+def _exact_model_target_cluster(
+    project: Path,
+    module_root_rel: str,
+    payload: OdooCodeChangeRequest,
+    ranked_paths: list[str],
+) -> list[str]:
+    """Complete and narrow an exact model task to its owning model/view files.
+
+    Cached module evidence can rank an adjacent model above the primary form
+    view when both repeat a generic business word.  When the request provides
+    an exact Odoo model, resolve its Python declaration and form-view record
+    directly from the selected custom addon.  This is a bounded local scan and
+    never reads Core/Enterprise source.
+    """
+    resolution = payload.target_resolution
+    model = str(getattr(resolution, "model", None) or payload.change_request.get("model") or "").strip()
+    if not re.fullmatch(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+", model):
+        return ranked_paths
+
+    module_dir = (project / module_root_rel).resolve()
+    task_text = " ".join(filter(None, (
+        payload.task_description,
+        payload.intent,
+        payload.target_hint,
+        _normalized_task_type(payload),
+    ))).lower()
+    needs_view = any(token in task_text for token in ("view", "form", "notebook", "page", "xml"))
+    model_literal = re.compile(
+        rf"\b_(?:name|inherit)\s*=\s*['\"]{re.escape(model)}['\"]"
+    )
+    view_model = re.compile(
+        rf"<field\b[^>]*\bname\s*=\s*['\"]model['\"][^>]*>\s*{re.escape(model)}\s*</field>",
+        re.I,
+    )
+
+    exact: list[str] = []
+    scan_specs = [("models", "*.py", model_literal)]
+    if needs_view:
+        scan_specs.append(("views", "*.xml", view_model))
+    for folder, pattern, matcher in scan_specs:
+        root = module_dir / folder
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob(pattern)):
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace")[:500_000]
+            except OSError:
+                continue
+            if matcher.search(content):
+                exact.append(path.relative_to(module_dir).as_posix())
+                if len(exact) >= 4:
+                    break
+
+    # A complete exact cluster is authoritative and removes adjacent-model
+    # noise.  If either required side is absent, retain ranked evidence so the
+    # normal resolver can diagnose rather than guessing.
+    has_model = any(path.startswith("models/") for path in exact)
+    has_view = any(path.startswith("views/") for path in exact)
+    if has_model and (has_view or not needs_view):
+        return exact
+    return list(dict.fromkeys([*exact, *ranked_paths]))[:4]
+
+
 def _contract_candidate_paths(
     project: Path,
     module_path: str,
@@ -4647,6 +4710,12 @@ async def _workflow_odoo_code_change_impl(payload: OdooCodeChangeRequest) -> dic
 
         if not focused_paths:
             cached_targets = _analysis_index_target_paths(analysis_index, payload)
+            cached_targets = _exact_model_target_cluster(
+                project,
+                module.path,
+                payload,
+                cached_targets,
+            )
             for module_rel in cached_targets:
                 rel = f"{module.path.rstrip('/')}/{module_rel.lstrip('/')}"
                 if (project / rel).is_file() and rel not in focused_paths:

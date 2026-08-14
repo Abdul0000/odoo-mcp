@@ -30,6 +30,7 @@ from odoo_agent_server.routers.tools import (
     _redact_debug_text,
     _exact_write_context,
     _exact_custom_targets_are_self_contained,
+    _exact_model_target_cluster,
     _focused_search,
     _infer_code_change_search_patterns,
     _inline_write_contexts,
@@ -1457,6 +1458,57 @@ def test_cached_analysis_keeps_only_strong_prescription_target_cluster():
     ]
     assert not any("patient" in path for path in targets)
     assert "__manifest__.py" not in targets
+
+
+def test_exact_model_target_cluster_keeps_treatment_model_and_primary_view(tmp_path):
+    project = tmp_path / "repo"
+    module = project / "clinic_management"
+    models = module / "models"
+    views = module / "views"
+    models.mkdir(parents=True)
+    views.mkdir(parents=True)
+    (models / "clinic_treatment.py").write_text(
+        "from odoo import fields, models\n"
+        "class ClinicTreatment(models.Model):\n"
+        "    _name = 'clinic.treatment'\n"
+        "    name = fields.Char()\n",
+        encoding="utf-8",
+    )
+    (models / "clinic_appointment.py").write_text(
+        "# Treatment references should not outrank the exact owner\n",
+        encoding="utf-8",
+    )
+    (views / "clinic_treatment_views.xml").write_text(
+        "<odoo><record id=\"view_clinic_treatment_form\" model=\"ir.ui.view\">"
+        "<field name=\"model\">clinic.treatment</field>"
+        "<field name=\"arch\" type=\"xml\"><form><sheet/></form></field>"
+        "</record></odoo>",
+        encoding="utf-8",
+    )
+    payload = OdooCodeChangeRequest(
+        module_name="clinic_management",
+        task_description="Add a Notes notebook page to the Treatment form view.",
+        task_type="xml_view",
+        target_resolution={
+            "mode": "new",
+            "kind": "field",
+            "identifier": "note",
+            "model": "clinic.treatment",
+            "require_live": False,
+        },
+    )
+
+    result = _exact_model_target_cluster(
+        project,
+        "clinic_management",
+        payload,
+        ["models/clinic_appointment.py"],
+    )
+
+    assert result == [
+        "models/clinic_treatment.py",
+        "views/clinic_treatment_views.xml",
+    ]
 
 
 def test_exact_core_extension_still_requires_installed_source_scope(tmp_path):
