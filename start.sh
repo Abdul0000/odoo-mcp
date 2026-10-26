@@ -70,9 +70,9 @@ if [ -n "${TARGET_GIT_REPO:-}" ]; then
   mkdir -p "$(dirname "$TARGET_PROJECT_PATH")"
   if [ ! -d "$TARGET_PROJECT_PATH/.git" ]; then
     if [ -n "$TARGET_GIT_BRANCH" ]; then
-      git clone --branch "$TARGET_GIT_BRANCH" "$TARGET_GIT_REPO" "$TARGET_PROJECT_PATH"
+      git clone --filter=blob:none --branch "$TARGET_GIT_BRANCH" "$TARGET_GIT_REPO" "$TARGET_PROJECT_PATH"
     else
-      git clone "$TARGET_GIT_REPO" "$TARGET_PROJECT_PATH"
+      git clone --filter=blob:none "$TARGET_GIT_REPO" "$TARGET_PROJECT_PATH"
     fi
   else
     cd "$TARGET_PROJECT_PATH"

@@ -13,6 +13,7 @@ from ..services.oauth_service import OAuthStore
 from ..services.prompt_service import load_mcp_system_prompt, load_client_check_system_prompt, shared_prompt_payload, client_check_prompt_payload
 from ..services.qwen_token_service import QwenTokenService
 from ..services.store_service import JsonStore
+from ..services.toon_service import BLOCK_KEYS, render_tool_text
 from ..services.mcp_operation_guard_service import McpOperationGuardService
 from ..services.workflow_watchdog_service import WorkflowWatchdogService
 from .tools import _dispatch, format_tool_validation_error, internal_tool_name, list_tools, strict_safe_tool_name, tool_input_schema, tool_output_schema
@@ -208,6 +209,22 @@ def _build_input_request(out: dict[str, Any], next_call: dict[str, Any] | None) 
         "prompt": str(out.get("message") or "User input is required to continue."),
         "resume_call": next_call,
     }
+
+
+_TOON_AUTO_TOOLS = {"odoo.search_read", "odoo.read_group", "odoo.query", "odoosh.query"}
+
+
+def _render_result_text(structured: Any, internal_name: str) -> str:
+    """Model-facing text for a tool result: TOON where it is smaller, JSON otherwise.
+
+    structuredContent stays plain JSON for clients that consume it; only the text block changes.
+    ODOO_AGENT_TOON_OUTPUT: auto (ws_* and tabular query tools), all, off.
+    """
+    mode = (settings.toon_output or "auto").strip().lower()
+    lean = internal_name.startswith("ws.")
+    if mode != "off" and (mode == "all" or lean or internal_name in _TOON_AUTO_TOOLS):
+        return render_tool_text(structured, block_keys=BLOCK_KEYS if lean else None)
+    return json.dumps(structured, ensure_ascii=False, default=str)
 
 
 def _ensure_provider_control_envelope(value: Any, *, is_error: bool = False) -> dict[str, Any]:
@@ -483,6 +500,19 @@ def _mcp_name_to_internal(name: str) -> str:
 # providers only request the change and poll jobs.get.  This removes duplicate
 # repo/scope/deploy loops and prevents direct push/module-deploy bypasses.
 _PROVIDER_TOOL_NAMES = {
+    "ws.open",
+    "ws.status",
+    "ws.outline",
+    "ws.scaffold",
+    "ws.extend",
+    "ws.symbol",
+    "ws.read",
+    "ws.grep",
+    "ws.edit",
+    "ws.diff",
+    "ws.lint",
+    "ws.commit",
+    "ws.discard",
     "connector.health",
     "skills.list",
     "skills.read",
@@ -628,6 +658,33 @@ def _force_remote_tool_list(tools: list[dict[str, Any]]) -> list[dict[str, Any]]
         item.setdefault("description", "Odoo MCP tool")
         sanitized.append(item)
     return sanitized
+
+
+_TOOLS_LIST_CACHE: dict[tuple[str, int], list[dict[str, Any]]] = {}
+
+
+def _cached_tools_list(profile: str) -> list[dict[str, Any]]:
+    """tools/list is rebuilt (schema generation + cleanup for every tool) only when settings change.
+
+    Keyed by a hash of the full settings snapshot, so any configuration change invalidates it.
+    """
+    dump = getattr(settings, "model_dump_json", None)
+    fingerprint = None
+    if callable(dump):
+        try:
+            fingerprint = hash(dump())
+        except Exception:  # noqa: BLE001 - never let caching break tools/list
+            fingerprint = None
+    if fingerprint is not None:
+        hit = _TOOLS_LIST_CACHE.get((profile, fingerprint))
+        if hit is not None:
+            return list(hit)
+    built = _force_remote_tool_list([_tool_to_mcp(tool, profile=profile) for tool in _tools_for_profile(profile)])
+    if fingerprint is not None:
+        if len(_TOOLS_LIST_CACHE) > 16:
+            _TOOLS_LIST_CACHE.clear()
+        _TOOLS_LIST_CACHE[(profile, fingerprint)] = built
+    return list(built)
 
 
 def _is_claude_request(request: Request | None) -> bool:
@@ -904,8 +961,7 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
             },
         )
     if method == "tools/list":
-        tools_payload = [_tool_to_mcp(tool, profile=profile) for tool in _tools_for_profile(profile)]
-        return _shell_response(request_id, {"tools": _force_remote_tool_list(tools_payload)})
+        return _shell_response(request_id, {"tools": _cached_tools_list(profile)})
     if method == "tools/call":
         name = params.get("name")
         arguments = params.get("arguments") or {}
@@ -956,15 +1012,19 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                 op_guard.after_tool_call(internal_name, arguments, structured if isinstance(structured, dict) else {"result": structured})
                 structured = op_guard.annotate_result(internal_name, arguments, structured if isinstance(structured, dict) else {"result": structured})
             if profile in {"provider", "claude", "chatgpt", "grok", "qwen"}:
-                structured = _ensure_provider_control_envelope(structured)
-                if internal_name != "artifacts.read":
-                    structured = _normalize_remote_structured(structured, internal_name)
-                structured = _provider_safe_next_calls(_ensure_provider_control_envelope(structured))
-            text = json.dumps(structured, ensure_ascii=False, default=str)
+                if internal_name.startswith("ws."):
+                    # Workspace tools return small, bounded, self-describing results: no lifecycle envelope.
+                    structured = _provider_safe_next_calls(structured if isinstance(structured, dict) else {"result": structured})
+                else:
+                    structured = _ensure_provider_control_envelope(structured)
+                    if internal_name != "artifacts.read":
+                        structured = _normalize_remote_structured(structured, internal_name)
+                    structured = _provider_safe_next_calls(_ensure_provider_control_envelope(structured))
+            text = _render_result_text(structured, internal_name)
             # Context-bloat guard: in long sessions, oversized tool outputs (large diffs,
             # logs, file reads) compound across many calls and slow down/derail the model.
             # Compatibility profiles also receive bounded structuredContent with artifact refs.
-            text = _cap_text(text, max_chars=12000 if profile in {"provider", "claude", "chatgpt", "grok", "qwen"} else 24000)
+            text = _cap_text(text, max_chars=(30000 if internal_name.startswith("ws.") else 12000) if profile in {"provider", "claude", "chatgpt", "grok", "qwen"} else 24000)
             return _shell_response(
                 request_id,
                 {

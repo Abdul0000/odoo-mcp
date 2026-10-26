@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover - Windows
 from fastapi import HTTPException, status
 
 from ..config import get_odoo_clients, settings
+from .job_retention import JobSignal, prune_job_dir
 from ..schemas import (
     ApprovalRecord,
     ApprovalStatus,
@@ -39,6 +40,7 @@ class JsonStore:
     """
 
     _lock = Lock()  # in-process thread safety
+    _job_signal = JobSignal()  # wakes wait_job the moment a job record changes
     _read_cache: dict[str, tuple[float, int, list[dict[str, Any]]]] = {}
 
     @contextmanager
@@ -97,7 +99,7 @@ class JsonStore:
     def _write_list(self, path: Path, rows: list[dict[str, Any]]) -> None:
         with self._lock:
             path.parent.mkdir(parents=True, exist_ok=True)
-            payload = json.dumps(rows, indent=2, sort_keys=True)
+            payload = json.dumps(rows, separators=(",", ":"))
             with self._file_lock(path):
                 tmp_path = path.with_suffix(path.suffix + ".tmp")
                 tmp_path.write_text(payload, encoding="utf-8")
@@ -119,7 +121,7 @@ class JsonStore:
                     raw = []
                 rows = raw if isinstance(raw, list) else []
                 result = update(rows)
-                payload = json.dumps(rows, indent=2, sort_keys=True)
+                payload = json.dumps(rows, separators=(",", ":"))
                 tmp_path = path.with_suffix(path.suffix + ".tmp")
                 tmp_path.write_text(payload, encoding="utf-8")
                 tmp_path.replace(path)
@@ -224,15 +226,15 @@ class JsonStore:
         deadline = None if timeout_seconds <= 0 else time.monotonic() + max(timeout_seconds, 0)
         interval = max(min(poll_interval_seconds, 10.0), 0.25)
         while True:
+            version = self._job_signal.version(job_id)
             job = self.get_job(job_id)
             if job.status not in {JobStatus.queued, JobStatus.running}:
                 return job
             if deadline is not None and time.monotonic() >= deadline:
                 return job
-            if deadline is None:
-                time.sleep(interval)
-            else:
-                time.sleep(min(interval, max(deadline - time.monotonic(), 0.0)))
+            wait = interval if deadline is None else min(interval, max(deadline - time.monotonic(), 0.0))
+            # A write from this process wakes us immediately; the timeout still covers writers elsewhere.
+            self._job_signal.wait_change(job_id, version, wait)
 
     def update_job(self, job: JobRecord) -> JobRecord:
         self._write_job(job)
@@ -252,11 +254,12 @@ class JsonStore:
 
     def _write_job(self, job: JobRecord) -> None:
         path = self._job_path(job.id)
-        payload = job.model_dump_json(indent=2)
+        payload = job.model_dump_json()
         with self._file_lock(path):
             tmp = path.with_suffix(".json.tmp")
             tmp.write_text(payload, encoding="utf-8")
             tmp.replace(path)
+        self._job_signal.bump(job.id)
 
     def _migrate_legacy_jobs(self) -> None:
         marker = self.jobs_dir / ".legacy_migrated"
@@ -274,26 +277,9 @@ class JsonStore:
         self._prune_job_files()
 
     def _prune_job_files(self) -> None:
-        """Bound terminal history while never evicting queued/running jobs."""
+        """Bound terminal history while never evicting queued/running jobs (see job_retention)."""
         maximum = max(20, int(getattr(settings, "job_max_count", 500)))
-        rows: list[tuple[str, Path, str]] = []
-        for path in self.jobs_dir.glob("*.json"):
-            try:
-                record = json.loads(path.read_text(encoding="utf-8"))
-                rows.append((str(record.get("created_at") or ""), path, str(record.get("status") or "")))
-            except (OSError, json.JSONDecodeError):
-                continue
-        rows.sort(key=lambda item: item[0])
-        if len(rows) <= maximum:
-            return
-        remove_count = len(rows) - maximum
-        for _created, path, job_status in rows:
-            if remove_count <= 0:
-                break
-            if job_status in {JobStatus.queued.value, JobStatus.running.value}:
-                continue
-            path.unlink(missing_ok=True)
-            remove_count -= 1
+        prune_job_dir(self.jobs_dir, maximum, {JobStatus.queued.value, JobStatus.running.value})
 
     def add_step(self, job: JobRecord, step: JobStep) -> JobRecord:
         step.finished_at = step.finished_at or datetime.now(timezone.utc).isoformat()

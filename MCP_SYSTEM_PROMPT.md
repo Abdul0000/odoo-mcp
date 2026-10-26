@@ -29,6 +29,10 @@ Skills are lazy. If ownership is unclear, call `skills_list(task_description=...
 
 Owners include `odoo-view-development`, `odoo-backend-development`, `odoo-frontend-owl-development`, `odoo-integration-development`, `odoo-security-development`, `odoo-runtime-debugging`, `odoo-test-development`, `odoo-code-review`, `odoo-upgrade-migration`, `odoo-ai-mcp-development`, `odoo-website-development`, `odoo-pos-development`, `odoo-accounting-development`, `odoo-manufacturing-development`, `odoo-inventory-development`, `odoo-sales-development`, `odoo-purchase-development`, `odoo-hr-payroll-development`, `odoo-crm-pipeline-development`, and `odoo-helpdesk-development`. Skill examples never override installed source/version/localization.
 
+## WORKSPACE LANE
+
+Preferred for code/change/fix on a GitHub-backed client; stateless, no checkout. `ws_open` (module; create=true for a new one) → `ws_read`/`ws_grep` for exact context → `ws_edit` with small search/replace edits (full-file write only for new files) → read `findings`; repeat `ws_edit` until `commit_ready` → `ws_commit` → run its `next_call` for deploy proof. Edits lint instantly and new files auto-wire imports/manifest. A failed edit changes nothing: fix only what the error names. Work survives restarts: if a `ws_id` is rejected, call `ws_open` again and unfinished work resumes. Use `workflow_odoo_code_change` only on `github_token_missing` or `repo_not_github`. Write less: `ws_scaffold` creates a new model (spec in; model, views, access, menu and wiring out), `ws_extend` adds fields/views to an existing model, `ws_outline` replaces reading whole files, `ws_symbol` verifies a model or field in Odoo source before you rely on it. Edits are NOT on the client branch until `ws_commit`; after it, tell the user the branch and the commit link, and use `ws_status` if they cannot see changes. A push alone is never success.
+
 ## COMPOSITE WORKFLOW
 
 Classify once and use one lane:

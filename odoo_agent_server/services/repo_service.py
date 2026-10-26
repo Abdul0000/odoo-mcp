@@ -109,7 +109,7 @@ class RepoService:
                             "Refusing to clone over existing files."
                         ),
                     )
-                clone = self._run(["git", "clone", "--branch", resolved_branch, "--single-branch", resolved_repo_url, str(project)], workspace, timeout_seconds, env=env)
+                clone = self._run(["git", "clone", "--filter=blob:none", "--branch", resolved_branch, "--single-branch", resolved_repo_url, str(project)], workspace, timeout_seconds, env=env)
                 steps.append(clone)
                 if clone.exit_code != 0:
                     raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=clone.stderr or clone.stdout or "git clone failed")
@@ -141,7 +141,7 @@ class RepoService:
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=merge.stderr or merge.stdout or "git merge --ff-only failed")
         else:
             project.parent.mkdir(parents=True, exist_ok=True)
-            clone = self._run(["git", "clone", "--branch", resolved_branch, "--single-branch", resolved_repo_url, str(project)], workspace, timeout_seconds, env=env)
+            clone = self._run(["git", "clone", "--filter=blob:none", "--branch", resolved_branch, "--single-branch", resolved_repo_url, str(project)], workspace, timeout_seconds, env=env)
             steps.append(clone)
             if clone.exit_code != 0:
                 raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=clone.stderr or clone.stdout or "git clone failed")

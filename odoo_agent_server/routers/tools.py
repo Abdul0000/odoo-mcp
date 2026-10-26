@@ -25,6 +25,17 @@ from pydantic import BaseModel, ValidationError
 from ..auth import AuthDependency
 from ..config import settings, get_odoo_clients, normalise_client
 from ..schemas import (
+    WsExtendRequest,
+    WsOutlineRequest,
+    WsScaffoldRequest,
+    WsSymbolRequest,
+    WsCommitRequest,
+    WsDiffRequest,
+    WsEditRequest,
+    WsGrepRequest,
+    WsIdRequest,
+    WsOpenRequest,
+    WsReadRequest,
     ApprovalCreateRequest,
     ArtifactReadRequest,
     AuditListRequest,
@@ -130,6 +141,7 @@ from ..schemas import (
 )
 from ..services.git_service import GitService
 from ..services.client_resolver_service import ClientResolverService
+from ..services.workspace_factory import run_ws
 from ..services.client_gate_service import ClientGateService
 from ..services.odoo_service import OdooService
 from ..services.odoo_code_search_service import OdooCodeSearchService
@@ -243,6 +255,8 @@ def _agent_priority(name: str) -> tuple[int, str]:
     }
     if name in order:
         return (order[name], name)
+    if name.startswith("ws."):
+        return (10, name)
     if name.startswith("workflow."):
         return (20, name)
     if name.startswith("repo."):
@@ -266,6 +280,64 @@ def _external_tool_descriptor(item: ToolDescriptor) -> ToolDescriptor:
 
 
 _TOOL_DESCRIPTORS = [
+    ToolDescriptor(
+        name="ws.open",
+        title="Open coding workspace",
+        description=(
+            "START HERE for any Odoo code change. Opens a module on the client's GitHub branch with no clone: returns ws_id, "
+            "depends and the file index. Unfinished work from an earlier session is resumed automatically. create=true starts a new module."
+        ),
+        read_only=False,
+        idempotent=True,
+    ),
+    ToolDescriptor(name="ws.status", title="Where is my work?", description="Shows which files are unpublished, the WIP branch, the client branch, the default branch and GitHub links. Use when the user cannot see changes on GitHub.", read_only=True),
+    ToolDescriptor(name="ws.outline", title="Outline module", description="Compact map of the module: manifest, models (fields with types, methods), views/actions/menus with inheritance. Read this instead of whole files.", read_only=True),
+    ToolDescriptor(
+        name="ws.scaffold",
+        title="Scaffold a new model",
+        description=(
+            "Write LESS: give model + field specs; the server generates the model class, form/list views (version-correct tree/list), action, menu, "
+            "access rule, manifest/import wiring, and a new module's manifest. Prefer this over hand-writing a new model."
+        ),
+    ),
+    ToolDescriptor(
+        name="ws.extend",
+        title="Extend an existing model",
+        description="Add fields to an existing model via _inherit and optionally inherit a view (view_ref + after_field) to show them. Generates correct, wired files.",
+    ),
+    ToolDescriptor(
+        name="ws.symbol",
+        title="Verify model/field in Odoo source",
+        description=(
+            "Check a model or field against upstream Odoo source for this module's series (and local code): module, file, type, comodel, compute. "
+            "Use before relying on a model/field you are not certain exists. Community modules in depends only."
+        ),
+        read_only=True,
+    ),
+    ToolDescriptor(name="ws.read", title="Read workspace files", description="Read up to 10 files (numbered lines, ranges supported). Sees your uncommitted edits.", read_only=True),
+    ToolDescriptor(name="ws.grep", title="Search workspace", description="Literal/regex search in the module (scope=repo for other modules; narrow with glob). Sees your uncommitted edits.", read_only=True),
+    ToolDescriptor(
+        name="ws.edit",
+        title="Edit workspace files",
+        description=(
+            "Small exact edits (search/replace) or full-file writes, applied atomically, then linted instantly: python, xml, xpath, js, csv, manifest, imports. "
+            "New files are auto-wired ('from . import', manifest data). If an edit fails nothing changes and you get the closest matches. "
+            "Fix reported errors with another ws.edit, then ws.commit."
+        ),
+    ),
+    ToolDescriptor(name="ws.diff", title="Workspace diff", description="Unified diff of your uncommitted changes against the branch.", read_only=True),
+    ToolDescriptor(name="ws.lint", title="Lint workspace", description="Re-run lint and module-closure checks; returns commit_ready.", read_only=True),
+    ToolDescriptor(
+        name="ws.commit",
+        title="Commit and push workspace",
+        description=(
+            "Push your edits as one atomic GitHub commit (no clone, never force). Survives a moving branch by replaying edits on the newer head; "
+            "retries are idempotent. Blocked only by lint errors, a protected branch, or a true same-line conflict. "
+            "The result's next_call runs the Odoo.sh deploy proof; a push alone is not a deployment."
+        ),
+        idempotent=True,
+    ),
+    ToolDescriptor(name="ws.discard", title="Discard workspace", description="Throw away unfinished workspace edits and its WIP branch.", destructive=True),
     ToolDescriptor(name="connector.health",
         title="Check connector health", description="Check connector service health", read_only=True),
     ToolDescriptor(
@@ -885,6 +957,19 @@ _TOOL_DESCRIPTORS = [
 ]
 
 _TOOL_INPUT_MODELS = {
+    "ws.open": WsOpenRequest,
+    "ws.status": WsIdRequest,
+    "ws.outline": WsOutlineRequest,
+    "ws.scaffold": WsScaffoldRequest,
+    "ws.extend": WsExtendRequest,
+    "ws.symbol": WsSymbolRequest,
+    "ws.read": WsReadRequest,
+    "ws.grep": WsGrepRequest,
+    "ws.edit": WsEditRequest,
+    "ws.diff": WsDiffRequest,
+    "ws.lint": WsIdRequest,
+    "ws.commit": WsCommitRequest,
+    "ws.discard": WsIdRequest,
     "connector.health": EmptyRequest,
     "skills.list": SkillListRequest,
     "skills.read": SkillReadRequest,
@@ -8693,7 +8778,56 @@ def _start_client_validation(req: ClientCheckRequest) -> dict[str, Any]:
     }
 
 
+async def _dispatch_ws(name: str, args: dict) -> dict:
+    """Workspace tools do blocking GitHub I/O: run off the event loop; errors come back as structured results."""
+    if name == "ws.open":
+        req = WsOpenRequest.model_validate(args)
+        return await asyncio.to_thread(run_ws, lambda svc: svc.open(req.client_name or "", req.module_name, create=req.create, fresh=req.fresh, branch=req.branch))
+    if name == "ws.status":
+        req = WsIdRequest.model_validate(args)
+        return await asyncio.to_thread(run_ws, lambda svc: svc.status(req.ws_id))
+    if name == "ws.outline":
+        req = WsOutlineRequest.model_validate(args)
+        return await asyncio.to_thread(run_ws, lambda svc: svc.outline(req.ws_id, req.paths))
+    if name == "ws.scaffold":
+        req = WsScaffoldRequest.model_validate(args)
+        specs = [f.model_dump(exclude_none=True) for f in req.fields]
+        return await asyncio.to_thread(run_ws, lambda svc: svc.scaffold(req.ws_id, req.model, specs, with_views=req.with_views, mail=req.mail, menu=req.menu, menu_parent=req.menu_parent, access_group=req.access_group, series=req.series, description=req.description))
+    if name == "ws.extend":
+        req = WsExtendRequest.model_validate(args)
+        specs = [f.model_dump(exclude_none=True) for f in req.fields]
+        return await asyncio.to_thread(run_ws, lambda svc: svc.extend(req.ws_id, req.model, specs, view_ref=req.view_ref, after_field=req.after_field, position=req.position, view_type=req.view_type, file_name=req.file_name, series=req.series))
+    if name == "ws.symbol":
+        req = WsSymbolRequest.model_validate(args)
+        return await asyncio.to_thread(run_ws, lambda svc: svc.symbol(req.ws_id, req.model, req.field, req.series))
+    if name == "ws.read":
+        req = WsReadRequest.model_validate(args)
+        return await asyncio.to_thread(run_ws, lambda svc: svc.read(req.ws_id, req.paths, start_line=req.start_line, max_lines=req.max_lines))
+    if name == "ws.grep":
+        req = WsGrepRequest.model_validate(args)
+        return await asyncio.to_thread(run_ws, lambda svc: svc.grep(req.ws_id, req.pattern, glob=req.glob, regex=req.regex, scope=req.scope, context=req.context, max_matches=req.max_matches))
+    if name == "ws.edit":
+        req = WsEditRequest.model_validate(args)
+        edits = [item.model_dump(exclude_none=True) for item in req.edits]
+        return await asyncio.to_thread(run_ws, lambda svc: svc.edit(req.ws_id, edits, strict=req.strict, autofix=req.autofix))
+    if name == "ws.diff":
+        req = WsDiffRequest.model_validate(args)
+        return await asyncio.to_thread(run_ws, lambda svc: svc.diff(req.ws_id, req.path))
+    if name == "ws.lint":
+        req = WsIdRequest.model_validate(args)
+        return await asyncio.to_thread(run_ws, lambda svc: svc.lint(req.ws_id))
+    if name == "ws.commit":
+        req = WsCommitRequest.model_validate(args)
+        return await asyncio.to_thread(run_ws, lambda svc: svc.commit(req.ws_id, req.message, push=req.push, branch=req.branch, allow_lint_errors=req.allow_lint_errors))
+    if name == "ws.discard":
+        req = WsIdRequest.model_validate(args)
+        return await asyncio.to_thread(run_ws, lambda svc: svc.discard(req.ws_id))
+    raise HTTPException(status_code=404, detail=f"unknown workspace tool {name}")
+
+
 async def _dispatch(name: str, args: dict) -> object:
+    if name.startswith("ws."):
+        return await _dispatch_ws(name, args)
     if name == "connector.health":
         EmptyRequest.model_validate(args)
         return {

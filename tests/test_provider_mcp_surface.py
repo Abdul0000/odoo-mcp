@@ -8,6 +8,19 @@ from odoo_agent_server.routers.mcp import provider_tool_names_safe
 from odoo_agent_server.schemas import OdooCodeChangeRequest, OdooCodeFileChange
 
 _PROVIDER_TOOLS = {
+    "ws_open",
+    "ws_status",
+    "ws_outline",
+    "ws_scaffold",
+    "ws_extend",
+    "ws_symbol",
+    "ws_read",
+    "ws_grep",
+    "ws_edit",
+    "ws_diff",
+    "ws_lint",
+    "ws_commit",
+    "ws_discard",
     "connector_health",
     "skills_list",
     "skills_read",

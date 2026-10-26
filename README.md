@@ -573,3 +573,68 @@ For an explicit user-authorized force push and deploy:
 ```
 
 The force override applies only to `workflow.verify_against_core`. Blocking QA, Python/XML syntax, parser, manifest, and module-structure failures still stop deployment. Override mode, reason, and accepted findings are attached to the safe-deploy request and returned in workflow results for auditability.
+
+## Workspace tools (`ws_*`) — stateless coding lane
+
+A coding loop that needs no checkout and no persistent disk (built for Render free).
+
+| Tool | Purpose |
+|---|---|
+| `ws_open` | Open a module on the client's GitHub branch; returns `ws_id` + file index. Resumes unfinished work. |
+| `ws_read` / `ws_grep` / `ws_diff` | Inspect files (including your uncommitted edits). |
+| `ws_edit` | Atomic search/replace or full-file writes. Lints instantly (python, xml, xpath, js, csv, manifest, imports) and auto-wires **new** files (`from . import`, manifest `data`). |
+| `ws_outline` | Compact map of the module (models with typed fields, views with inheritance, menus) instead of reading whole files. |
+| `ws_scaffold` | Write less: model + field spec in; model class, form/list views (tree vs list by series), action, menu, access rule, wiring and a new module's manifest out. |
+| `ws_extend` | Add fields to an existing model via `_inherit`, optionally inheriting a view next to an anchor field. |
+| `ws_symbol` | Verify a model/field (type, comodel, compute, defining module) against upstream `odoo/odoo` at the module's series, plus local code. Community modules in `depends` only; enterprise is not covered. |
+| `ws_lint` | Re-run lint and module-closure checks; returns `commit_ready`. |
+| `ws_commit` | One atomic GitHub commit via the Git Data API (never force). Replays edits onto a newer branch head, retries are idempotent (`MCP-Op` commit trailer). Returns `next_call` for the Odoo.sh deploy proof. |
+| `ws_discard` | Drop the workspace and its WIP branch. |
+
+How it survives Render restarts: after each successful `ws_edit` the edit journal is checkpointed to the
+GitHub branch `mcp/wip/<client>-<module>`. `ws_id` is self-describing, so any call after a spin-down
+rebuilds the workspace by replaying the journal on the current branch head. Conflicts are reported per edit.
+
+Requirements: each client in `ODOO_CLIENTS` needs an HTTPS `github.com` repo and a `token` with
+`contents:write` (or set `GITHUB_TOKEN`). SSH-only or non-GitHub repos keep using `workflow_odoo_code_change`.
+
+What `ws_edit` wires for you: new `.py` files get their `from . import` (creating `__init__.py` chains), new
+`views|security|data|report|wizard|demo` XML/CSV files are added to the manifest (security first), and *deleting* such a
+file removes its import / manifest entry. Static files under `static/src` that no manifest `assets` entry covers raise an
+`asset_unregistered` warning (they would never load). Binary files and files over 400 KB are rejected.
+
+Cost model (measured against a fake GitHub): `ws_open` ~7 API calls regardless of module size (files load lazily);
+each `ws_edit` ~4-5 calls (only the compacted journal is checkpointed; file bytes upload once, at commit; identical content
+is never uploaded twice); a `ws_commit` on an unmoved branch does no tree walk and no trailer lookup. Connections are kept alive.
+
+Settings: `ODOO_AGENT_WS_CHECKPOINT_MODE` (`async` default: edits return immediately, a background thread persists the journal;
+`sync` persists before returning), `ODOO_AGENT_WS_PROTECTED_BRANCHES` (default `main,master,production,prod,live`; pushing there is blocked,
+use a feature branch), `ODOO_AGENT_WS_AUTOCHECKPOINT`, `ODOO_AGENT_TOON_OUTPUT` (`auto` | `all` | `off`).
+
+`ws_*` do not require the heavy `client_check` Odoo validation (that state lives in `/tmp` and is lost on every
+Render spin-down); they only touch GitHub with the client's own token. The deploy proof that follows
+(`workflow_module_install_and_check`) keeps its existing validation gate.
+
+### TOON output
+Text results of `ws_*` and tabular query tools are rendered as TOON (uniform arrays collapse to a header plus rows;
+code and diffs are emitted raw instead of JSON-escaped). The renderer verifies a lossless round-trip and falls back
+to compact JSON whenever TOON is not smaller, so it can never grow a response. `structuredContent` stays JSON.
+
+### Running the offline tests
+```
+python -m unittest tests.test_toon_service tests.test_workspace_service tests.test_ws_tool_wiring
+```
+(stdlib only; they use an in-memory fake of the GitHub Git Data API in `tests/support/fake_github.py`.)
+
+### Scenario harness
+`python -m tests.evals.run` runs scripted end-to-end tasks (new model, extend + verify, lint-fix loop, delete, teammate push
+mid-task, restart mid-task) against in-memory fakes and enforces tool-call and API-call budgets. It evaluates the *tooling*;
+it does not measure a language model. Run the same task prompts through the live connector to evaluate a model.
+
+### Where do my changes show up on GitHub?
+1. While editing: on the branch `mcp/wip/<client>-<module>` (real files, plus `.mcp-wip-*.json`). They are **not** on the client branch yet.
+   Switch the branch dropdown in GitHub to that branch. Disable with `ODOO_AGENT_WS_WIP_FILES=false`; changesets over 60 files / 2 MB are journal-only.
+2. After `ws_commit`: on the client's configured branch (for example `staging`), which is often **not** GitHub's default branch (`main`).
+   The result contains `urls.commit` and a `where` note naming the branch. `ws_status` answers "where is my work?" at any time.
+3. If nothing appears anywhere: check `checkpoint.saved` / the `ws_commit` status (blocked_by_lint, blocked_protected_branch,
+   conflict, or a GitHub 401/403 meaning the token lacks `contents:write`).

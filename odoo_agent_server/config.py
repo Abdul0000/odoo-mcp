@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     require_approval: bool = Field(default=False, alias="ODOO_AGENT_REQUIRE_APPROVAL")
     approval_required_actions_raw: str = Field(default="", alias="ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS")
     protected_branches_raw: str = Field(default="", alias="ODOO_AGENT_PROTECTED_BRANCHES")
+    # ws_* workspace tools (GitHub API engine; no clone, no local state)
+    github_token: str | None = Field(default=None, alias="GITHUB_TOKEN")
+    ws_protected_branches_raw: str = Field(default="main,master,production,prod,live", alias="ODOO_AGENT_WS_PROTECTED_BRANCHES")
+    ws_autocheckpoint: bool = Field(default=True, alias="ODOO_AGENT_WS_AUTOCHECKPOINT")
+    ws_wip_files: bool = Field(default=True, alias="ODOO_AGENT_WS_WIP_FILES")  # show changed files on the WIP branch
+    ws_checkpoint_mode: str = Field(default="async", alias="ODOO_AGENT_WS_CHECKPOINT_MODE")  # async | sync
+    # TOON text rendering for tool results: auto (tabular-heavy tools), all, off
+    toon_output: str = Field(default="auto", alias="ODOO_AGENT_TOON_OUTPUT")
 
     # Git deployment guardrails. These are optional but strongly recommended in production.
     target_git_repo: str | None = Field(default=None, alias="TARGET_GIT_REPO")

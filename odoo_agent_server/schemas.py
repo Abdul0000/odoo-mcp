@@ -2860,3 +2860,112 @@ class RepoIndexResult(BaseModel):
     manifest_files: list[str] = Field(default_factory=list)
     template_names: dict[str, str] = Field(default_factory=dict, description="template name -> file path")
     notes: list[str] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- workspace (ws_*) tools
+class WsOpenRequest(BaseModel):
+    client_name: str | None = Field(default=None, description="Client from ODOO_CLIENTS (omit when only one).")
+    module_name: str = Field(..., description="Technical module name, e.g. my_module.")
+    create: bool = Field(default=False, description="Start a new module that does not exist yet.")
+    fresh: bool = Field(default=False, description="Discard unfinished WIP from an earlier session instead of resuming it.")
+    branch: str | None = Field(default=None, description="Branch to work on. Defaults to the client's branch.")
+
+
+class WsEditItem(BaseModel):
+    path: str = Field(..., description="Module-relative path (models/x.py). Prefix repo: for repository-root files.")
+    op: Literal["replace", "write", "append", "delete"] | None = Field(default=None, description="Inferred: content->write, search->replace.")
+    search: str | None = Field(default=None, description="Exact text to find (replace).")
+    replace: str | None = Field(default=None, description="Replacement text (replace).")
+    content: str | None = Field(default=None, description="Full file text (write) or text to add (append).")
+    regex: bool = Field(default=False, description="Treat search as a regex.")
+    expect: int = Field(default=1, ge=0, le=500, description="Expected match count; 0 replaces all.")
+
+
+class WsEditRequest(BaseModel):
+    ws_id: str
+    edits: list[WsEditItem] = Field(..., min_length=1, max_length=40, description="Applied atomically: if one fails nothing changes.")
+    strict: bool = Field(default=False, description="Roll the batch back when lint finds errors.")
+    autofix: bool = Field(default=True, description="Auto-add 'from . import x' and manifest data entries for NEW files.")
+
+
+class WsReadRequest(BaseModel):
+    ws_id: str
+    paths: list[str] = Field(..., min_length=1, max_length=10)
+    start_line: int = Field(default=1, ge=1)
+    max_lines: int = Field(default=300, ge=1, le=1000)
+
+
+class WsGrepRequest(BaseModel):
+    ws_id: str
+    pattern: str
+    glob: str | None = Field(default=None, description="Filter, e.g. *.xml or sale_*/**/*.py.")
+    regex: bool = False
+    scope: Literal["module", "repo"] = Field(default="module", description="repo searches other modules too (narrow with glob).")
+    context: int = Field(default=0, ge=0, le=5)
+    max_matches: int = Field(default=40, ge=1, le=100)
+
+
+class WsDiffRequest(BaseModel):
+    ws_id: str
+    path: str | None = None
+
+
+class WsIdRequest(BaseModel):
+    ws_id: str
+
+
+class WsCommitRequest(BaseModel):
+    ws_id: str
+    message: str = Field(..., min_length=3, max_length=500)
+    push: bool = Field(default=True, description="False only checks readiness.")
+    branch: str | None = Field(default=None, description="Push to this NEW branch instead of the client's branch.")
+    allow_lint_errors: bool = Field(default=False, description="Only when the user explicitly accepts a known-broken push.")
+
+
+class WsFieldSpec(BaseModel):
+    name: str = Field(..., description="snake_case field name.")
+    type: Literal["Char", "Text", "Html", "Integer", "Float", "Boolean", "Date", "Datetime", "Selection", "Many2one", "One2many", "Many2many", "Monetary", "Binary"] = "Char"
+    comodel: str | None = Field(default=None, description="Target model for Many2one/One2many/Many2many.")
+    inverse: str | None = Field(default=None, description="One2many only: the Many2one field name on the other model.")
+    options: list[str] | None = Field(default=None, description="Selection only: ['draft:Draft','done:Done'].")
+    required: bool = False
+    string: str | None = None
+    default: str | None = Field(default=None, description="Selection default key.")
+    currency_field: str | None = None
+
+
+class WsOutlineRequest(BaseModel):
+    ws_id: str
+    paths: list[str] | None = Field(default=None, description="Limit to these files; default is the whole module.")
+
+
+class WsScaffoldRequest(BaseModel):
+    ws_id: str
+    model: str = Field(..., description="New model, e.g. my.thing.")
+    fields: list[WsFieldSpec] = Field(..., min_length=1, max_length=40)
+    with_views: bool = Field(default=True, description="Generate form/list views, action and menu.")
+    mail: bool = Field(default=False, description="Add mail.thread/activity mixins, chatter and the mail dependency.")
+    menu: str | None = Field(default=None, description="Menu label (default from the model name).")
+    menu_parent: str | None = Field(default=None, description="Parent menu xmlid, e.g. sale.sale_menu_root.")
+    access_group: str = "base.group_user"
+    series: int | None = Field(default=None, ge=14, le=25, description="Odoo major version. Required for a brand-new module; otherwise read from the manifest.")
+    description: str | None = None
+
+
+class WsExtendRequest(BaseModel):
+    ws_id: str
+    model: str = Field(..., description="Existing model to extend via _inherit, e.g. sale.order.")
+    fields: list[WsFieldSpec] = Field(..., min_length=1, max_length=40)
+    view_ref: str | None = Field(default=None, description="xmlid of the view to inherit, e.g. sale.view_order_form.")
+    after_field: str | None = Field(default=None, description="Existing field in that view to anchor next to (required with view_ref).")
+    position: Literal["after", "before", "inside"] = "after"
+    view_type: Literal["form", "list", "tree"] = "form"
+    file_name: str | None = Field(default=None, description="Override the generated file stem.")
+    series: int | None = Field(default=None, ge=14, le=25)
+
+
+class WsSymbolRequest(BaseModel):
+    ws_id: str
+    model: str
+    field: str | None = Field(default=None, description="Also report this field's type/comodel/compute.")
+    series: int | None = Field(default=None, ge=14, le=25)
