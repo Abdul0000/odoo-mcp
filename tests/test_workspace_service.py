@@ -487,9 +487,15 @@ class Efficiency(unittest.TestCase):
 
     def test_closest_is_fast_on_big_files(self):
         big = "\n".join(f"    line_{i} = fields.Char(string='x{i}')" for i in range(6000))
-        t = _time.time()
-        out = _closest(big, "    line_9999 = fields.Char(string='zz')\n    other = 1")
-        self.assertLess(_time.time() - t, 0.5)
+        needle = "    line_9999 = fields.Char(string='zz')\n    other = 1"
+        # CPU time, best of 3: immune to scheduler noise on busy CI machines; a full window scan
+        # (the regression this guards) is orders of magnitude slower than the budget.
+        best = float("inf")
+        for _ in range(3):
+            t = _time.process_time()
+            out = _closest(big, needle)
+            best = min(best, _time.process_time() - t)
+        self.assertLess(best, 0.5)
         self.assertIsInstance(out, list)
 
     def test_js_lint_is_cached_by_content(self):

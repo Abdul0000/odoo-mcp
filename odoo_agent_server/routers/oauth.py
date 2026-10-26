@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import secrets
+
 from html import escape
 from typing import Any
 from urllib.parse import parse_qs
@@ -156,7 +158,7 @@ async def oauth_authorize_post(request: Request):
     raw = (await request.body()).decode("utf-8")
     parsed = {key: values[-1] for key, values in parse_qs(raw, keep_blank_values=True).items()}
     connector_token = parsed.pop("connector_token", "")
-    if connector_token != settings.api_token:
+    if not secrets.compare_digest(connector_token.encode("utf-8"), settings.api_token.encode("utf-8")):
         return HTMLResponse(_authorization_form(parsed, error="Invalid connector admin token"), status_code=403)
     return _authorize_redirect(parsed)
 

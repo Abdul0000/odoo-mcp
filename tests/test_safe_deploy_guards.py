@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.conftest import advance_clock_on_job_wait, patch_module_clock
 import asyncio
 import subprocess
 import time
@@ -15,6 +16,7 @@ from odoo_agent_server.services.approval_service import ApprovalService
 from odoo_agent_server.services.git_service import GitService
 from odoo_agent_server.services.odoosh_service import OdooShService
 from odoo_agent_server.services.repo_service import RepoService
+from odoo_agent_server.services import store_service
 from odoo_agent_server.services.store_service import JsonStore
 from odoo_agent_server.services.workflow_guard_service import safe_deploy_shell_block
 from odoo_agent_server.routers.workflow import _infer_registry_fields_from_python, _pre_push_verify_files
@@ -900,8 +902,8 @@ def test_safe_deploy_wait_for_result_positive_timeout_returns_running(tmp_path, 
     monkeypatch.setattr(settings, "state_dir", str(tmp_path / "state"))
     monkeypatch.setattr(workflow, "submit_background", lambda callback: None)
     clock = _FakeClock()
-    monkeypatch.setattr(workflow.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(workflow.time, "sleep", clock.sleep)
+    patch_module_clock(monkeypatch, clock, workflow, store_service)
+    advance_clock_on_job_wait(monkeypatch, clock)
     project = tmp_path / "repo"
     (project / "x_module").mkdir(parents=True)
 
@@ -923,8 +925,8 @@ def test_safe_deploy_wait_loop_does_not_sleep_past_timeout(tmp_path, monkeypatch
     store = JsonStore()
     job = store.create_job(JobRecord(job_type="safe_deploy_module", status=JobStatus.running))
     clock = _FakeClock()
-    monkeypatch.setattr(workflow.time, "monotonic", clock.monotonic)
-    monkeypatch.setattr(workflow.time, "sleep", clock.sleep)
+    patch_module_clock(monkeypatch, clock, workflow, store_service)
+    advance_clock_on_job_wait(monkeypatch, clock)
 
     started = clock.monotonic()
     result = workflow._wait_workflow_job_until_terminal(store, job.id, poll_interval_seconds=10, timeout_seconds=1)

@@ -25,6 +25,7 @@ from pydantic import BaseModel, ValidationError
 from ..auth import AuthDependency
 from ..config import settings, get_odoo_clients, normalise_client
 from ..schemas import (
+    CommandResult,
     WsExtendRequest,
     WsOutlineRequest,
     WsScaffoldRequest,
@@ -957,19 +958,6 @@ _TOOL_DESCRIPTORS = [
 ]
 
 _TOOL_INPUT_MODELS = {
-    "ws.open": WsOpenRequest,
-    "ws.status": WsIdRequest,
-    "ws.outline": WsOutlineRequest,
-    "ws.scaffold": WsScaffoldRequest,
-    "ws.extend": WsExtendRequest,
-    "ws.symbol": WsSymbolRequest,
-    "ws.read": WsReadRequest,
-    "ws.grep": WsGrepRequest,
-    "ws.edit": WsEditRequest,
-    "ws.diff": WsDiffRequest,
-    "ws.lint": WsIdRequest,
-    "ws.commit": WsCommitRequest,
-    "ws.discard": WsIdRequest,
     "connector.health": EmptyRequest,
     "skills.list": SkillListRequest,
     "skills.read": SkillReadRequest,
@@ -8778,51 +8766,41 @@ def _start_client_validation(req: ClientCheckRequest) -> dict[str, Any]:
     }
 
 
+def _fields(req) -> list[dict]:
+    return [f.model_dump(exclude_none=True) for f in req.fields]
+
+
+# One row per workspace tool: (request model, handler(service, request)). Adding a tool is one row
+# here plus its descriptor; there is no per-tool branching to keep in sync.
+_WS_HANDLERS: dict[str, tuple[type[BaseModel], typing.Callable[[typing.Any, typing.Any], dict]]] = {
+    "ws.open": (WsOpenRequest, lambda svc, r: svc.open(r.client_name or "", r.module_name, create=r.create, fresh=r.fresh, branch=r.branch)),
+    "ws.status": (WsIdRequest, lambda svc, r: svc.status(r.ws_id)),
+    "ws.outline": (WsOutlineRequest, lambda svc, r: svc.outline(r.ws_id, r.paths)),
+    "ws.scaffold": (WsScaffoldRequest, lambda svc, r: svc.scaffold(r.ws_id, r.model, _fields(r), with_views=r.with_views, mail=r.mail, menu=r.menu, menu_parent=r.menu_parent, access_group=r.access_group, series=r.series, description=r.description)),
+    "ws.extend": (WsExtendRequest, lambda svc, r: svc.extend(r.ws_id, r.model, _fields(r), view_ref=r.view_ref, after_field=r.after_field, position=r.position, view_type=r.view_type, file_name=r.file_name, series=r.series)),
+    "ws.symbol": (WsSymbolRequest, lambda svc, r: svc.symbol(r.ws_id, r.model, r.field, r.series)),
+    "ws.read": (WsReadRequest, lambda svc, r: svc.read(r.ws_id, r.paths, start_line=r.start_line, max_lines=r.max_lines)),
+    "ws.grep": (WsGrepRequest, lambda svc, r: svc.grep(r.ws_id, r.pattern, glob=r.glob, regex=r.regex, scope=r.scope, context=r.context, max_matches=r.max_matches)),
+    "ws.edit": (WsEditRequest, lambda svc, r: svc.edit(r.ws_id, [e.model_dump(exclude_none=True) for e in r.edits], strict=r.strict, autofix=r.autofix)),
+    "ws.diff": (WsDiffRequest, lambda svc, r: svc.diff(r.ws_id, r.path)),
+    "ws.lint": (WsIdRequest, lambda svc, r: svc.lint(r.ws_id)),
+    "ws.commit": (WsCommitRequest, lambda svc, r: svc.commit(r.ws_id, r.message, push=r.push, branch=r.branch, allow_lint_errors=r.allow_lint_errors)),
+    "ws.discard": (WsIdRequest, lambda svc, r: svc.discard(r.ws_id)),
+}
+
+
+# Single source of truth for ws.* input models (the registry above is derived, not duplicated).
+_TOOL_INPUT_MODELS.update({_name: _model for _name, (_model, _) in _WS_HANDLERS.items()})
+
+
 async def _dispatch_ws(name: str, args: dict) -> dict:
     """Workspace tools do blocking GitHub I/O: run off the event loop; errors come back as structured results."""
-    if name == "ws.open":
-        req = WsOpenRequest.model_validate(args)
-        return await asyncio.to_thread(run_ws, lambda svc: svc.open(req.client_name or "", req.module_name, create=req.create, fresh=req.fresh, branch=req.branch))
-    if name == "ws.status":
-        req = WsIdRequest.model_validate(args)
-        return await asyncio.to_thread(run_ws, lambda svc: svc.status(req.ws_id))
-    if name == "ws.outline":
-        req = WsOutlineRequest.model_validate(args)
-        return await asyncio.to_thread(run_ws, lambda svc: svc.outline(req.ws_id, req.paths))
-    if name == "ws.scaffold":
-        req = WsScaffoldRequest.model_validate(args)
-        specs = [f.model_dump(exclude_none=True) for f in req.fields]
-        return await asyncio.to_thread(run_ws, lambda svc: svc.scaffold(req.ws_id, req.model, specs, with_views=req.with_views, mail=req.mail, menu=req.menu, menu_parent=req.menu_parent, access_group=req.access_group, series=req.series, description=req.description))
-    if name == "ws.extend":
-        req = WsExtendRequest.model_validate(args)
-        specs = [f.model_dump(exclude_none=True) for f in req.fields]
-        return await asyncio.to_thread(run_ws, lambda svc: svc.extend(req.ws_id, req.model, specs, view_ref=req.view_ref, after_field=req.after_field, position=req.position, view_type=req.view_type, file_name=req.file_name, series=req.series))
-    if name == "ws.symbol":
-        req = WsSymbolRequest.model_validate(args)
-        return await asyncio.to_thread(run_ws, lambda svc: svc.symbol(req.ws_id, req.model, req.field, req.series))
-    if name == "ws.read":
-        req = WsReadRequest.model_validate(args)
-        return await asyncio.to_thread(run_ws, lambda svc: svc.read(req.ws_id, req.paths, start_line=req.start_line, max_lines=req.max_lines))
-    if name == "ws.grep":
-        req = WsGrepRequest.model_validate(args)
-        return await asyncio.to_thread(run_ws, lambda svc: svc.grep(req.ws_id, req.pattern, glob=req.glob, regex=req.regex, scope=req.scope, context=req.context, max_matches=req.max_matches))
-    if name == "ws.edit":
-        req = WsEditRequest.model_validate(args)
-        edits = [item.model_dump(exclude_none=True) for item in req.edits]
-        return await asyncio.to_thread(run_ws, lambda svc: svc.edit(req.ws_id, edits, strict=req.strict, autofix=req.autofix))
-    if name == "ws.diff":
-        req = WsDiffRequest.model_validate(args)
-        return await asyncio.to_thread(run_ws, lambda svc: svc.diff(req.ws_id, req.path))
-    if name == "ws.lint":
-        req = WsIdRequest.model_validate(args)
-        return await asyncio.to_thread(run_ws, lambda svc: svc.lint(req.ws_id))
-    if name == "ws.commit":
-        req = WsCommitRequest.model_validate(args)
-        return await asyncio.to_thread(run_ws, lambda svc: svc.commit(req.ws_id, req.message, push=req.push, branch=req.branch, allow_lint_errors=req.allow_lint_errors))
-    if name == "ws.discard":
-        req = WsIdRequest.model_validate(args)
-        return await asyncio.to_thread(run_ws, lambda svc: svc.discard(req.ws_id))
-    raise HTTPException(status_code=404, detail=f"unknown workspace tool {name}")
+    entry = _WS_HANDLERS.get(name)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"unknown workspace tool {name}")
+    model, handler = entry
+    req = model.model_validate(args)
+    return await asyncio.to_thread(run_ws, lambda svc: handler(svc, req))
 
 
 async def _dispatch(name: str, args: dict) -> object:

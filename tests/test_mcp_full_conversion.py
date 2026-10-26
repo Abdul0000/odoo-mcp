@@ -1,3 +1,4 @@
+from tests.conftest import WS_TOOLS
 from fastapi.testclient import TestClient
 
 from odoo_agent_server.config import settings
@@ -39,7 +40,7 @@ _PROVIDER_TOOLS = {
     "jobs_list",
     "jobs_get",
     "odoosh_error_pack",
-}
+} | WS_TOOLS
 
 
 

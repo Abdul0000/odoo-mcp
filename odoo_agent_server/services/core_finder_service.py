@@ -24,7 +24,12 @@ from __future__ import annotations
 import ast
 import os
 import re
+from collections.abc import Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..schemas import ListModuleFilesResult  # noqa: F401
 
 from . import core_sync_service
 from .client_resolver_service import ClientResolverService

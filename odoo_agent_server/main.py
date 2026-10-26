@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 
@@ -30,10 +31,18 @@ from .services.prompt_service import load_mcp_system_prompt, load_client_check_s
 from .services.runtime_identity_service import SERVICE_VERSION, runtime_identity
 from .services.workflow_progress_service import WorkflowProgressService
 
-if os.getenv("RENDER", "").lower() in {"1", "true", "yes"} and settings.api_token == "change-me":
-    raise RuntimeError("ODOO_AGENT_API_TOKEN must be set to a non-default secret on Render")
+_HOSTED_MARKERS = ("RENDER", "KOYEB_APP_NAME", "FLY_APP_NAME", "DYNO", "K_SERVICE", "ODOO_AGENT_REQUIRE_STRONG_TOKEN")
+if any(os.getenv(name, "").lower() not in {"", "0", "false", "no"} for name in _HOSTED_MARKERS) and settings.api_token == "change-me":
+    raise RuntimeError("ODOO_AGENT_API_TOKEN must be set to a non-default secret on a hosted deployment")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    validate_required_tool_registry()
+    yield
+
 
 app = FastAPI(
+    lifespan=lifespan,
     title="Odoo MCP Agent Connector",
     version=SERVICE_VERSION,
     description=(
@@ -61,7 +70,6 @@ def tool_registry_status() -> dict[str, object]:
     }
 
 
-@app.on_event("startup")
 def validate_required_tool_registry() -> None:
     status = tool_registry_status()
     if status["missing_tools"]:

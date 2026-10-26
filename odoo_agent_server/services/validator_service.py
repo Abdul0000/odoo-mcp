@@ -600,7 +600,6 @@ class OdooModuleValidator:
         contract = self.merge_contracts(module_contract, self.requested_contract(task_description, create_module))
         if not any(value for value in contract.values()):
             return []
-        text = str(task_description or "").lower()
         findings: list[Finding] = []
         entries = [item for item in (manifest.get("data") or []) if isinstance(item, str)]
         layer_checks = {

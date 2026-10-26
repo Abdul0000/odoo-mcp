@@ -79,7 +79,8 @@ def test_agent_instructions_require_complete_safe_deploy_flow():
     assert skills["mode"] == "on_demand"
     assert skills["list_tool"] == "skills_list"
     assert skills["read_tool"] == "skills_read"
-    assert len(json.dumps(response.json(), ensure_ascii=False)) < 13_000
+    # Re-measured after adding the WORKSPACE LANE prompt section (14.1 KB).
+    assert len(json.dumps(response.json(), ensure_ascii=False)) < 15_000
     assert "available" not in skills
     assert response.json()["runtime"]["prompt_sha256"]
 

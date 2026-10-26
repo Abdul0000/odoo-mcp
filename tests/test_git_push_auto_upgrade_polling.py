@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.conftest import patch_module_clock
+from odoo_agent_server.services import store_service
 import json
 
 import pytest
@@ -111,8 +113,7 @@ def project(tmp_path):
 
 def _run_module_push(project, monkeypatch, fake_odoosh_cls):
     fake_clock = _FakeClock()
-    monkeypatch.setattr(odoosh_service.time, "monotonic", fake_clock.monotonic)
-    monkeypatch.setattr(odoosh_service.time, "sleep", fake_clock.sleep)
+    patch_module_clock(monkeypatch, fake_clock, odoosh_service, store_service, git)
     monkeypatch.setattr(git, "GitService", lambda: _FakeGit("custom_addons/x_module/models/a.py\n"))
     monkeypatch.setattr(git, "OdooShService", fake_odoosh_cls)
     result = git.git_push(GitPushRequest(project_path=str(project), branch="dev"))

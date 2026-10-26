@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from tests.conftest import WS_TOOLS
 import subprocess
 from pathlib import Path
 
@@ -180,7 +181,7 @@ def test_mcp_initialize_list_and_call(tmp_path, monkeypatch):
         "jobs_list",
         "jobs_get",
         "odoosh_error_pack",
-    }
+    } | WS_TOOLS
 
     called = client.post(
         "/mcp",

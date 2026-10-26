@@ -14,8 +14,7 @@ class WsWiring(unittest.TestCase):
     def test_every_tool_is_registered_everywhere(self):
         for name in NAMES:
             self.assertIn(f'name="{name}"', TOOLS, f"descriptor missing for {name}")
-            self.assertRegex(TOOLS, rf'"{re.escape(name)}": Ws\w+Request', f"input model missing for {name}")
-            self.assertIn(f'if name == "{name}":', TOOLS, f"dispatch branch missing for {name}")
+            self.assertRegex(TOOLS, rf'"{re.escape(name)}": \(Ws\w+Request, ', f"handler row missing for {name}")
             self.assertIn(f'"{name}",', MCP, f"provider list missing {name}")
 
     def test_ws_names_are_strict_mcp_safe(self):
@@ -33,3 +32,10 @@ class WsWiring(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_every_ws_descriptor_has_exactly_one_handler():
+    from odoo_agent_server.routers import tools
+
+    declared = {d.name for d in tools._TOOL_DESCRIPTORS if d.name.startswith("ws.")}
+    assert declared == set(tools._WS_HANDLERS)

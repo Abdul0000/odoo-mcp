@@ -1,3 +1,13 @@
+# Review fixes (post v3)
+
+- tests: fake clocks scoped per module (`patch_module_clock`, `advance_clock_on_job_wait`); the old patches mutated the global `time` module and hung the suite. Flaky timing test uses CPU time, best of 3.
+- tests: stale tool-set expectations include ws_* (`WS_TOOLS`); size budgets re-measured (tools/list 80 KB, instructions 15 KB).
+- deps: `requirements-dev.txt` (jsonschema, pytest-asyncio); `pytest.ini` asyncio strict mode.
+- security: OAuth signing never uses a public fallback key (derived HMAC from API token, or random per-process); connector token compared in constant time; hosted-deployment guard covers Render, Koyeb, Fly, Heroku, Cloud Run. NOTE: OAuth access tokens issued before this change stop validating once; clients re-authorise.
+- bug: `CommandResult` was undefined on the job-resume fallback path in routers/tools.py.
+- arch: ws.* dispatch is one handler table (`_WS_HANDLERS`); input models derived from it.
+- hygiene: FastAPI `lifespan` replaces `on_event`; `ruff.toml` (real-bug rules) and a CI workflow with a 10-minute timeout.
+
 # odoo-mcp ws upgrade (v3)
 
 v3: visible WIP branch (real files), ws_status, commit links + default-branch note, edit results say 'published: false'.

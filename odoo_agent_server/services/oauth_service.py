@@ -27,6 +27,9 @@ class OAuthClient:
 
 
 
+_EPHEMERAL_SECRET = secrets.token_bytes(32)
+
+
 def _token_secret() -> bytes:
     """Return the stable signing secret for stateless OAuth tokens.
 
@@ -38,12 +41,15 @@ def _token_secret() -> bytes:
     New tokens are signed and self-validating. The file store remains for
     short-lived authorization codes and backwards-compatible legacy tokens.
     """
-    secret = settings.oauth_token_secret or settings.api_token
-    if not secret or secret == "change-me":
-        # Development-safe fallback. Production should set ODOO_AGENT_API_TOKEN
-        # or ODOO_AGENT_OAUTH_TOKEN_SECRET to a strong stable secret.
-        secret = "odoo-agent-development-token-secret"
-    return secret.encode("utf-8")
+    if settings.oauth_token_secret:
+        return settings.oauth_token_secret.encode("utf-8")
+    if settings.api_token and settings.api_token != "change-me":
+        # Domain-separated derivation: tokens stay stable across redeploys without using the raw
+        # API token as an HMAC key (a leaked access token must not help forge or replay the other).
+        return hmac.new(settings.api_token.encode("utf-8"), b"odoo-mcp/oauth-token-signing/v1", hashlib.sha256).digest()
+    # No usable secret configured: a random per-process key. Tokens simply stop validating on
+    # restart; there is never a publicly known signing key.
+    return _EPHEMERAL_SECRET
 
 
 def _b64url_encode(raw: bytes) -> str:
