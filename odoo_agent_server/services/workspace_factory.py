@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any, Callable
 
 from fastapi import HTTPException
 
 from ..config import settings
 from .client_resolver_service import ClientResolverService
-from .github_commit_service import GitHubError, GitHubRepo, parse_repo
+from .github_commit_service import GitHubError
+from .repo_provider_service import build_repo, detect_provider, parse_hosts
 from .workspace_service import ClientTarget, WorkspaceError, WorkspaceService
 
 
@@ -16,27 +18,34 @@ def _resolve(name: str | None) -> ClientTarget:
     client = ClientResolverService().resolve_client(name or None, require_complete=True)
     if client is None:
         raise WorkspaceError("client_missing", "no client configured in ODOO_CLIENTS")
-    token = client.token or settings.github_token
-    if not token:
-        raise WorkspaceError("github_token_missing", f"client '{client.name}' has no GitHub token (set 'token' in ODOO_CLIENTS or GITHUB_TOKEN with contents:write)")
+    hosts = parse_hosts(settings.gitlab_hosts_raw)
     try:
-        owner, repo = parse_repo(client.repo)
+        kind = detect_provider(client.repo, client.provider, hosts)
     except ValueError as exc:
-        raise WorkspaceError("repo_not_github", str(exc), repo=client.public.get("repo")) from exc
-    return ClientTarget(client.name, _repo(owner, repo, token), client.branch)
+        raise WorkspaceError("repo_provider_unknown", str(exc), repo=client.public.get("repo")) from exc
+    token = client.token or (settings.gitlab_token if kind == "gitlab" else settings.github_token)
+    if not token:
+        hint = "GITLAB_TOKEN with api scope (Developer+ role)" if kind == "gitlab" else "GITHUB_TOKEN with contents:write"
+        raise WorkspaceError(f"{kind}_token_missing", f"client '{client.name}' has no {kind.title()} token (set 'token' in ODOO_CLIENTS or {hint})")
+    try:
+        repo = _repo(client.repo, token, kind, client.api_url, hosts)
+    except ValueError as exc:
+        raise WorkspaceError("repo_url_invalid", str(exc), repo=client.public.get("repo")) from exc
+    return ClientTarget(client.name, repo, client.branch)
 
 
-_REPOS: dict[tuple[str, str, str], GitHubRepo] = {}
+_REPOS: dict[tuple[str, str, str, str], Any] = {}
 
 
-def _repo(owner: str, repo: str, token: str) -> GitHubRepo:
-    """One GitHubRepo per repo+token so its known-blob cache survives across tool calls."""
-    key = (owner, repo, hashlib.sha256(token.encode()).hexdigest()[:16])
+def _repo(url: str, token: str, kind: str, api_url: str | None, hosts: frozenset[str]) -> Any:
+    """One engine per repo+token so its known-blob/tree caches survive across tool calls."""
+    clean = re.sub(r"//[^@/]+@", "//", (url or "").strip())
+    key = (kind, clean, hashlib.sha256(token.encode()).hexdigest()[:16], api_url or "")
     found = _REPOS.get(key)
     if found is None:
         if len(_REPOS) > 32:
             _REPOS.clear()
-        found = _REPOS[key] = GitHubRepo(owner, repo, token)
+        found = _REPOS[key] = build_repo(url, token, provider=kind, api_url=api_url, gitlab_hosts=hosts, github_token=settings.github_token)
     return found
 
 
@@ -55,5 +64,6 @@ def run_ws(fn: Callable[[WorkspaceService], dict[str, Any]]) -> dict[str, Any]:
         detail = exc.detail if isinstance(exc.detail, (dict, str)) else str(exc.detail)
         return {"status": "error", "error_code": "client_resolution", "error": detail if isinstance(detail, str) else detail.get("message", "client could not be resolved"), "detail": detail if isinstance(detail, dict) else None, "hint": "pass client_name exactly as listed by client_check"}
     except GitHubError as exc:
-        return {"status": "error", "error_code": f"github_{exc.status}", "error": exc.message, "retryable": exc.retryable, "path": exc.path,
-                "hint": "retry the same call" if exc.retryable else "fix token/permissions/branch, then retry"}
+        return {"status": "error", "error_code": f"{exc.provider}_{exc.status}", "error": exc.message, "retryable": exc.retryable, "path": exc.path, **getattr(exc, "extra", {}),
+                **({"needs_user": True, "fallback": {"tool": "workflow_odoo_code_change", "why": "credentials are rejected for the stateless lane; ask the user to fix the token, or use the checkout lane if it has working access"}} if exc.status in (401, 403) and not exc.retryable else {}),
+                "hint": getattr(exc, "hint", None) or ("retry the same call" if exc.retryable else "fix token/permissions/branch, then retry")}

@@ -1,5 +1,5 @@
 # Render blueprint for the free tier. Nothing here relies on a persistent disk:
-# ws_* tools keep state in GitHub (WIP branches) and signed tokens, not in /tmp.
+# ws_* tools keep state in the client's GitHub/GitLab repo (WIP branches) and signed tokens, not in /tmp.
 services:
   - type: web
     name: odoo-mcp
@@ -10,9 +10,13 @@ services:
     envVars:
       - key: ODOO_AGENT_API_TOKEN
         sync: false
-      - key: ODOO_CLIENTS          # JSON list; each client needs a GitHub "token" with contents:write
+      - key: ODOO_CLIENTS          # JSON list; each client needs a "token": GitHub contents:write, or GitLab api scope
         sync: false
-      - key: GITHUB_TOKEN          # optional fallback when a client has no token
+      - key: GITHUB_TOKEN          # optional fallback for GitHub clients without a token (also used for odoo/odoo core lookups)
+        sync: false
+      - key: GITLAB_TOKEN          # optional fallback for GitLab clients without a token
+        sync: false
+      - key: GITLAB_HOSTS          # optional: self-managed GitLab hostnames, comma separated
         sync: false
       - key: ODOO_AGENT_TOON_OUTPUT
         value: auto

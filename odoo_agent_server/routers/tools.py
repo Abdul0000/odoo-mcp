@@ -285,13 +285,13 @@ _TOOL_DESCRIPTORS = [
         name="ws.open",
         title="Open coding workspace",
         description=(
-            "START HERE for any Odoo code change. Opens a module on the client's GitHub branch with no clone: returns ws_id, "
+            "START HERE for any Odoo code change. Opens a module on the client's GitHub/GitLab branch with no clone: returns ws_id, "
             "depends and the file index. Unfinished work from an earlier session is resumed automatically. create=true starts a new module."
         ),
         read_only=False,
         idempotent=True,
     ),
-    ToolDescriptor(name="ws.status", title="Where is my work?", description="Shows which files are unpublished, the WIP branch, the client branch, the default branch and GitHub links. Use when the user cannot see changes on GitHub.", read_only=True),
+    ToolDescriptor(name="ws.status", title="Where is my work?", description="Shows which files are unpublished, the WIP branch, the client branch, the default branch and repository links. Use when the user cannot see changes on GitHub/GitLab.", read_only=True),
     ToolDescriptor(name="ws.outline", title="Outline module", description="Compact map of the module: manifest, models (fields with types, methods), views/actions/menus with inheritance. Read this instead of whole files.", read_only=True),
     ToolDescriptor(
         name="ws.scaffold",
@@ -332,7 +332,7 @@ _TOOL_DESCRIPTORS = [
         name="ws.commit",
         title="Commit and push workspace",
         description=(
-            "Push your edits as one atomic GitHub commit (no clone, never force). Survives a moving branch by replaying edits on the newer head; "
+            "Push your edits as one atomic GitHub/GitLab commit (no clone, never force). Survives a moving branch by replaying edits on the newer head; "
             "retries are idempotent. Blocked only by lint errors, a protected branch, or a true same-line conflict. "
             "The result's next_call runs the Odoo.sh deploy proof; a push alone is not a deployment."
         ),
@@ -517,7 +517,7 @@ _TOOL_DESCRIPTORS = [
         title="Verify deployed source",
         description=(
             "Compare active checkout files to the real Odoo.sh /home/odoo/src/user files and optionally live module status. "
-            "Use before saying a local/GitHub change is already deployed, already live, or already done. repo.read alone is not proof. "
+            "Use before saying a local/Git remote change is already deployed, already live, or already done. repo.read alone is not proof. "
             "If git diff shows no changes for a module, workflow.safe_deploy_module will automatically run this source verification and return verified_already_deployed — read this field before telling the user anything is 'already added' or 'already live'. Do not make that claim from memory of a previous turn."
         ),
         read_only=True,
@@ -616,7 +616,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="git.commit",
         title="Commit code changes", description="Create a git commit", requires_approval=True),
     ToolDescriptor(name="git.push",
-        title="Push code to GitHub", description="Direct git.push is blocked for Odoo module code changes. Use workflow.safe_deploy_module so push, deploy, upgrade, and verification remain one controlled job. Non-module pushes may still use this tool.", requires_approval=True),
+        title="Push code to Git remote", description="Direct git.push is blocked for Odoo module code changes. Use workflow.safe_deploy_module so push, deploy, upgrade, and verification remain one controlled job. Non-module pushes may still use this tool.", requires_approval=True),
     ToolDescriptor(
         name="odoosh.module_install_ssh",
         title="Install module via SSH",
@@ -8794,7 +8794,7 @@ _TOOL_INPUT_MODELS.update({_name: _model for _name, (_model, _) in _WS_HANDLERS.
 
 
 async def _dispatch_ws(name: str, args: dict) -> dict:
-    """Workspace tools do blocking GitHub I/O: run off the event loop; errors come back as structured results."""
+    """Workspace tools do blocking GitHub/GitLab I/O: run off the event loop; errors come back as structured results."""
     entry = _WS_HANDLERS.get(name)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"unknown workspace tool {name}")
@@ -9994,7 +9994,7 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                 resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "verified_files": sorted(expected_user_hashes), "result": _step_payload(result)}
                 if result.exit_code != 0:
                     resume_results["status"] = "deploy_code_mismatch"
-                    resume_results["message"] = "Odoo.sh source checkout did not match the changed local/GitHub files. Module upgrade was not attempted."
+                    resume_results["message"] = "Odoo.sh source checkout did not match the changed local/remote Git files. Module upgrade was not attempted."
                     resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}}
                     return _persist_resume_result(store, job, resume_results, original_request)
 
