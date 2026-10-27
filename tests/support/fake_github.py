@@ -134,7 +134,7 @@ class FakeGitHub:
             if not self._is_ancestor(self.refs[b], payload["sha"]):
                 return 422, {}, {"message": "Update is not a fast forward"}
             self.refs[b] = payload["sha"]
-            return 200, {}, {}
+            return 200, {}, {"ref": f"refs/heads/{b}", "object": {"sha": payload["sha"]}}
         if method == "DELETE" and m:
             self.refs.pop(m.group(1), None)
             return 204, {}, None

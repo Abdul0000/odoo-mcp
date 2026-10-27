@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     protected_branches_raw: str = Field(default="", alias="ODOO_AGENT_PROTECTED_BRANCHES")
     # ws_* workspace tools (GitHub API engine; no clone, no local state)
     github_token: str | None = Field(default=None, alias="GITHUB_TOKEN")
+    # GitLab clients (gitlab.com or self-managed): token needs the api scope (Developer+; Maintainer for protected branches)
+    gitlab_token: str | None = Field(default=None, alias="GITLAB_TOKEN")
+    gitlab_hosts_raw: str = Field(default="", alias="GITLAB_HOSTS")  # extra self-managed hosts, comma separated
     ws_protected_branches_raw: str = Field(default="main,master,production,prod,live", alias="ODOO_AGENT_WS_PROTECTED_BRANCHES")
     ws_autocheckpoint: bool = Field(default=True, alias="ODOO_AGENT_WS_AUTOCHECKPOINT")
     ws_wip_files: bool = Field(default=True, alias="ODOO_AGENT_WS_WIP_FILES")  # show changed files on the WIP branch
@@ -265,6 +268,8 @@ def get_odoo_clients() -> list[dict]:
 
     Each client dict should have:
       name, repo, branch, path, token,
+      provider (optional: "github" | "gitlab"; inferred from the repo host when omitted),
+      api_url (optional: self-managed GitLab API base, e.g. https://git.example.com/api/v4),
       environment (optional: test, development, staging, production),
       odoo_url, odoo_db, odoo_login, odoo_password, odoo_verify_ssl,
       optional per-client Odoo.sh keys:
@@ -317,6 +322,8 @@ def normalise_client(client: dict) -> dict:
         "branch",
         "path",
         "token",
+        "provider",
+        "api_url",
         "environment",
         "odoo_url",
         "odoo_db",
@@ -346,6 +353,7 @@ def safe_client_public(client: dict) -> dict:
         "repo": mask_repo_url(normalized.get("repo", "")) if normalized.get("repo") else None,
         "branch": normalized.get("branch"),
         "path": normalized.get("path"),
+        "provider": normalized.get("provider"),
         "environment": normalized.get("environment"),
         "odoo_url": normalized.get("odoo_url"),
         "odoo_db": normalized.get("odoo_db"),
@@ -378,7 +386,7 @@ def get_client(name: str) -> dict:
 
 
 def make_authenticated_repo_url(repo: str, token: str | None) -> str:
-    """Inject GitHub token into HTTPS repo URL for authenticated git operations."""
+    """Inject the token into an HTTPS repo URL (oauth2:<token>@ works for GitHub and GitLab) for git CLI operations."""
     if not token:
         return repo
     if "oauth2:" in repo or f"{token}@" in repo:
