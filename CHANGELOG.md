@@ -1,15 +1,3 @@
-# GitLab support for ws_* (v3.1)
-
-- New `gitlab_commit_service.GitLabRepo`: same engine interface as `GitHubRepo`, backed by the GitLab REST API (gitlab.com + self-managed). No clone, stateless.
-- New `repo_provider_service`: provider chosen per client (`provider` key, `GITLAB_HOSTS`, or host sniffing); `workspace_factory` builds the right engine and token (`GITLAB_TOKEN` fallback).
-- Engine write primitive is now `commit_to_branch(...)` (GitHub: create tree commit + move ref, unchanged behaviour; GitLab: one atomic commit POST with tip check, post-commit parent verification, no blind replay of an ambiguous POST).
-- `GitHubRepo` omits the Authorization header when no token is set (anonymous odoo/odoo core reads from GitLab clients).
-- Errors carry the provider (`gitlab_404`, ...); a push that landed on a newer tip reports `landed_commit` + hint.
-- `start.sh` trusts gitlab.com and `GITLAB_HOSTS` for SSH; `.env.example`, `render.yaml`, README updated.
-- `ws_commit` result: `evidence` (exact statuses incl. `remote_confirmed`, deployed/verified_live false) and `changes` (per-file created/modified/deleted + line counts, local only).
-- Recovery: unreachable-repo errors carry `fallback: workflow_odoo_code_change`; 401/403 also `needs_user: true`.
-- Tests: `tests/test_commit_evidence.py`, `tests/test_gitlab_commit_service.py` (+ `tests/support/fake_gitlab.py`), `tests/test_repo_provider_factory.py`; opt-in real-server check `tests/live_gitlab_smoke.py`.
-
 # Review fixes (post v3)
 
 - tests: fake clocks scoped per module (`patch_module_clock`, `advance_clock_on_job_wait`); the old patches mutated the global `time` module and hung the suite. Flaky timing test uses CPU time, best of 3.

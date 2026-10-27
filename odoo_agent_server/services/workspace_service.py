@@ -52,9 +52,6 @@ MAX_WIP_FILES = 60
 MAX_WIP_BYTES = 2_000_000
 
 
-FALLBACK_CODES = frozenset({"github_token_missing", "gitlab_token_missing", "repo_provider_unknown", "repo_url_invalid"})
-
-
 class WorkspaceError(RuntimeError):
     def __init__(self, code: str, message: str, **extra: Any) -> None:
         super().__init__(message)
@@ -63,10 +60,7 @@ class WorkspaceError(RuntimeError):
         self.extra = extra
 
     def as_dict(self) -> dict[str, Any]:
-        out = {"status": "error", "error_code": self.code, "error": self.message, **self.extra}
-        if self.code in FALLBACK_CODES:  # never dead-end: name the supported alternate lane
-            out["fallback"] = {"tool": "workflow_odoo_code_change", "why": "the stateless workspace lane cannot reach this repo; the checkout-based lane can"}
-        return out
+        return {"status": "error", "error_code": self.code, "error": self.message, **self.extra}
 
 
 def slugify(value: str) -> str:
@@ -561,7 +555,7 @@ class WorkspaceService:
         self.checkpoint_mode = checkpoint_mode
         self.wip_files = wip_files
         self.registry = registry or REGISTRY
-        self.core_repo_factory = core_repo_factory or (lambda ws: ws.repo.core_repo())
+        self.core_repo_factory = core_repo_factory or (lambda ws: GitHubRepo("odoo", "odoo", ws.repo.token, transport=ws.repo.transport, sleep=ws.repo.sleep))
 
     # ------------------------------------------------------------------ open
     def open(self, client_name: str, module_name: str, *, create: bool = False, fresh: bool = False, branch: str | None = None) -> dict[str, Any]:
@@ -999,25 +993,6 @@ class WorkspaceService:
                 chunks.append({"path": p, "diff": text})
             return {"status": "ok", "files": chunks, "changed": len(paths)}
 
-    def _change_summary(self, ws: Workspace, changed: list[str], limit: int = 40) -> dict[str, Any]:
-        """Reviewable summary of what is about to be committed. Local only: never fetches a file."""
-        files, added_total, removed_total = [], 0, 0
-        for p in changed:
-            new = ws.overlay.get(p)
-            old = ws.base_text.get(p)
-            kind = "deleted" if new is None else ("modified" if p in ws.tree else "created")
-            if old is None and kind == "modified":
-                files.append({"path": p, "change": kind})  # base never loaded (whole-file write): counts unknown, no fetch
-                continue
-            added = removed = 0
-            for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, (old or "").splitlines(), (new or "").splitlines(), autojunk=False).get_opcodes():
-                if tag != "equal":
-                    removed += i2 - i1
-                    added += j2 - j1
-            added_total, removed_total = added_total + added, removed_total + removed
-            files.append({"path": p, "change": kind, "added": added, "removed": removed})
-        return {"files": files[:limit], "file_count": len(changed), "added": added_total, "removed": removed_total, "truncated": len(files) > limit}
-
     def _lint_changed(self, ws: Workspace) -> list[dict[str, Any]]:
         changed = ws.changed_paths()
         deleted = [p for p in changed if ws.overlay.get(p) is None]
@@ -1116,12 +1091,16 @@ class WorkspaceService:
             repo = ws.repo
             changes = files + [FileChange(path=self._journal_name(ws), content=payload)]
             message = f"mcp wip: {ws.module} ({ops} ops, {len(files)} files)"
-            create = ws.wip_head is None and not repo.ref_exists(ws.wip_branch)
+            created = repo.create_tree_commit(parent=parent, base_tree=base_tree, changes=changes, message=message)
             try:
-                created = repo.commit_to_branch(ws.wip_branch, parent=parent, base_tree=base_tree, changes=changes, message=message, create=create)
+                if ws.wip_head is None and not repo.ref_exists(ws.wip_branch):
+                    repo.move_ref(ws.wip_branch, created["commit"], create=True)
+                else:
+                    repo.move_ref(ws.wip_branch, created["commit"])
             except NonFastForward:
                 head = repo.head(ws.wip_branch)
-                created = repo.commit_to_branch(ws.wip_branch, parent=head["commit"], base_tree=base_tree, changes=changes, message=message)
+                created = repo.create_tree_commit(parent=head["commit"], base_tree=base_tree, changes=changes, message=message)
+                repo.move_ref(ws.wip_branch, created["commit"])
             ws.wip_head = created["commit"]
             return {"saved": True, "branch": ws.wip_branch, "ops": ops, "files_visible_on_github": files_visible, "url": repo.web_url("tree", ws.wip_branch)}
         except Exception as exc:  # noqa: BLE001 - persistence is best effort, never blocks editing
@@ -1243,7 +1222,6 @@ class WorkspaceService:
                         conflicts.append({"path": bad_lint[0]["path"], "reason": "merged result fails lint after rebasing onto newer upstream commits", "findings": bad_lint[:10]})
                 return changes, conflicts
 
-            summary = self._change_summary(ws, changed)  # before the push resets the overlay
             outcome = push_changes(repo, target_branch, message=message, key=key, build_changes=build, expected_base=expected)
             result: dict[str, Any] = {"status": outcome.status, "branch": target_branch, "attempts": outcome.attempts, "api_calls": outcome.api_calls}
             if outcome.status in {"pushed", "already_pushed", "no_changes"} and outcome.commit:
@@ -1253,26 +1231,14 @@ class WorkspaceService:
                 if outcome.status != "no_changes":
                     self._after_push(ws, target_branch, outcome)
                 result["published"] = True
-                result["changes"] = summary
-                result["evidence"] = {
-                    "implemented": True,
-                    "validated": "lint_passed" if not errors else "lint_overridden",
-                    "committed": True,
-                    "pushed": True,
-                    "remote_confirmed": bool(outcome.confirmed),
-                    "deployed": False,
-                    "verified_live": False,
-                    "pending": "Odoo.sh build + module upgrade proof: run next_call. Do not report deployed or live until it confirms.",
-                }
                 result["urls"] = {"commit": repo.web_url("commit", outcome.commit), "branch": repo.web_url("tree", target_branch)}
                 default = repo.default_branch()
-                label = getattr(repo, "label", "GitHub")
                 if default and default != target_branch:
-                    result["where"] = f"pushed to branch '{target_branch}', NOT the default branch '{default}': in {label} use the branch dropdown, or open urls.commit"
+                    result["where"] = f"pushed to branch '{target_branch}', NOT the default branch '{default}': in GitHub use the branch dropdown, or open urls.commit"
                 else:
                     result["where"] = f"pushed to '{target_branch}'"
                 result["next_call"] = {"tool": "workflow_module_install_and_check", "arguments": {"client_name": ws.client, "module_name": ws.module, "expected_sha": outcome.commit, "branch": target_branch}}
-                result["deploy_note"] = f"Pushed to {label}. This is not deployment: run next_call (Odoo.sh build + module upgrade proof)."
+                result["deploy_note"] = "Pushed to GitHub. This is not deployment: run next_call (Odoo.sh build + module upgrade proof)."
             elif outcome.status == "conflict":
                 result["conflicts"] = outcome.conflicts
                 result["hint"] = "Upstream changed the same lines. Re-read those files with ws_read (they show the current branch state after ws_open fresh=true), then re-apply your intent."

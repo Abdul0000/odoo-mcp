@@ -595,35 +595,8 @@ How it survives Render restarts: after each successful `ws_edit` the edit journa
 GitHub branch `mcp/wip/<client>-<module>`. `ws_id` is self-describing, so any call after a spin-down
 rebuilds the workspace by replaying the journal on the current branch head. Conflicts are reported per edit.
 
-Requirements: each client in `ODOO_CLIENTS` needs a **GitHub or GitLab** repo and a `token` for it
-(GitHub: `contents:write`, or `GITHUB_TOKEN`; GitLab: `api` scope, or `GITLAB_TOKEN`). SSH remote URLs are accepted
-(only the host/path is read; the API token does the work). Bitbucket/other hosts keep using `workflow_odoo_code_change`.
-
-### GitHub and GitLab clients
-The host is detected from the repo URL (`github.com` -> GitHub; `gitlab.com`, `gitlab.*` -> GitLab). For any other
-self-managed GitLab host either add `"provider": "gitlab"` to that client or list the hostname in `GITLAB_HOSTS`.
-A GitLab behind a sub-path can set `"api_url": "https://host/gitlab/api/v4"` on the client. Per client:
-
-```json
-{"name": "Client B", "repo": "https://gitlab.com/group/subgroup/project.git", "branch": "staging",
- "path": "/workspace/repos/client_b", "token": "glpat-...", "odoo_url": "...", "odoo_db": "..."}
-```
-
-Behaviour is identical for the model (same `ws_*` tools, same results); differences you may notice:
-- GitLab has no Git Data API, so each write is **one** `POST /repository/commits` that also moves the branch. The engine
-  re-checks the branch tip right before it and compares the new commit's parent afterwards: a branch that moved is replayed
-  (same as GitHub); a push that slips into the few-millisecond window between check and commit returns `gitlab_409` with
-  `landed_commit` and a hint to compare before deploying (history is intact, nothing is force-pushed).
-- A 5xx/timeout on that POST is never blindly replayed: the engine first checks whether the commit already landed (`MCP-Op` trailer),
-  so a lost response cannot create a duplicate commit.
-- Committing to a protected branch needs the Maintainer role on GitLab (the default `ODOO_AGENT_WS_PROTECTED_BRANCHES` still blocks main/master/production).
-- GitLab's tree listing has no file sizes, so oversize detection for existing files happens when the file is read (the 400 KB guard still applies to writes).
-- `odoo/odoo` core lookups (`ws_symbol`) always use GitHub (anonymous works; `GITHUB_TOKEN` raises the rate limit).
-- Self-managed GitLab with a private CA: set `GITLAB_CA_BUNDLE` to the PEM path. `git` CLI tools (`repo.*`, `workflow_*`) already
-  work over HTTPS (`oauth2:<token>@`) or SSH; `start.sh` pre-trusts `gitlab.com` and every host in `GITLAB_HOSTS` for SSH.
-
-Verify once against your real GitLab (creates and deletes one throw-away branch `mcp/smoke/<ts>`):
-`GITLAB_SMOKE_REPO=... GITLAB_SMOKE_TOKEN=... GITLAB_SMOKE_BRANCH=staging python -m tests.live_gitlab_smoke`
+Requirements: each client in `ODOO_CLIENTS` needs an HTTPS `github.com` repo and a `token` with
+`contents:write` (or set `GITHUB_TOKEN`). SSH-only or non-GitHub repos keep using `workflow_odoo_code_change`.
 
 What `ws_edit` wires for you: new `.py` files get their `from . import` (creating `__init__.py` chains), new
 `views|security|data|report|wizard|demo` XML/CSV files are added to the manifest (security first), and *deleting* such a
@@ -647,31 +620,21 @@ Text results of `ws_*` and tabular query tools are rendered as TOON (uniform arr
 code and diffs are emitted raw instead of JSON-escaped). The renderer verifies a lossless round-trip and falls back
 to compact JSON whenever TOON is not smaller, so it can never grow a response. `structuredContent` stays JSON.
 
-### What `ws_commit` proves (and what it does not)
-A pushed result carries `evidence` with the exact statuses: `implemented`, `validated` (`lint_passed` / `lint_overridden`),
-`committed`, `pushed`, `remote_confirmed` (the server's own response proved the branch points at the commit; also true when
-an earlier identical push is found by its `MCP-Op` trailer), and always `deployed: false, verified_live: false` until the
-`next_call` proof confirms them. `changes` lists every file as created/modified/deleted with added/removed line counts, computed
-locally before the push (no extra API calls). Errors that mean "this lane cannot reach the repo" (`*_token_missing`,
-`repo_provider_unknown`, `repo_url_invalid`) carry `fallback: workflow_odoo_code_change`; rejected credentials (401/403) also
-carry `needs_user: true` because only the user can grant access.
-
 ### Running the offline tests
 ```
 python -m unittest tests.test_toon_service tests.test_workspace_service tests.test_ws_tool_wiring
 ```
-(stdlib only; they use in-memory fakes of the GitHub Git Data API and the GitLab REST API in `tests/support/fake_github.py` and
-`tests/support/fake_gitlab.py`. GitLab: `python -m unittest tests.test_gitlab_commit_service tests.test_repo_provider_factory`.)
+(stdlib only; they use an in-memory fake of the GitHub Git Data API in `tests/support/fake_github.py`.)
 
 ### Scenario harness
 `python -m tests.evals.run` runs scripted end-to-end tasks (new model, extend + verify, lint-fix loop, delete, teammate push
 mid-task, restart mid-task) against in-memory fakes and enforces tool-call and API-call budgets. It evaluates the *tooling*;
 it does not measure a language model. Run the same task prompts through the live connector to evaluate a model.
 
-### Where do my changes show up on GitHub / GitLab?
+### Where do my changes show up on GitHub?
 1. While editing: on the branch `mcp/wip/<client>-<module>` (real files, plus `.mcp-wip-*.json`). They are **not** on the client branch yet.
-   Switch the branch dropdown in GitHub/GitLab to that branch. Disable with `ODOO_AGENT_WS_WIP_FILES=false`; changesets over 60 files / 2 MB are journal-only.
+   Switch the branch dropdown in GitHub to that branch. Disable with `ODOO_AGENT_WS_WIP_FILES=false`; changesets over 60 files / 2 MB are journal-only.
 2. After `ws_commit`: on the client's configured branch (for example `staging`), which is often **not** GitHub's default branch (`main`).
    The result contains `urls.commit` and a `where` note naming the branch. `ws_status` answers "where is my work?" at any time.
 3. If nothing appears anywhere: check `checkpoint.saved` / the `ws_commit` status (blocked_by_lint, blocked_protected_branch,
-   conflict, or a GitHub/GitLab 401/403 meaning the token lacks `contents:write` / the `api` scope).
+   conflict, or a GitHub 401/403 meaning the token lacks `contents:write`).
