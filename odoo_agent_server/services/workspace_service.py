@@ -52,9 +52,6 @@ MAX_WIP_FILES = 60
 MAX_WIP_BYTES = 2_000_000
 
 
-FALLBACK_CODES = frozenset({"github_token_missing", "gitlab_token_missing", "repo_provider_unknown", "repo_url_invalid"})
-
-
 class WorkspaceError(RuntimeError):
     def __init__(self, code: str, message: str, **extra: Any) -> None:
         super().__init__(message)
@@ -63,10 +60,7 @@ class WorkspaceError(RuntimeError):
         self.extra = extra
 
     def as_dict(self) -> dict[str, Any]:
-        out = {"status": "error", "error_code": self.code, "error": self.message, **self.extra}
-        if self.code in FALLBACK_CODES:  # never dead-end: name the supported alternate lane
-            out["fallback"] = {"tool": "workflow_odoo_code_change", "why": "the stateless workspace lane cannot reach this repo; the checkout-based lane can"}
-        return out
+        return {"status": "error", "error_code": self.code, "error": self.message, **self.extra}
 
 
 def slugify(value: str) -> str:
@@ -112,12 +106,64 @@ def _closest(text: str, needle: str, limit: int = 3) -> list[dict[str, Any]]:
     return [{"line": i + 1, "similarity": round(r, 2), "text": "\n".join(lines[i : i + n])[:400]} for r, i in scored[:limit]]
 
 
+def _lead(line: str) -> str:
+    return line[: len(line) - len(line.lstrip())]
+
+
+def _heal_replace(current: str, search: str, replacement: str) -> str | None:
+    """Apply a replace whose search differs from the file only by per-line leading/trailing
+    whitespace (the usual agent indentation slip). Only a UNIQUE match is healed; the
+    replacement is re-indented to the file's own indentation. Returns the new text or None."""
+    want = [row.strip() for row in search.strip("\n").splitlines()]
+    if not want or not any(want):
+        return None
+    lines = current.splitlines(keepends=True)
+    stripped = [row.strip() for row in lines]
+    n = len(want)
+    hits = [i for i in range(len(lines) - n + 1) if stripped[i : i + n] == want]
+    if len(hits) != 1:
+        return None
+    i = hits[0]
+    block = "".join(lines[i : i + n])
+    eol = "\r\n" if block.endswith("\r\n") else "\n" if block.endswith("\n") else ""
+    want_rows = search.strip("\n").splitlines()
+    search_indent = next((_lead(r) for r in want_rows if r.strip()), "")
+    file_indent = _lead(lines[i])
+    out = []
+    for row in replacement.strip("\n").splitlines():
+        if not row.strip():
+            out.append("")
+        elif search_indent and row.startswith(search_indent):
+            out.append(file_indent + row[len(search_indent):])
+        elif not search_indent:
+            out.append(file_indent + row)
+        else:
+            out.append(row)
+    new_block = (eol.join(out) + eol) if out else ""
+    return "".join(lines[:i]) + new_block + "".join(lines[i + n :])
+
+
 def infer_op(edit: dict[str, Any]) -> str | None:
     return edit.get("op") or ("write" if edit.get("content") is not None else "replace" if edit.get("search") is not None else None)
 
 
 def apply_edit(current: str | None, edit: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
     """Return (new_text_or_None_for_delete, error). ``current`` is None when the file is absent."""
+    text, err, _healed = apply_edit_ex(current, edit)
+    return text, err
+
+
+def apply_edit_ex(current: str | None, edit: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None, bool]:
+    """Like apply_edit, plus ``healed``: True when a whitespace-only search mismatch was repaired."""
+    text, err = _apply_edit(current, edit)
+    if err and err.get("code") == "no_match" and current is not None and not edit.get("regex"):
+        healed = _heal_replace(current, edit.get("search") or "", edit.get("replace", ""))
+        if healed is not None:
+            return healed, None, True
+    return text, err, False
+
+
+def _apply_edit(current: str | None, edit: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
     op = edit.get("op") or ("write" if edit.get("content") is not None else "replace" if edit.get("search") is not None else None)
     path = edit["path"]
     if op == "delete":
@@ -561,7 +607,7 @@ class WorkspaceService:
         self.checkpoint_mode = checkpoint_mode
         self.wip_files = wip_files
         self.registry = registry or REGISTRY
-        self.core_repo_factory = core_repo_factory or (lambda ws: ws.repo.core_repo())
+        self.core_repo_factory = core_repo_factory or (lambda ws: GitHubRepo("odoo", "odoo", ws.repo.token, transport=ws.repo.transport, sleep=ws.repo.sleep))
 
     # ------------------------------------------------------------------ open
     def open(self, client_name: str, module_name: str, *, create: bool = False, fresh: bool = False, branch: str | None = None) -> dict[str, Any]:
@@ -756,6 +802,7 @@ class WorkspaceService:
                 normalized.append(item)
             staged = dict(ws.overlay)
             results, failed = [], False
+            healed_edits: list[dict[str, Any]] = []
             applied: list[dict[str, Any]] = []
             for index, edit in enumerate(normalized):
                 path = edit["path"]
@@ -770,7 +817,7 @@ class WorkspaceService:
                     current = ws.load([path]).get(path)
                 else:
                     current = None
-                new_text, err = apply_edit(current, edit)
+                new_text, err, healed = apply_edit_ex(current, edit)
                 if err:
                     failed = True
                     results.append({"i": index, "path": path, "ok": False, **err})
@@ -778,6 +825,8 @@ class WorkspaceService:
                 staged[path] = new_text
                 applied.append({**edit, "op": infer_op(edit)})  # journal entries always carry an explicit op
                 results.append({"i": index, "path": path, "ok": True, "op": infer_op(edit)})
+                if healed:
+                    healed_edits.append({"i": index, "path": path, "note": "search differed only by whitespace/indentation; matched the one place it fits and kept the file's indentation"})
             if failed:
                 return {"status": "rejected", "reason": "edit_failed", "applied": 0, "results": results, "hint": "Nothing was changed. Fix only the failing edits and resend the whole batch."}
             saved_overlay, saved_journal = dict(ws.overlay), list(ws.journal)
@@ -816,6 +865,7 @@ class WorkspaceService:
                 "status": "ok" if not errors else "ok_with_errors",
                 "applied": len(applied),
                 "autofixed": [{"path": o["path"], "what": _auto_label(o)} for o in auto_ops],
+                **({"healed": healed_edits} if healed_edits else {}),
                 "findings": findings,
                 "errors": len(errors),
                 "changed": summary,
@@ -999,25 +1049,6 @@ class WorkspaceService:
                 chunks.append({"path": p, "diff": text})
             return {"status": "ok", "files": chunks, "changed": len(paths)}
 
-    def _change_summary(self, ws: Workspace, changed: list[str], limit: int = 40) -> dict[str, Any]:
-        """Reviewable summary of what is about to be committed. Local only: never fetches a file."""
-        files, added_total, removed_total = [], 0, 0
-        for p in changed:
-            new = ws.overlay.get(p)
-            old = ws.base_text.get(p)
-            kind = "deleted" if new is None else ("modified" if p in ws.tree else "created")
-            if old is None and kind == "modified":
-                files.append({"path": p, "change": kind})  # base never loaded (whole-file write): counts unknown, no fetch
-                continue
-            added = removed = 0
-            for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, (old or "").splitlines(), (new or "").splitlines(), autojunk=False).get_opcodes():
-                if tag != "equal":
-                    removed += i2 - i1
-                    added += j2 - j1
-            added_total, removed_total = added_total + added, removed_total + removed
-            files.append({"path": p, "change": kind, "added": added, "removed": removed})
-        return {"files": files[:limit], "file_count": len(changed), "added": added_total, "removed": removed_total, "truncated": len(files) > limit}
-
     def _lint_changed(self, ws: Workspace) -> list[dict[str, Any]]:
         changed = ws.changed_paths()
         deleted = [p for p in changed if ws.overlay.get(p) is None]
@@ -1116,12 +1147,16 @@ class WorkspaceService:
             repo = ws.repo
             changes = files + [FileChange(path=self._journal_name(ws), content=payload)]
             message = f"mcp wip: {ws.module} ({ops} ops, {len(files)} files)"
-            create = ws.wip_head is None and not repo.ref_exists(ws.wip_branch)
+            created = repo.create_tree_commit(parent=parent, base_tree=base_tree, changes=changes, message=message)
             try:
-                created = repo.commit_to_branch(ws.wip_branch, parent=parent, base_tree=base_tree, changes=changes, message=message, create=create)
+                if ws.wip_head is None and not repo.ref_exists(ws.wip_branch):
+                    repo.move_ref(ws.wip_branch, created["commit"], create=True)
+                else:
+                    repo.move_ref(ws.wip_branch, created["commit"])
             except NonFastForward:
                 head = repo.head(ws.wip_branch)
-                created = repo.commit_to_branch(ws.wip_branch, parent=head["commit"], base_tree=base_tree, changes=changes, message=message)
+                created = repo.create_tree_commit(parent=head["commit"], base_tree=base_tree, changes=changes, message=message)
+                repo.move_ref(ws.wip_branch, created["commit"])
             ws.wip_head = created["commit"]
             return {"saved": True, "branch": ws.wip_branch, "ops": ops, "files_visible_on_github": files_visible, "url": repo.web_url("tree", ws.wip_branch)}
         except Exception as exc:  # noqa: BLE001 - persistence is best effort, never blocks editing
@@ -1174,7 +1209,7 @@ class WorkspaceService:
         return {"status": "ok", "discarded": ws.ws_id, "wip_branch_deleted": ws.wip_branch}
 
     # ------------------------------------------------------------------ commit
-    def commit(self, ws_id: str, message: str, *, push: bool = True, branch: str | None = None, allow_lint_errors: bool = False) -> dict[str, Any]:
+    def commit(self, ws_id: str, message: str | None = None, *, push: bool = True, branch: str | None = None, allow_lint_errors: bool = False) -> dict[str, Any]:
         ws = self.get(ws_id)
         with ws.lock:
             changed = ws.changed_paths()
@@ -1184,6 +1219,8 @@ class WorkspaceService:
             errors = [f for f in findings if f["severity"] == "error"]
             if errors and not allow_lint_errors:
                 return {"status": "blocked_by_lint", "errors": len(errors), "findings": errors[:40], "hint": "Fix with ws_edit. Only pass allow_lint_errors=true if the user explicitly wants a known-broken push."}
+            if not message or len(message.strip()) < 3:
+                message = _auto_message(ws.module, ws.overlay, changed)
             target_branch = branch or ws.branch
             if target_branch in self.protected:
                 return {"status": "blocked_protected_branch", "branch": target_branch, "hint": f"'{target_branch}' is protected. Commit to the client's staging branch or pass branch='<new-branch>' to create one; merge via pull request."}
@@ -1243,7 +1280,6 @@ class WorkspaceService:
                         conflicts.append({"path": bad_lint[0]["path"], "reason": "merged result fails lint after rebasing onto newer upstream commits", "findings": bad_lint[:10]})
                 return changes, conflicts
 
-            summary = self._change_summary(ws, changed)  # before the push resets the overlay
             outcome = push_changes(repo, target_branch, message=message, key=key, build_changes=build, expected_base=expected)
             result: dict[str, Any] = {"status": outcome.status, "branch": target_branch, "attempts": outcome.attempts, "api_calls": outcome.api_calls}
             if outcome.status in {"pushed", "already_pushed", "no_changes"} and outcome.commit:
@@ -1253,26 +1289,14 @@ class WorkspaceService:
                 if outcome.status != "no_changes":
                     self._after_push(ws, target_branch, outcome)
                 result["published"] = True
-                result["changes"] = summary
-                result["evidence"] = {
-                    "implemented": True,
-                    "validated": "lint_passed" if not errors else "lint_overridden",
-                    "committed": True,
-                    "pushed": True,
-                    "remote_confirmed": bool(outcome.confirmed),
-                    "deployed": False,
-                    "verified_live": False,
-                    "pending": "Odoo.sh build + module upgrade proof: run next_call. Do not report deployed or live until it confirms.",
-                }
                 result["urls"] = {"commit": repo.web_url("commit", outcome.commit), "branch": repo.web_url("tree", target_branch)}
                 default = repo.default_branch()
-                label = getattr(repo, "label", "GitHub")
                 if default and default != target_branch:
-                    result["where"] = f"pushed to branch '{target_branch}', NOT the default branch '{default}': in {label} use the branch dropdown, or open urls.commit"
+                    result["where"] = f"pushed to branch '{target_branch}', NOT the default branch '{default}': in GitHub use the branch dropdown, or open urls.commit"
                 else:
                     result["where"] = f"pushed to '{target_branch}'"
                 result["next_call"] = {"tool": "workflow_module_install_and_check", "arguments": {"client_name": ws.client, "module_name": ws.module, "expected_sha": outcome.commit, "branch": target_branch}}
-                result["deploy_note"] = f"Pushed to {label}. This is not deployment: run next_call (Odoo.sh build + module upgrade proof)."
+                result["deploy_note"] = "Pushed to GitHub. This is not deployment: run next_call (Odoo.sh build + module upgrade proof)."
             elif outcome.status == "conflict":
                 result["conflicts"] = outcome.conflicts
                 result["hint"] = "Upstream changed the same lines. Re-read those files with ws_read (they show the current branch state after ws_open fresh=true), then re-apply your intent."
@@ -1306,6 +1330,20 @@ class WorkspaceService:
         ws.journal.clear()
         self._drop_wip(ws)
         ws.branch = branch
+
+
+def _auto_message(module: str, overlay: dict[str, Any], changed: list[str]) -> str:
+    """Conventional one-line commit message so the agent never stalls composing one."""
+    added = [p for p in changed if overlay.get(p) is not None and p.rsplit("/", 1)[-1] not in {"__manifest__.py"}]
+    names = ", ".join(sorted({p.rsplit("/", 1)[-1] for p in changed})[:4])
+    more = len(changed) - 4
+    suffix = f" (+{more} more)" if more > 0 else ""
+    verb = "update"
+    if changed and all(overlay.get(p) is None for p in changed):
+        verb = "remove files from"
+    elif added and len(added) == len(changed):
+        verb = "update"
+    return f"[IMP] {module}: {verb} {names}{suffix}"[:200]
 
 
 def _auto_label(op: dict[str, Any]) -> str:

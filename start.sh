@@ -26,13 +26,7 @@ if [ -f /tmp/keys/github_key ]; then
   export GIT_SSH_COMMAND="ssh -i /tmp/keys/github_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 fi
 
-ssh-keyscan github.com gitlab.com >> /root/.ssh/known_hosts 2>/dev/null || true
-# Self-managed GitLab hosts (comma separated) get trusted for SSH too.
-if [ -n "${GITLAB_HOSTS:-}" ]; then
-  for h in $(echo "$GITLAB_HOSTS" | tr ',' ' '); do
-    ssh-keyscan "$h" >> /root/.ssh/known_hosts 2>/dev/null || true
-  done
-fi
+ssh-keyscan github.com >> /root/.ssh/known_hosts 2>/dev/null || true
 
 # Verify SSH keys are valid
 if [ -f /tmp/keys/odoosh_key ]; then

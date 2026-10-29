@@ -24,8 +24,6 @@ class ResolvedClient:
     branch: str
     path: str
     token: str | None = None
-    provider: str | None = None
-    api_url: str | None = None
     environment: str | None = None
     odoo_url: str | None = None
     odoo_db: str | None = None
@@ -53,7 +51,6 @@ class ResolvedClient:
                 "repo": self.repo,
                 "branch": self.branch,
                 "path": self.path,
-                "provider": self.provider,
                 "environment": self.environment,
                 "odoo_url": self.odoo_url,
                 "odoo_db": self.odoo_db,
@@ -224,8 +221,6 @@ class ClientResolverService:
             branch=client["branch"],
             path=client["path"],
             token=client.get("token") or None,
-            provider=(client.get("provider") or "").lower() or None,
-            api_url=client.get("api_url") or None,
             environment=self._parse_environment(client.get("environment")),
             odoo_url=client.get("odoo_url") or None,
             odoo_db=client.get("odoo_db") or None,

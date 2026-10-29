@@ -2027,7 +2027,7 @@ class ToolDescriptor(BaseModel):
         default=None,
         description=(
             "Human-readable action label shown in MCP/client tool-call UI "
-            "(e.g. 'Push code to Git remote' instead of raw name 'git.push'). "
+            "(e.g. 'Push code to GitHub' instead of raw name 'git.push'). "
             "Falls back to a humanized version of `name` if not set."
         ),
     )
@@ -2103,7 +2103,7 @@ class SafeDeployModuleRequest(BaseProjectRequest, ApprovalMixin):
         default=True,
         description=(
             "When Odoo.sh deploy validation is blocked only by SSH/public-key or connection availability, "
-            "allow verified source to be committed and pushed to GitHub/GitLab without claiming Odoo.sh deployment or module upgrade."
+            "allow verified source to be committed and pushed to GitHub without claiming Odoo.sh deployment or module upgrade."
         ),
     )
     force_new_deploy: bool = Field(
@@ -2916,7 +2916,7 @@ class WsIdRequest(BaseModel):
 
 class WsCommitRequest(BaseModel):
     ws_id: str
-    message: str = Field(..., min_length=3, max_length=500)
+    message: str | None = Field(default=None, min_length=3, max_length=500, description="Optional; a conventional message is generated from the changed files when omitted.")
     push: bool = Field(default=True, description="False only checks readiness.")
     branch: str | None = Field(default=None, description="Push to this NEW branch instead of the client's branch.")
     allow_lint_errors: bool = Field(default=False, description="Only when the user explicitly accepts a known-broken push.")

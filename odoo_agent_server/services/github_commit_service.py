@@ -25,10 +25,8 @@ Transport = Callable[[str, str, dict[str, str], bytes | None], tuple[int, dict[s
 
 
 class GitHubError(RuntimeError):
-    provider = "github"
-
     def __init__(self, status: int, message: str, *, retryable: bool = False, path: str = "") -> None:
-        super().__init__(f"{ {'github': 'GitHub', 'gitlab': 'GitLab'}.get(self.provider, self.provider) } {status} {path}: {message}")
+        super().__init__(f"GitHub {status} {path}: {message}")
         self.status = status
         self.message = message
         self.retryable = retryable
@@ -127,26 +125,19 @@ class GitHubRepo:
     transport: Transport = default_transport
     sleep: Callable[[float], None] = time.sleep
     max_attempts: int = 5
-    label: str = "GitHub"
-    provider: str = "github"
     calls: int = field(default=0, init=False)
     known_blobs: set = field(default_factory=set, init=False, repr=False)
     _default_branch: str | None = field(default=None, init=False, repr=False)
-
-    def core_repo(self) -> "GitHubRepo":
-        """The odoo/odoo core source used for symbol lookups."""
-        return GitHubRepo("odoo", "odoo", self.token, transport=self.transport, sleep=self.sleep)
 
     # ------------------------------------------------------------ low level
     def request(self, method: str, path: str, payload: Any = None, *, ok: tuple[int, ...] = (200, 201)) -> Any:
         url = path if path.startswith("http") else f"{API}/repos/{self.owner}/{self.repo}{path}"
         headers = {
+            "Authorization": f"Bearer {self.token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
             "User-Agent": "odoo-mcp-agent",
         }
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
         body = None
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
@@ -284,23 +275,11 @@ class GitHubRepo:
         commit = self.request("POST", "/git/commits", {"message": message, "tree": tree["sha"], "parents": [parent]})
         return {"commit": commit["sha"], "tree": tree["sha"]}
 
-    def commit_to_branch(self, branch: str, *, parent: str, base_tree: str, changes: list[FileChange], message: str, create: bool = False) -> dict[str, str]:
-        """Commit ``changes`` on ``parent`` and move ``branch`` (fast-forward only). Raises NonFastForward if it moved.
-
-        This is the one write primitive the workspace engine uses, so a provider without a Git Data API
-        (GitLab) can implement it as a single atomic call.
-        """
-        created = self.create_tree_commit(parent=parent, base_tree=base_tree, changes=changes, message=message)
-        created["confirmed"] = self.move_ref(branch, created["commit"], create=create)
-        return created
-
-    def move_ref(self, branch: str, sha: str, *, create: bool = False) -> bool:
-        """Move/create the ref. True when the response itself proves the remote ref now points at ``sha``."""
+    def move_ref(self, branch: str, sha: str, *, create: bool = False) -> None:
         if create:
-            data = self.request("POST", "/git/refs", {"ref": f"refs/heads/{branch}", "sha": sha})
+            self.request("POST", "/git/refs", {"ref": f"refs/heads/{branch}", "sha": sha})
         else:
-            data = self.request("PATCH", f"/git/refs/heads/{branch}", {"sha": sha, "force": False})
-        return isinstance(data, dict) and (data.get("object") or {}).get("sha") == sha
+            self.request("PATCH", f"/git/refs/heads/{branch}", {"sha": sha, "force": False})
 
     def delete_branch(self, branch: str) -> None:
         self.request("DELETE", f"/git/refs/heads/{branch}", ok=(200, 204, 422))
@@ -340,11 +319,10 @@ class CommitOutcome:
     conflicts: list[dict[str, Any]] = field(default_factory=list)
     changes: list[FileChange] = field(default_factory=list)
     api_calls: int = 0
-    confirmed: bool = False  # the server's own response proved the branch now points at ``commit``
 
 
 def push_changes(
-    repo: Any,
+    repo: GitHubRepo,
     branch: str,
     *,
     message: str,
@@ -371,7 +349,7 @@ def push_changes(
         if moved or expected_base is None or attempt > 1:
             landed = find_trailer(repo.recent_commit_messages(branch), key)
             if landed:
-                outcome.status, outcome.commit, outcome.api_calls, outcome.confirmed = "already_pushed", landed, repo.calls, True  # found on the remote branch history
+                outcome.status, outcome.commit, outcome.api_calls = "already_pushed", landed, repo.calls
                 return outcome
         cache: dict[str, dict[str, dict[str, str]]] = {}
 
@@ -387,13 +365,13 @@ def push_changes(
         if not changes:
             outcome.status, outcome.commit, outcome.api_calls = "no_changes", head["commit"], repo.calls
             return outcome
+        created = repo.create_tree_commit(parent=head["commit"], base_tree=head["tree"], changes=changes, message=with_trailer(message, key))
         try:
-            created = repo.commit_to_branch(branch, parent=head["commit"], base_tree=head["tree"], changes=changes, message=with_trailer(message, key))
+            repo.move_ref(branch, created["commit"])
         except NonFastForward:
             outcome.rebased = True
             continue
         outcome.status, outcome.commit, outcome.tree, outcome.changes, outcome.api_calls = "pushed", created["commit"], created["tree"], changes, repo.calls
-        outcome.confirmed = bool(created.get("confirmed"))
         outcome.rebased = outcome.rebased or moved
         return outcome
     outcome.status = "conflict"

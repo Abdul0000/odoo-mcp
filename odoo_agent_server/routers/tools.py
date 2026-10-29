@@ -142,6 +142,12 @@ from ..schemas import (
 )
 from ..services.git_service import GitService
 from ..services.client_resolver_service import ClientResolverService
+from ..services.checkout_redirect_service import (
+    CHECKOUT_REDIRECT_TOOLS,
+    build_ws_redirect,
+    is_missing_checkout,
+    redirect_from_arguments,
+)
 from ..services.workspace_factory import run_ws
 from ..services.client_gate_service import ClientGateService
 from ..services.odoo_service import OdooService
@@ -285,13 +291,13 @@ _TOOL_DESCRIPTORS = [
         name="ws.open",
         title="Open coding workspace",
         description=(
-            "START HERE for any Odoo code change. Opens a module on the client's GitHub/GitLab branch with no clone: returns ws_id, "
+            "START HERE for any Odoo code change. Opens a module on the client's GitHub branch with no clone: returns ws_id, "
             "depends and the file index. Unfinished work from an earlier session is resumed automatically. create=true starts a new module."
         ),
         read_only=False,
         idempotent=True,
     ),
-    ToolDescriptor(name="ws.status", title="Where is my work?", description="Shows which files are unpublished, the WIP branch, the client branch, the default branch and repository links. Use when the user cannot see changes on GitHub/GitLab.", read_only=True),
+    ToolDescriptor(name="ws.status", title="Where is my work?", description="Shows which files are unpublished, the WIP branch, the client branch, the default branch and GitHub links. Use when the user cannot see changes on GitHub.", read_only=True),
     ToolDescriptor(name="ws.outline", title="Outline module", description="Compact map of the module: manifest, models (fields with types, methods), views/actions/menus with inheritance. Read this instead of whole files.", read_only=True),
     ToolDescriptor(
         name="ws.scaffold",
@@ -322,7 +328,7 @@ _TOOL_DESCRIPTORS = [
         title="Edit workspace files",
         description=(
             "Small exact edits (search/replace) or full-file writes, applied atomically, then linted instantly: python, xml, xpath, js, csv, manifest, imports. "
-            "New files are auto-wired ('from . import', manifest data). If an edit fails nothing changes and you get the closest matches. "
+            "New files are auto-wired ('from . import', manifest data). A search that differs only by indentation/whitespace is self-healed when it matches one place (result shows healed). If an edit still fails nothing changes and you get the closest matches. "
             "Fix reported errors with another ws.edit, then ws.commit."
         ),
     ),
@@ -332,7 +338,7 @@ _TOOL_DESCRIPTORS = [
         name="ws.commit",
         title="Commit and push workspace",
         description=(
-            "Push your edits as one atomic GitHub/GitLab commit (no clone, never force). Survives a moving branch by replaying edits on the newer head; "
+            "Push your edits as one atomic GitHub commit (no clone, never force); message is optional (auto-generated). Survives a moving branch by replaying edits on the newer head; "
             "retries are idempotent. Blocked only by lint errors, a protected branch, or a true same-line conflict. "
             "The result's next_call runs the Odoo.sh deploy proof; a push alone is not a deployment."
         ),
@@ -517,7 +523,7 @@ _TOOL_DESCRIPTORS = [
         title="Verify deployed source",
         description=(
             "Compare active checkout files to the real Odoo.sh /home/odoo/src/user files and optionally live module status. "
-            "Use before saying a local/Git remote change is already deployed, already live, or already done. repo.read alone is not proof. "
+            "Use before saying a local/GitHub change is already deployed, already live, or already done. repo.read alone is not proof. "
             "If git diff shows no changes for a module, workflow.safe_deploy_module will automatically run this source verification and return verified_already_deployed — read this field before telling the user anything is 'already added' or 'already live'. Do not make that claim from memory of a previous turn."
         ),
         read_only=True,
@@ -616,7 +622,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="git.commit",
         title="Commit code changes", description="Create a git commit", requires_approval=True),
     ToolDescriptor(name="git.push",
-        title="Push code to Git remote", description="Direct git.push is blocked for Odoo module code changes. Use workflow.safe_deploy_module so push, deploy, upgrade, and verification remain one controlled job. Non-module pushes may still use this tool.", requires_approval=True),
+        title="Push code to GitHub", description="Direct git.push is blocked for Odoo module code changes. Use workflow.safe_deploy_module so push, deploy, upgrade, and verification remain one controlled job. Non-module pushes may still use this tool.", requires_approval=True),
     ToolDescriptor(
         name="odoosh.module_install_ssh",
         title="Install module via SSH",
@@ -4258,6 +4264,28 @@ def _inspect_only_module_analysis_request(payload: OdooCodeChangeRequest) -> Mod
     )
 
 
+def _checkout_missing_redirect(payload: OdooCodeChangeRequest) -> dict[str, Any] | None:
+    """Same-turn redirect to the ws_* lane when this host has no local checkout."""
+    if payload.project_path:
+        return None  # caller asked for a specific checkout; keep the existing behavior
+    try:
+        client_name, project_path = _resolve_code_change_project(payload)
+        client = ClientResolverService().resolve_client(client_name=client_name, require_complete=False)
+    except HTTPException:
+        return None
+    if client is None or not client.repo or Path(project_path).expanduser().is_dir():
+        return None
+    return build_ws_redirect(
+        client_name=client.name,
+        module_name=payload.module_name,
+        create_module=payload.create_module,
+        task_description=payload.task_description,
+        search_patterns=payload.search_patterns,
+        target_files=getattr(payload, "target_files", None) or [],
+        commit_message=getattr(payload, "commit_message", None),
+    )
+
+
 async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str, Any]:
     """Run blocking work off-loop with bounded admission and no cancellation."""
     if _is_explicit_read_only_inspection(payload):
@@ -4277,6 +4305,9 @@ async def _workflow_odoo_code_change(payload: OdooCodeChangeRequest) -> dict[str
                 },
             })
         return result
+    redirect = _checkout_missing_redirect(payload)
+    if redirect is not None:
+        return redirect
     if not payload.wait_for_result:
         started = _start_or_reuse_code_change_job(payload)
         if started.get("state_class") != "running" or not started.get("job_id"):
@@ -8794,7 +8825,7 @@ _TOOL_INPUT_MODELS.update({_name: _model for _name, (_model, _) in _WS_HANDLERS.
 
 
 async def _dispatch_ws(name: str, args: dict) -> dict:
-    """Workspace tools do blocking GitHub/GitLab I/O: run off the event loop; errors come back as structured results."""
+    """Workspace tools do blocking GitHub I/O: run off the event loop; errors come back as structured results."""
     entry = _WS_HANDLERS.get(name)
     if entry is None:
         raise HTTPException(status_code=404, detail=f"unknown workspace tool {name}")
@@ -8803,7 +8834,34 @@ async def _dispatch_ws(name: str, args: dict) -> dict:
     return await asyncio.to_thread(run_ws, lambda svc: handler(svc, req))
 
 
+def _missing_checkout_redirect(name: str, args: dict, exc: HTTPException) -> dict[str, Any] | None:
+    """Any workflow that dies on a missing local checkout becomes a same-turn ws_open redirect."""
+    if name not in CHECKOUT_REDIRECT_TOOLS or exc.status_code != 404 or not is_missing_checkout(exc.detail):
+        return None
+    if not isinstance(args, dict) or args.get("project_path"):
+        return None  # caller pinned a checkout path: keep the explicit error
+    try:
+        client = ClientResolverService().resolve_client(
+            client_name=args.get("client_name"), require_complete=False
+        )
+    except HTTPException:
+        return None
+    if client is None or not client.repo:
+        return None
+    return redirect_from_arguments(args, client.name)
+
+
 async def _dispatch(name: str, args: dict) -> object:
+    try:
+        return await _dispatch_inner(name, args)
+    except HTTPException as exc:
+        redirect = _missing_checkout_redirect(name, args, exc)
+        if redirect is None:
+            raise
+        return redirect
+
+
+async def _dispatch_inner(name: str, args: dict) -> object:
     if name.startswith("ws."):
         return await _dispatch_ws(name, args)
     if name == "connector.health":
@@ -9183,7 +9241,7 @@ def _resolve_dispatch_return_annotation(node: ast.AST, namespace: dict) -> Any:
 def _tool_output_schemas() -> dict:
     schemas: dict[str, dict] = {}
     try:
-        source = inspect.getsource(_dispatch)
+        source = inspect.getsource(_dispatch_inner)
         tree = ast.parse(textwrap.dedent(source))
         namespace = globals()
         func_def = tree.body[0]
@@ -9994,7 +10052,7 @@ async def _resume_job(req: "ResumeJobRequest") -> dict:
                 resume_results["steps_run"][step_name] = {"status": "ok" if result.exit_code == 0 else "failed", "verified_files": sorted(expected_user_hashes), "result": _step_payload(result)}
                 if result.exit_code != 0:
                     resume_results["status"] = "deploy_code_mismatch"
-                    resume_results["message"] = "Odoo.sh source checkout did not match the changed local/remote Git files. Module upgrade was not attempted."
+                    resume_results["message"] = "Odoo.sh source checkout did not match the changed local/GitHub files. Module upgrade was not attempted."
                     resume_results["next_call"] = {"tool": "odoosh.error_pack", "arguments": {"tail_lines": 150}}
                     return _persist_resume_result(store, job, resume_results, original_request)
 

@@ -1,14 +1,24 @@
-# GitLab support for ws_* (v3.1)
+# v3.3 real-coder tool upgrades
 
-- New `gitlab_commit_service.GitLabRepo`: same engine interface as `GitHubRepo`, backed by the GitLab REST API (gitlab.com + self-managed). No clone, stateless.
-- New `repo_provider_service`: provider chosen per client (`provider` key, `GITLAB_HOSTS`, or host sniffing); `workspace_factory` builds the right engine and token (`GITLAB_TOKEN` fallback).
-- Engine write primitive is now `commit_to_branch(...)` (GitHub: create tree commit + move ref, unchanged behaviour; GitLab: one atomic commit POST with tip check, post-commit parent verification, no blind replay of an ambiguous POST).
-- `GitHubRepo` omits the Authorization header when no token is set (anonymous odoo/odoo core reads from GitLab clients).
-- Errors carry the provider (`gitlab_404`, ...); a push that landed on a newer tip reports `landed_commit` + hint.
-- `start.sh` trusts gitlab.com and `GITLAB_HOSTS` for SSH; `.env.example`, `render.yaml`, README updated.
-- `ws_commit` result: `evidence` (exact statuses incl. `remote_confirmed`, deployed/verified_live false) and `changes` (per-file created/modified/deleted + line counts, local only).
-- Recovery: unreachable-repo errors carry `fallback: workflow_odoo_code_change`; 401/403 also `needs_user: true`.
-- Tests: `tests/test_commit_evidence.py`, `tests/test_gitlab_commit_service.py` (+ `tests/support/fake_gitlab.py`), `tests/test_repo_provider_factory.py`; opt-in real-server check `tests/live_gitlab_smoke.py`.
+- feat: `ws_edit` self-heals a search that differs only by per-line indentation/trailing whitespace when it matches exactly one place; the replacement is re-indented to the file's own indentation. Result lists `healed`. Ambiguous or content-different searches still fail with `closest`. Healed edits replay correctly after restart/rebase.
+- feat: `ws_commit` `message` is optional; a conventional `[IMP] module: update files` message is generated, so the agent never stalls composing one.
+- tests: `tests/test_real_coder_tools.py` (13 cases). Full regression: 745 passed, 2 skipped.
+
+# v3.2 real-coder prompt
+
+- prompt: REAL CODER MODE moved first and hardened: tool call first, no permission questions, parallel reads, one batched `ws_edit`, `ws_symbol` verification, all `findings` fixed before `ws_commit`, 4-line final report. Prompt stays under 12 KB.
+
+# v3.1 fixes (test-suite green)
+
+- fix: output-schema scanner inspected the thin `_dispatch` wrapper (added by the no-checkout redirect) instead of `_dispatch_inner`, so every tool lost its pydantic `outputSchema`. It now scans `_dispatch_inner`.
+- prompt: tightened `MCP_SYSTEM_PROMPT.md` (13.3 KB -> under 12 KB) without removing any contract marker, so REAL CODER MODE fits the size budgets again.
+- result: 731 passed, 2 skipped (full regression, `-o addopts=""`).
+
+# Keep the coding agent moving (no-checkout redirect)
+
+- fix: `workflow_odoo_code_change` on a host with no local checkout (e.g. Render) no longer fails with "Project path not found"; it returns `status: use_ws_lane` with `next_call: ws.open` and the task carried over, so the agent continues in the same turn (`services/checkout_redirect_service.py`).
+- general: `_dispatch` turns a missing-checkout 404 from `workflow.odoo_code_change`, `module_analyze`, `odoo_debug_and_fix` and `frontend_visual_implement` into the same redirect for any client that has a repo configured (an explicit `project_path` keeps its error).
+- prompt: new REAL CODER MODE (act first, no plan block, resolve unknowns from source, 'push/do it/go' runs the whole chain, never stop on recoverable failures, short final report); results carrying `next_call` run in the same turn; code/change/fix routes to the workspace lane first and is provider-neutral (GitHub or GitLab).
 
 # Review fixes (post v3)
 
