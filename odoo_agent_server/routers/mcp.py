@@ -320,6 +320,33 @@ def _ensure_provider_control_envelope(value: Any, *, is_error: bool = False) -> 
             "retryable": retryable_value if isinstance(retryable_value, bool) else None,
         }
     )
+
+    # Non-terminal jobs always expose a durable resume path, so a client that
+    # loses the poll loop can recover without resubmitting the heavy workflow.
+    if (
+        not terminal
+        and isinstance(out.get("job_id"), str)
+        and not isinstance(out.get("resume_next_call"), dict)
+    ):
+        out["resume_next_call"] = {
+            "tool": "workflow.resume_job",
+            "arguments": {"job_id": str(out["job_id"])},
+        }
+
+    # Enforce the lifecycle invariant after every branch above: terminal means
+    # no next call, and non-terminal means a callable continuation exists.
+    if out["terminal"]:
+        out["completion_required"] = False
+        if isinstance(out.get("next_call"), dict):
+            out.setdefault("recovery_call", out["next_call"])
+            out["next_call"] = None
+    elif not isinstance(out.get("next_call"), dict):
+        out["next_call"] = None
+        out["completion_required"] = False
+        out["terminal"] = True
+        out["state_class"] = "blocked"
+        out["outcome"] = "blocked"
+        out["success_allowed"] = False
     return out
 
 
@@ -338,7 +365,11 @@ def _provider_safe_next_calls(value: Any) -> Any:
     for key, child in value.items():
         if key == "tool" and isinstance(child, str):
             internal = internal_tool_name(child)
-            if internal in _PROVIDER_TOOL_NAMES:
+            # A dotted internal name is not callable by a strict remote-MCP
+            # client even when the tool is on the provider surface, so any tool
+            # reference (including recovery/next_call paths) is flattened to the
+            # strict-safe name. Non-tool scalar values stay untouched.
+            if "." in child or internal in _PROVIDER_TOOL_NAMES:
                 out[key] = strict_safe_tool_name(internal)
             else:
                 out[key] = child
@@ -350,6 +381,57 @@ def _provider_safe_next_calls(value: Any) -> Any:
         arguments["wait_timeout_seconds"] = WorkflowWatchdogService().provider_wait_timeout(requested)
         out["arguments"] = arguments
     return out
+
+
+def _callable_continuation(call: Any) -> dict[str, Any] | None:
+    """Return a callable continuation for a non-provider tool target.
+
+    The provider manifest is intentionally small, so a server result can name a
+    tool that the remote client never received in ``tools/list``. Returning such
+    a name makes the client retry or fail with "unknown tool". Keep the original
+    intent in ``requested_tool`` and point at a tool the client can actually call.
+    """
+    if not isinstance(call, dict):
+        return None
+    tool = str(call.get("tool") or "").strip()
+    if not tool:
+        return None
+    if tool in {strict_safe_tool_name(name) for name in _PROVIDER_TOOL_NAMES}:
+        return None
+    arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+    job_id = arguments.get("job_id") or call.get("job_id")
+    if job_id:
+        return {
+            "tool": strict_safe_tool_name("jobs.get"),
+            "arguments": {
+                "job_id": str(job_id),
+                "wait_for_result": True,
+                "wait_timeout_seconds": 600,
+                "poll_interval_seconds": 1.0,
+            },
+            "requested_tool": tool,
+        }
+    return {
+        "tool": strict_safe_tool_name("workflow.agent_instructions"),
+        "arguments": {},
+        "requested_tool": tool,
+    }
+
+
+def _ensure_callable_continuations(structured: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite top-level continuation calls that the provider cannot invoke."""
+    if not isinstance(structured, dict):
+        return structured
+    for key in ("next_call", "recovery_call", "resume_next_call"):
+        replacement = _callable_continuation(structured.get(key))
+        if replacement is not None:
+            structured[key] = replacement
+    input_request = structured.get("input_request")
+    if isinstance(input_request, dict):
+        replacement = _callable_continuation(input_request.get("resume_call"))
+        if replacement is not None:
+            input_request["resume_call"] = replacement
+    return structured
 
 
 def _normalize_remote_structured(value: Any, tool_name: str) -> dict[str, Any]:
@@ -530,6 +612,8 @@ _PROVIDER_TOOL_NAMES = {
     "odoo.query",
     "odoo.search_read",
     "odoo.read_group",
+    "odoo.fields_get",
+    "odoo.list_models",
     "odoo.record_create",
     "odoo.record_write",
     "odoo.record_action",
@@ -545,6 +629,46 @@ _PROVIDER_TOOL_NAMES = {
     "artifacts.read",
     "workflow.resume_job",
     "jobs.list",
+    "jobs.get",
+    "odoosh.error_pack",
+}
+
+# Lean manifest for clients with a tight planning-context budget (for example
+# Claude Code over a remote MCP transport). It keeps the server-owned composite
+# workflow, the workspace lane, polling, and discovery, and drops tools that are
+# only useful for manual REST/debug flows.
+_PROVIDER_TOOL_NAMES_MINIMAL = {
+    "ws.open",
+    "ws.status",
+    "ws.outline",
+    "ws.scaffold",
+    "ws.extend",
+    "ws.symbol",
+    "ws.read",
+    "ws.grep",
+    "ws.edit",
+    "ws.diff",
+    "ws.lint",
+    "ws.commit",
+    "ws.discard",
+    "connector.health",
+    "skills.list",
+    "skills.read",
+    "client.check",
+    "workflow.agent_instructions",
+    "workflow.odoo_code_change",
+    "workflow.resume_continuation",
+    "workflow.odoo_debug_and_fix",
+    "workflow.module_analyze",
+    "workflow.module_install_and_check",
+    "workflow.frontend_visual_implement",
+    "odoo.query",
+    "odoo.search_read",
+    "odoo.read_group",
+    "odoo.fields_get",
+    "odoo.list_models",
+    "artifacts.read",
+    "workflow.resume_job",
     "jobs.get",
     "odoosh.error_pack",
 }
@@ -660,10 +784,10 @@ def _force_remote_tool_list(tools: list[dict[str, Any]]) -> list[dict[str, Any]]
     return sanitized
 
 
-_TOOLS_LIST_CACHE: dict[tuple[str, int], list[dict[str, Any]]] = {}
+_TOOLS_LIST_CACHE: dict[tuple[str, int, bool], list[dict[str, Any]]] = {}
 
 
-def _cached_tools_list(profile: str) -> list[dict[str, Any]]:
+def _cached_tools_list(profile: str, *, minimal: bool = False) -> list[dict[str, Any]]:
     """tools/list is rebuilt (schema generation + cleanup for every tool) only when settings change.
 
     Keyed by a hash of the full settings snapshot, so any configuration change invalidates it.
@@ -676,14 +800,17 @@ def _cached_tools_list(profile: str) -> list[dict[str, Any]]:
         except Exception:  # noqa: BLE001 - never let caching break tools/list
             fingerprint = None
     if fingerprint is not None:
-        hit = _TOOLS_LIST_CACHE.get((profile, fingerprint))
+        hit = _TOOLS_LIST_CACHE.get((profile, fingerprint, minimal))
         if hit is not None:
             return list(hit)
-    built = _force_remote_tool_list([_tool_to_mcp(tool, profile=profile) for tool in _tools_for_profile(profile)])
+    built = _force_remote_tool_list([
+        _tool_to_mcp(tool, profile=profile)
+        for tool in _tools_for_profile(profile, minimal=minimal)
+    ])
     if fingerprint is not None:
         if len(_TOOLS_LIST_CACHE) > 16:
             _TOOLS_LIST_CACHE.clear()
-        _TOOLS_LIST_CACHE[(profile, fingerprint)] = built
+        _TOOLS_LIST_CACHE[(profile, fingerprint, minimal)] = built
     return list(built)
 
 
@@ -698,12 +825,26 @@ def _is_claude_request(request: Request | None) -> bool:
     return "claude" in joined or "anthropic" in joined
 
 
-def _tools_for_profile(profile: str | None = None) -> list[Any]:
+def _tools_for_profile(profile: str | None = None, *, minimal: bool = False) -> list[Any]:
     tools = list_tools(strict_names=False)
     # All remote/provider MCP endpoints intentionally expose the same tiny tool
     # surface.  Full low-level tools remain available through REST /tools for
-    # debugging/admin use, but not to provider agents.
-    return [tool for tool in tools if tool.name in _PROVIDER_TOOL_NAMES]
+    # debugging/admin use, but not to provider agents. A lean subset is available
+    # for clients with a tight planning-context budget.
+    allowed = _PROVIDER_TOOL_NAMES_MINIMAL if minimal else _PROVIDER_TOOL_NAMES
+    return [tool for tool in tools if tool.name in allowed]
+
+
+def _requested_minimal(request: Request | None) -> bool:
+    """Return True when the client asked for the lean provider manifest."""
+    if request is None:
+        return False
+    value = (
+        request.query_params.get("profile")
+        or request.headers.get("x-mcp-profile")
+        or ""
+    ).strip().lower()
+    return value in {"minimal", "lean", "claude-minimal", "claude_code_minimal"}
 
 
 def _remote_compatible_schema(schema: dict[str, Any]) -> dict[str, Any]:
@@ -871,17 +1012,23 @@ async def mcp_shell(request: Request, payload: Any = Body(...)) -> dict[str, Any
     It exposes initialize, tools/list, and tools/call over one HTTPS POST route.
     The same service functions are used by REST/OpenAPI and this MCP-style bridge.
     """
+    minimal = _requested_minimal(request)
     if isinstance(payload, list):
         responses = []
         for item in payload:
-            response = await _handle_shell(item, profile="provider", request=request)
+            response = await _handle_shell(item, profile="provider", request=request, minimal=minimal)
             if response is not None:
                 responses.append(response)
         return responses
-    return await _handle_shell(payload, profile="provider", request=request)
+    return await _handle_shell(payload, profile="provider", request=request, minimal=minimal)
 
 
-async def _handle_shell(payload: dict[str, Any], profile: str | None = None, request: Request | None = None) -> dict[str, Any] | None:
+async def _handle_shell(
+    payload: dict[str, Any],
+    profile: str | None = None,
+    request: Request | None = None,
+    minimal: bool = False,
+) -> dict[str, Any] | None:
     method = payload.get("method")
     request_id = payload.get("id")
     params = payload.get("params") or {}
@@ -961,7 +1108,7 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
             },
         )
     if method == "tools/list":
-        return _shell_response(request_id, {"tools": _cached_tools_list(profile)})
+        return _shell_response(request_id, {"tools": _cached_tools_list(profile, minimal=minimal)})
     if method == "tools/call":
         name = params.get("name")
         arguments = params.get("arguments") or {}
@@ -1020,6 +1167,7 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                     if internal_name != "artifacts.read":
                         structured = _normalize_remote_structured(structured, internal_name)
                     structured = _provider_safe_next_calls(_ensure_provider_control_envelope(structured))
+                    structured = _ensure_callable_continuations(structured)
             text = _render_result_text(structured, internal_name)
             # Context-bloat guard: in long sessions, oversized tool outputs (large diffs,
             # logs, file reads) compound across many calls and slow down/derail the model.
@@ -1043,6 +1191,12 @@ async def _handle_shell(payload: dict[str, Any], profile: str | None = None, req
                         "error_type": "tool_input_invalid",
                         "error_code": "tool_input_invalid",
                         "retryable": False,
+                        # Give the model one concrete, callable recovery step
+                        # instead of a raw Pydantic dump it cannot act on.
+                        "next_call": {
+                            "tool": "workflow.agent_instructions",
+                            "arguments": {},
+                        },
                     },
                     is_error=True,
                 )
@@ -1085,15 +1239,16 @@ def claude_mcp_health() -> dict[str, Any]:
 
 
 @claude_router.post("/mcp")
-async def claude_mcp_shell(payload: Any = Body(...)) -> dict[str, Any] | list[dict[str, Any]] | None:
+async def claude_mcp_shell(request: Request, payload: Any = Body(...)) -> dict[str, Any] | list[dict[str, Any]] | None:
+    minimal = _requested_minimal(request)
     if isinstance(payload, list):
         responses = []
         for item in payload:
-            response = await _handle_shell(item, profile="claude")
+            response = await _handle_shell(item, profile="claude", request=request, minimal=minimal)
             if response is not None:
                 responses.append(response)
         return responses
-    return await _handle_shell(payload, profile="claude")
+    return await _handle_shell(payload, profile="claude", request=request, minimal=minimal)
 
 
 @chatgpt_router.get("/mcp")
@@ -1120,14 +1275,15 @@ def chatgpt_tools_debug() -> dict[str, Any]:
 
 @chatgpt_router.post("/mcp")
 async def chatgpt_mcp_shell(request: Request, payload: Any = Body(...)) -> dict[str, Any] | list[dict[str, Any]] | None:
+    minimal = _requested_minimal(request)
     if isinstance(payload, list):
         responses = []
         for item in payload:
-            response = await _handle_shell(item, profile="chatgpt")
+            response = await _handle_shell(item, profile="chatgpt", request=request, minimal=minimal)
             if response is not None:
                 responses.append(response)
         return responses
-    return await _handle_shell(payload, profile="chatgpt")
+    return await _handle_shell(payload, profile="chatgpt", request=request, minimal=minimal)
 
 
 @grok_router.get("/mcp")
@@ -1158,14 +1314,15 @@ def grok_tools_debug() -> dict[str, Any]:
 async def grok_mcp_shell(request: Request, payload: Any = Body(...)) -> dict[str, Any] | list[dict[str, Any]] | None:
     # Keep Grok on the same hybrid-safe contract as ChatGPT: short bounded waits,
     # OAuth/tool-call auth, strict tool names, and success_allowed=false until terminal proof.
+    minimal = _requested_minimal(request)
     if isinstance(payload, list):
         responses = []
         for item in payload:
-            response = await _handle_shell(item, profile="grok")
+            response = await _handle_shell(item, profile="grok", request=request, minimal=minimal)
             if response is not None:
                 responses.append(response)
         return responses
-    return await _handle_shell(payload, profile="grok")
+    return await _handle_shell(payload, profile="grok", request=request, minimal=minimal)
 
 
 @router.get("/system-prompt")
@@ -1269,26 +1426,28 @@ def qwen_mcp_query_health(access_token: str = Query(default="")) -> dict[str, An
 
 
 @qwen_router.post("/mcp/{access_token}")
-async def qwen_mcp_path_shell(access_token: str, payload: Any = Body(...)) -> dict[str, Any] | list[dict[str, Any]] | None:
+async def qwen_mcp_path_shell(access_token: str, request: Request, payload: Any = Body(...)) -> dict[str, Any] | list[dict[str, Any]] | None:
     _validate_qwen_url_token(access_token)
+    minimal = _requested_minimal(request)
     if isinstance(payload, list):
         responses = []
         for item in payload:
-            response = await _handle_shell(item, profile="qwen")
+            response = await _handle_shell(item, profile="qwen", request=request, minimal=minimal)
             if response is not None:
                 responses.append(response)
         return responses
-    return await _handle_shell(payload, profile="qwen")
+    return await _handle_shell(payload, profile="qwen", request=request, minimal=minimal)
 
 
 @qwen_router.post("/mcp")
-async def qwen_mcp_query_shell(payload: Any = Body(...), access_token: str = Query(default="")) -> dict[str, Any] | list[dict[str, Any]] | None:
+async def qwen_mcp_query_shell(request: Request, payload: Any = Body(...), access_token: str = Query(default="")) -> dict[str, Any] | list[dict[str, Any]] | None:
     _validate_qwen_url_token(access_token)
+    minimal = _requested_minimal(request)
     if isinstance(payload, list):
         responses = []
         for item in payload:
-            response = await _handle_shell(item, profile="qwen")
+            response = await _handle_shell(item, profile="qwen", request=request, minimal=minimal)
             if response is not None:
                 responses.append(response)
         return responses
-    return await _handle_shell(payload, profile="qwen")
+    return await _handle_shell(payload, profile="qwen", request=request, minimal=minimal)

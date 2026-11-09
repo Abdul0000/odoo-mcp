@@ -119,6 +119,44 @@ class OdooService:
             result={"ssh_attempt": ssh_result.model_dump(mode="json"), "https_jsonrpc_attempt": https_result.model_dump(mode="json")},
         )
 
+    def fields_get(self, model: str, limit: int = 500) -> OdooResult:
+        """Read-only discovery of one model's fields from the live registry.
+
+        Implemented as a bounded ``ir.model.fields`` search_read so it uses the
+        same SSH-first / HTTPS JSON-RPC fallback transport as every other read.
+        """
+        safe_model = str(model or "").strip()
+        if not safe_model or "\x00" in safe_model:
+            return OdooResult(status="failed", database=self._database(), error="model is required for odoo.fields_get")
+        return self.search_read(
+            "ir.model.fields",
+            [["model", "=", safe_model]],
+            ["name", "ttype", "field_description", "relation", "required", "readonly", "store"],
+            limit=max(1, min(int(limit or 500), 2000)),
+            offset=0,
+            order="name asc",
+            context=None,
+            timeout_seconds=120,
+        )
+
+    def list_models(self, search: str | None = None, include_transient: bool = True, limit: int = 200) -> OdooResult:
+        """Read-only discovery of the Odoo data model from ir.model."""
+        domain: list[Any] = []
+        if search:
+            domain.append(["model", "ilike", str(search).strip()])
+        if not include_transient:
+            domain.append(["transient", "=", False])
+        return self.search_read(
+            "ir.model",
+            domain,
+            ["model", "name", "transient", "modules"],
+            limit=max(1, min(int(limit or 200), 2000)),
+            offset=0,
+            order="model asc",
+            context=None,
+            timeout_seconds=120,
+        )
+
     def feature_inspect(
         self,
         models: list[str],

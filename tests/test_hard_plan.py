@@ -171,6 +171,8 @@ def test_mcp_initialize_list_and_call(tmp_path, monkeypatch):
         "odoo_query",
         "odoo_search_read",
         "odoo_read_group",
+        "odoo_fields_get",
+        "odoo_list_models",
         "odoo_record_create",
         "odoo_record_write",
         "odoo_record_action",

@@ -77,6 +77,8 @@ from ..schemas import (
     OdooModuleRequest,
     OdooModuleTestRequest,
     OdooReadGroupRequest,
+    OdooFieldsGetRequest,
+    OdooListModelsRequest,
     OdooFlowTestRequest,
     OdooMutationAuditRequest,
     OdooRecordActionRequest,
@@ -768,6 +770,25 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(name="odoo.read_group",
         title="Aggregate Odoo records", description="Return live grouped counts, sums, averages, minima, or maxima with safe read_group. Example: account.move customer invoices grouped by state.", read_only=True),
     ToolDescriptor(
+        name="odoo.fields_get",
+        title="List Odoo model fields",
+        description=(
+            "Read-only discovery of the fields on one live Odoo model: name, type, relation, "
+            "required, readonly, store. Use before writing code that references a field you did not "
+            "confirm from installed source."
+        ),
+        read_only=True,
+    ),
+    ToolDescriptor(
+        name="odoo.list_models",
+        title="List Odoo models",
+        description=(
+            "Read-only discovery of live Odoo models from ir.model, optionally filtered by a "
+            "technical-name substring. Use to find the exact model before reading records or source."
+        ),
+        read_only=True,
+    ),
+    ToolDescriptor(
         name="odoo.record_create",
         title="Create Odoo records",
         description=(
@@ -1034,6 +1055,8 @@ _TOOL_INPUT_MODELS = {
     "odoo.search_read": OdooSearchReadRequest,
     "odoo.feature_inspect": OdooFeatureInspectRequest,
     "odoo.read_group": OdooReadGroupRequest,
+    "odoo.fields_get": OdooFieldsGetRequest,
+    "odoo.list_models": OdooListModelsRequest,
     "odoo.record_create": OdooRecordCreateRequest,
     "odoo.record_write": OdooRecordWriteRequest,
     "odoo.record_action": OdooRecordActionRequest,
@@ -9078,6 +9101,19 @@ async def _dispatch_inner(name: str, args: dict) -> object:
         req = OdooReadGroupRequest.model_validate(args)
         data = await asyncio.to_thread(_read_group_via_shell, req)
         return data.get("odoo") if data.get("status") == "ok" else OdooResult(status="failed", result=data, error=data.get("message"))
+    if name == "odoo.fields_get":
+        req = OdooFieldsGetRequest.model_validate(args)
+        client = _resolve_query_client(req.client_name)
+        return await asyncio.to_thread(_odoo_service_for_client(client).fields_get, req.model, req.limit)
+    if name == "odoo.list_models":
+        req = OdooListModelsRequest.model_validate(args)
+        client = _resolve_query_client(req.client_name)
+        return await asyncio.to_thread(
+            _odoo_service_for_client(client).list_models,
+            req.search,
+            req.include_transient,
+            req.limit,
+        )
     if name == "odoo.record_create":
         req = OdooRecordCreateRequest.model_validate(args)
         return await asyncio.to_thread(FunctionalOperationService().create, req)

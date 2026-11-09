@@ -11,7 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from ..auth import external_base_url
 from ..config import settings
-from ..services.oauth_service import OAuthStore, build_redirect, parse_basic_auth
+from ..services.oauth_service import OAuthStore, build_redirect, is_loopback_host, parse_basic_auth
 
 router = APIRouter(tags=["oauth"])
 
@@ -145,10 +145,27 @@ def _authorize_redirect(params: dict[str, str]) -> RedirectResponse:
     return RedirectResponse(build_redirect(redirect_uri, {"code": code, "state": state}), status_code=302)
 
 
+def _is_loopback_redirect(redirect_uri: str | None) -> bool:
+    if not redirect_uri:
+        return False
+    from urllib.parse import urlparse
+
+    try:
+        host = urlparse(redirect_uri).hostname or ""
+    except ValueError:
+        return False
+    return is_loopback_host(host)
+
+
 @router.get("/oauth/authorize", response_model=None)
 def oauth_authorize_get(request: Request):
     params = _query_params_to_dict(request)
     if settings.oauth_auto_approve:
+        return _authorize_redirect(params)
+    if settings.oauth_auto_approve_loopback and _is_loopback_redirect(params.get("redirect_uri")):
+        # Native clients (Claude Code and other local CLIs) cannot complete an
+        # interactive consent form. Loopback redirects are already restricted
+        # to localhost/127.0.0.1 and PKCE is still enforced on exchange.
         return _authorize_redirect(params)
     return HTMLResponse(_authorization_form(params))
 

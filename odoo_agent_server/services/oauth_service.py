@@ -348,13 +348,30 @@ def _validate_client_secret(client: OAuthClient, client_secret: str | None) -> N
         raise HTTPException(status_code=401, detail="Invalid OAuth client secret")
 
 
+def is_loopback_host(host: str) -> bool:
+    """True for the loopback hosts allowed by the OAuth 2.1 native-app flow."""
+    value = (host or "").strip().lower().rstrip(".")
+    return value in {"localhost", "127.0.0.1", "::1"} or value.endswith(".localhost")
+
+
 def _validate_redirect_uri(uri: str, *, allow_chatgpt_defaults: bool) -> None:
     parsed = urlparse(uri)
+    host = parsed.hostname or ""
+    if is_loopback_host(host):
+        # RFC 8252: native apps may use http on loopback. Never allow loopback
+        # with embedded credentials.
+        if parsed.scheme not in {"http", "https"}:
+            raise HTTPException(status_code=400, detail="loopback redirect_uri must use http or https")
+        if parsed.username or parsed.password:
+            raise HTTPException(status_code=400, detail="redirect_uri must not embed credentials")
+        if settings.oauth_allow_loopback_redirects:
+            return
+        raise HTTPException(status_code=400, detail="loopback redirect_uri is disabled on this deployment")
     if parsed.scheme != "https":
         raise HTTPException(status_code=400, detail="redirect_uri must use https")
     if not parsed.netloc:
         raise HTTPException(status_code=400, detail="redirect_uri host is required")
-    if allow_chatgpt_defaults and _is_chatgpt_redirect_host(parsed.hostname or ""):
+    if allow_chatgpt_defaults and _is_chatgpt_redirect_host(host):
         return
 
 
@@ -367,6 +384,8 @@ def _validate_redirect_for_client(client: OAuthClient, redirect_uri: str) -> Non
     # Static client fallback for user-defined OAuth setup. In production,
     # configure ODOO_AGENT_OAUTH_ALLOWED_REDIRECT_URIS for tighter control.
     host = urlparse(redirect_uri).hostname or ""
+    if settings.oauth_allow_loopback_redirects and is_loopback_host(host):
+        return
     if not _is_chatgpt_redirect_host(host):
         raise HTTPException(status_code=400, detail="static OAuth client only permits built-in compatibility redirect hosts unless an allowlist is configured")
 

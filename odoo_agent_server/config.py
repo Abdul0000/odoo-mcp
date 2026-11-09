@@ -52,6 +52,14 @@ class Settings(BaseSettings):
     oauth_static_client_secret: str | None = Field(default=None, alias="ODOO_AGENT_OAUTH_STATIC_CLIENT_SECRET")
     oauth_token_secret: str | None = Field(default=None, alias="ODOO_AGENT_OAUTH_TOKEN_SECRET")
     oauth_allowed_redirect_uris_raw: str = Field(default="", alias="ODOO_AGENT_OAUTH_ALLOWED_REDIRECT_URIS")
+    # OAuth 2.1 for native/CLI clients (for example Claude Code) uses a
+    # loopback HTTP redirect. Allow http://localhost and http://127.0.0.1
+    # automatically unless an explicit allowlist is configured.
+    oauth_allow_loopback_redirects: bool = Field(default=True, alias="ODOO_AGENT_OAUTH_ALLOW_LOOPBACK_REDIRECTS")
+    # Headless/dev convenience: auto-approve OAuth authorization requests whose
+    # redirect target is loopback, so native clients can complete the flow
+    # without a browser consent form. Disable for shared/public deployments.
+    oauth_auto_approve_loopback: bool = Field(default=True, alias="ODOO_AGENT_OAUTH_AUTO_APPROVE_LOOPBACK")
     oauth_authorization_code_ttl_seconds: int = Field(default=600, alias="ODOO_AGENT_OAUTH_AUTH_CODE_TTL_SECONDS")
     oauth_access_token_ttl_seconds: int = Field(default=3600, alias="ODOO_AGENT_OAUTH_ACCESS_TOKEN_TTL_SECONDS")
     oauth_refresh_token_ttl_seconds: int = Field(default=2592000, alias="ODOO_AGENT_OAUTH_REFRESH_TOKEN_TTL_SECONDS")

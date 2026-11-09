@@ -144,19 +144,26 @@ docker compose up --build
 
 Mount your Odoo repo under `./repos` or change the volume and `ODOO_AGENT_ALLOWED_ROOTS`.
 
-## Optional CDP browser setup
+## Optional CDP browser setup (operator-provided)
 
-The connector does not bundle Chromium. For UI console diagnostics, run Chrome/Chromium outside the connector with remote debugging enabled and set `ODOO_AGENT_CDP_URL`:
+The connector does not bundle Chromium and never launches one itself. Browser
+verification is an **operator-provided dependency**: an MCP agent cannot
+provision it. For UI console diagnostics, run Chrome/Chromium outside the
+connector with remote debugging enabled and set `ODOO_AGENT_CDP_URL`:
 
 ```text
 ODOO_AGENT_CDP_URL=http://chrome-host:9222
 ```
 
-Example local Chrome launch:
+Example local Chrome launch (run on the machine that hosts the browser):
 
 ```bash
 chrome --remote-debugging-port=9222 --headless=new --disable-gpu --no-sandbox
 ```
+
+When `ODOO_AGENT_CDP_URL` is empty, `browser.screenshot` and `browser.pos_flow`
+return a clear "not configured" result. Source, deploy, and upgrade
+verification do not depend on the browser.
 
 ## Connect an MCP Client
 
@@ -312,12 +319,16 @@ Protected branches such as `main`, `master`, `production`, `prod`, and `live` al
 All operational REST APIs are also exposed as MCP-callable tools through `POST /mcp` using JSON-RPC `tools/list` and `tools/call`.
 Tool lists expose strict underscore names such as `qa_self_run`, `git_push`, and `odoo_module_deploy`; `tools/call` still accepts the older dotted aliases such as `qa.self_run` for compatibility.
 
-Current MCP tool count: `33`.
+The authoritative tool list is always `GET /tools/list` or MCP `tools/list`;
+do not rely on a hardcoded count. A representative operational subset:
 
 ```text
 connector.health
 workflow.capability_check
 workflow.full_verify
+workflow.odoo_code_change
+workflow.odoo_debug_and_fix
+workflow.safe_deploy_module
 qa_self_run
 repo.list
 repo.read
@@ -340,11 +351,12 @@ odoo.module_status
 odoo.module_install
 odoo.module_update
 odoo.search_read
+odoo.read_group
+odoo.fields_get
+odoo.list_models
 browser.screenshot
 approvals.list
 approvals.request
-approvals.approve
-approvals.reject
 jobs.list
 jobs.get  # waits server-side by default until job is done or timeout
 audit.list
@@ -439,6 +451,71 @@ ODOO_AGENT_OAUTH_STATIC_CLIENT_SECRET=
 ```
 
 Then enter this client ID in the MCP client. Leave client secret empty unless you explicitly set `ODOO_AGENT_OAUTH_STATIC_CLIENT_SECRET`.
+
+### Claude Code quick connect
+
+Claude Code connects to remote MCP servers over HTTP and accepts either a bearer token or an OAuth 2.1 flow. The simplest setup for a private connector is a static bearer token:
+
+```bash
+# Claude Code CLI: register the connector with its bearer token
+claude mcp add --transport http \
+  --header "Authorization: Bearer $ODOO_AGENT_API_TOKEN" \
+  odoo-mcp https://your-connector.example.com/mcp
+```
+
+Equivalent `.mcp.json` entry:
+
+```json
+{
+  "mcpServers": {
+    "odoo-mcp": {
+      "type": "http",
+      "url": "https://your-connector.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${ODOO_AGENT_API_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+If you prefer OAuth instead of a pasted token, native clients use a loopback
+redirect (`http://localhost:<port>/callback`). The connector allows loopback
+redirects by default and can auto-approve them for headless clients:
+
+```env
+ODOO_AGENT_OAUTH_ALLOW_LOOPBACK_REDIRECTS=true
+ODOO_AGENT_OAUTH_AUTO_APPROVE_LOOPBACK=true
+```
+
+Set `ODOO_AGENT_OAUTH_AUTO_APPROVE_LOOPBACK=false` for shared or public
+deployments so a human must paste the admin token on the consent page.
+
+#### Lean tool manifest for tight contexts
+
+Claude Code loads the whole `tools/list` manifest into its planning context.
+If the default manifest is too large, request the lean subset by adding
+`?profile=minimal` to the MCP URL (or sending `X-MCP-Profile: minimal`):
+
+```text
+https://your-connector.example.com/mcp?profile=minimal
+```
+
+The lean profile keeps the server-owned composite workflow, the `ws_*`
+workspace lane, polling, skills, artifacts, and live read discovery, and drops
+tools only needed for manual REST/debug use.
+
+### Live model discovery
+
+Two read-only tools let an agent confirm the live data model before writing
+code:
+
+- `odoo_fields_get` — fields of one model (`model`, `limit`): name, type,
+  relation, required, readonly, store.
+- `odoo_list_models` — `ir.model` rows filtered by an optional `search`
+  substring (`include_transient`, `limit`).
+
+Both use the same Odoo.sh SSH / HTTPS JSON-RPC transport as `odoo_search_read`.
 
 ### Security notes
 

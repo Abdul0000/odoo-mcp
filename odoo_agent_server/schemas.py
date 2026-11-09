@@ -1416,6 +1416,47 @@ class OdooReadGroupRequest(BaseModel):
     timeout_seconds: int = Field(default=120, ge=15, le=300)
 
 
+class OdooFieldsGetRequest(BaseModel):
+    """Read-only discovery of the fields on one Odoo model."""
+
+    client_name: str | None = Field(default=None, description="Selected ODOO_CLIENTS entry.")
+    model: str = Field(..., description="Odoo technical model name, e.g. sale.order")
+    limit: int = Field(default=500, ge=1, le=2000, description="Maximum fields to return")
+
+    @field_validator("model")
+    @classmethod
+    def fields_get_model_must_be_safe(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]+", value):
+            raise ValueError("model must be a safe Odoo technical model name")
+        return value
+
+
+class OdooListModelsRequest(BaseModel):
+    """Read-only discovery of the Odoo data model (ir.model)."""
+
+    client_name: str | None = Field(default=None, description="Selected ODOO_CLIENTS entry.")
+    search: str | None = Field(
+        default=None,
+        max_length=200,
+        description="Optional substring matched against the technical model name.",
+    )
+    include_transient: bool = Field(default=True, description="Include wizard/transient models")
+    limit: int = Field(default=200, ge=1, le=2000, description="Maximum models to return")
+
+    @field_validator("search")
+    @classmethod
+    def list_models_search_must_be_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = str(value).strip()
+        if not value:
+            return None
+        if "\x00" in value:
+            raise ValueError("search must not contain NUL bytes")
+        return value
+
+
 class OdooMutationBaseRequest(BaseModel):
     client_name: str | None = Field(default=None, description="Selected ODOO_CLIENTS entry.")
     request_id: str = Field(..., min_length=8, max_length=100, pattern=r"^[A-Za-z0-9_.:-]+$")

@@ -5,7 +5,18 @@ from datetime import datetime, timezone
 from fastapi import APIRouter
 
 from ..auth import AuthDependency
-from ..schemas import CommandResult, JobRecord, JobStatus, OdooFeatureInspectRequest, OdooModuleRequest, OdooReadGroupRequest, OdooResult, OdooSearchReadRequest
+from ..schemas import (
+    CommandResult,
+    JobRecord,
+    JobStatus,
+    OdooFeatureInspectRequest,
+    OdooFieldsGetRequest,
+    OdooListModelsRequest,
+    OdooModuleRequest,
+    OdooReadGroupRequest,
+    OdooResult,
+    OdooSearchReadRequest,
+)
 from ..services.approval_service import ApprovalService
 from ..services.odoo_service import OdooService
 from ..services.odoosh_service import OdooShService
@@ -427,6 +438,20 @@ def odoo_feature_inspect(payload: OdooFeatureInspectRequest) -> OdooResult:
         sample_limit=payload.sample_limit,
         timeout_seconds=payload.timeout_seconds,
     )
+
+
+@router.post("/fields-get", response_model=OdooResult)
+def odoo_fields_get(payload: OdooFieldsGetRequest) -> OdooResult:
+    """Read-only field discovery for one live Odoo model."""
+    client = ClientResolverService().resolve_client(client_name=payload.client_name, require_complete=True) if payload.client_name else ClientResolverService().resolve_client(require_complete=False)
+    return _odoo_service_for_client(client).fields_get(payload.model, payload.limit)
+
+
+@router.post("/list-models", response_model=OdooResult)
+def odoo_list_models(payload: OdooListModelsRequest) -> OdooResult:
+    """Read-only model discovery from the live Odoo registry."""
+    client = ClientResolverService().resolve_client(client_name=payload.client_name, require_complete=True) if payload.client_name else ClientResolverService().resolve_client(require_complete=False)
+    return _odoo_service_for_client(client).list_models(payload.search, payload.include_transient, payload.limit)
 
 
 @router.post("/read-group", response_model=OdooResult)
