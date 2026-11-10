@@ -190,8 +190,8 @@ def test_provider_tool_contract_stays_within_context_budget():
     import json
 
     tools = _mcp_tools_list()
-    # Budget re-measured after adding the 13 ws_* tools (76.2 KB). Keep headroom small so growth is noticed.
-    assert len(json.dumps(tools, ensure_ascii=False)) < 80_000
+    # Budget re-measured after adding the explicit approval-continuation action. Keep headroom small so growth is noticed.
+    assert len(json.dumps(tools, ensure_ascii=False)) < 80_100
 
 
 def test_provider_tool_descriptions_are_complete_and_semantically_compact():
