@@ -67,6 +67,7 @@ from ..schemas import (
     ReaUpstreamRequest,
     ReaApiInspectRequest,
     ReaRuntimeTraceRequest,
+    ReaImpactRequest,
     FrontendVisualImplementRequest,
     EmptyRequest,
     SkillListRequest,
@@ -192,6 +193,7 @@ from ..services.rea_xray_service import ReaXrayService
 from ..services.rea_upstream_service import ReaUpstreamService
 from ..services.rea_api_inspect_service import ReaApiInspectService
 from ..services.rea_runtime_trace_service import ReaRuntimeTraceService
+from ..services.rea_impact_service import ReaImpactService
 from ..services.live_assertion_service import LiveAssertionService
 from ..services.functional_operation_service import FunctionalOperationService
 from ..services.module_test_service import ModuleTestService
@@ -498,6 +500,13 @@ _TOOL_DESCRIPTORS = [
         name="rea.api_inspect",
         title="Inspect external API integrations",
         description="Static, read-only inventory of addon HTTP/RPC calls, routes, endpoint configuration and TLS/timeout settings; never connects to endpoints.",
+        read_only=True,
+        idempotent=True,
+    ),
+    ToolDescriptor(
+        name="rea.impact_predict",
+        title="Predict Odoo change impact",
+        description="Predict affected addon components and risk from proposed file diffs using the static architecture graph and optional exported trace evidence; advisory and read-only.",
         read_only=True,
         idempotent=True,
     ),
@@ -1041,6 +1050,7 @@ _TOOL_INPUT_MODELS = {
     "rea.upstream_compare": ReaUpstreamRequest,
     "rea.api_inspect": ReaApiInspectRequest,
     "rea.runtime_trace": ReaRuntimeTraceRequest,
+    "rea.impact_predict": ReaImpactRequest,
     "workflow.module_test": OdooModuleTestRequest,
     "workflow.module_install_and_check": OdooModuleRequest,
     "workflow.frontend_visual_implement": FrontendVisualImplementRequest,
@@ -9014,6 +9024,33 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             ReaRuntimeTraceService().analyze, events=request.events,
             trace_id=request.trace_id, slow_threshold_ms=request.slow_threshold_ms,
         )
+    if name == "rea.impact_predict":
+        request = ReaImpactRequest.model_validate(args)
+        base_request = ModuleAnalyzeRequest(
+            client_name=request.client_name,
+            project_path=request.project_path,
+            module_name=request.module_name,
+            max_files=50,
+        )
+        result = await asyncio.to_thread(_workflow_module_analyze, base_request)
+        if result.get("status") != "analyzed":
+            return result
+        graph = await asyncio.to_thread(
+            ReaXrayService().build,
+            module_path=Path(result["module_path"]),
+            module_name=result["module_name"],
+            max_files=50,
+        )
+        result["rea_impact"] = await asyncio.to_thread(
+            ReaImpactService().predict,
+            module_path=Path(result["module_path"]),
+            module_name=result["module_name"],
+            changed_files=[item.model_dump() for item in request.changed_files],
+            graph=graph,
+            runtime_events=request.runtime_events,
+        )
+        result["rea_impact"]["architecture_graph"] = graph.get("summary", {})
+        return result
     if name == "rea.api_inspect":
         request = ReaApiInspectRequest.model_validate(args)
         base_request = ModuleAnalyzeRequest(client_name=request.client_name, project_path=request.project_path, module_name=request.module_name)
