@@ -750,3 +750,30 @@ This phase performs no outbound requests, DNS resolution, credential reads, or e
 ## REA Phase 4 — Runtime execution tracing
 
 `rea_runtime_trace` analyzes a caller-supplied, bounded export of Odoo runtime spans. It correlates model/method durations, highlights slow calls and high call counts, and groups repeated SQL/query signatures as possible N+1 patterns. Input is capped at 2,000 events and output includes event-index evidence. The tool does not activate Odoo's profiler, attach to a live worker, execute SQL, or capture traffic; profiling/export must be explicitly performed by the operator using an approved environment and supplied to the analyzer.
+
+
+## REA Phase 5 — Change impact prediction
+
+`rea_impact_predict` predicts likely addon components affected by a proposed change. Supply the addon name and a bounded list of changed addon-relative paths; optional unified diff snippets improve symbol matching. The tool builds the static X-Ray graph, maps changed paths/symbols to graph nodes, follows connected model/view/action relationships, and returns an advisory risk level with impacted components and reasons. Optional caller-supplied runtime trace events add evidence when changed methods appear in the trace.
+
+Example MCP arguments:
+
+```json
+{
+  "module_name": "my_custom_addon",
+  "changed_files": [
+    {
+      "path": "models/sale_order.py",
+      "change_type": "modify",
+      "diff": "-    def _compute_amount(self):\n+    def _compute_amount(self, discount=None):"
+    },
+    {
+      "path": "views/sale_order_views.xml",
+      "change_type": "modify",
+      "diff": ""
+    }
+  ]
+}
+```
+
+The prediction is static and advisory, not proof of runtime impact. It does not modify files, run tests, query Odoo, deploy, or push. Validate high-risk findings with focused tests and an explicitly approved staging workflow.
