@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     screenshot_dir: str = Field(default="/tmp/odoo_agent_screenshots", alias="ODOO_AGENT_SCREENSHOT_DIR")
     cdp_url: str | None = Field(default=None, alias="ODOO_AGENT_CDP_URL")
 
-    # Approval gating is disabled in this build so MCP tools can write, commit, push, and deploy directly.
+    # Approval defaults protect high-impact writes; read-only operations remain available.
     require_approval: bool = Field(default=True, alias="ODOO_AGENT_REQUIRE_APPROVAL")
     approval_required_actions_raw: str = Field(default="repo.prepare,repo.write,repo.delete,repo.apply_patch,repo.apply_patch_atomic,repo.clean_pyc,git.commit,git.push,odoo.module_install,odoo.module_update,odoosh.module_install_ssh,odoosh.module_deploy_ssh,workflow.safe_deploy_module,odoo.record_create,odoo.record_write,odoo.record_action.*", alias="ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS")
     protected_branches_raw: str = Field(default="", alias="ODOO_AGENT_PROTECTED_BRANCHES")
