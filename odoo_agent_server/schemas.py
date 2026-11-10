@@ -1000,6 +1000,12 @@ class ReaApiInspectRequest(BaseModel):
         return value
 
 
+class ReaRuntimeTraceRequest(BaseModel):
+    """Bounded analyzer for exported Odoo runtime trace spans."""
+    trace_id: str | None = Field(default=None, max_length=160)
+    slow_threshold_ms: float = Field(default=100.0, ge=0, le=600000)
+    events: list[dict[str, Any]] = Field(..., min_length=1, max_length=2000)
+
 class FrontendVisualImplementRequest(BaseModel):
     """Generic Odoo frontend visual implementation workflow.
 
