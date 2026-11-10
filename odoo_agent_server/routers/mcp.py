@@ -608,6 +608,7 @@ _PROVIDER_TOOL_NAMES = {
     "rea.upstream_compare",
     "rea.api_inspect",
     "rea.runtime_trace",
+    "rea.impact_predict",
     "workflow.module_test",
     "workflow.module_install_and_check",
     "workflow.frontend_visual_implement",
