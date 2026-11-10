@@ -1043,6 +1043,8 @@ class ReaSelfHealRequest(BaseModel):
     action: Literal["auto", "start", "continue", "poll", "verify"] = "auto"
     debug_session_id: str | None = Field(default=None, max_length=64)
     runtime_evidence: list[str] = Field(default_factory=list, max_length=50)
+    runtime_events: list[dict[str, Any]] = Field(default_factory=list, max_length=2000)
+    proposed_changes: list[ReaImpactChangeFile] = Field(default_factory=list, max_length=30)
     writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=50)
     auto_deploy: bool = Field(default=False, description="Deployment is disabled unless explicitly set true.")
     max_fix_cycles: int = Field(default=3, ge=1, le=5)
