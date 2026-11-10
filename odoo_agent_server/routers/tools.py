@@ -488,7 +488,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(
         name="rea.api_inspect",
         title="Inspect external API integrations",
-        description="Read-only static inventory of outbound HTTP/RPC clients, webhook routes, URL/config references, timeouts and TLS settings in an Odoo addon. No network requests.",
+        description="Static, read-only inventory of addon HTTP/RPC calls, routes, endpoint configuration and TLS/timeout settings; never connects to endpoints.",
         read_only=True,
         idempotent=True,
     ),
