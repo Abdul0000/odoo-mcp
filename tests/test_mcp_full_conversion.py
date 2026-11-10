@@ -28,6 +28,7 @@ _PROVIDER_TOOLS = {
     "rea_upstream_compare",
     "rea_api_inspect",
     "rea_runtime_trace",
+    "rea_impact_predict",
     "workflow_module_test",
     "workflow_module_install_and_check",
     "workflow_frontend_visual_implement",
