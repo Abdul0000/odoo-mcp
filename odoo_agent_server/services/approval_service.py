@@ -32,9 +32,14 @@ class ApprovalService:
         # old/stale ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS values must not block tools.
         # This fixes Render envs where REQUIRE_APPROVAL=false but the action list
         # still contains deploy/update actions from older builds.
+        required_actions = settings.approval_required_actions
+        action_is_required = action in required_actions or any(
+            item.endswith(".*") and action.startswith(item[:-1])
+            for item in required_actions
+        )
         approval_required = force or (
             bool(settings.require_approval)
-            and (not settings.approval_required_actions or action in settings.approval_required_actions)
+            and (not required_actions or action_is_required)
         )
         if not approval_required:
             self.store.log_audit(action, "allowed", "Approval not required", {"approval_required": False})
