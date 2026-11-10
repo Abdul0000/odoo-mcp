@@ -902,11 +902,7 @@ _TOOL_DESCRIPTORS = [
         title="Request approval", description="Create an approval request", requires_approval=False),
     ToolDescriptor(
         name="approvals.approve",
-        title="Record explicit human approval",
-        description=(
-            "Approve only the exact pending Odoo action the user explicitly approved in this chat; never infer consent. "
-            "Then retry the same flow with its original request_id and approval_id."
-        ),
+        description="Approve this exact pending action only after explicit user consent.",
         requires_approval=False,
         idempotent=True,
     ),

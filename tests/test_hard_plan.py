@@ -179,6 +179,7 @@ def test_mcp_initialize_list_and_call(tmp_path, monkeypatch):
         "odoo_record_action",
         "odoo_flow_test",
         "odoo_mutation_audit",
+    "approvals_approve",
         "artifacts_read",
         "workflow_resume_job",
         "jobs_list",
