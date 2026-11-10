@@ -403,7 +403,9 @@ class OdooJsonRpcService:
                     error="Odoo JSON-2 accepts named parameters only; positional action arguments are not supported.",
                 )
             try:
-                result = self._json2_call(model, action, {"ids": ids, **kwargs}, timeout_seconds)
+                params = dict(kwargs)
+                params["ids"] = ids
+                result = self._json2_call(model, action, params, timeout_seconds)
                 return OdooResult(status="ok", base_url=self._base_url(), database=self._db(), result=result)
             except Exception as exc:
                 return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error=self._format_exception(exc))
