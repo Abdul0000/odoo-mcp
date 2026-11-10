@@ -30,7 +30,6 @@ _PROVIDER_TOOLS = {
     "workflow_resume_continuation",
     "workflow_odoo_debug_and_fix",
     "workflow_module_analyze",
-    "rea_impact_predict",
     "rea_self_heal",
     "workflow_module_test",
     "workflow_module_install_and_check",
