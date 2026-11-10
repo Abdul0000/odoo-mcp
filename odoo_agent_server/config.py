@@ -165,6 +165,7 @@ class Settings(BaseSettings):
     odoo_db_name: str | None = Field(default=None, alias="ODOO_DB_NAME")
     odoo_login: str | None = Field(default=None, alias="ODOO_LOGIN")
     odoo_password: str | None = Field(default=None, alias="ODOO_PASSWORD")
+    odoo_api_key: str | None = Field(default=None, alias="ODOO_API_KEY")
     odoo_https_verify_ssl: bool = Field(default=True, alias="ODOO_HTTPS_VERIFY_SSL")
     functional_operations_enabled: bool = Field(
         default=False,
@@ -330,6 +331,7 @@ def normalise_client(client: dict) -> dict:
         "odoo_db",
         "odoo_login",
         "odoo_password",
+        "odoo_api_key",
         "odoo_verify_ssl",
         "odoosh_db_name",
         "odoosh_ssh_host",
