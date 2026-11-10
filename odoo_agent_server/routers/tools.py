@@ -1166,9 +1166,18 @@ def list_tools(include_deprecated: bool = False, strict_names: bool = True) -> l
     # If global approval is disabled, do not advertise approval as required even
     # when an old ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS value is still present.
     required = settings.approval_required_actions if settings.require_approval else set()
+
+    def approval_required(name: str) -> bool:
+        return name in required or any(
+            rule.endswith(".*") and (
+                name.startswith(rule[:-1]) or rule.startswith(name + ".")
+            )
+            for rule in required
+        )
+
     visible = _TOOL_DESCRIPTORS if include_deprecated else [t for t in _TOOL_DESCRIPTORS if not t.deprecated]
     ordered = sorted(visible, key=lambda item: _agent_priority(item.name))
-    result = [item.model_copy(update={"requires_approval": item.name in required}) for item in ordered]
+    result = [item.model_copy(update={"requires_approval": approval_required(item.name)}) for item in ordered]
     if strict_names:
         return [_external_tool_descriptor(item) for item in result]
     return result
