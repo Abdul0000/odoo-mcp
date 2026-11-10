@@ -65,7 +65,19 @@ class OdooJsonRpcService:
             data = response.json()
         if data.get("error"):
             error = data["error"]
-            message = error.get("message") or error.get("data", {}).get("message") or str(error)
+            details = error.get("data") if isinstance(error, dict) else None
+            details = details if isinstance(details, dict) else {}
+            # Odoo wraps ORM exceptions in a generic top-level "Odoo Server Error".
+            # Prefer the nested exception message so callers see the actionable
+            # cause (for example, an invalid field or access-rule failure).
+            message = (
+                details.get("message")
+                or error.get("message")
+                or str(error)
+            )
+            exception_name = details.get("name")
+            if exception_name and exception_name not in message:
+                message = f"{exception_name}: {message}"
             raise RuntimeError(message)
         return data.get("result")
 
