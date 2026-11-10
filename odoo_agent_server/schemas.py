@@ -1031,6 +1031,33 @@ class ReaImpactRequest(BaseModel):
             raise ValueError("module_name contains unsafe characters")
         return value
 
+class ReaSelfHealRequest(BaseModel):
+    """Evidence-led REA repair workflow with deployment disabled by default."""
+    client_name: str | None = Field(default=None, max_length=120)
+    project_path: str | None = Field(default=None, max_length=1000)
+    module_name: str = Field(..., min_length=1, max_length=200)
+    issue_description: str = Field(..., min_length=3, max_length=10000)
+    expected_result: str = Field(..., min_length=3, max_length=5000)
+    reproduction_steps: list[str] = Field(default_factory=list, max_length=20)
+    surface: Literal["auto", "backend", "controller", "cron", "integration", "frontend", "security", "install_upgrade", "performance"] = "auto"
+    action: Literal["auto", "start", "continue", "poll", "verify"] = "auto"
+    debug_session_id: str | None = Field(default=None, max_length=64)
+    runtime_evidence: list[str] = Field(default_factory=list, max_length=50)
+    writes: list[OdooCodeFileChange] = Field(default_factory=list, max_length=50)
+    auto_deploy: bool = Field(default=False, description="Deployment is disabled unless explicitly set true.")
+    max_fix_cycles: int = Field(default=3, ge=1, le=5)
+
+    @field_validator("module_name")
+    @classmethod
+    def self_heal_module_name_must_be_safe(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or chr(0) in value or "/" in value or chr(92) in value or ".." in value:
+            raise ValueError("module_name must be a safe addon hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
+
+
 class FrontendVisualImplementRequest(BaseModel):
     """Generic Odoo frontend visual implementation workflow.
 
