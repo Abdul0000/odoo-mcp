@@ -110,7 +110,7 @@ odoo.module_update
 odoosh.module_update
 ```
 
-High-impact writes require a one-time approval by default. Read-only discovery and query tools remain approval-free. The default policy covers repository mutations, Git commit/push, module install/update, safe deploy, and functional record mutations. Set `ODOO_AGENT_REQUIRE_APPROVAL=false` only for an explicitly trusted development environment; production deployments should keep approval enabled.
+High-impact writes require a one-time approval by default. Read-only discovery and query tools remain approval-free. The default policy covers repository mutations, Git commit/push, module install/update, safe deploy, and sensitive record actions. Set `ODOO_AGENT_REQUIRE_APPROVAL=false` only for an explicitly trusted development environment; production deployments should keep approval enabled.
 
 ## Install locally
 
