@@ -68,6 +68,7 @@ from ..schemas import (
     ReaApiInspectRequest,
     ReaRuntimeTraceRequest,
     ReaImpactRequest,
+    ReaSelfHealRequest,
     FrontendVisualImplementRequest,
     EmptyRequest,
     SkillListRequest,
@@ -509,6 +510,12 @@ _TOOL_DESCRIPTORS = [
         description="Predict affected addon components and risk from proposed file diffs using the static architecture graph and optional exported trace evidence; advisory and read-only.",
         read_only=True,
         idempotent=True,
+    ),
+    ToolDescriptor(
+        name="rea.self_heal",
+        title="Run guarded REA self-healing workflow",
+        description="Gather bounded X-Ray, upstream and API evidence, then hand off to the existing Odoo debug/fix workflow. Deployment is disabled by default.",
+        requires_approval=True,
     ),
     ToolDescriptor(
         name="workflow.module_test",
@@ -1051,6 +1058,7 @@ _TOOL_INPUT_MODELS = {
     "rea.api_inspect": ReaApiInspectRequest,
     "rea.runtime_trace": ReaRuntimeTraceRequest,
     "rea.impact_predict": ReaImpactRequest,
+    "rea.self_heal": ReaSelfHealRequest,
     "workflow.module_test": OdooModuleTestRequest,
     "workflow.module_install_and_check": OdooModuleRequest,
     "workflow.frontend_visual_implement": FrontendVisualImplementRequest,
@@ -9024,6 +9032,92 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             ReaRuntimeTraceService().analyze, events=request.events,
             trace_id=request.trace_id, slow_threshold_ms=request.slow_threshold_ms,
         )
+    if name == "rea.self_heal":
+        request = ReaSelfHealRequest.model_validate(args)
+        analysis_request = ModuleAnalyzeRequest(
+            client_name=request.client_name,
+            project_path=request.project_path,
+            module_name=request.module_name,
+            max_files=50,
+        )
+        analysis = await asyncio.to_thread(_workflow_module_analyze, analysis_request)
+        if analysis.get("status") != "analyzed":
+            return {
+                "status": "blocked",
+                "reason": "REA could not resolve a unique addon for the repair workflow.",
+                "analysis": analysis,
+                "writes_applied": False,
+                "deployment_started": False,
+            }
+        module_path = Path(analysis["module_path"])
+        xray = await asyncio.to_thread(
+            ReaXrayService().build,
+            module_path=module_path,
+            module_name=analysis["module_name"],
+            max_files=50,
+        )
+        upstream = await asyncio.to_thread(
+            ReaUpstreamService().compare,
+            module_path=module_path,
+            module_name=analysis["module_name"],
+            client_name=request.client_name,
+        )
+        api_inspection = await asyncio.to_thread(
+            ReaApiInspectService().inspect,
+            module_path=module_path,
+            module_name=analysis["module_name"],
+        )
+        def _rea_evidence_lines(report: dict[str, Any], limit: int = 12) -> list[str]:
+            lines = []
+            for item in (report.get("findings") or [])[:limit]:
+                evidence = item.get("evidence") or {}
+                location = evidence.get("path") or "unknown path"
+                if evidence.get("line"):
+                    location += f":{evidence['line']}"
+                lines.append(
+                    f"- {item.get('code') or item.get('type') or 'finding'} "
+                    f"({item.get('severity') or 'info'}): {item.get('message') or item.get('symbol') or item.get('method') or ''} [{location}]"
+                )
+            return lines
+        rea_context = [
+            "REA EVIDENCE (static and advisory; verify against current source):",
+            f"X-Ray: {len(xray.get('nodes', []))} nodes, {len(xray.get('edges', []))} edges; coverage={xray.get('coverage', {})}.",
+            f"Upstream: {len(upstream.get('findings', []))} findings; coverage={upstream.get('coverage', {})}.",
+            f"External APIs: {api_inspection.get('summary', {})}; coverage={api_inspection.get('coverage', {})}.",
+            *_rea_evidence_lines(upstream),
+            *_rea_evidence_lines(api_inspection),
+        ]
+        debug_request = OdooDebugAndFixRequest.model_validate({
+            "client_name": request.client_name,
+            "project_path": request.project_path or analysis.get("project_path"),
+            "module_name": analysis["module_name"],
+            "issue_description": request.issue_description + "\\n\\n" + "\\n".join(rea_context),
+            "expected_result": request.expected_result,
+            "reproduction_steps": request.reproduction_steps,
+            "surface": request.surface,
+            "action": request.action,
+            "debug_session_id": request.debug_session_id,
+            "runtime_evidence": request.runtime_evidence,
+            "writes": [item.model_dump() for item in request.writes],
+            "auto_deploy": request.auto_deploy,
+            "max_fix_cycles": request.max_fix_cycles,
+        })
+        repair = await _workflow_odoo_debug_and_fix(debug_request)
+        return {
+            "status": "repair_workflow_started" if isinstance(repair, dict) else "repair_workflow_result",
+            "module_name": analysis["module_name"],
+            "rea_evidence": {
+                "xray_summary": xray.get("summary", {}),
+                "upstream": upstream,
+                "api_inspection": api_inspection,
+            },
+            "repair_workflow": repair,
+            "safety": {
+                "rea_static_analysis_only": True,
+                "writes_applied_by_rea": False,
+                "deployment_enabled": request.auto_deploy,
+            },
+        }
     if name == "rea.impact_predict":
         request = ReaImpactRequest.model_validate(args)
         base_request = ModuleAnalyzeRequest(
