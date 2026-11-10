@@ -604,7 +604,6 @@ _PROVIDER_TOOL_NAMES = {
     "workflow.resume_continuation",
     "workflow.odoo_debug_and_fix",
     "workflow.module_analyze",
-    "rea.impact_predict",
     "rea.self_heal",
     "workflow.module_test",
     "workflow.module_install_and_check",
