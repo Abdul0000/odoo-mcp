@@ -166,6 +166,7 @@ def test_mcp_initialize_list_and_call(tmp_path, monkeypatch):
         "workflow_odoo_debug_and_fix",
         "workflow_module_analyze",
                         "rea_impact_predict",
+    "rea_self_heal",
         "workflow_module_test",
         "workflow_module_install_and_check",
         "workflow_frontend_visual_implement",
