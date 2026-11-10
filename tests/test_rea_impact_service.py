@@ -40,11 +40,15 @@ def test_impact_prediction_follows_graph_and_marks_business_critical_change(tmp_
         }],
         graph=graph,
         runtime_events=[{"model": "sale.order", "method": "_compute_amount", "duration_ms": 120}],
+        upstream_findings=[{"code": "METHOD_SIGNATURE_DRIFT", "model": "sale.order", "symbol": "_compute_amount"}],
+        api_findings=[{"type": "outbound_client_call", "evidence": {"path": "models/sale_order.py", "line": 9}}],
     )
     assert result["status"] == "predicted"
     assert result["risk"] == "high"
     assert result["summary"]["impacted_components"] >= 2
     assert result["summary"]["runtime_trace_matches"] == 1
+    assert result["summary"]["upstream_matches"] == 1
+    assert result["summary"]["api_integration_matches"] == 1
     assert any(item["id"] == "method:sale.order._compute_amount" for item in result["impacted_components"])
 
 
