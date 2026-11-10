@@ -705,14 +705,10 @@ _CHATGPT_QUICK_WAIT_TOOLS = {
 
 _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
     "client.check": (
-        "Select and validate the configured Odoo client before protected work. Without client_name it lists choices; "
-        "with client_name and validate=true it prepares/verifies checkout, Git, Odoo.sh SSH, Odoo shell, and addons. "
-        "Slow validation returns job_id/next_call; poll jobs.get. Writes, Git, and deploy stay blocked until validation passes."
+        "Select Odoo client; validate=true checks checkout, Git, SSH, shell and addons. Slow checks return job_id. No writes before validation passes."
     ),
     "workflow.odoo_code_change": (
-        "Implement or repair an Odoo addon. Resolves checkout and target, applies one writes set, runs QA/core verification, "
-        "and starts safe deploy. Long work returns operation_id/job_id for jobs.get; identical retries reuse the same job. "
-        "For needs_writes, preserve coding_session_id/workspace_session_id and supply writes."
+        "Implement or repair addon; resolves checkout, applies writes, runs QA/core checks and safe deploy. For needs_writes, preserve coding_session_id/workspace_session_id and supply writes."
     ),
     "workflow.resume_continuation": (
         "Resume an interrupted code-change after an ephemeral Render restart. Pass the latest signed resume_token "
@@ -720,7 +716,7 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
         "current checkout, source, target, QA, and deploy gates before any mutation."
     ),
     "workflow.odoo_debug_and_fix": (
-        "Source-first debugger for errors and silent wrong results. Preserve IDs and returned calls; claim fixed only when truth_gate.verified_fixed=true."
+        "Source-first Odoo debugger. Preserve IDs and returned calls; claim fixed only when truth_gate.verified_fixed=true."
     ),
     "workflow.module_analyze": (
         "Read-only addon architecture analysis with bounded source evidence and optional live checks."
@@ -729,14 +725,10 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
         "Read-only addon graph of dependencies, models, fields, methods and UI records with evidence."
     ),
     "workflow.module_install_and_check": (
-        "Fast path for an explicit module install, upgrade, or install-and-fix request. It starts the guarded Odoo job and "
-        "returns job_id/next_call for jobs.get. Repair source only from its concrete traceback or dependency error; an "
-        "uninstallable registry state alone is not permission to edit code."
+        "Guarded Odoo module install/upgrade job. Repair source only from a concrete traceback or dependency error; uninstallable registry state alone is not permission to edit code."
     ),
     "workflow.frontend_visual_implement": (
-        "Odoo visual workflow for POS/OWL/dashboard/website/backend UI assets and styling. It generates deterministic "
-        "SCSS/SVG/XML/JS writes, reads native context, verifies, and uses safe deploy. Use create_module=true only for a new "
-        "standalone root addon; otherwise modify the validated custom addon without editing Odoo core."
+        "Odoo UI/website/POS visual workflow with deterministic asset writes and safe deploy. Use create_module=true only for a standalone root addon; otherwise modify the validated custom addon without editing Odoo core."
     ),
 }
 
