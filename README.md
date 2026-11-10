@@ -754,7 +754,7 @@ This phase performs no outbound requests, DNS resolution, credential reads, or e
 
 ## REA Phase 5 — Change impact prediction
 
-`rea_impact_predict` predicts likely addon components affected by a proposed change. Supply the addon name and a bounded list of changed addon-relative paths; optional unified diff snippets improve symbol matching. The tool builds the static X-Ray graph, maps changed paths/symbols to graph nodes, follows connected model/view/action relationships, and returns an advisory risk level with impacted components and reasons. Optional caller-supplied runtime trace events add evidence when changed methods appear in the trace.
+`rea_impact_predict` predicts likely addon components affected by a proposed change. Supply the addon name and a bounded list of changed addon-relative paths; optional unified diff snippets improve symbol matching. The tool builds the static X-Ray graph, compares the addon with installed upstream source, inspects external API integration points, maps changed paths/symbols to graph nodes, and follows connected model/view/action relationships. Optional caller-supplied runtime trace events add evidence when changed methods appear in the trace. The response includes evidence matches and coverage from each source.
 
 Example MCP arguments:
 
