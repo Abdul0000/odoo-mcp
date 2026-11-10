@@ -294,6 +294,17 @@ class OdooJsonRpcService:
         )
 
     def check_access_rights(self, model: str, operation: str, timeout_seconds: int = 60) -> OdooResult:
+        if self._api_key():
+            try:
+                result = self._json2_call(
+                    model,
+                    "check_access_rights",
+                    {"operation": operation, "raise_exception": False},
+                    timeout_seconds,
+                )
+                return OdooResult(status="ok", base_url=self._base_url(), database=self._db(), result=result)
+            except Exception as exc:
+                return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error=self._format_exception(exc))
         return self.execute_model_method(
             model,
             "check_access_rights",
@@ -313,6 +324,17 @@ class OdooJsonRpcService:
         kwargs: dict[str, Any] = {"fields": fields}
         if context:
             kwargs["context"] = context
+        if self._api_key():
+            try:
+                result = self._json2_call(
+                    model,
+                    "read",
+                    {"ids": ids, **kwargs},
+                    timeout_seconds,
+                )
+                return OdooResult(status="ok", base_url=self._base_url(), database=self._db(), result=result or [])
+            except Exception as exc:
+                return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error=self._format_exception(exc))
         return self.execute_model_method(model, "read", [ids], kwargs, timeout_seconds)
 
     def create_records(
@@ -323,6 +345,17 @@ class OdooJsonRpcService:
         timeout_seconds: int = 60,
     ) -> OdooResult:
         kwargs = {"context": context} if context else {}
+        if self._api_key():
+            try:
+                result = self._json2_call(
+                    model,
+                    "create",
+                    {"vals_list": records, **kwargs},
+                    timeout_seconds,
+                )
+                return OdooResult(status="ok", base_url=self._base_url(), database=self._db(), result=result)
+            except Exception as exc:
+                return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error=self._format_exception(exc))
         values: dict[str, Any] | list[dict[str, Any]] = records[0] if len(records) == 1 else records
         return self.execute_model_method(model, "create", [values], kwargs, timeout_seconds)
 
@@ -335,6 +368,17 @@ class OdooJsonRpcService:
         timeout_seconds: int = 60,
     ) -> OdooResult:
         kwargs = {"context": context} if context else {}
+        if self._api_key():
+            try:
+                result = self._json2_call(
+                    model,
+                    "write",
+                    {"ids": ids, "vals": values, **kwargs},
+                    timeout_seconds,
+                )
+                return OdooResult(status="ok", base_url=self._base_url(), database=self._db(), result=result)
+            except Exception as exc:
+                return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error=self._format_exception(exc))
         return self.execute_model_method(model, "write", [ids, values], kwargs, timeout_seconds)
 
     def run_action(
@@ -350,6 +394,19 @@ class OdooJsonRpcService:
         kwargs = dict(keyword_arguments or {})
         if context:
             kwargs["context"] = context
+        if self._api_key():
+            if arguments:
+                return OdooResult(
+                    status="failed",
+                    base_url=self._base_url(),
+                    database=self._db(),
+                    error="Odoo JSON-2 accepts named parameters only; positional action arguments are not supported.",
+                )
+            try:
+                result = self._json2_call(model, action, {"ids": ids, **kwargs}, timeout_seconds)
+                return OdooResult(status="ok", base_url=self._base_url(), database=self._db(), result=result)
+            except Exception as exc:
+                return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error=self._format_exception(exc))
         return self.execute_model_method(
             model,
             action,
