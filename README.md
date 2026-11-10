@@ -777,3 +777,26 @@ Example MCP arguments:
 ```
 
 The prediction is static and advisory, not proof of runtime impact. It does not modify files, run tests, query Odoo, deploy, or push. Validate high-risk findings with focused tests and an explicitly approved staging workflow.
+
+
+## REA Phase 6 — Guarded self-healing workflow
+
+`rea_self_heal` connects REA investigation to the existing Odoo debug-and-fix pipeline. It first resolves one unambiguous custom addon, then gathers bounded X-Ray architecture, installed-upstream compatibility, and external API integration evidence. Those findings are attached to the repair context before the established debugger derives the fault, requests exact writes when needed, and applies the existing verification gates.
+
+Example MCP arguments:
+
+```json
+{
+  "module_name": "my_custom_addon",
+  "issue_description": "The order total is incorrect after applying a fixed discount.",
+  "expected_result": "The order total must equal the discounted line totals.",
+  "reproduction_steps": [
+    "Create a quotation with two order lines",
+    "Apply a fixed discount",
+    "Recompute the order total"
+  ],
+  "surface": "backend"
+}
+```
+
+Deployment defaults to **disabled**. Set `auto_deploy=true` only when deployment is explicitly authorized. The workflow does not claim a fix merely because files were written: the existing debug workflow requires its verification evidence before reporting a verified repair. Ambiguous addon resolution blocks the workflow before repair. REA's X-Ray/upstream/API scans are static evidence, not proof of runtime behavior.
