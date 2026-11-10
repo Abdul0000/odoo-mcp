@@ -9067,6 +9067,24 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             module_path=module_path,
             module_name=analysis["module_name"],
         )
+        runtime_trace = None
+        if request.runtime_events:
+            runtime_trace = await asyncio.to_thread(
+                ReaRuntimeTraceService().analyze,
+                events=request.runtime_events,
+            )
+        impact_prediction = None
+        if request.proposed_changes:
+            impact_prediction = await asyncio.to_thread(
+                ReaImpactService().predict,
+                module_path=module_path,
+                module_name=analysis["module_name"],
+                changed_files=[item.model_dump() for item in request.proposed_changes],
+                graph=xray,
+                runtime_events=request.runtime_events,
+                upstream_findings=upstream.get("findings", []),
+                api_findings=api_inspection.get("findings", []),
+            )
         def _rea_evidence_lines(report: dict[str, Any], limit: int = 12) -> list[str]:
             lines = []
             for item in (report.get("findings") or [])[:limit]:
@@ -9084,6 +9102,8 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             f"X-Ray: {len(xray.get('nodes', []))} nodes, {len(xray.get('edges', []))} edges; coverage={xray.get('coverage', {})}.",
             f"Upstream: {len(upstream.get('findings', []))} findings; coverage={upstream.get('coverage', {})}.",
             f"External APIs: {api_inspection.get('summary', {})}; coverage={api_inspection.get('coverage', {})}.",
+            f"Runtime trace: {runtime_trace.get('summary', {}) if runtime_trace else 'not supplied'}.",
+            f"Change impact: {impact_prediction.get('summary', {}) if impact_prediction else 'no proposed changes supplied'}.",
             *_rea_evidence_lines(upstream),
             *_rea_evidence_lines(api_inspection),
         ]
@@ -9097,7 +9117,11 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             "surface": request.surface,
             "action": request.action,
             "debug_session_id": request.debug_session_id,
-            "runtime_evidence": request.runtime_evidence,
+            "runtime_evidence": [
+                *request.runtime_evidence,
+                *([f"REA runtime trace summary: {runtime_trace.get('summary', {})}"] if runtime_trace else []),
+                *([f"REA impact prediction: {impact_prediction.get('summary', {})}; risk={impact_prediction.get('risk')}"] if impact_prediction else []),
+            ],
             "writes": [item.model_dump() for item in request.writes],
             "auto_deploy": request.auto_deploy,
             "max_fix_cycles": request.max_fix_cycles,
@@ -9110,6 +9134,8 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                 "xray_summary": xray.get("summary", {}),
                 "upstream": upstream,
                 "api_inspection": api_inspection,
+                "runtime_trace": runtime_trace,
+                "impact_prediction": impact_prediction,
             },
             "repair_workflow": repair,
             "safety": {
