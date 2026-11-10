@@ -29,6 +29,7 @@ class ResolvedClient:
     odoo_db: str | None = None
     odoo_login: str | None = None
     odoo_password: str | None = None
+    odoo_api_key: str | None = None
     odoo_verify_ssl: bool | None = None
     odoosh_db_name: str | None = None
     odoosh_ssh_host: str | None = None
@@ -226,6 +227,7 @@ class ClientResolverService:
             odoo_db=client.get("odoo_db") or None,
             odoo_login=client.get("odoo_login") or None,
             odoo_password=client.get("odoo_password") or None,
+            odoo_api_key=client.get("odoo_api_key") or None,
             odoo_verify_ssl=self._parse_optional_bool(client.get("odoo_verify_ssl")),
             odoosh_db_name=client.get("odoosh_db_name") or None,
             odoosh_ssh_host=client.get("odoosh_ssh_host") or None,
