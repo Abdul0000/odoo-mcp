@@ -222,13 +222,35 @@ class FunctionalOperationService:
         if len(before) != len(request.ids):
             raise HTTPException(status_code=404, detail="One or more action records are missing or blocked by record rules.")
         approval_payload = self._redact(payload)
-        self.approvals.ensure_allowed(
-            f"odoo.record_action.{request.model}.{request.action}",
-            request.approval_id,
-            approval_payload,
-            force=sensitive,
-            bind_payload=sensitive,
-        )
+        try:
+            self.approvals.ensure_allowed(
+                f"odoo.record_action.{request.model}.{request.action}",
+                request.approval_id,
+                approval_payload,
+                force=sensitive,
+                bind_payload=sensitive,
+            )
+        except HTTPException as exc:
+            detail = exc.detail
+            if exc.status_code == status.HTTP_409_CONFLICT and isinstance(detail, dict) and detail.get("approval_required"):
+                # Keep the mutation resumable. The approval is deliberately not
+                # written to the mutation ledger, so the exact same request_id
+                # can be retried after a human approves the payload-bound gate.
+                return {
+                    "status": "awaiting_approval",
+                    "operation": "record_action",
+                    "request_id": request.request_id,
+                    "client_name": self._client_key(client),
+                    "model": request.model,
+                    "action": request.action,
+                    "record_ids": request.ids,
+                    "approval_id": detail.get("approval_id"),
+                    "approval_action": detail.get("action"),
+                    "verified": False,
+                    "success_allowed": False,
+                    "next_action": "Obtain explicit user approval, approve this exact approval_id, then retry the identical action with the same request_id and approval_id.",
+                }
+            raise
         result = rpc.run_action(
             request.model,
             request.ids,
@@ -353,9 +375,12 @@ class FunctionalOperationService:
             stage_results.append({"stage": stage, **result})
             if result.get("status") != "ok" or result.get("verified") is not True:
                 break
-        complete = len(stage_results) == len(stages) and all(item.get("status") == "ok" for item in stage_results)
+        pending = next((item for item in stage_results if item.get("status") == "awaiting_approval"), None)
+        complete = len(stage_results) == len(stages) and all(
+            item.get("status") == "ok" and item.get("verified") is True for item in stage_results
+        )
         response = {
-            "status": "ok" if complete else "failed",
+            "status": "awaiting_approval" if pending else ("ok" if complete else "failed"),
             "operation": "flow_test",
             "request_id": request.request_id,
             "client_name": self._client_key(client),
@@ -367,6 +392,15 @@ class FunctionalOperationService:
             "success_allowed": complete,
             "cleanup": "Only draft/cancelled test records may be removed manually; no automatic unlink is exposed.",
         }
+        if pending:
+            response["approval"] = {
+                "approval_id": pending.get("approval_id"),
+                "action": pending.get("approval_action"),
+                "model": pending.get("model"),
+                "record_ids": pending.get("record_ids"),
+            }
+            response["next_action"] = "After explicit user approval, call approvals.approve and retry this exact flow with the same request_id and approval_id. Completed prior steps are idempotently replayed."
+            return response
         payload = request.model_dump(mode="json", exclude={"approval_id"})
         return self._save(request, client, "flow_test", payload, response)
 
@@ -484,12 +518,13 @@ class FunctionalOperationService:
             if result.get("status") not in {"ok", "preview"} or result.get("verified") is not True:
                 break
 
+        pending = next((item for item in stage_results if item.get("status") == "awaiting_approval"), None)
         complete = len(stage_results) == len(request.steps) and all(
             item.get("status") == "ok" and item.get("verified") is True
             for item in stage_results
         )
         response = {
-            "status": "ok" if complete else "failed",
+            "status": "awaiting_approval" if pending else ("ok" if complete else "failed"),
             "operation": "flow_test",
             "request_id": request.request_id,
             "client_name": self._client_key(client),
@@ -499,6 +534,15 @@ class FunctionalOperationService:
             "verified": complete,
             "success_allowed": complete,
         }
+        if pending:
+            response["approval"] = {
+                "approval_id": pending.get("approval_id"),
+                "action": pending.get("approval_action"),
+                "model": pending.get("model"),
+                "record_ids": pending.get("record_ids"),
+            }
+            response["next_action"] = "After explicit user approval, call approvals.approve and retry this exact flow with the same request_id and approval_id. Completed prior steps are idempotently replayed."
+            return response
         payload = request.model_dump(mode="json", exclude={"approval_id"})
         return self._save(request, client, "flow_test", payload, response)
 

@@ -44,6 +44,7 @@ _PROVIDER_TOOLS = {
     "odoo_record_action",
     "odoo_flow_test",
     "odoo_mutation_audit",
+    "approvals_approve",
     "artifacts_read",
     "workflow_resume_job",
     "jobs_list",

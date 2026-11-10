@@ -620,6 +620,8 @@ _PROVIDER_TOOL_NAMES = {
     "odoo.record_action",
     "odoo.flow_test",
     "odoo.mutation_audit",
+    # This tool records an explicit user decision for one pending protected flow.
+    "approvals.approve",
     # Source discovery and verification are server-owned steps inside the
     # composite workflows. Keeping them off the provider surface avoids extra
     # planning loops and repeated input-schema payloads.

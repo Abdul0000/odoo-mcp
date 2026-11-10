@@ -38,6 +38,8 @@ from ..schemas import (
     WsOpenRequest,
     WsReadRequest,
     ApprovalCreateRequest,
+    ApprovalDecisionRequest,
+    ApprovalStatus,
     ArtifactReadRequest,
     AuditListRequest,
     BaseProjectRequest,
@@ -898,12 +900,17 @@ _TOOL_DESCRIPTORS = [
         title="List pending approvals", description="List pending/recent approval records", read_only=True),
     ToolDescriptor(name="approvals.request",
         title="Request approval", description="Create an approval request", requires_approval=False),
-    # Phase 4: approvals.approve/reject are intentionally NOT exposed as MCP
-    # tools. Protected-branch git.push creates an approval record that must
-    # be approved by a human via the REST API (POST /approvals/approve) with
-    # the connector's own API token — not by the agent itself. Exposing
-    # these here would let the agent self-approve the exact gate meant to
-    # require human review.
+    ToolDescriptor(
+        name="approvals.approve",
+        title="Record explicit human approval",
+        description=(
+            "Approve one pending payload-bound Odoo mutation approval only after the user explicitly approves "
+            "that exact approval ID and action in the current conversation. Never call this tool to self-approve "
+            "or infer consent. After approval, resume the same flow with the same request_id and approval_id."
+        ),
+        requires_approval=False,
+        idempotent=True,
+    ),
     ToolDescriptor(name="jobs.list",
         title="List background jobs", description="List recent connector jobs", read_only=True),
     ToolDescriptor(name="jobs.get",
@@ -1128,6 +1135,7 @@ _TOOL_INPUT_MODELS = {
     "browser.pos_flow": PosFlowCheckRequest,
     "approvals.list": LimitRequest,
     "approvals.request": ApprovalCreateRequest,
+    "approvals.approve": ApprovalDecisionRequest,
     "jobs.list": LimitRequest,
     "jobs.get": JobGetRequest,
     "audit.list": AuditListRequest,
@@ -9424,6 +9432,13 @@ async def _dispatch_inner(name: str, args: dict) -> object:
     if name == "approvals.request":
         req = ApprovalCreateRequest.model_validate(args)
         return JsonStore().create_approval(ApprovalRecord(action=req.action, summary=req.summary, payload_preview=req.payload_preview))
+    if name == "approvals.approve":
+        req = ApprovalDecisionRequest.model_validate(args)
+        store = JsonStore()
+        approval = store.get_approval(req.approval_id)
+        if approval.status != ApprovalStatus.pending:
+            raise HTTPException(status_code=409, detail=f"Approval {req.approval_id} is {approval.status.value}, not pending.")
+        return store.set_approval_status(req.approval_id, ApprovalStatus.approved, req.reason)
     if name == "jobs.list":
         req = LimitRequest.model_validate(args)
         return JsonStore().list_jobs(limit=req.limit)
