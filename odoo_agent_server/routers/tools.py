@@ -9104,7 +9104,7 @@ async def _dispatch_inner(name: str, args: dict) -> object:
         })
         repair = await _workflow_odoo_debug_and_fix(debug_request)
         return {
-            "status": "repair_workflow_started" if isinstance(repair, dict) else "repair_workflow_result",
+            "status": repair.get("status", "repair_workflow_result") if isinstance(repair, dict) else "repair_workflow_result",
             "module_name": analysis["module_name"],
             "rea_evidence": {
                 "xray_summary": xray.get("summary", {}),
