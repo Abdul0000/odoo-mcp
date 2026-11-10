@@ -966,6 +966,25 @@ class ReaXrayRequest(BaseModel):
         return value
 
 
+class ReaUpstreamRequest(BaseModel):
+    """Bounded read-only comparison against installed Odoo source."""
+    client_name: str | None = Field(default=None, max_length=120)
+    project_path: str | None = Field(default=None, max_length=1000)
+    module_name: str = Field(..., min_length=1, max_length=200)
+    max_dependency_files: int = Field(default=30, ge=5, le=60)
+    max_total_chars: int = Field(default=12000, ge=4000, le=20000)
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or chr(0) in value or "/" in value or chr(92) in value or ".." in value:
+            raise ValueError("module_name must be a safe addon hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
+
+
 class FrontendVisualImplementRequest(BaseModel):
     """Generic Odoo frontend visual implementation workflow.
 

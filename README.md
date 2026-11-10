@@ -733,3 +733,8 @@ not represented as runtime proof.
 
 External API/TLS investigation, runtime tracing, and upstream version diffs are
 later REA phases and are not part of this initial tool.
+
+
+## REA Phase 2 — Upstream intelligence
+
+`rea_upstream_compare` compares custom addon model extensions against the selected client's installed Odoo source roots and declared manifest dependencies. It reports method-signature drift, candidate overrides with no same-named upstream method, and field type/comodel differences with custom and upstream file evidence. Analysis is read-only and bounded. It does not fetch arbitrary code or execute addon code. Version/edition is not inferred unless identified by the installed source tree; findings are advisory and require runtime confirmation.

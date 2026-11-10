@@ -64,6 +64,7 @@ from ..schemas import (
     OdooDebugRecordAssertion,
     ModuleAnalyzeRequest,
     ReaXrayRequest,
+    ReaUpstreamRequest,
     FrontendVisualImplementRequest,
     EmptyRequest,
     SkillListRequest,
@@ -186,6 +187,7 @@ from ..services.skill_service import SkillService
 from ..services.validator_service import OdooModuleValidator
 from ..services.module_analysis_service import ModuleAnalysisService
 from ..services.rea_xray_service import ReaXrayService
+from ..services.rea_upstream_service import ReaUpstreamService
 from ..services.live_assertion_service import LiveAssertionService
 from ..services.functional_operation_service import FunctionalOperationService
 from ..services.module_test_service import ModuleTestService
@@ -471,6 +473,13 @@ _TOOL_DESCRIPTORS = [
             "models, inheritance, relational fields, methods, views, actions, menus and UI-to-method links. "
             "Uses bounded local AST/XML analysis; never executes addon code or contacts external hosts."
         ),
+        read_only=True,
+        idempotent=True,
+    ),
+    ToolDescriptor(
+        name="rea.upstream_compare",
+        title="Compare addon with Odoo upstream",
+        description="Read-only comparison of custom model overrides and fields against installed Odoo source; returns evidence-backed advisory findings.",
         read_only=True,
         idempotent=True,
     ),
@@ -1011,6 +1020,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.odoo_debug_and_fix": OdooDebugAndFixRequest,
     "workflow.module_analyze": ModuleAnalyzeRequest,
     "rea.xray_module": ReaXrayRequest,
+    "rea.upstream_compare": ReaUpstreamRequest,
     "workflow.module_test": OdooModuleTestRequest,
     "workflow.module_install_and_check": OdooModuleRequest,
     "workflow.frontend_visual_implement": FrontendVisualImplementRequest,
@@ -8965,6 +8975,18 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             "Use rea_xray.nodes and rea_xray.edges as the static architecture map. "
             "Every edge carries source-path evidence. Treat the graph as source-derived, "
             "not proof of runtime execution; request live verification only when needed."
+        )
+        return result
+    if name == "rea.upstream_compare":
+        request = ReaUpstreamRequest.model_validate(args)
+        base_request = ModuleAnalyzeRequest(client_name=request.client_name, project_path=request.project_path, module_name=request.module_name)
+        result = await asyncio.to_thread(_workflow_module_analyze, base_request)
+        if result.get("status") != "analyzed":
+            return result
+        result["rea_upstream"] = await asyncio.to_thread(
+            ReaUpstreamService().compare, module_path=Path(result["module_path"]),
+            module_name=result["module_name"], client_name=request.client_name,
+            max_dependency_files=request.max_dependency_files, max_total_chars=request.max_total_chars,
         )
         return result
     if name == "workflow.module_test":

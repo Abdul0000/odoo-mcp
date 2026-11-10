@@ -605,6 +605,7 @@ _PROVIDER_TOOL_NAMES = {
     "workflow.odoo_debug_and_fix",
     "workflow.module_analyze",
     "rea.xray_module",
+    "rea.upstream_compare",
     "workflow.module_test",
     "workflow.module_install_and_check",
     "workflow.frontend_visual_implement",
