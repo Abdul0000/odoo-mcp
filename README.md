@@ -96,7 +96,7 @@ Navigates Odoo pages through an external Chrome DevTools Protocol browser and re
 - `GET /jobs/{job_id}`
 - `GET /jobs/audit/events`
 
-Dangerous actions can require approval. Protected branch pushes always require approval regardless of the global setting:
+High-impact actions require approval by default. Protected branch pushes always require approval regardless of the global setting:
 
 ```text
 repo.write
