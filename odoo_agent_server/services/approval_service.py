@@ -23,11 +23,7 @@ class ApprovalService:
         force: bool = False,
         bind_payload: bool = False,
     ) -> None:
-        """Enforce approval only when enabled/configured.
-
-        Default deployments can run approval-free, but tests and high-risk
-        production deployments can enable global approval or per-action approval.
-        """
+        """Enforce the configured one-time approval policy for mutations."""
         # Global approval switch is authoritative. If ODOO_AGENT_REQUIRE_APPROVAL=false,
         # old/stale ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS values must not block tools.
         # This fixes Render envs where REQUIRE_APPROVAL=false but the action list
