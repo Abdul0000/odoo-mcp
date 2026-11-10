@@ -126,12 +126,21 @@ class FunctionalOperationService:
         for values in request.records:
             self._validate_values(fields, values, creating=True)
         context = self._safe_context(request.context)
+        approval_payload = self._redact(payload)
+        self.approvals.ensure_allowed(
+            "odoo.record_create",
+            request.approval_id,
+            approval_payload,
+            bind_payload=True,
+        )
         result = rpc.create_records(request.model, request.records, context)
         ids = self._created_ids(result)
         if not ids:
+            self.approvals.mark_failed(request.approval_id, result.error or "Odoo create returned no record IDs.")
             return self._failed(request, client, "record_create", payload, result.error or "Odoo create returned no record IDs.")
         verify_fields = self._verify_fields(fields, request.verify_fields, request.records)
         verified_records = self._read_ok(rpc, request.model, ids, verify_fields, context)
+        self.approvals.mark_consumed(request.approval_id)
         response = {
             "status": "ok",
             "operation": "record_create",
@@ -173,10 +182,19 @@ class FunctionalOperationService:
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"message": "Record changed since inspection; write was not executed.", "mismatches": mismatches[:20]},
             )
+        approval_payload = self._redact(payload)
+        self.approvals.ensure_allowed(
+            "odoo.record_write",
+            request.approval_id,
+            approval_payload,
+            bind_payload=True,
+        )
         result = rpc.write_records(request.model, request.ids, request.values, context)
         if result.status != "ok" or result.result is not True:
+            self.approvals.mark_failed(request.approval_id, result.error or "Odoo write failed.")
             return self._failed(request, client, "record_write", payload, result.error or "Odoo write failed.")
         after = self._read_ok(rpc, request.model, request.ids, tracked, context)
+        self.approvals.mark_consumed(request.approval_id)
         verified = len(after) == len(request.ids) and all(
             self._value_matches(row.get(key), value)
             for row in after
