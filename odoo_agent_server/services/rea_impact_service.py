@@ -61,6 +61,8 @@ class ReaImpactService:
         self, *, module_path: Path, module_name: str,
         changed_files: list[dict[str, Any]], graph: dict[str, Any] | None = None,
         runtime_events: list[dict[str, Any]] | None = None,
+        upstream_findings: list[dict[str, Any]] | None = None,
+        api_findings: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         root = module_path.resolve(strict=True)
         if not root.is_dir() or not (root / "__manifest__.py").is_file():
@@ -160,6 +162,27 @@ class ReaImpactService:
             risk = "medium"
             risk_reasons.append("The change is connected to a broad set of addon components")
 
+        upstream_findings = upstream_findings or []
+        api_findings = api_findings or []
+        upstream_matches = [
+            item for item in upstream_findings
+            if isinstance(item, dict) and (
+                item.get("symbol") in changed_symbols or item.get("model") in changed_symbols
+            )
+        ][:50]
+        api_matches = [
+            item for item in api_findings
+            if isinstance(item, dict) and (item.get("evidence") or {}).get("path") in {x["path"] for x in normalized}
+        ][:50]
+        if upstream_matches:
+            risk_reasons.append("Changed symbols have upstream signature or field compatibility findings")
+            if risk == "low":
+                risk = "medium"
+        if api_matches:
+            risk_reasons.append("Changed files contain external API or webhook integration points")
+            if risk == "low":
+                risk = "medium"
+
         runtime_matches = []
         for event_index, event in enumerate((runtime_events or [])[:2000]):
             if not isinstance(event, dict):
@@ -183,12 +206,16 @@ class ReaImpactService:
                 "seed_nodes": len(seeds),
                 "impacted_components": len(impacted),
                 "runtime_trace_matches": len(runtime_matches),
+                "upstream_matches": len(upstream_matches),
+                "api_integration_matches": len(api_matches),
                 "graph_complete": bool((graph.get("coverage") or {}).get("complete", False)),
             },
             "changed_files": normalized,
             "impacted_components": sorted(impacted.values(), key=lambda x: (x["depth"], x["kind"] or "", x["name"] or "")),
             "risk_reasons": list(dict.fromkeys(risk_reasons))[:50],
             "runtime_trace_matches": runtime_matches[:50],
+            "upstream_matches": upstream_matches,
+            "api_integration_matches": api_matches,
             "warnings": warnings,
             "limitations": [
                 "Prediction is static and advisory; it does not prove runtime impact.",
