@@ -27,6 +27,7 @@ _PROVIDER_TOOLS = {
     "rea_xray_module",
     "rea_upstream_compare",
     "rea_api_inspect",
+    "rea_runtime_trace",
     "workflow_module_test",
     "workflow_module_install_and_check",
     "workflow_frontend_visual_implement",
