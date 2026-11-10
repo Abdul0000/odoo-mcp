@@ -744,9 +744,9 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
 def _provider_tool_description(tool) -> str:
     """Return a complete semantic description without cutting a sentence mid-word."""
     description = _PROVIDER_COMPACT_TOOL_DESCRIPTIONS.get(tool.name) or " ".join(str(tool.description).split())
-    if len(description) <= 500:
+    if len(description) <= 220:
         return description
-    compact = description[:497].rsplit(" ", 1)[0].rstrip(" ,;:")
+    compact = description[:217].rsplit(" ", 1)[0].rstrip(" ,;:")
     return compact + "."
 
 _REMOTE_TOOL_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")

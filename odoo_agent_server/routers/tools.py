@@ -8986,7 +8986,6 @@ async def _dispatch_inner(name: str, args: dict) -> object:
         result["rea_upstream"] = await asyncio.to_thread(
             ReaUpstreamService().compare, module_path=Path(result["module_path"]),
             module_name=result["module_name"], client_name=request.client_name,
-            max_dependency_files=request.max_dependency_files, max_total_chars=request.max_total_chars,
         )
         return result
     if name == "workflow.module_test":

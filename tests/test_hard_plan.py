@@ -167,6 +167,7 @@ def test_mcp_initialize_list_and_call(tmp_path, monkeypatch):
         "workflow_module_analyze",
         "rea_xray_module",
         "rea_upstream_compare",
+        "rea_upstream_compare",
     "rea_xray_module",
         "workflow_module_test",
         "workflow_module_install_and_check",
