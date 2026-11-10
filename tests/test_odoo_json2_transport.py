@@ -139,3 +139,42 @@ def test_json2_request_uses_bearer_key_and_database_header(monkeypatch):
     assert seen["headers"]["Authorization"] == "bearer test-api-key"
     assert seen["headers"]["X-Odoo-Database"] == "example"
     assert seen["json"] == {"domain": []}
+
+
+
+def test_json2_create_write_and_action_use_named_parameters(monkeypatch):
+    service = _service()
+    calls = []
+
+    def fake_call(model, method, params, timeout_seconds):
+        calls.append((model, method, params))
+        return [21] if method == "create" else True
+
+    monkeypatch.setattr(service, "_json2_call", fake_call)
+
+    created = service.create_records("res.partner", [{"name": "JSON-2"}], {"lang": "en_US"})
+    written = service.write_records("res.partner", [21], {"name": "Updated"}, {"lang": "en_US"})
+    acted = service.run_action("sale.order", [42], "action_confirm", context={"lang": "en_US"})
+
+    assert created.status == "ok" and created.result == [21]
+    assert written.status == "ok" and written.result is True
+    assert acted.status == "ok"
+    assert calls == [
+        ("res.partner", "create", {"vals_list": [{"name": "JSON-2"}], "context": {"lang": "en_US"}}),
+        ("res.partner", "write", {"ids": [21], "vals": {"name": "Updated"}, "context": {"lang": "en_US"}}),
+        ("sale.order", "action_confirm", {"ids": [42], "context": {"lang": "en_US"}}),
+    ]
+
+
+def test_json2_rejects_positional_action_arguments(monkeypatch):
+    service = _service()
+    monkeypatch.setattr(
+        service,
+        "_json2_call",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not send positional args")),
+    )
+
+    result = service.run_action("sale.order", [42], "some_action", arguments=["unexpected"])
+
+    assert result.status == "failed"
+    assert "named parameters only" in result.error
