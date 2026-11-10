@@ -709,10 +709,9 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
         "Slow validation returns job_id/next_call; poll jobs.get. Writes, Git, and deploy stay blocked until validation passes."
     ),
     "workflow.odoo_code_change": (
-        "Odoo code workflow for existing changes or complete new addons. It prepares checkout, resolves the "
-        "module/target, persists a durable operation before work, applies one complete writes set, runs QA/core verification, "
-        "and starts safe deploy. Short work returns directly; long work returns operation_id/job_id for jobs.get. An identical "
-        "transport retry reuses the same job. On needs_writes, preserve coding_session_id/workspace_session_id and add writes."
+        "Implement or repair an Odoo addon. Resolves checkout and target, applies one writes set, runs QA/core verification, "
+        "and starts safe deploy. Long work returns operation_id/job_id for jobs.get; identical retries reuse the same job. "
+        "For needs_writes, preserve coding_session_id/workspace_session_id and supply writes."
     ),
     "workflow.resume_continuation": (
         "Resume an interrupted code-change after an ephemeral Render restart. Pass the latest signed resume_token "
@@ -726,7 +725,7 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
         "Read-only addon architecture analysis with bounded source evidence and optional live checks."
     ),
     "rea.xray_module": (
-        "Read-only Odoo addon graph: dependencies, models, fields, methods, views, actions and menus with source evidence."
+        "Read-only addon graph of dependencies, models, fields, methods and UI records with evidence."
     ),
     "workflow.module_install_and_check": (
         "Fast path for an explicit module install, upgrade, or install-and-fix request. It starts the guarded Odoo job and "

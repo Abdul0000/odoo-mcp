@@ -715,3 +715,21 @@ it does not measure a language model. Run the same task prompts through the live
    The result contains `urls.commit` and a `where` note naming the branch. `ws_status` answers "where is my work?" at any time.
 3. If nothing appears anywhere: check `checkpoint.saved` / the `ws_commit` status (blocked_by_lint, blocked_protected_branch,
    conflict, or a GitHub 401/403 meaning the token lacks `contents:write`).
+
+
+## REA — Reverse Engineer Anything (Phase 1)
+
+The read-only `rea_xray_module` MCP tool builds a bounded, evidence-backed
+architecture graph for a custom Odoo addon. It reuses the validated client and
+module resolution path from `workflow_module_analyze`, then extracts module
+dependencies, model definitions and inheritance, relational fields, methods,
+views, window actions, menus, and view-to-method links from Python AST and XML.
+
+The X-Ray runs locally against the selected checkout, does not import or
+execute addon code, does not contact external hosts, and requires no persistent
+disk. Its response includes graph nodes, typed edges with source-path evidence,
+coverage/omitted-file information, and parse warnings. Static relationships are
+not represented as runtime proof.
+
+External API/TLS investigation, runtime tracing, and upstream version diffs are
+later REA phases and are not part of this initial tool.
