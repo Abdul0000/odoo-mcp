@@ -110,13 +110,7 @@ odoo.module_update
 odoosh.module_update
 ```
 
-Approval gating is disabled in this build. Write, commit, push, module update, and safe deploy tools run without `approval_id`:
-
-```env
-ODOO_AGENT_REQUIRE_APPROVAL=false
-ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS=
-ODOO_AGENT_PROTECTED_BRANCHES=
-```
+High-impact writes require a one-time approval by default. Read-only discovery and query tools remain approval-free. The default policy covers repository mutations, Git commit/push, module install/update, safe deploy, and functional record mutations. Set `ODOO_AGENT_REQUIRE_APPROVAL=false` only for an explicitly trusted development environment; production deployments should keep approval enabled.
 
 ## Install locally
 
@@ -800,3 +794,8 @@ Example MCP arguments:
 ```
 
 Optional `runtime_events` and `proposed_changes` inputs activate the Phase 4 trace analyzer and Phase 5 impact predictor; these results are attached to the repair context too. Deployment defaults to **disabled**. Set `auto_deploy=true` only when deployment is explicitly authorized. The workflow does not claim a fix merely because files were written: the existing debug workflow requires its verification evidence before reporting a verified repair. Ambiguous addon resolution blocks the workflow before repair. REA's source scans are static evidence, not proof of runtime behavior.
+
+
+## Odoo 19+ External JSON-2 transport
+
+For Odoo 19+ databases that expose External JSON-2, add `odoo_api_key` to the selected `ODOO_CLIENTS` entry (or set `ODOO_API_KEY` for single-client configuration). The connector uses `POST /json/2/<model>/<method>` with `Authorization: bearer <key>` for `search_read`, `read_group`, and `fields_get`, sending named parameters and `X-Odoo-Database` when configured. When no API key is supplied, existing username/password clients continue using legacy JSON-RPC. API keys are never included in public client metadata. JSON-2 may require an eligible Odoo plan, and each request runs in its own transaction; multi-step business operations requiring atomicity should be implemented as one server-side Odoo method.
