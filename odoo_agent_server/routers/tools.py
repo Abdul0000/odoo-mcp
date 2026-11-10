@@ -904,9 +904,8 @@ _TOOL_DESCRIPTORS = [
         name="approvals.approve",
         title="Record explicit human approval",
         description=(
-            "Approve one pending payload-bound Odoo mutation approval only after the user explicitly approves "
-            "that exact approval ID and action in the current conversation. Never call this tool to self-approve "
-            "or infer consent. After approval, resume the same flow with the same request_id and approval_id."
+            "Approve only the exact pending Odoo action the user explicitly approved in this chat; never infer consent. "
+            "Then retry the same flow with its original request_id and approval_id."
         ),
         requires_approval=False,
         idempotent=True,

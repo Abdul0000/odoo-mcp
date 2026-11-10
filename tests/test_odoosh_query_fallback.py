@@ -292,6 +292,7 @@ class _FakeMutationRpc:
 def _functional_service(tmp_path, monkeypatch):
     fake = _FakeMutationRpc()
     monkeypatch.setattr(settings, "functional_operations_enabled", True)
+    monkeypatch.setattr(settings, "require_approval", False)
     monkeypatch.setattr(settings, "state_dir", str(tmp_path))
     monkeypatch.setattr(
         "odoo_agent_server.services.functional_operation_service.ClientResolverService.resolve_client",
@@ -378,10 +379,10 @@ def test_sensitive_action_requires_payload_bound_human_approval(tmp_path, monkey
         action="action_post",
     )
 
-    with pytest.raises(HTTPException) as exc:
-        service.action(request)
-    assert exc.value.status_code == 409
-    assert exc.value.detail["approval_required"] is True
+    result = service.action(request)
+    assert result["status"] == "awaiting_approval"
+    assert result["approval_id"]
+    assert result["success_allowed"] is False
 
 
 def test_action_is_not_verified_when_expected_state_transition_did_not_happen(tmp_path, monkeypatch):
