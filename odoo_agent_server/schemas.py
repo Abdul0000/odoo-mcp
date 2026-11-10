@@ -1006,6 +1006,31 @@ class ReaRuntimeTraceRequest(BaseModel):
     slow_threshold_ms: float = Field(default=100.0, ge=0, le=600000)
     events: list[dict[str, Any]] = Field(..., min_length=1, max_length=2000)
 
+class ReaImpactChangeFile(BaseModel):
+    """One proposed addon-relative file change used for impact prediction."""
+    path: str = Field(..., min_length=1, max_length=500)
+    change_type: Literal["add", "modify", "delete", "rename"] = "modify"
+    diff: str = Field(default="", max_length=20000)
+
+
+class ReaImpactRequest(BaseModel):
+    """Predict likely Odoo addon impact from bounded proposed changes."""
+    client_name: str | None = Field(default=None, max_length=120)
+    project_path: str | None = Field(default=None, max_length=1000)
+    module_name: str = Field(..., min_length=1, max_length=200)
+    changed_files: list[ReaImpactChangeFile] = Field(..., min_length=1, max_length=30)
+    runtime_events: list[dict[str, Any]] = Field(default_factory=list, max_length=2000)
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or chr(0) in value or "/" in value or chr(92) in value or ".." in value:
+            raise ValueError("module_name must be a safe addon hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
+
 class FrontendVisualImplementRequest(BaseModel):
     """Generic Odoo frontend visual implementation workflow.
 
