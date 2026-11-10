@@ -723,10 +723,10 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
         "Source-first debugger for errors and silent wrong results. Preserve IDs and returned calls; claim fixed only when truth_gate.verified_fixed=true."
     ),
     "workflow.module_analyze": (
-        "One-pass read-only addon analysis with bounded evidence, dependent-module references, early stop, and optional one-shell live verification."
+        "Read-only addon architecture analysis with bounded source evidence and optional live checks."
     ),
     "rea.xray_module": (
-        "Read-only Odoo X-Ray: return a bounded source-evidence graph of module dependencies, models, fields, methods, views, actions and menus."
+        "Read-only Odoo addon graph: dependencies, models, fields, methods, views, actions and menus with source evidence."
     ),
     "workflow.module_install_and_check": (
         "Fast path for an explicit module install, upgrade, or install-and-fix request. It starts the guarded Odoo job and "

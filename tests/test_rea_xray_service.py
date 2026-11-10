@@ -79,3 +79,18 @@ def test_rea_xray_invalid_source_is_reported(tmp_path):
     (module / "models" / "sale.py").write_text("def broken(:\n", encoding="utf-8")
     graph = ReaXrayService().build(module_path=module, module_name="my_addon")
     assert any(warning["code"] == "PYTHON_PARSE_ERROR" for warning in graph["warnings"])
+
+
+def test_rea_xray_enforces_total_source_character_budget(tmp_path):
+    module = _addon(tmp_path)
+    for index in range(2):
+        (module / "models" / f"large_{index}.py").write_text(
+            "value = '" + ("x" * 2400) + "'\\n",
+            encoding="utf-8",
+        )
+    graph = ReaXrayService().build(
+        module_path=module,
+        module_name="my_addon",
+        max_total_chars=4000,
+    )
+    assert any(warning["code"] == "SOURCE_BUDGET_EXCEEDED" for warning in graph["warnings"])

@@ -8960,6 +8960,7 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             module_path=Path(result["module_path"]),
             module_name=result["module_name"],
             max_files=request.max_files,
+            max_total_chars=request.max_total_chars,
         )
         result["inspection_instructions"] = (
             "Use rea_xray.nodes and rea_xray.edges as the static architecture map. "

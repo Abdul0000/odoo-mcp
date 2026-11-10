@@ -950,10 +950,11 @@ class ModuleAnalyzeRequest(BaseModel):
 class ReaXrayRequest(BaseModel):
     """Compact provider contract for bounded, read-only Odoo X-Ray."""
 
-    client_name: str | None = Field(default=None, max_length=120, description="Validated ODOO_CLIENTS entry")
-    project_path: str | None = Field(default=None, max_length=1000, description="Existing checkout; client path is used when omitted")
-    module_name: str = Field(..., min_length=1, max_length=200, description="Custom addon technical name or safe human hint")
-    max_files: int = Field(default=15, ge=5, le=50, description="Maximum addon files to inspect")
+    client_name: str | None = Field(default=None, max_length=120)
+    project_path: str | None = Field(default=None, max_length=1000)
+    module_name: str = Field(..., min_length=1, max_length=200)
+    max_files: int = Field(default=15, ge=5, le=50)
+    max_total_chars: int = Field(default=12000, ge=4000, le=12000)
 
     @field_validator("module_name")
     @classmethod

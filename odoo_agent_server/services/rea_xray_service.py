@@ -73,6 +73,7 @@ class ReaXrayService:
         module_path: Path,
         module_name: str,
         max_files: int = 50,
+        max_total_chars: int = 12000,
     ) -> dict[str, Any]:
         """Return bounded graph nodes/edges with source-path evidence."""
         module_path = module_path.resolve(strict=True)
@@ -150,6 +151,8 @@ class ReaXrayService:
             )
 
         scanned: list[str] = []
+        total_source_chars = 0
+        source_char_budget = max(4000, min(int(max_total_chars), 12000))
         for relative, path in selected:
             try:
                 if path.stat().st_size > self._MAX_FILE_BYTES:
@@ -161,6 +164,11 @@ class ReaXrayService:
                 warnings.append({"code": "FILE_UNREADABLE", "path": relative})
                 omitted.append(relative)
                 continue
+            if total_source_chars + len(source) > source_char_budget:
+                warnings.append({"code": "SOURCE_BUDGET_EXCEEDED", "path": relative})
+                omitted.append(relative)
+                continue
+            total_source_chars += len(source)
             scanned.append(relative)
 
             if path.suffix.lower() == ".py":
