@@ -903,7 +903,6 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(
         name="approvals.approve",
         description="Approve this exact pending action only after explicit user consent.",
-        requires_approval=False,
     ),
     ToolDescriptor(name="jobs.list",
         title="List background jobs", description="List recent connector jobs", read_only=True),
