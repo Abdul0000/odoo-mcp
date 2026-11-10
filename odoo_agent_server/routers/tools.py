@@ -66,6 +66,7 @@ from ..schemas import (
     ReaXrayRequest,
     ReaUpstreamRequest,
     ReaApiInspectRequest,
+    ReaRuntimeTraceRequest,
     FrontendVisualImplementRequest,
     EmptyRequest,
     SkillListRequest,
@@ -190,6 +191,7 @@ from ..services.module_analysis_service import ModuleAnalysisService
 from ..services.rea_xray_service import ReaXrayService
 from ..services.rea_upstream_service import ReaUpstreamService
 from ..services.rea_api_inspect_service import ReaApiInspectService
+from ..services.rea_runtime_trace_service import ReaRuntimeTraceService
 from ..services.live_assertion_service import LiveAssertionService
 from ..services.functional_operation_service import FunctionalOperationService
 from ..services.module_test_service import ModuleTestService
@@ -482,6 +484,13 @@ _TOOL_DESCRIPTORS = [
         name="rea.upstream_compare",
         title="Compare addon with Odoo upstream",
         description="Read-only comparison of custom model overrides and fields against installed Odoo source; returns evidence-backed advisory findings.",
+        read_only=True,
+        idempotent=True,
+    ),
+    ToolDescriptor(
+        name="rea.runtime_trace",
+        title="Analyze Odoo runtime trace",
+        description="Analyze supplied Odoo trace spans for slow methods and repeated queries; does not enable profiling or capture live traffic.",
         read_only=True,
         idempotent=True,
     ),
@@ -1031,6 +1040,7 @@ _TOOL_INPUT_MODELS = {
     "rea.xray_module": ReaXrayRequest,
     "rea.upstream_compare": ReaUpstreamRequest,
     "rea.api_inspect": ReaApiInspectRequest,
+    "rea.runtime_trace": ReaRuntimeTraceRequest,
     "workflow.module_test": OdooModuleTestRequest,
     "workflow.module_install_and_check": OdooModuleRequest,
     "workflow.frontend_visual_implement": FrontendVisualImplementRequest,
@@ -8998,6 +9008,12 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             module_name=result["module_name"], client_name=request.client_name,
         )
         return result
+    if name == "rea.runtime_trace":
+        request = ReaRuntimeTraceRequest.model_validate(args)
+        return await asyncio.to_thread(
+            ReaRuntimeTraceService().analyze, events=request.events,
+            trace_id=request.trace_id, slow_threshold_ms=request.slow_threshold_ms,
+        )
     if name == "rea.api_inspect":
         request = ReaApiInspectRequest.model_validate(args)
         base_request = ModuleAnalyzeRequest(client_name=request.client_name, project_path=request.project_path, module_name=request.module_name)
