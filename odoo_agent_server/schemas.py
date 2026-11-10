@@ -947,6 +947,25 @@ class ModuleAnalyzeRequest(BaseModel):
 
 
 
+class ReaXrayRequest(BaseModel):
+    """Compact provider contract for bounded, read-only Odoo X-Ray."""
+
+    client_name: str | None = Field(default=None, max_length=120, description="Validated ODOO_CLIENTS entry")
+    project_path: str | None = Field(default=None, max_length=1000, description="Existing checkout; client path is used when omitted")
+    module_name: str = Field(..., min_length=1, max_length=200, description="Custom addon technical name or safe human hint")
+    max_files: int = Field(default=15, ge=5, le=50, description="Maximum addon files to inspect")
+
+    @field_validator("module_name")
+    @classmethod
+    def module_name_must_be_safe(cls, value: str) -> str:
+        value = str(value or "").strip()
+        if not value or chr(0) in value or "/" in value or chr(92) in value or ".." in value:
+            raise ValueError("module_name must be a module technical name or a safe human hint")
+        if not re.fullmatch(r"[A-Za-z0-9_. -]+", value):
+            raise ValueError("module_name contains unsafe characters")
+        return value
+
+
 class FrontendVisualImplementRequest(BaseModel):
     """Generic Odoo frontend visual implementation workflow.
 

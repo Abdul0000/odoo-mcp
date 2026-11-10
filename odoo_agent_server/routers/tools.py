@@ -63,6 +63,7 @@ from ..schemas import (
     OdooTargetResolutionResult,
     OdooDebugRecordAssertion,
     ModuleAnalyzeRequest,
+    ReaXrayRequest,
     FrontendVisualImplementRequest,
     EmptyRequest,
     SkillListRequest,
@@ -184,6 +185,7 @@ from ..services.deploy_impact_service import classify_deploy_impact
 from ..services.skill_service import SkillService
 from ..services.validator_service import OdooModuleValidator
 from ..services.module_analysis_service import ModuleAnalysisService
+from ..services.rea_xray_service import ReaXrayService
 from ..services.live_assertion_service import LiveAssertionService
 from ..services.functional_operation_service import FunctionalOperationService
 from ..services.module_test_service import ModuleTestService
@@ -460,6 +462,17 @@ _TOOL_DESCRIPTORS = [
             "Returns bounded cached evidence; never writes, pulls, runs QA, or deploys."
         ),
         read_only=True,
+    ),
+    ToolDescriptor(
+        name="rea.xray_module",
+        title="Reverse engineer Odoo module",
+        description=(
+            "Read-only REA X-Ray: map a custom addon into an evidence-backed graph of modules, "
+            "models, inheritance, relational fields, methods, views, actions, menus and UI-to-method links. "
+            "Uses bounded local AST/XML analysis; never executes addon code or contacts external hosts."
+        ),
+        read_only=True,
+        idempotent=True,
     ),
     ToolDescriptor(
         name="workflow.module_test",
@@ -997,6 +1010,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.resume_continuation": ContinuationResumeRequest,
     "workflow.odoo_debug_and_fix": OdooDebugAndFixRequest,
     "workflow.module_analyze": ModuleAnalyzeRequest,
+    "rea.xray_module": ReaXrayRequest,
     "workflow.module_test": OdooModuleTestRequest,
     "workflow.module_install_and_check": OdooModuleRequest,
     "workflow.frontend_visual_implement": FrontendVisualImplementRequest,
@@ -2315,7 +2329,7 @@ def _resolve_module_from_source_evidence(
                         declared_models.add(pattern)
             score = (len(path_hits) * 100) + (len(content_hits) * 25)
             matches.append({
-                "path": f"{str(item.path).replace('\\', '/').strip('/')}/{rel}",
+                "path": f"{str(item.path).replace(chr(92), '/').strip('/')}/{rel}",
                 "score": score,
                 "path_hits": path_hits,
                 "content_hits": content_hits,
@@ -8930,6 +8944,29 @@ async def _dispatch_inner(name: str, args: dict) -> object:
     if name == "workflow.module_analyze":
         request = ModuleAnalyzeRequest.model_validate(args)
         return await asyncio.to_thread(_workflow_module_analyze, request)
+    if name == "rea.xray_module":
+        request = ReaXrayRequest.model_validate(args)
+        analysis_request = ModuleAnalyzeRequest(
+            client_name=request.client_name,
+            project_path=request.project_path,
+            module_name=request.module_name,
+            max_files=request.max_files,
+        )
+        result = await asyncio.to_thread(_workflow_module_analyze, analysis_request)
+        if result.get("status") != "analyzed":
+            return result
+        result["rea_xray"] = await asyncio.to_thread(
+            ReaXrayService().build,
+            module_path=Path(result["module_path"]),
+            module_name=result["module_name"],
+            max_files=request.max_files,
+        )
+        result["inspection_instructions"] = (
+            "Use rea_xray.nodes and rea_xray.edges as the static architecture map. "
+            "Every edge carries source-path evidence. Treat the graph as source-derived, "
+            "not proof of runtime execution; request live verification only when needed."
+        )
+        return result
     if name == "workflow.module_test":
         request = OdooModuleTestRequest.model_validate(args)
         return ModuleTestService().start(request, self_run)

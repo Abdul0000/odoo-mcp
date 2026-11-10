@@ -30,6 +30,7 @@ _PROVIDER_TOOLS = {
     "workflow_resume_continuation",
     "workflow_odoo_debug_and_fix",
     "workflow_module_analyze",
+    "rea_xray_module",
     "workflow_module_test",
     "workflow_module_install_and_check",
     "workflow_frontend_visual_implement",
@@ -328,3 +329,12 @@ def test_provider_health_exposes_live_identity_and_workflow_progress():
     assert structured["runtime"]["commit_sha"]
     assert structured["runtime"]["prompt_sha256"]
     assert {"active_count", "active", "recent"} <= set(structured["workflow_progress"])
+
+
+def test_rea_xray_tool_is_exposed_with_bounded_module_analysis_schema():
+    tools = {tool["name"]: tool for tool in _mcp_tools_list()}
+    rea = tools["rea_xray_module"]
+    assert rea["annotations"]["readOnlyHint"] is True
+    properties = rea["inputSchema"]["properties"]
+    assert {"client_name", "project_path", "module_name", "max_files", "max_total_chars"} <= set(properties)
+    assert properties["max_files"]["maximum"] == 50
