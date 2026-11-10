@@ -9091,7 +9091,7 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             "client_name": request.client_name,
             "project_path": request.project_path or analysis.get("project_path"),
             "module_name": analysis["module_name"],
-            "issue_description": request.issue_description + "\\n\\n" + "\\n".join(rea_context),
+            "issue_description": request.issue_description + "\n\n" + "\n".join(rea_context),
             "expected_result": request.expected_result,
             "reproduction_steps": request.reproduction_steps,
             "surface": request.surface,
