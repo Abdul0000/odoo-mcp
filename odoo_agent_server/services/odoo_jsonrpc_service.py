@@ -34,8 +34,12 @@ class OdooJsonRpcService:
     def _password(self) -> str | None:
         return (self.client.odoo_password if self.client else None) or settings.odoo_password
 
+    def _api_key(self) -> str | None:
+        return (self.client.odoo_api_key if self.client else None) or settings.odoo_api_key
+
     def configured(self) -> bool:
-        return bool(self._base_url() and self._db() and self._login() and self._password())
+        credentials_ready = bool(self._api_key()) or bool(self._login() and self._password())
+        return bool(self._base_url() and self._db() and credentials_ready)
 
     def _verify_ssl(self) -> bool:
         if self.client is not None and self.client.odoo_verify_ssl is not None:
@@ -64,6 +68,31 @@ class OdooJsonRpcService:
             message = error.get("message") or error.get("data", {}).get("message") or str(error)
             raise RuntimeError(message)
         return data.get("result")
+
+    def _json2_call(self, model: str, method: str, params: dict[str, Any], timeout_seconds: int) -> Any:
+        """Call Odoo 19+ External JSON-2 with a dedicated API key."""
+        base_url = self._base_url()
+        api_key = self._api_key()
+        if not base_url or not api_key:
+            raise RuntimeError("Odoo JSON-2 requires odoo_api_key and odoo_url.")
+        if not re.fullmatch(r"[a-zA-Z0-9_.]+", model or "") or not re.fullmatch(r"[a-zA-Z0-9_]+", method or ""):
+            raise ValueError("Invalid Odoo model or method name for JSON-2.")
+        headers = {
+            "Authorization": f"bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "odoo-mcp-agent/1.0",
+        }
+        if self._db():
+            headers["X-Odoo-Database"] = str(self._db())
+        with httpx.Client(
+            timeout=httpx.Timeout(timeout_seconds, connect=min(10, timeout_seconds)),
+            verify=self._verify_ssl(),
+        ) as client:
+            response = client.post(f"{base_url}/json/2/{model}/{method}", headers=headers, json=params)
+            response.raise_for_status()
+            if not response.content:
+                return None
+            return response.json()
 
     def _login_uid(self, timeout_seconds: int) -> int:
         db = self._db()
@@ -121,15 +150,28 @@ class OdooJsonRpcService:
             kwargs["context"] = context
 
         try:
-            uid = self._login_uid(timeout_seconds)
-            db = self._db()
-            password = self._password()
-            records = self._call(
-                "object",
-                "execute_kw",
-                [db, uid, password, model, "search_read", [domain or []], kwargs],
-                timeout_seconds,
-            )
+            if self._api_key():
+                params: dict[str, Any] = {
+                    "domain": domain or [],
+                    "fields": safe_fields,
+                    "limit": kwargs["limit"],
+                    "offset": kwargs["offset"],
+                }
+                if order:
+                    params["order"] = order
+                if context:
+                    params["context"] = context
+                records = self._json2_call(model, "search_read", params, timeout_seconds)
+            else:
+                uid = self._login_uid(timeout_seconds)
+                db = self._db()
+                password = self._password()
+                records = self._call(
+                    "object",
+                    "execute_kw",
+                    [db, uid, password, model, "search_read", [domain or []], kwargs],
+                    timeout_seconds,
+                )
             return OdooResult(
                 status="ok",
                 base_url=self._base_url(),
@@ -168,13 +210,24 @@ class OdooJsonRpcService:
         if context:
             kwargs["context"] = context
         try:
-            uid = self._login_uid(timeout_seconds)
-            records = self._call(
-                "object",
-                "execute_kw",
-                [self._db(), uid, self._password(), model, "read_group", [domain or [], fields, groupby], kwargs],
-                timeout_seconds,
-            )
+            if self._api_key():
+                params: dict[str, Any] = {
+                    "domain": domain or [],
+                    "fields": fields,
+                    "groupby": groupby,
+                    "lazy": bool(lazy),
+                }
+                if context:
+                    params["context"] = context
+                records = self._json2_call(model, "read_group", params, timeout_seconds)
+            else:
+                uid = self._login_uid(timeout_seconds)
+                records = self._call(
+                    "object",
+                    "execute_kw",
+                    [self._db(), uid, self._password(), model, "read_group", [domain or [], fields, groupby], kwargs],
+                    timeout_seconds,
+                )
             return OdooResult(status="ok", base_url=self._base_url(), database=self._db(), result=records or [])
         except Exception as exc:
             return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error=self._format_exception(exc))
@@ -221,6 +274,17 @@ class OdooJsonRpcService:
             )
 
     def fields_get(self, model: str, timeout_seconds: int = 60) -> OdooResult:
+        if self._api_key():
+            try:
+                result = self._json2_call(
+                    model,
+                    "fields_get",
+                    {"attributes": ["type", "readonly", "required", "string", "relation"]},
+                    timeout_seconds,
+                )
+                return OdooResult(status="ok", base_url=self._base_url(), database=self._db(), result=result or {})
+            except Exception as exc:
+                return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error=self._format_exception(exc))
         return self.execute_model_method(
             model,
             "fields_get",
