@@ -604,6 +604,7 @@ _PROVIDER_TOOL_NAMES = {
     "workflow.resume_continuation",
     "workflow.odoo_debug_and_fix",
     "workflow.module_analyze",
+    "rea.xray_module",
     "workflow.module_test",
     "workflow.module_install_and_check",
     "workflow.frontend_visual_implement",
@@ -723,6 +724,9 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
     ),
     "workflow.module_analyze": (
         "One-pass read-only addon analysis with bounded evidence, dependent-module references, early stop, and optional one-shell live verification."
+    ),
+    "rea.xray_module": (
+        "Read-only Odoo X-Ray: return a bounded source-evidence graph of module dependencies, models, fields, methods, views, actions and menus."
     ),
     "workflow.module_install_and_check": (
         "Fast path for an explicit module install, upgrade, or install-and-fix request. It starts the guarded Odoo job and "

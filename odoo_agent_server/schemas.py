@@ -947,6 +947,10 @@ class ModuleAnalyzeRequest(BaseModel):
 
 
 
+class ReaXrayRequest(ModuleAnalyzeRequest):
+    """Read-only REA Odoo X-Ray using bounded source analysis."""
+
+
 class FrontendVisualImplementRequest(BaseModel):
     """Generic Odoo frontend visual implementation workflow.
 
