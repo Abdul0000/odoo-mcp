@@ -738,3 +738,10 @@ later REA phases and are not part of this initial tool.
 ## REA Phase 2 — Upstream intelligence
 
 `rea_upstream_compare` compares custom addon model extensions against the selected client's installed Odoo source roots and declared manifest dependencies. It reports method-signature drift, candidate overrides with no same-named upstream method, and field type/comodel differences with custom and upstream file evidence. Analysis is read-only and bounded. It does not fetch arbitrary code or execute addon code. Version/edition is not inferred unless identified by the installed source tree; findings are advisory and require runtime confirmation.
+
+
+## REA Phase 3 — External API integration intelligence
+
+`rea_api_inspect` statically inventories external integration behavior in a custom addon: HTTP/RPC client calls, webhook/controller routes, literal URL references, environment/config credential references, timeout parameters, and TLS verification settings. Each finding includes file and line evidence plus coverage metadata.
+
+This phase performs no outbound requests, DNS resolution, credential reads, or endpoint probing. It parses source only and reports configuration names rather than secret values. Network/TLS checks require a separate explicitly authorized, allowlisted endpoint workflow.

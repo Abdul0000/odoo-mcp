@@ -65,6 +65,7 @@ from ..schemas import (
     ModuleAnalyzeRequest,
     ReaXrayRequest,
     ReaUpstreamRequest,
+    ReaApiInspectRequest,
     FrontendVisualImplementRequest,
     EmptyRequest,
     SkillListRequest,
@@ -188,6 +189,7 @@ from ..services.validator_service import OdooModuleValidator
 from ..services.module_analysis_service import ModuleAnalysisService
 from ..services.rea_xray_service import ReaXrayService
 from ..services.rea_upstream_service import ReaUpstreamService
+from ..services.rea_api_inspect_service import ReaApiInspectService
 from ..services.live_assertion_service import LiveAssertionService
 from ..services.functional_operation_service import FunctionalOperationService
 from ..services.module_test_service import ModuleTestService
@@ -480,6 +482,13 @@ _TOOL_DESCRIPTORS = [
         name="rea.upstream_compare",
         title="Compare addon with Odoo upstream",
         description="Read-only comparison of custom model overrides and fields against installed Odoo source; returns evidence-backed advisory findings.",
+        read_only=True,
+        idempotent=True,
+    ),
+    ToolDescriptor(
+        name="rea.api_inspect",
+        title="Inspect external API integrations",
+        description="Read-only static inventory of outbound HTTP/RPC clients, webhook routes, URL/config references, timeouts and TLS settings in an Odoo addon. No network requests.",
         read_only=True,
         idempotent=True,
     ),
@@ -1021,6 +1030,7 @@ _TOOL_INPUT_MODELS = {
     "workflow.module_analyze": ModuleAnalyzeRequest,
     "rea.xray_module": ReaXrayRequest,
     "rea.upstream_compare": ReaUpstreamRequest,
+    "rea.api_inspect": ReaApiInspectRequest,
     "workflow.module_test": OdooModuleTestRequest,
     "workflow.module_install_and_check": OdooModuleRequest,
     "workflow.frontend_visual_implement": FrontendVisualImplementRequest,
@@ -8986,6 +8996,16 @@ async def _dispatch_inner(name: str, args: dict) -> object:
         result["rea_upstream"] = await asyncio.to_thread(
             ReaUpstreamService().compare, module_path=Path(result["module_path"]),
             module_name=result["module_name"], client_name=request.client_name,
+        )
+        return result
+    if name == "rea.api_inspect":
+        request = ReaApiInspectRequest.model_validate(args)
+        base_request = ModuleAnalyzeRequest(client_name=request.client_name, project_path=request.project_path, module_name=request.module_name)
+        result = await asyncio.to_thread(_workflow_module_analyze, base_request)
+        if result.get("status") != "analyzed":
+            return result
+        result["rea_api_inspection"] = await asyncio.to_thread(
+            ReaApiInspectService().inspect, module_path=Path(result["module_path"]), module_name=result["module_name"]
         )
         return result
     if name == "workflow.module_test":

@@ -606,6 +606,7 @@ _PROVIDER_TOOL_NAMES = {
     "workflow.module_analyze",
     "rea.xray_module",
     "rea.upstream_compare",
+    "rea.api_inspect",
     "workflow.module_test",
     "workflow.module_install_and_check",
     "workflow.frontend_visual_implement",
