@@ -799,4 +799,4 @@ Example MCP arguments:
 }
 ```
 
-Deployment defaults to **disabled**. Set `auto_deploy=true` only when deployment is explicitly authorized. The workflow does not claim a fix merely because files were written: the existing debug workflow requires its verification evidence before reporting a verified repair. Ambiguous addon resolution blocks the workflow before repair. REA's X-Ray/upstream/API scans are static evidence, not proof of runtime behavior.
+Optional `runtime_events` and `proposed_changes` inputs activate the Phase 4 trace analyzer and Phase 5 impact predictor; these results are attached to the repair context too. Deployment defaults to **disabled**. Set `auto_deploy=true` only when deployment is explicitly authorized. The workflow does not claim a fix merely because files were written: the existing debug workflow requires its verification evidence before reporting a verified repair. Ambiguous addon resolution blocks the workflow before repair. REA's source scans are static evidence, not proof of runtime behavior.
