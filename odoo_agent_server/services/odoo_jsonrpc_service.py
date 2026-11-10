@@ -106,7 +106,7 @@ class OdooJsonRpcService:
         return int(uid)
 
     def _format_exception(self, exc: Exception) -> str:
-        message = f"Odoo HTTPS JSON-RPC fallback failed: {exc}"
+        message = f"Odoo HTTPS transport failed: {exc}"
         if isinstance(exc, httpx.ConnectError) and "CERTIFICATE_VERIFY_FAILED" in str(exc):
             message += (
                 "; TLS certificate verification failed. For Odoo.sh/dev hosts with a known "
@@ -128,7 +128,7 @@ class OdooJsonRpcService:
         timeout_seconds: int = 60,
     ) -> OdooResult:
         if not self.configured():
-            return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error="Odoo HTTPS JSON-RPC fallback is not configured for this client.")
+            return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error="Odoo HTTPS transport is not configured for this client.")
         if not re.fullmatch(r"[a-zA-Z0-9_.]+", model or ""):
             return OdooResult(status="failed", base_url=self._base_url(), database=self._db(), error="Invalid model name for JSON-RPC query.")
         safe_fields: list[str] = []
