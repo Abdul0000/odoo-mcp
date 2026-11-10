@@ -22,7 +22,7 @@ class Settings(BaseSettings):
     cdp_url: str | None = Field(default=None, alias="ODOO_AGENT_CDP_URL")
 
     # Approval gating is disabled in this build so MCP tools can write, commit, push, and deploy directly.
-    require_approval: bool = Field(default=False, alias="ODOO_AGENT_REQUIRE_APPROVAL")
+    require_approval: bool = Field(default=True, alias="ODOO_AGENT_REQUIRE_APPROVAL")
     approval_required_actions_raw: str = Field(default="", alias="ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS")
     protected_branches_raw: str = Field(default="", alias="ODOO_AGENT_PROTECTED_BRANCHES")
     # ws_* workspace tools (GitHub API engine; no clone, no local state)
