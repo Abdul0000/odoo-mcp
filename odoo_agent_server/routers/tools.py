@@ -9041,6 +9041,17 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             module_name=result["module_name"],
             max_files=50,
         )
+        upstream = await asyncio.to_thread(
+            ReaUpstreamService().compare,
+            module_path=Path(result["module_path"]),
+            module_name=result["module_name"],
+            client_name=request.client_name,
+        )
+        api_inspection = await asyncio.to_thread(
+            ReaApiInspectService().inspect,
+            module_path=Path(result["module_path"]),
+            module_name=result["module_name"],
+        )
         result["rea_impact"] = await asyncio.to_thread(
             ReaImpactService().predict,
             module_path=Path(result["module_path"]),
@@ -9048,7 +9059,11 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             changed_files=[item.model_dump() for item in request.changed_files],
             graph=graph,
             runtime_events=request.runtime_events,
+            upstream_findings=upstream.get("findings", []),
+            api_findings=api_inspection.get("findings", []),
         )
+        result["rea_impact"]["upstream_coverage"] = upstream.get("coverage", {})
+        result["rea_impact"]["api_coverage"] = api_inspection.get("coverage", {})
         result["rea_impact"]["architecture_graph"] = graph.get("summary", {})
         return result
     if name == "rea.api_inspect":
