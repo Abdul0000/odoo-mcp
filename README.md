@@ -799,3 +799,6 @@ Optional `runtime_events` and `proposed_changes` inputs activate the Phase 4 tra
 ## Odoo 19+ External JSON-2 transport
 
 For Odoo 19+ databases that expose External JSON-2, add `odoo_api_key` to the selected `ODOO_CLIENTS` entry (or set `ODOO_API_KEY` for single-client configuration). The connector uses `POST /json/2/<model>/<method>` with `Authorization: bearer <key>` for `search_read`, `read_group`, and `fields_get`, sending named parameters and `X-Odoo-Database` when configured. When no API key is supplied, existing username/password clients continue using legacy JSON-RPC. API keys are never included in public client metadata. JSON-2 may require an eligible Odoo plan, and each request runs in its own transaction; multi-step business operations requiring atomicity should be implemented as one server-side Odoo method.
+
+
+**Deployment note:** an existing Render environment variable overrides code defaults. Set `ODOO_AGENT_REQUIRE_APPROVAL=true` in the Render service environment and redeploy to activate the new default on an already-configured service. Existing explicit `false` values remain respected for compatibility.
