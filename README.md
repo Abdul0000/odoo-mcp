@@ -745,3 +745,8 @@ later REA phases and are not part of this initial tool.
 `rea_api_inspect` statically inventories external integration behavior in a custom addon: HTTP/RPC client calls, webhook/controller routes, literal URL references, environment/config credential references, timeout parameters, and TLS verification settings. Each finding includes file and line evidence plus coverage metadata.
 
 This phase performs no outbound requests, DNS resolution, credential reads, or endpoint probing. It parses source only and reports configuration names rather than secret values. Network/TLS checks require a separate explicitly authorized, allowlisted endpoint workflow.
+
+
+## REA Phase 4 — Runtime execution tracing
+
+`rea_runtime_trace` analyzes a caller-supplied, bounded export of Odoo runtime spans. It correlates model/method durations, highlights slow calls and high call counts, and groups repeated SQL/query signatures as possible N+1 patterns. Input is capped at 2,000 events and output includes event-index evidence. The tool does not activate Odoo's profiler, attach to a live worker, execute SQL, or capture traffic; profiling/export must be explicitly performed by the operator using an approved environment and supplied to the analyzer.
