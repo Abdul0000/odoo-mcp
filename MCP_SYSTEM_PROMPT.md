@@ -54,6 +54,14 @@ use its transitive closure, reverse dependents, cycle list, cross-module model
 links, and `coverage.complete` flag in downstream impact reasoning; never
 treat omitted or unresolved modules as a complete graph.
 
+When the caller supplies an explicit validated `client_name`, X-Ray and
+workspace-backed impact prediction also compare bounded static evidence with
+the live Odoo registry (`ir.model`, `ir.model.fields`, `ir.module.module`).
+Keep these results separate from source-derived inference: registry presence
+confirms metadata, not method execution. Treat query failures and truncated
+coverage as unknown, never as proof of absence. Without an explicit
+`client_name`, keep the result static-only.
+
 ## COMPOSITE WORKFLOW
 
 Classify once and use one lane:
