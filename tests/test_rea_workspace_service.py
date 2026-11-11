@@ -2,7 +2,6 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from odoo_agent_server.services.github_commit_service import GitHubRepo
 from odoo_agent_server.services.rea_upstream_service import ReaUpstreamService
 from odoo_agent_server.services.rea_workspace_service import rea_workspace_snapshot
 from tests.support.fake_github import FakeGitHub
