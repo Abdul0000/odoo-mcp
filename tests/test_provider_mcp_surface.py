@@ -105,6 +105,14 @@ def test_rea_xray_provider_description_mentions_phase9_dependency_intelligence()
     assert "reverse dependencies" in description
     assert len(description) <= 220
 
+def test_rea_xray_exposes_optional_live_registry_switch():
+    from odoo_agent_server.schemas import ReaXrayRequest
+
+    request = ReaXrayRequest(module_name="example_addon")
+    assert request.include_runtime is True
+    static_request = ReaXrayRequest(module_name="example_addon", include_runtime=False)
+    assert static_request.include_runtime is False
+
 
 def test_rea_analysis_tools_accept_stateless_workspace_ids():
     tools = {tool["name"]: tool for tool in _mcp_tools_list()}
