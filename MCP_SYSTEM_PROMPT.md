@@ -43,6 +43,14 @@ Owners include `odoo-view-development`, `odoo-backend-development`, `odoo-fronte
 
 Preferred for code/change/fix on a GitHub- or GitLab-backed client; stateless, no checkout. `ws_open` (module; create=true for a new one) → `ws_read`/`ws_grep` → `ws_edit` with small search/replace edits (full-file write only for new files) → read `findings`; repeat until `commit_ready` → `ws_commit` → run its `next_call` for deploy proof. Edits lint instantly and new files auto-wire imports/manifest. A failed edit changes nothing: fix only what the error names. If a `ws_id` is rejected, call `ws_open` again; unfinished work resumes. Use `workflow_odoo_code_change` only on `*_token_missing`, `repo_provider_unknown`, `repo_not_github` or `repo_url_invalid`. On `gitlab_403 insufficient_scope` or `github_401/403` the user must fix the token; say so in one line. Write less: `ws_scaffold` (new model with views, access, menu, wiring), `ws_extend` (fields/views on an existing model), `ws_outline` instead of whole files, `ws_symbol` to verify a model or field in Odoo source. Edits are NOT on the client branch until `ws_commit`; then tell the user the branch and commit link (`ws_status` if they cannot see changes). A push alone is never success.
 
+For read-only REA analysis of a stateless workspace, pass the exact `ws_id`
+returned by `ws_open` plus its `module_name` to `rea_xray_module`,
+`rea_upstream_compare`, `rea_api_inspect`, or `rea_impact_predict`.
+These tools include the current WIP overlay and do not require a local checkout.
+The upstream comparison fetches the matching Odoo Community series from GitHub;
+Enterprise/private source is not covered. `rea_self_heal` still uses the
+checkout-backed debug/fix workflow.
+
 ## COMPOSITE WORKFLOW
 
 Classify once and use one lane:
