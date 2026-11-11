@@ -30,6 +30,11 @@ _PROVIDER_TOOLS = {
     "workflow_resume_continuation",
     "workflow_odoo_debug_and_fix",
     "workflow_module_analyze",
+    "rea_xray_module",
+    "rea_upstream_compare",
+    "rea_runtime_trace",
+    "rea_api_inspect",
+    "rea_impact_predict",
     "rea_self_heal",
     "workflow_module_test",
     "workflow_module_install_and_check",
@@ -73,6 +78,25 @@ def test_provider_mcp_tools_list_exposes_core_read_tools_on_single_mcp_endpoint(
     assert _PROVIDER_TOOLS <= names
     assert len(names) == len(_PROVIDER_TOOLS)
     assert set(provider_tool_names_safe()) == names
+
+
+def test_provider_exposes_all_read_only_rea_analysis_tools():
+    tools = {tool["name"]: tool for tool in _mcp_tools_list()}
+    rea_read_tools = {
+        "rea_xray_module",
+        "rea_upstream_compare",
+        "rea_runtime_trace",
+        "rea_api_inspect",
+        "rea_impact_predict",
+    }
+
+    assert rea_read_tools | {"rea_self_heal"} <= set(tools)
+    for name in rea_read_tools:
+        tool = tools[name]
+        assert tool["inputSchema"]["type"] == "object"
+        assert tool["outputSchema"]["type"] == "object"
+        assert tool["annotations"]["readOnlyHint"] is True
+        assert tool["annotations"]["idempotentHint"] is True
 
 
 def test_functional_mutation_tools_advertise_side_effects_and_idempotency():
