@@ -1310,7 +1310,8 @@ def _rea_runtime_registry(client_name: str | None, dependencies: dict[str, Any])
             )
             payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
             if not isinstance(payload, dict) or payload.get("status") != "ok":
-                return [], str((payload or {}).get("error") or f"{model} registry query failed")
+                error = payload.get("error") if isinstance(payload, dict) else None
+                return [], str(error or f"{model} registry query failed")
             rows = payload.get("result")
             if not isinstance(rows, list):
                 return [], f"{model} registry query returned an unexpected result shape"
@@ -9148,8 +9149,15 @@ async def _dispatch_inner(name: str, args: dict) -> object:
         if request.include_runtime:
             result["rea_runtime_registry"] = _rea_runtime_registry(
                 request.client_name,
-                {"module_name": result["rea_xray"].get("module_name", request.module_name),
-                 "model_ownership": [], "cross_module_relationships": []},
+                {
+                    "module_name": result["rea_xray"].get("module_name", request.module_name),
+                    "model_ownership": [
+                        {"model": node.get("name"), "module": request.module_name}
+                        for node in result["rea_xray"].get("nodes", [])
+                        if isinstance(node, dict) and node.get("kind") == "model" and node.get("name")
+                    ],
+                    "cross_module_relationships": [],
+                },
             )
         result["inspection_instructions"] = (
             "Use rea_xray.nodes and rea_xray.edges as the static architecture map. "
@@ -9383,6 +9391,21 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             module_path=Path(result["module_path"]),
             module_name=result["module_name"],
         )
+        runtime_registry = (
+            _rea_runtime_registry(
+                request.client_name,
+                {
+                    "module_name": result["module_name"],
+                    "model_ownership": [
+                        {"model": node.get("name"), "module": result["module_name"]}
+                        for node in graph.get("nodes", [])
+                        if isinstance(node, dict) and node.get("kind") == "model" and node.get("name")
+                    ],
+                    "cross_module_relationships": [],
+                },
+            )
+            if request.client_name else {"status": "skipped", "reason": "client_name not supplied"}
+        )
         result["rea_impact"] = await asyncio.to_thread(
             ReaImpactService().predict,
             module_path=Path(result["module_path"]),
@@ -9392,6 +9415,7 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             runtime_events=request.runtime_events,
             upstream_findings=upstream.get("findings", []),
             api_findings=api_inspection.get("findings", []),
+            runtime_registry=runtime_registry,
         )
         result["rea_impact"]["upstream_coverage"] = upstream.get("coverage", {})
         result["rea_impact"]["api_coverage"] = api_inspection.get("coverage", {})
