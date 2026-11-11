@@ -99,6 +99,19 @@ def test_provider_exposes_all_read_only_rea_analysis_tools():
         assert tool["annotations"]["idempotentHint"] is True
 
 
+def test_rea_analysis_tools_accept_stateless_workspace_ids():
+    tools = {tool["name"]: tool for tool in _mcp_tools_list()}
+    for name in (
+        "rea_xray_module",
+        "rea_upstream_compare",
+        "rea_api_inspect",
+        "rea_impact_predict",
+    ):
+        properties = tools[name]["inputSchema"]["properties"]
+        assert "ws_id" in properties
+        assert properties["ws_id"]["type"] == "string"
+
+
 def test_functional_mutation_tools_advertise_side_effects_and_idempotency():
     tools = {tool["name"]: tool for tool in _mcp_tools_list()}
 
