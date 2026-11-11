@@ -197,7 +197,7 @@ from ..services.rea_upstream_service import ReaUpstreamService
 from ..services.rea_api_inspect_service import ReaApiInspectService
 from ..services.rea_runtime_trace_service import ReaRuntimeTraceService
 from ..services.rea_impact_service import ReaImpactService
-from ..services.rea_workspace_service import rea_workspace_snapshot
+from ..services.rea_workspace_service import run_rea_workspace
 from ..services.live_assertion_service import LiveAssertionService
 from ..services.functional_operation_service import FunctionalOperationService
 from ..services.module_test_service import ModuleTestService
@@ -9006,11 +9006,8 @@ async def _dispatch_inner(name: str, args: dict) -> object:
     if name == "rea.xray_module":
         request = ReaXrayRequest.model_validate(args)
         if request.ws_id:
-            with rea_workspace_snapshot(request.ws_id, max_files=request.max_files) as snapshot:
-                if snapshot["module_name"] != request.module_name:
-                    return {"status": "error", "error_code": "workspace_module_mismatch", "error": "module_name must match the module encoded in ws_id", "workspace_module": snapshot["module_name"]}
-                graph = await asyncio.to_thread(
-                    ReaXrayService().build,
+            def analyze(snapshot):
+                graph = ReaXrayService().build(
                     module_path=snapshot["module_path"],
                     module_name=snapshot["module_name"],
                     max_files=request.max_files,
@@ -9022,6 +9019,10 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     "workspace_source": snapshot["source"],
                     "workspace_coverage": snapshot["coverage"],
                 }
+            return await asyncio.to_thread(
+                run_rea_workspace, request.ws_id, request.module_name, analyze,
+                max_files=request.max_files,
+            )
         analysis_request = ModuleAnalyzeRequest(
             client_name=request.client_name,
             project_path=request.project_path,
@@ -9046,11 +9047,8 @@ async def _dispatch_inner(name: str, args: dict) -> object:
     if name == "rea.upstream_compare":
         request = ReaUpstreamRequest.model_validate(args)
         if request.ws_id:
-            with rea_workspace_snapshot(request.ws_id) as snapshot:
-                if snapshot["module_name"] != request.module_name:
-                    return {"status": "error", "error_code": "workspace_module_mismatch", "error": "module_name must match the module encoded in ws_id", "workspace_module": snapshot["module_name"]}
-                report = await asyncio.to_thread(
-                    ReaUpstreamService().compare_workspace,
+            def analyze(snapshot):
+                report = ReaUpstreamService().compare_workspace(
                     files=snapshot["files"],
                     module_name=snapshot["module_name"],
                     workspace=snapshot["workspace"],
@@ -9062,6 +9060,9 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     "workspace_source": snapshot["source"],
                     "workspace_coverage": snapshot["coverage"],
                 }
+            return await asyncio.to_thread(
+                run_rea_workspace, request.ws_id, request.module_name, analyze,
+            )
         base_request = ModuleAnalyzeRequest(client_name=request.client_name, project_path=request.project_path, module_name=request.module_name)
         result = await asyncio.to_thread(_workflow_module_analyze, base_request)
         if result.get("status") != "analyzed":
@@ -9192,28 +9193,22 @@ async def _dispatch_inner(name: str, args: dict) -> object:
     if name == "rea.impact_predict":
         request = ReaImpactRequest.model_validate(args)
         if request.ws_id:
-            with rea_workspace_snapshot(request.ws_id) as snapshot:
-                if snapshot["module_name"] != request.module_name:
-                    return {"status": "error", "error_code": "workspace_module_mismatch", "error": "module_name must match the module encoded in ws_id", "workspace_module": snapshot["module_name"]}
-                graph = await asyncio.to_thread(
-                    ReaXrayService().build,
+            def analyze(snapshot):
+                graph = ReaXrayService().build(
                     module_path=snapshot["module_path"],
                     module_name=snapshot["module_name"],
                     max_files=50,
                 )
-                upstream = await asyncio.to_thread(
-                    ReaUpstreamService().compare_workspace,
+                upstream = ReaUpstreamService().compare_workspace(
                     files=snapshot["files"],
                     module_name=snapshot["module_name"],
                     workspace=snapshot["workspace"],
                 )
-                api_inspection = await asyncio.to_thread(
-                    ReaApiInspectService().inspect,
+                api_inspection = ReaApiInspectService().inspect(
                     module_path=snapshot["module_path"],
                     module_name=snapshot["module_name"],
                 )
-                impact = await asyncio.to_thread(
-                    ReaImpactService().predict,
+                impact = ReaImpactService().predict(
                     module_path=snapshot["module_path"],
                     module_name=snapshot["module_name"],
                     changed_files=[item.model_dump() for item in request.changed_files],
@@ -9232,6 +9227,9 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     "workspace_source": snapshot["source"],
                     "workspace_coverage": snapshot["coverage"],
                 }
+            return await asyncio.to_thread(
+                run_rea_workspace, request.ws_id, request.module_name, analyze,
+            )
         base_request = ModuleAnalyzeRequest(
             client_name=request.client_name,
             project_path=request.project_path,
@@ -9275,11 +9273,8 @@ async def _dispatch_inner(name: str, args: dict) -> object:
     if name == "rea.api_inspect":
         request = ReaApiInspectRequest.model_validate(args)
         if request.ws_id:
-            with rea_workspace_snapshot(request.ws_id) as snapshot:
-                if snapshot["module_name"] != request.module_name:
-                    return {"status": "error", "error_code": "workspace_module_mismatch", "error": "module_name must match the module encoded in ws_id", "workspace_module": snapshot["module_name"]}
-                report = await asyncio.to_thread(
-                    ReaApiInspectService().inspect,
+            def analyze(snapshot):
+                report = ReaApiInspectService().inspect(
                     module_path=snapshot["module_path"],
                     module_name=snapshot["module_name"],
                 )
@@ -9290,6 +9285,9 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     "workspace_source": snapshot["source"],
                     "workspace_coverage": snapshot["coverage"],
                 }
+            return await asyncio.to_thread(
+                run_rea_workspace, request.ws_id, request.module_name, analyze,
+            )
         base_request = ModuleAnalyzeRequest(client_name=request.client_name, project_path=request.project_path, module_name=request.module_name)
         result = await asyncio.to_thread(_workflow_module_analyze, base_request)
         if result.get("status") != "analyzed":
