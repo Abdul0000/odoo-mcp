@@ -15,7 +15,6 @@ from .github_commit_service import FileChange, GitHubError, CommitOutcome, git_b
 
 def parse_gitlab_repo(url: str) -> tuple[str, str]:
     raw = (url or "").strip()
-    raw = re.sub(r"^[^@]+@", "", raw) if raw.startswith("git@") else raw
     if raw.startswith("git@") and ":" in raw:
         host, path = raw[4:].split(":", 1)
         base = "https://" + host
@@ -50,7 +49,11 @@ class GitLabRepo:
         try:
             with urllib.request.urlopen(req, timeout=30) as response:
                 raw = response.read()
-                return response.status, {k.lower(): v for k, v in response.headers.items()}, json.loads(raw) if raw else None
+                try:
+                    data = json.loads(raw) if raw else None
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    data = raw.decode("utf-8", "replace")
+                return response.status, {k.lower(): v for k, v in response.headers.items()}, data
         except urllib.error.HTTPError as exc:
             raw = exc.read()
             try: data = json.loads(raw) if raw else {}
@@ -144,9 +147,10 @@ class GitLabRepo:
         current = self.head(branch)["commit"]
         if expected_head and current != expected_head:
             raise GitHubError(409, "branch head changed before commit", path=branch)
+        current_tree = self.tree(current)
         actions = []
         for change in changes:
-            action = "delete" if change.content is None else ("update" if change.path in self.tree(current) else "create")
+            action = "delete" if change.content is None else ("update" if change.path in current_tree else "create")
             row = {"action": action, "file_path": change.path}
             if change.content is not None: row["content"] = change.content
             actions.append(row)
@@ -161,6 +165,10 @@ class GitLabRepo:
             outcome.attempts = attempt
             head = self.head(branch)
             moved = expected_base is not None and head["commit"] != expected_base
+            landed = next((row["sha"] for row in self.recent_commit_messages(branch, 30) if ("MCP-Op: " + key) in row["message"]), None)
+            if landed:
+                outcome.status, outcome.commit, outcome.api_calls = "already_pushed", landed, self.calls
+                return outcome
             cache = {}
             def get_tree():
                 if "tree" not in cache: cache["tree"] = self.tree(head["tree"])
