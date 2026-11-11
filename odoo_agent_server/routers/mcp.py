@@ -728,7 +728,7 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
         "Read-only addon architecture analysis with bounded source evidence and optional live checks."
     ),
     "rea.xray_module": (
-        "Read-only addon graph; ws_id also maps transitive/reverse dependencies and cross-module model/field links."
+        "Read-only addon graph with transitive/reverse dependencies, cross-module model/field links, and optional live Odoo registry confirmation when client_name is explicit."
     ),
     "rea.upstream_compare": (
         "Compare workspace overrides and fields with matching Odoo Community source via GitHub; advisory only."
@@ -737,7 +737,7 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
         "Static HTTP/RPC, routes, timeout and TLS inventory from source or ws_id; no network requests."
     ),
     "rea.impact_predict": (
-        "Predict changed-component impact and risk using graph, upstream, API and trace evidence."
+        "Predict changed-component impact using graph, upstream, API, trace, and optional live registry evidence when client_name is explicit."
     ),
     "workflow.module_install_and_check": (
         "Guarded Odoo module install/upgrade job. Repair source only from a concrete traceback or dependency error; uninstallable registry state alone is not permission to edit code."
