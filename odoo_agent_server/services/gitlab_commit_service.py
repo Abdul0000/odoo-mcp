@@ -197,6 +197,15 @@ class GitLabRepo:
         outcome.api_calls = self.calls
         return outcome
 
+    def move_ref(self, branch: str, sha: str, *, create: bool = False):
+        if not create:
+            current = self.head(branch)["commit"]
+            if current == sha:
+                return
+            raise GitHubError(422, "GitLab ref updates are performed through branch commits, not detached SHA updates", path=branch)
+        encoded = urllib.parse.quote(branch, safe="")
+        self.request("POST", "/repository/branches", {"branch": branch, "ref": sha})
+
     def delete_branch(self, branch: str):
         encoded = urllib.parse.quote(branch, safe="")
         self.request("DELETE", f"/repository/branches/{encoded}", ok=(200, 202, 204))
