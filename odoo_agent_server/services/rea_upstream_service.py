@@ -112,7 +112,7 @@ class ReaUpstreamService:
         stop = False
         for dependency in dependencies:
             base = "odoo/addons/base" if dependency == "base" else f"addons/{dependency}"
-            module_found = False
+            module_found = core_repo.tree_at(head["tree"], base) is not None
             for folder in ("models", "wizard", "wizards", "controllers"):
                 entries = core_repo.tree_at(head["tree"], f"{base}/{folder}") or {}
                 py_entries = [
