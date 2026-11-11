@@ -32,11 +32,12 @@ class ReaDependencyService:
         return "" if str(parent) == "." else str(parent)
 
     @staticmethod
-    def _parse_models(source: str, path: str, module: str) -> list[dict[str, Any]]:
-        try:
-            tree = ast.parse(source, filename=path)
-        except SyntaxError:
-            return []
+    def _parse_models(source: str, path: str, module: str, tree: ast.AST | None = None) -> list[dict[str, Any]]:
+        if tree is None:
+            try:
+                tree = ast.parse(source, filename=path)
+            except SyntaxError:
+                return []
         found: list[dict[str, Any]] = []
         for cls in (node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)):
             own: list[str] = []
@@ -338,6 +339,7 @@ class ReaDependencyService:
         files_scanned = 0
         model_rows: list[dict[str, Any]] = []
         unreadable: list[str] = []
+        parse_warnings: list[dict[str, str]] = []
         for _priority, path, module, meta in selected_files:
             source = texts.get(path)
             if source is None:
@@ -351,7 +353,12 @@ class ReaDependencyService:
                 continue
             source_chars += len(source)
             files_scanned += 1
-            model_rows.extend(self._parse_models(source, path, module))
+            try:
+                parsed_tree = ast.parse(source, filename=path)
+            except SyntaxError as exc:
+                parse_warnings.append({"code": "PYTHON_PARSE_ERROR", "path": path, "message": str(exc)[:200]})
+                continue
+            model_rows.extend(self._parse_models(source, path, module, tree=parsed_tree))
 
         model_modules: dict[str, set[str]] = {}
         for row in model_rows:
@@ -414,12 +421,16 @@ class ReaDependencyService:
                 "included_modules": len(included_roots),
                 "python_files_scanned": files_scanned,
                 "python_files_omitted": len(set(omitted_files)),
+                "omitted_file_paths": sorted(set(omitted_files))[:100],
                 "unreadable_files": unreadable[:100],
                 "source_chars": source_chars,
-                "complete": not module_limit_hit and not malformed and not manifest_omitted and not omitted_files and not unreadable,
+                "complete": not module_limit_hit and not malformed and not manifest_omitted and not ambiguous_deps and not omitted_files and not unreadable and not parse_warnings,
                 "manifest_scan_truncated": len(manifest_paths) > candidate_limit,
             },
-            "warnings": [{"code": "MANIFEST_UNREADABLE", "path": p} for p in malformed[:50]],
+            "warnings": (
+                [{"code": "MANIFEST_UNREADABLE", "path": p} for p in malformed[:50]]
+                + parse_warnings[:50]
+            ),
             "limitations": [
                 "Dependency resolution covers addons visible in this GitHub repository; Odoo core, Enterprise, and external repositories are reported as unresolved.",
                 "Model and field relationships are inferred statically from Python AST; dynamic declarations and runtime registry state are not covered.",
