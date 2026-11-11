@@ -1,7 +1,7 @@
 """Stateless-first coding workspace for Odoo addons.
 
-A workspace is an overlay of edits on top of one commit of a GitHub branch.
-Nothing depends on local disk: file contents are fetched through the GitHub API,
+A workspace is an overlay of edits on top of one commit of a GitHub or GitLab branch.
+Nothing depends on local disk: file contents are fetched through the configured Git provider API,
 edits live in memory *and* in a journal that is checkpointed to a WIP branch
 (``mcp/wip/<client>-<module>``), so a Render restart loses nothing - the next
 call rebuilds the workspace by replaying the journal on the current branch head.
@@ -1125,7 +1125,7 @@ class WorkspaceService:
         ws.ckpt_idle.wait(timeout)
 
     def _checkpoint(self, ws: Workspace) -> dict[str, Any]:
-        """Persist the compacted journal and (by default) the changed files, so the work is visible on GitHub.
+        """Persist the compacted journal and (by default) the changed files, so the work is visible on the Git provider.
 
         Blobs are content-addressed, so only files whose content changed since the last checkpoint are uploaded.
         """
