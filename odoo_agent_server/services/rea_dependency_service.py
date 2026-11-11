@@ -234,7 +234,14 @@ class ReaDependencyService:
             forward_truncated or reverse_truncated or forward_depth_hit or reverse_depth_hit
             or len(included_roots) > max_modules or len(manifest_paths) > candidate_limit
         )
-        included_roots = set(sorted(included_roots, key=lambda p: (p != target_root, p))[:max_modules])
+        included_roots = set(sorted(
+            included_roots,
+            key=lambda root: (
+                root != target_root,
+                min(forward_depth.get(root, 999), reverse_depth.get(root, 999)),
+                root,
+            ),
+        )[:max_modules])
         forward_depth = {k: v for k, v in forward_depth.items() if k in included_roots}
         reverse_depth = {k: v for k, v in reverse_depth.items() if k in included_roots}
 
@@ -311,7 +318,10 @@ class ReaDependencyService:
             else:
                 texts[path] = source
         fetch_files: dict[str, str] = {}
-        fetch_bytes = 0
+        fetch_bytes = sum(
+            len(text.encode("utf-8")) for _priority, path, _module, _meta in selected_files
+            if path in texts
+        )
         for _priority, path, _module, meta in selected_files:
             if path in texts:
                 continue
