@@ -193,6 +193,7 @@ from ..services.skill_service import SkillService
 from ..services.validator_service import OdooModuleValidator
 from ..services.module_analysis_service import ModuleAnalysisService
 from ..services.rea_xray_service import ReaXrayService
+from ..services.rea_dependency_service import ReaDependencyService
 from ..services.rea_upstream_service import ReaUpstreamService
 from ..services.rea_api_inspect_service import ReaApiInspectService
 from ..services.rea_runtime_trace_service import ReaRuntimeTraceService
@@ -481,7 +482,8 @@ _TOOL_DESCRIPTORS = [
         description=(
             "Read-only REA X-Ray: map a custom addon into an evidence-backed graph of modules, "
             "models, inheritance, relational fields, methods, views, actions, menus and UI-to-method links. "
-            "Accepts a local addon path or stateless ws_id from ws_open; uses bounded AST/XML analysis and never executes addon code or contacts external hosts."
+            "For ws_id, also returns transitive/reverse addon dependencies and cross-module model/field links. "
+            "Uses bounded static analysis; never executes addon code or contacts external hosts."
         ),
         read_only=True,
         idempotent=True,
@@ -9012,10 +9014,16 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     module_name=snapshot["module_name"],
                     max_files=request.max_files,
                 )
+                dependencies = ReaDependencyService().analyze(
+                    workspace=snapshot["workspace"],
+                    files=snapshot["files"],
+                    module_name=snapshot["module_name"],
+                )
                 return {
                     "status": "analyzed",
                     "module_name": snapshot["module_name"],
                     "rea_xray": graph,
+                    "rea_dependencies": dependencies,
                     "workspace_source": snapshot["source"],
                     "workspace_coverage": snapshot["coverage"],
                 }
@@ -9208,6 +9216,11 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     module_path=snapshot["module_path"],
                     module_name=snapshot["module_name"],
                 )
+                dependencies = ReaDependencyService().analyze(
+                    workspace=snapshot["workspace"],
+                    files=snapshot["files"],
+                    module_name=snapshot["module_name"],
+                )
                 impact = ReaImpactService().predict(
                     module_path=snapshot["module_path"],
                     module_name=snapshot["module_name"],
@@ -9216,10 +9229,12 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     runtime_events=request.runtime_events,
                     upstream_findings=upstream.get("findings", []),
                     api_findings=api_inspection.get("findings", []),
+                    dependency_map=dependencies,
                 )
                 impact["upstream_coverage"] = upstream.get("coverage", {})
                 impact["api_coverage"] = api_inspection.get("coverage", {})
                 impact["architecture_graph"] = graph.get("summary", {})
+                impact["dependency_coverage"] = dependencies.get("coverage", {})
                 return {
                     "status": "predicted",
                     "module_name": snapshot["module_name"],
