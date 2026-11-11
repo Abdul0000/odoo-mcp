@@ -19,7 +19,7 @@ def _resolve(name: str | None) -> ClientTarget:
         raise WorkspaceError("client_missing", "no client configured in ODOO_CLIENTS")
     token = client.token or settings.github_token
     if not token:
-        raise WorkspaceError("github_token_missing", f"client '{client.name}' has no GitHub token (set 'token' in ODOO_CLIENTS or GITHUB_TOKEN with contents:write)")
+        raise WorkspaceError("git_token_missing", f"client '{client.name}' has no repository access token (set 'token' in ODOO_CLIENTS or GITHUB_TOKEN)")
     repo_url = client.repo or ""
     if "gitlab." in repo_url.lower() or "gitlab.com/" in repo_url.lower():
         try:
@@ -78,5 +78,5 @@ def run_ws(fn: Callable[[WorkspaceService], dict[str, Any]]) -> dict[str, Any]:
         detail = exc.detail if isinstance(exc.detail, (dict, str)) else str(exc.detail)
         return {"status": "error", "error_code": "client_resolution", "error": detail if isinstance(detail, str) else detail.get("message", "client could not be resolved"), "detail": detail if isinstance(detail, dict) else None, "hint": "pass client_name exactly as listed by client_check"}
     except GitHubError as exc:
-        return {"status": "error", "error_code": f"github_{exc.status}", "error": exc.message, "retryable": exc.retryable, "path": exc.path,
+        return {"status": "error", "error_code": f"git_provider_{exc.status}", "error": exc.message, "retryable": exc.retryable, "path": exc.path,
                 "hint": "retry the same call" if exc.retryable else "fix token/permissions/branch, then retry"}
