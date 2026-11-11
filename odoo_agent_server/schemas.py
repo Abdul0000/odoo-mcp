@@ -955,6 +955,7 @@ class ReaXrayRequest(BaseModel):
     ws_id: str | None = Field(default=None, max_length=512, description="ws_open ID")
     module_name: str = Field(..., min_length=1, max_length=200, description="Custom addon technical name or safe human hint")
     max_files: int = Field(default=15, ge=5, le=50, description="Maximum addon files to inspect")
+    include_runtime: bool = Field(default=True, description="When client_name is explicit, compare static evidence with the live Odoo registry using bounded read-only queries.")
 
     @field_validator("module_name")
     @classmethod
