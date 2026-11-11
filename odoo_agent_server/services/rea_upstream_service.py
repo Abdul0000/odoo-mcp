@@ -59,6 +59,170 @@ class ReaUpstreamService:
             for name in names: result.append({"model":name,"defined":name in own,"methods":methods,"fields":fields,"path":path,"line":node.lineno})
         return result,[]
 
+
+    def compare_workspace(
+        self, *, files: dict[str, str], module_name: str, workspace: Any,
+        max_dependency_files: int = 30, max_total_chars: int = 12000,
+    ) -> dict[str, Any]:
+        """Compare workspace source with matching Odoo Community source through GitHub.
+
+        The addon is read from the stateless GitHub workspace (including its WIP
+        overlay); upstream source is fetched from the matching Odoo series.
+        No local Odoo checkout or persistent disk is required.
+        """
+        manifest_text = files.get("__manifest__.py")
+        if not manifest_text:
+            raise ValueError("workspace snapshot is missing __manifest__.py")
+        try:
+            manifest = ast.literal_eval(manifest_text)
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError(f"unable to parse addon manifest: {exc}") from exc
+        if not isinstance(manifest, dict):
+            raise ValueError("manifest must contain a dictionary")
+        version = str(manifest.get("version") or "")
+        match = __import__("re").match(r"^(\\d{1,2})\\.\\d+", version)
+        if not match:
+            return {
+                "status": "series_unknown", "module": module_name,
+                "message": "Cannot infer Odoo series from the addon manifest; set a valid version such as 18.0.1.0.0.",
+                "coverage": {"complete": False, "custom_files_scanned": 0, "dependency_files_scanned": 0},
+            }
+        series = int(match.group(1))
+        dependencies = [
+            value for value in manifest.get("depends", [])
+            if isinstance(value, str) and value.strip()
+        ]
+        from .github_commit_service import GitHubRepo
+
+        core_repo = GitHubRepo(
+            "odoo", "odoo", workspace.repo.token,
+            transport=workspace.repo.transport, sleep=workspace.repo.sleep,
+        )
+        branch = f"{series}.0"
+        head = core_repo.head(branch)
+        upstream: dict[str, dict[str, Any]] = {}
+        scanned: list[str] = []
+        omitted: list[str] = []
+        unresolved: list[str] = []
+        warnings: list[dict[str, str]] = []
+        chars = 0
+        budget = max(4000, min(int(max_total_chars), 20000))
+        limit = max(5, min(int(max_dependency_files), 60))
+        stop = False
+        for dependency in dependencies:
+            base = "odoo/addons/base" if dependency == "base" else f"addons/{dependency}"
+            module_found = False
+            for folder in ("models", "wizard", "wizards", "controllers"):
+                entries = core_repo.tree_at(head["tree"], f"{base}/{folder}") or {}
+                py_entries = [
+                    (name, meta) for name, meta in sorted(entries.items())
+                    if meta.get("type") == "blob" and name.endswith(".py") and name != "__init__.py"
+                ]
+                if py_entries:
+                    module_found = True
+                for name, meta in py_entries:
+                    rel = f"{base}/{folder}/{name}"
+                    size = int(meta.get("size") or 0)
+                    if size > self._MAX_FILE_BYTES:
+                        omitted.append(rel)
+                        continue
+                    if len(scanned) >= limit or chars >= budget:
+                        omitted.append(rel)
+                        stop = True
+                        break
+                    source = core_repo.blobs_text({name: meta["sha"]}).get(name, "")
+                    if chars + len(source) > budget:
+                        omitted.append(rel)
+                        continue
+                    chars += len(source)
+                    scanned.append(rel)
+                    models, errors = self._models(source, rel)
+                    warnings.extend(errors)
+                    for model in models:
+                        upstream.setdefault(model["model"], model)
+                if stop:
+                    break
+            if not module_found:
+                unresolved.append(dependency)
+            if stop:
+                break
+
+        custom: list[dict[str, Any]] = []
+        custom_count = 0
+        for relative, source in sorted(files.items()):
+            if not relative.endswith(".py") or any(part in {"static", "tests", "__pycache__"} for part in Path(relative).parts):
+                continue
+            custom_count += 1
+            models, errors = self._models(source, relative)
+            custom.extend(models)
+            warnings.extend(errors)
+
+        findings: list[dict[str, Any]] = []
+        for item in custom:
+            base = upstream.get(item["model"])
+            if not base:
+                if not item["defined"]:
+                    findings.append({
+                        "code": "UPSTREAM_MODEL_NOT_FOUND", "severity": "warning",
+                        "model": item["model"],
+                        "message": "No matching model definition found in the declared dependencies on the selected Community series.",
+                        "evidence": {"custom_path": item["path"], "custom_line": item["line"]},
+                    })
+                continue
+            for name, signature in item["methods"].items():
+                previous = base["methods"].get(name)
+                evidence = {
+                    "custom_path": item["path"], "custom_line": item["line"],
+                    "upstream_path": base["path"], "upstream_line": base["line"],
+                }
+                if previous and previous != signature:
+                    findings.append({
+                        "code": "METHOD_SIGNATURE_DRIFT", "severity": "warning",
+                        "model": item["model"], "symbol": name,
+                        "message": "Custom override signature differs from the selected Odoo Community definition.",
+                        "custom_signature": signature, "upstream_signature": previous, "evidence": evidence,
+                    })
+                elif previous is None and name not in {"__init__", "__str__", "__repr__"}:
+                    findings.append({
+                        "code": "CUSTOM_METHOD_NOT_FOUND_UPSTREAM", "severity": "info",
+                        "model": item["model"], "symbol": name,
+                        "message": "No same-named method exists in the selected Odoo Community definition; confirm this is an intentional extension.",
+                        "evidence": evidence,
+                    })
+            for name, spec in item["fields"].items():
+                previous = base["fields"].get(name)
+                if previous and previous != spec:
+                    findings.append({
+                        "code": "FIELD_TYPE_DRIFT", "severity": "warning",
+                        "model": item["model"], "symbol": name,
+                        "message": "Custom field declaration differs from upstream type or comodel.",
+                        "custom_field": {"type": spec[0], "comodel": spec[1]},
+                        "upstream_field": {"type": previous[0], "comodel": previous[1]},
+                        "evidence": {
+                            "custom_path": item["path"], "custom_line": item["line"],
+                            "upstream_path": base["path"], "upstream_line": base["line"],
+                        },
+                    })
+        return {
+            "status": "compared", "module": module_name, "series": series,
+            "upstream_source": f"odoo/odoo@{branch}", "dependencies": dependencies,
+            "unresolved_dependencies": unresolved,
+            "coverage": {
+                "dependency_files_scanned": len(scanned),
+                "dependency_files_omitted": len(omitted),
+                "custom_files_scanned": custom_count,
+                "source_chars": chars,
+                "complete": not omitted and not unresolved,
+            },
+            "findings": findings[:200], "warnings": warnings[:100],
+            "omitted_files": omitted[:100],
+            "limitations": [
+                "Community source only; Enterprise/private addons are not available from odoo/odoo.",
+                "Only direct manifest dependencies are searched; transitive dependency closure is a later phase.",
+                "This is static evidence and does not prove runtime compatibility.",
+            ],
+        }
+
     def compare(self, *, module_path:Path, module_name:str, client_name:str|None=None,
                 max_dependency_files:int=30, max_total_chars:int=12000)->dict[str,Any]:
         module_path=module_path.resolve(strict=True); manifest_path=module_path/"__manifest__.py"
