@@ -89,10 +89,12 @@ class ReaUpstreamService:
                 "coverage": {"complete": False, "custom_files_scanned": 0, "dependency_files_scanned": 0},
             }
         series = int(match.group(1))
-        dependencies = [
+        all_dependencies = [
             value for value in manifest.get("depends", [])
             if isinstance(value, str) and value.strip()
         ]
+        dependencies = all_dependencies[:30]
+        dependency_limit_hit = len(all_dependencies) > len(dependencies)
         from .github_commit_service import GitHubRepo
 
         core_repo = GitHubRepo(
@@ -112,8 +114,15 @@ class ReaUpstreamService:
         stop = False
         for dependency in dependencies:
             base = "odoo/addons/base" if dependency == "base" else f"addons/{dependency}"
-            module_found = core_repo.tree_at(head["tree"], base) is not None
+            module_entries = core_repo.tree_at(head["tree"], base)
+            module_found = module_entries is not None
+            available_folders = {
+                name for name, meta in (module_entries or {}).items()
+                if meta.get("type") == "tree"
+            }
             for folder in ("models", "wizard", "wizards", "controllers"):
+                if folder not in available_folders:
+                    continue
                 entries = core_repo.tree_at(head["tree"], f"{base}/{folder}") or {}
                 py_entries = [
                     (name, meta) for name, meta in sorted(entries.items())
@@ -207,13 +216,13 @@ class ReaUpstreamService:
         return {
             "status": "compared", "module": module_name, "series": series,
             "upstream_source": f"odoo/odoo@{branch}", "dependencies": dependencies,
-            "unresolved_dependencies": unresolved,
+            "unresolved_dependencies": unresolved,\n            "dependencies_truncated": dependency_limit_hit,
             "coverage": {
                 "dependency_files_scanned": len(scanned),
                 "dependency_files_omitted": len(omitted),
                 "custom_files_scanned": custom_count,
                 "source_chars": chars,
-                "complete": not omitted and not unresolved,
+                "complete": not omitted and not unresolved and not dependency_limit_hit,
             },
             "findings": findings[:200], "warnings": warnings[:100],
             "omitted_files": omitted[:100],
