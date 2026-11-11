@@ -216,7 +216,8 @@ class ReaUpstreamService:
         return {
             "status": "compared", "module": module_name, "series": series,
             "upstream_source": f"odoo/odoo@{branch}", "dependencies": dependencies,
-            "unresolved_dependencies": unresolved,\n            "dependencies_truncated": dependency_limit_hit,
+            "unresolved_dependencies": unresolved,
+            "dependencies_truncated": dependency_limit_hit,
             "coverage": {
                 "dependency_files_scanned": len(scanned),
                 "dependency_files_omitted": len(omitted),
