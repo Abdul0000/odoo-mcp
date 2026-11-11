@@ -149,10 +149,14 @@ def test_phase9_impact_prediction_includes_reverse_dependents_and_cycles():
 
 def test_phase9_reports_external_dependencies_and_respects_module_bound():
     files = {
-        "addons/a_mod/__manifest__.py": "{'depends': ['b_mod', 'base', 'enterprise_secret']}\n",
+        "addons/a_mod/__manifest__.py": "{'depends': ['b_mod', 'd_mod', 'e_mod', 'f_mod', 'g_mod', 'base', 'enterprise_secret']}\n",
         "addons/a_mod/models/a.py": "VALUE = 1\n",
         "addons/b_mod/__manifest__.py": "{'depends': []}\n",
         "addons/c_mod/__manifest__.py": "{'depends': ['a_mod']}\n",
+        "addons/d_mod/__manifest__.py": "{'depends': []}\n",
+        "addons/e_mod/__manifest__.py": "{'depends': []}\n",
+        "addons/f_mod/__manifest__.py": "{'depends': []}\n",
+        "addons/g_mod/__manifest__.py": "{'depends': []}\n",
     }
     _transport, workspace = _workspace(files)
     result = ReaDependencyService().analyze(
@@ -164,5 +168,7 @@ def test_phase9_reports_external_dependencies_and_respects_module_bound():
 
     assert "base" in result["unresolved_dependencies"]
     assert "enterprise_secret" in result["unresolved_dependencies"]
-    assert {row["module"] for row in result["transitive_dependencies"]} == {"b_mod"}
-    assert {row["module"] for row in result["reverse_dependents"]} == {"c_mod"}
+    assert len(result["transitive_dependencies"]) <= 4
+    assert result["coverage"]["included_modules"] <= 5
+    assert result["coverage"]["complete"] is False
+    assert result["coverage"]["module_count_truncated"] is True
