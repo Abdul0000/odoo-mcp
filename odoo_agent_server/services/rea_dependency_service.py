@@ -222,7 +222,10 @@ class ReaDependencyService:
         visiting: list[str] = []
         visited: set[str] = set()
         adjacency = {
-            PurePosixPath(root).name: [dep for dep in deps_by_root.get(root, []) if dep in root_by_name and root_by_name[dep] in included_roots]
+            (PurePosixPath(root).name if root else workspace.module): [
+                dep for dep in deps_by_root.get(root, [])
+                if dep in root_by_name and root_by_name[dep] in included_roots
+            ]
             for root in included_roots
         }
         cycles: list[list[str]] = []
@@ -278,6 +281,9 @@ class ReaDependencyService:
             source = texts.get(path)
             if source is None:
                 unreadable.append(path)
+                continue
+            if len(source.encode("utf-8")) > self.MAX_FILE_BYTES:
+                omitted_files.append(path)
                 continue
             if source_chars + len(source) > self.MAX_TOTAL_CHARS:
                 omitted_files.append(path)
