@@ -64,6 +64,7 @@ class ReaImpactService:
         upstream_findings: list[dict[str, Any]] | None = None,
         api_findings: list[dict[str, Any]] | None = None,
         dependency_map: dict[str, Any] | None = None,
+        runtime_registry: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         root = module_path.resolve(strict=True)
         if not root.is_dir() or not (root / "__manifest__.py").is_file():
@@ -73,6 +74,8 @@ class ReaImpactService:
 
         graph = graph or {}
         dependency_map = dependency_map or {}
+        runtime_registry = runtime_registry or {"status": "skipped", "evidence_level": "static_only"}
+        runtime_summary = runtime_registry.get("summary") or {}
         nodes = graph.get("nodes", [])
         edges = graph.get("edges", [])
         node_by_id = {str(n.get("id")): n for n in nodes if n.get("id")}
@@ -239,6 +242,9 @@ class ReaImpactService:
                 "dependency_cycles": len(dependency_cycles),
                 "graph_complete": bool((graph.get("coverage") or {}).get("complete", False)),
                 "dependency_map_complete": bool((dependency_map.get("coverage") or {}).get("complete", False)),
+                "runtime_registry_confirmed_models": runtime_summary.get("confirmed_models", 0),
+                "runtime_installed_modules": runtime_summary.get("installed_modules", 0),
+                "runtime_registry_complete": bool((runtime_registry.get("coverage") or {}).get("complete", False)),
             },
             "changed_files": normalized,
             "impacted_components": sorted(impacted.values(), key=lambda x: (x["depth"], x["kind"] or "", x["name"] or "")),
@@ -247,6 +253,7 @@ class ReaImpactService:
             "dependency_cycles": dependency_cycles[:30],
             "risk_reasons": list(dict.fromkeys(risk_reasons))[:50],
             "runtime_trace_matches": runtime_matches[:50],
+            "runtime_registry": runtime_registry,
             "upstream_matches": upstream_matches,
             "api_integration_matches": api_matches,
             "warnings": warnings,
