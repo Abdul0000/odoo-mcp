@@ -173,3 +173,64 @@ def test_phase9_reports_external_dependencies_and_respects_module_bound():
     assert result["coverage"]["included_modules"] <= 5
     assert result["coverage"]["complete"] is False
     assert result["coverage"]["module_count_truncated"] is True
+
+
+
+def test_phase10_runtime_registry_confirms_static_models_fields_and_installed_modules():
+    from odoo_agent_server.services.rea_runtime_registry_service import ReaRuntimeRegistryService
+
+    dependencies = {
+        "module_name": "a_mod",
+        "model_ownership": [
+            {"model": "sale.order", "module": "a_mod", "role": "extends"},
+            {"model": "x.custom", "module": "a_mod", "role": "defines"},
+        ],
+        "cross_module_relationships": [
+            {"kind": "relates_to_model", "model": "sale.order", "field": "partner_id", "comodel": "res.partner"},
+        ],
+        "transitive_dependencies": [{"module": "sale"}],
+        "reverse_dependents": [{"module": "b_mod"}],
+    }
+    result = ReaRuntimeRegistryService().analyze(
+        dependencies=dependencies,
+        model_rows=[
+            {"model": "sale.order", "modules": "sale,a_mod", "name": "Sales Order"},
+            {"model": "x.custom", "modules": "a_mod", "name": "Custom"},
+        ],
+        field_rows=[
+            {"model": "sale.order", "name": "partner_id", "ttype": "many2one", "relation": "res.partner"},
+        ],
+        module_rows=[
+            {"name": "a_mod", "state": "installed", "latest_version": "1.0"},
+            {"name": "sale", "state": "installed", "latest_version": "1.0"},
+            {"name": "b_mod", "state": "uninstalled", "latest_version": "1.0"},
+        ],
+        requested_model_count=2,
+        requested_module_count=3,
+        client_name="SproutBoxes",
+    )
+    assert result["status"] == "confirmed"
+    assert result["summary"]["confirmed_models"] == 2
+    assert result["summary"]["owner_matches"] == 2
+    assert result["summary"]["confirmed_fields"] == 1
+    assert result["summary"]["relation_matches"] == 1
+    assert result["summary"]["installed_modules"] == 2
+    assert result["coverage"]["complete"] is True
+
+
+def test_phase10_runtime_registry_marks_query_failures_as_incomplete_not_missing():
+    from odoo_agent_server.services.rea_runtime_registry_service import ReaRuntimeRegistryService
+
+    result = ReaRuntimeRegistryService().analyze(
+        dependencies={"model_ownership": [{"model": "x.model", "module": "x_addon"}]},
+        model_rows=[],
+        field_rows=[],
+        module_rows=[],
+        query_errors={"ir.model": "permission denied"},
+        requested_model_count=1,
+        requested_module_count=1,
+    )
+    assert result["status"] == "partial"
+    assert result["coverage"]["complete"] is False
+    assert result["models"][0]["runtime_present"] is False
+    assert result["query_errors"]["ir.model"] == "permission denied"
