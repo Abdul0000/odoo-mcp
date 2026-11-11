@@ -194,6 +194,7 @@ from ..services.validator_service import OdooModuleValidator
 from ..services.module_analysis_service import ModuleAnalysisService
 from ..services.rea_xray_service import ReaXrayService
 from ..services.rea_dependency_service import ReaDependencyService
+from ..services.rea_runtime_registry_service import ReaRuntimeRegistryService
 from ..services.rea_upstream_service import ReaUpstreamService
 from ..services.rea_api_inspect_service import ReaApiInspectService
 from ..services.rea_runtime_trace_service import ReaRuntimeTraceService
@@ -1258,6 +1259,99 @@ def _resolve_query_client(client_name: str | None, query_text: str | None = None
         return ClientResolverService().resolve_client(require_complete=True)
     client = ClientResolverService().resolve_client(client_name=requested, require_complete=True)
     return client
+
+
+def _rea_runtime_registry(client_name: str | None, dependencies: dict[str, Any]) -> dict[str, Any]:
+    """Compare bounded static addon evidence with one explicitly selected live Odoo registry."""
+    if not client_name:
+        return {
+            "status": "skipped",
+            "reason": "Pass client_name to opt into live registry confirmation.",
+            "evidence_level": "static_only",
+        }
+    try:
+        client = _resolve_query_client(client_name)
+        service = _odoo_service_for_client(client)
+        static_models = {
+            str(row.get("model"))
+            for row in dependencies.get("model_ownership", [])
+            if isinstance(row, dict) and row.get("model")
+        }
+        for relation in dependencies.get("cross_module_relationships", []):
+            if not isinstance(relation, dict):
+                continue
+            for key in ("model", "source_model", "target_model"):
+                if relation.get(key):
+                    static_models.add(str(relation[key]))
+        module_names = {str(dependencies.get("module_name") or "")}
+        module_names.update(
+            str(row.get("module"))
+            for key in ("transitive_dependencies", "reverse_dependents")
+            for row in dependencies.get(key, [])
+            if isinstance(row, dict) and row.get("module")
+        )
+        module_names.update(
+            str(row.get("source_module"))
+            for row in dependencies.get("cross_module_relationships", [])
+            if isinstance(row, dict) and row.get("source_module")
+        )
+        module_names.update(
+            str(row.get("target_module"))
+            for row in dependencies.get("cross_module_relationships", [])
+            if isinstance(row, dict) and row.get("target_module")
+        )
+        static_models = sorted(static_models)[:250]
+        module_names = sorted(name for name in module_names if name)[:150]
+
+        def read_rows(model: str, domain: list, fields: list[str], limit: int) -> tuple[list[dict], str | None]:
+            result = service.search_read(
+                model, domain, fields, limit=limit, offset=0, order=None,
+                context=None, timeout_seconds=90,
+            )
+            payload = result.model_dump(mode="json") if hasattr(result, "model_dump") else result
+            if not isinstance(payload, dict) or payload.get("status") != "ok":
+                return [], str((payload or {}).get("error") or f"{model} registry query failed")
+            rows = payload.get("result")
+            if not isinstance(rows, list):
+                return [], f"{model} registry query returned an unexpected result shape"
+            return rows, None
+
+        model_rows, model_error = read_rows(
+            "ir.model", [["model", "in", static_models]],
+            ["model", "name", "transient", "modules"], max(1, len(static_models)),
+        ) if static_models else ([], None)
+        field_rows, field_error = read_rows(
+            "ir.model.fields", [["model", "in", static_models]],
+            ["model", "name", "ttype", "relation", "required", "store"], 3000,
+        ) if static_models else ([], None)
+        module_rows, module_error = read_rows(
+            "ir.module.module", [["name", "in", module_names]],
+            ["name", "state", "latest_version"], max(1, len(module_names)),
+        ) if module_names else ([], None)
+        return ReaRuntimeRegistryService().analyze(
+            dependencies=dependencies,
+            model_rows=model_rows,
+            field_rows=field_rows,
+            module_rows=module_rows,
+            query_errors={
+                key: value for key, value in (
+                    ("ir.model", model_error),
+                    ("ir.model.fields", field_error),
+                    ("ir.module.module", module_error),
+                ) if value
+            },
+            requested_model_count=len(static_models),
+            requested_module_count=len(module_names),
+            client_name=client.name if client else client_name,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "status": "unavailable",
+            "evidence_level": "static_only",
+            "client_name": client_name,
+            "error": str(exc)[:500],
+            "coverage": {"complete": False},
+        }
 
 
 def _search_read_via_shell(
@@ -9019,6 +9113,11 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     files=snapshot["files"],
                     module_name=snapshot["module_name"],
                 )
+                runtime_registry = (
+                    _rea_runtime_registry(request.client_name, dependencies)
+                    if request.include_runtime else {"status": "skipped", "reason": "include_runtime=false"}
+                )
+                dependencies["runtime_registry"] = runtime_registry
                 return {
                     "status": "analyzed",
                     "module_name": snapshot["module_name"],
@@ -9046,10 +9145,17 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             module_name=result["module_name"],
             max_files=request.max_files,
         )
+        if request.include_runtime:
+            result["rea_runtime_registry"] = _rea_runtime_registry(
+                request.client_name,
+                {"module_name": result["rea_xray"].get("module_name", request.module_name),
+                 "model_ownership": [], "cross_module_relationships": []},
+            )
         result["inspection_instructions"] = (
             "Use rea_xray.nodes and rea_xray.edges as the static architecture map. "
-            "Every edge carries source-path evidence. Treat the graph as source-derived, "
-            "not proof of runtime execution; request live verification only when needed."
+            "Every edge carries source-path evidence. Runtime registry evidence is separately "
+            "labelled and confirms installed model/module metadata only; it does not prove a "
+            "specific method executed. Treat missing registry evidence as unresolved, not absent."
         )
         return result
     if name == "rea.upstream_compare":
@@ -9221,6 +9327,10 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     files=snapshot["files"],
                     module_name=snapshot["module_name"],
                 )
+                runtime_registry = (
+                    _rea_runtime_registry(request.client_name, dependencies)
+                    if request.client_name else {"status": "skipped", "reason": "client_name not supplied"}
+                )
                 impact = ReaImpactService().predict(
                     module_path=snapshot["module_path"],
                     module_name=snapshot["module_name"],
@@ -9230,7 +9340,9 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     upstream_findings=upstream.get("findings", []),
                     api_findings=api_inspection.get("findings", []),
                     dependency_map=dependencies,
+                    runtime_registry=runtime_registry,
                 )
+                impact["runtime_registry"] = runtime_registry
                 impact["upstream_coverage"] = upstream.get("coverage", {})
                 impact["api_coverage"] = api_inspection.get("coverage", {})
                 impact["architecture_graph"] = graph.get("summary", {})
