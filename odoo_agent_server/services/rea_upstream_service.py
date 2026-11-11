@@ -1,5 +1,6 @@
 from __future__ import annotations
 import ast
+import re
 from pathlib import Path
 from typing import Any
 from .core_finder_service import CoreFinderService
@@ -80,7 +81,7 @@ class ReaUpstreamService:
         if not isinstance(manifest, dict):
             raise ValueError("manifest must contain a dictionary")
         version = str(manifest.get("version") or "")
-        match = __import__("re").match(r"^(\\d{1,2})\\.\\d+", version)
+        match = re.match(r"^(\d{1,2})\.\d+", version)
         if not match:
             return {
                 "status": "series_unknown", "module": module_name,
