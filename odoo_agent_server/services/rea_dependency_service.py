@@ -230,9 +230,10 @@ class ReaDependencyService:
 
         included_roots = set(forward_depth) | set(reverse_depth)
         included_roots.add(target_root)
+        combined_module_truncated = len(included_roots) > max_modules
         module_limit_hit = (
             forward_truncated or reverse_truncated or forward_depth_hit or reverse_depth_hit
-            or len(included_roots) > max_modules or len(manifest_paths) > candidate_limit
+            or combined_module_truncated or len(manifest_paths) > candidate_limit
         )
         included_roots = set(sorted(
             included_roots,
@@ -407,7 +408,7 @@ class ReaDependencyService:
                 "manifest_omitted_paths": manifest_omitted[:100],
                 "manifest_bytes_fetched": manifest_bytes,
                 "dependency_depth_truncated": forward_depth_hit or reverse_depth_hit,
-                "module_count_truncated": forward_truncated or reverse_truncated,
+                "module_count_truncated": forward_truncated or reverse_truncated or combined_module_truncated,
                 "candidate_manifests": len(manifest_paths),
                 "manifests_scanned": len(manifests),
                 "included_modules": len(included_roots),
