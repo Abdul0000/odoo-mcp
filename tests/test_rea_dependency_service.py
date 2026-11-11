@@ -84,8 +84,8 @@ def test_phase9_impact_prediction_includes_reverse_dependents_and_cycles():
     with TemporaryDirectory(prefix="rea-impact-") as temp:
         root = Path(temp)
         (root / "models").mkdir()
-        (root / "__manifest__.py").write_text("{'depends': []}\\n", encoding="utf-8")
-        (root / "models" / "a.py").write_text("VALUE = 1\\n", encoding="utf-8")
+        (root / "__manifest__.py").write_text("{'depends': []}\n", encoding="utf-8")
+        (root / "models" / "a.py").write_text("VALUE = 1\n", encoding="utf-8")
         dependency_map = {
             "reverse_dependents": [
                 {"module": "d_mod", "depth": 1},
