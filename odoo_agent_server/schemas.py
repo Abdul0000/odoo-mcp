@@ -952,7 +952,7 @@ class ReaXrayRequest(BaseModel):
 
     client_name: str | None = Field(default=None, max_length=120, description="Validated ODOO_CLIENTS entry")
     project_path: str | None = Field(default=None, max_length=1000, description="Existing checkout; client path is used when omitted")
-    ws_id: str | None = Field(default=None, max_length=512, description="ws_open ID; includes the current WIP overlay.")
+    ws_id: str | None = Field(default=None, max_length=512, description="ws_open ID")
     module_name: str = Field(..., min_length=1, max_length=200, description="Custom addon technical name or safe human hint")
     max_files: int = Field(default=15, ge=5, le=50, description="Maximum addon files to inspect")
 
@@ -971,7 +971,7 @@ class ReaUpstreamRequest(BaseModel):
     """Bounded read-only comparison against installed Odoo source."""
     client_name: str | None = Field(default=None, max_length=120)
     project_path: str | None = Field(default=None, max_length=1000)
-    ws_id: str | None = Field(default=None, max_length=512, description="ws_open ID; includes the current WIP overlay.")
+    ws_id: str | None = Field(default=None, max_length=512, description="ws_open ID")
     module_name: str = Field(..., min_length=1, max_length=200)
 
     @field_validator("module_name")
@@ -989,7 +989,7 @@ class ReaApiInspectRequest(BaseModel):
     """Read-only static inventory of external API integrations in an addon."""
     client_name: str | None = Field(default=None, max_length=120)
     project_path: str | None = Field(default=None, max_length=1000)
-    ws_id: str | None = Field(default=None, max_length=512, description="ws_open ID; includes the current WIP overlay.")
+    ws_id: str | None = Field(default=None, max_length=512, description="ws_open ID")
     module_name: str = Field(..., min_length=1, max_length=200)
 
     @field_validator("module_name")
@@ -1020,7 +1020,7 @@ class ReaImpactRequest(BaseModel):
     """Predict likely Odoo addon impact from bounded proposed changes."""
     client_name: str | None = Field(default=None, max_length=120)
     project_path: str | None = Field(default=None, max_length=1000)
-    ws_id: str | None = Field(default=None, max_length=512, description="ws_open ID; includes the current WIP overlay.")
+    ws_id: str | None = Field(default=None, max_length=512, description="ws_open ID")
     module_name: str = Field(..., min_length=1, max_length=200)
     changed_files: list[ReaImpactChangeFile] = Field(..., min_length=1, max_length=30)
     runtime_events: list[dict[str, Any]] = Field(default_factory=list, max_length=2000)
