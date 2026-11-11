@@ -72,19 +72,20 @@ class ReaRuntimeRegistryService:
         for relation in dependencies.get("cross_module_relationships", []):
             if not isinstance(relation, dict) or relation.get("kind") != "relates_to_model":
                 continue
-            model = str(relation.get("source_model") or "")
+            model = str(relation.get("model") or relation.get("source_model") or "")
             field_name = str(relation.get("field") or relation.get("field_name") or "")
+            static_comodel = relation.get("comodel") or relation.get("target_model")
             if not model or not field_name:
                 continue
             live = runtime_fields.get((model, field_name))
             field_evidence.append({
                 "model": model,
                 "field": field_name,
-                "static_comodel": relation.get("target_model"),
+                "static_comodel": static_comodel,
                 "runtime_present": live is not None,
                 "runtime_type": live.get("ttype") if live else None,
                 "runtime_relation": live.get("relation") if live else None,
-                "relation_match": bool(live and live.get("relation") == relation.get("target_model")),
+                "relation_match": bool(live and live.get("relation") == static_comodel),
             })
 
         static_modules = {
