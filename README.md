@@ -796,6 +796,43 @@ Example MCP arguments:
 Optional `runtime_events` and `proposed_changes` inputs activate the Phase 4 trace analyzer and Phase 5 impact predictor; these results are attached to the repair context too. Deployment defaults to **disabled**. Set `auto_deploy=true` only when deployment is explicitly authorized. The workflow does not claim a fix merely because files were written: the existing debug workflow requires its verification evidence before reporting a verified repair. Ambiguous addon resolution blocks the workflow before repair. REA's source scans are static evidence, not proof of runtime behavior.
 
 
+
+## REA Phase 8 — Stateless GitHub workspace analysis
+
+REA X-Ray, upstream comparison, external API inspection, and impact prediction
+accept an optional `ws_id` returned by `ws_open`. When supplied, the analyzer
+rebuilds the module from the selected GitHub branch and its persisted WIP
+journal, so the current unpublished workspace overlay is included. The source
+snapshot is bounded (maximum 120 files and 2 MB), materialized only in a
+temporary directory for the existing AST/XML analyzers, and removed when the
+request completes. No persistent Render checkout is required.
+
+Example sequence:
+
+```json
+{
+  "module_name": "my_custom_addon",
+  "ws_id": "the_ws_id_returned_by_ws_open"
+}
+```
+
+Use the same `ws_id` with `rea_xray_module`, `rea_api_inspect`,
+`rea_upstream_compare`, or `rea_impact_predict`. The `module_name` must match
+the module encoded in the workspace ID. If `ws_id` is omitted, the existing
+local-checkout behavior remains available.
+
+For workspace upstream comparison, the connector reads the addon manifest's
+Odoo series and fetches matching Community source from `odoo/odoo` (for example
+`18.0`) through the configured GitHub token. This avoids relying on
+`/home/odoo/src` being present on Render. Enterprise/private source remains
+out of scope. Only direct manifest dependencies are compared in this phase;
+transitive dependency closure is a later phase.
+
+`rea_self_heal` continues to use the existing checkout-backed debug/fix
+workflow. The stateless analysis tools do not imply that a repair, push,
+deployment, or module upgrade has occurred.
+
+
 ## Odoo 19+ External JSON-2 transport
 
 For Odoo 19+ databases that expose External JSON-2, add `odoo_api_key` to the selected `ODOO_CLIENTS` entry (or set `ODOO_API_KEY` for single-client configuration). The connector uses `POST /json/2/<model>/<method>` with `Authorization: bearer <key>` for `search_read`, `read_group`, `fields_get`, `read`, `create`, `write`, access-right checks, and business actions that use named arguments. Recordset methods send `ids`; create sends `vals_list`; write sends `vals`. JSON-2 has no positional-argument support, so actions that require positional arguments return a clear unsupported-arguments error. The transport sends named parameters and `X-Odoo-Database` when configured. When no API key is supplied, existing username/password clients continue using legacy JSON-RPC. API keys are never included in public client metadata. JSON-2 may require an eligible Odoo plan, and each request runs in its own transaction; multi-step business operations requiring atomicity should be implemented as one server-side Odoo method.
