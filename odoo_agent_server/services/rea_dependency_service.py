@@ -331,7 +331,9 @@ class ReaDependencyService:
                 for row in model_rows[:500]
             ],
             "coverage": {
-                "repository_addons": len(manifests),\n                "manifest_files_omitted": len(manifest_omitted),\n                "manifest_bytes_fetched": manifest_bytes,
+                "repository_addons": len(manifests),
+                "manifest_files_omitted": len(manifest_omitted),
+                "manifest_bytes_fetched": manifest_bytes,
                 "candidate_manifests": len(manifest_paths),
                 "manifests_scanned": len(manifests),
                 "included_modules": len(included_roots),
