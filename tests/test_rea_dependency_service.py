@@ -83,24 +83,24 @@ def test_phase9_transitive_reverse_cycles_and_cross_module_model_fields():
 
 def test_phase9_uses_target_wip_overlay_for_manifest_and_model_files():
     files = {
-        "addons/a_mod/__manifest__.py": "{'depends': ['b_mod']}\\n",
-        "addons/a_mod/models/base.py": "VALUE = 1\\n",
-        "addons/b_mod/__manifest__.py": "{'depends': []}\\n",
-        "addons/c_mod/__manifest__.py": "{'depends': ['a_mod']}\\n",
+        "addons/a_mod/__manifest__.py": "{'depends': ['b_mod']}\n",
+        "addons/a_mod/models/base.py": "VALUE = 1\n",
+        "addons/b_mod/__manifest__.py": "{'depends': []}\n",
+        "addons/c_mod/__manifest__.py": "{'depends': ['a_mod']}\n",
         "addons/c_mod/models/c.py": (
-            "from odoo import models\\n"
-            "class CModel(models.Model):\\n"
-            "    _name = 'c.model'\\n"
+            "from odoo import models\n"
+            "class CModel(models.Model):\n"
+            "    _name = 'c.model'\n"
         ),
     }
     _transport, workspace = _workspace(files)
     workspace.overlay = {
-        "addons/a_mod/__manifest__.py": "{'depends': ['c_mod']}\\n",
+        "addons/a_mod/__manifest__.py": "{'depends': ['c_mod']}\n",
         "addons/a_mod/models/base.py": None,
         "addons/a_mod/models/new.py": (
-            "from odoo import models\\n"
-            "class OverlayModel(models.Model):\\n"
-            "    _name = 'overlay.model'\\n"
+            "from odoo import models\n"
+            "class OverlayModel(models.Model):\n"
+            "    _name = 'overlay.model'\n"
         ),
     }
     result = ReaDependencyService().analyze(
