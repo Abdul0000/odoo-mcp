@@ -99,6 +99,13 @@ def test_provider_exposes_all_read_only_rea_analysis_tools():
         assert tool["annotations"]["idempotentHint"] is True
 
 
+def test_rea_xray_provider_description_mentions_phase9_dependency_intelligence():
+    tools = {tool["name"]: tool for tool in _mcp_tools_list()}
+    description = tools["rea_xray_module"]["description"]
+    assert "reverse dependencies" in description
+    assert len(description) <= 220
+
+
 def test_rea_analysis_tools_accept_stateless_workspace_ids():
     tools = {tool["name"]: tool for tool in _mcp_tools_list()}
     for name in (
