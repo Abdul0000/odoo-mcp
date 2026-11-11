@@ -149,7 +149,7 @@ def test_phase9_impact_prediction_includes_reverse_dependents_and_cycles():
 
 def test_phase9_reports_external_dependencies_and_respects_module_bound():
     files = {
-        "addons/a_mod/__manifest__.py": "{'depends': ['b_mod', 'd_mod', 'e_mod', 'f_mod', 'g_mod', 'base', 'enterprise_secret']}\n",
+        "addons/a_mod/__manifest__.py": "{'depends': ['base', 'enterprise_secret', 'b_mod', 'd_mod', 'e_mod', 'f_mod', 'g_mod']}\n",
         "addons/a_mod/models/a.py": "VALUE = 1\n",
         "addons/b_mod/__manifest__.py": "{'depends': []}\n",
         "addons/c_mod/__manifest__.py": "{'depends': ['a_mod']}\n",
