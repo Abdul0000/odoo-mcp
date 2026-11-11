@@ -42,7 +42,6 @@ class ReaGitHubUpstreamTests(unittest.TestCase):
             ),
         }
         transport = FakeGitHub(core_files, branch="18.0")
-        core_repo = GitHubRepo("odoo", "odoo", "test-token", transport=transport, sleep=lambda _s: None)
         workspace = SimpleNamespace(
             repo=SimpleNamespace(token="test-token", transport=transport, sleep=lambda _s: None)
         )
