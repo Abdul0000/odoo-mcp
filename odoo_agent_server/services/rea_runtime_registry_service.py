@@ -95,6 +95,13 @@ class ReaRuntimeRegistryService:
             if isinstance(row, dict) and row.get("module")
         }
         static_modules.add(str(dependencies.get("module_name") or ""))
+        for relation in dependencies.get("cross_module_relationships", []):
+            if isinstance(relation, dict):
+                static_modules.update(
+                    str(relation[key])
+                    for key in ("source_module", "target_module")
+                    if relation.get(key)
+                )
         module_evidence = []
         for module in sorted(name for name in static_modules if name):
             live = runtime_modules.get(module)
