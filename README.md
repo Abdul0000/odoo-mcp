@@ -867,3 +867,22 @@ For Odoo 19+ databases that expose External JSON-2, add `odoo_api_key` to the se
 
 
 **Deployment note:** an existing Render environment variable overrides code defaults. Set `ODOO_AGENT_REQUIRE_APPROVAL=true` in the Render service environment and redeploy to activate the new default on an already-configured service. Existing explicit `false` values remain respected for compatibility.
+
+
+
+## REA Phase 10 — Runtime-aware dependency intelligence
+
+rea_xray_module and workspace-backed rea_impact_predict can reconcile static
+addon dependency/model evidence with the selected database's live Odoo
+registry. Pass an explicit client_name to enable the bounded, read-only
+registry check. The connector queries ir.model, ir.model.fields, and
+ir.module.module through the existing OdooService transport (SSH-first,
+HTTPS JSON-RPC fallback); it never writes records or executes addon code.
+
+The result labels runtime evidence separately from static inference and reports
+model presence, Odoo's registered owning modules, relation-field confirmation,
+module installation state, query errors, and truncation coverage. A failed or
+partial registry query is marked incomplete and is never interpreted as proof
+that a model or module is absent. Registry presence confirms metadata only,
+not method execution. The scan is bounded to 250 models, 3,000 fields, and 150
+modules. Omitting client_name keeps the analysis static-only.
