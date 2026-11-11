@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     require_approval: bool = Field(default=True, alias="ODOO_AGENT_REQUIRE_APPROVAL")
     approval_required_actions_raw: str = Field(default="repo.prepare,repo.write,repo.delete,repo.apply_patch,repo.apply_patch_atomic,repo.clean_pyc,git.commit,git.push,odoo.module_install,odoo.module_update,odoosh.module_install_ssh,odoosh.module_deploy_ssh,workflow.safe_deploy_module,odoo.record_action.*", alias="ODOO_AGENT_APPROVAL_REQUIRED_ACTIONS")
     protected_branches_raw: str = Field(default="", alias="ODOO_AGENT_PROTECTED_BRANCHES")
-    # ws_* workspace tools (GitHub API engine; no clone, no local state)
+    # ws_* workspace tools (GitHub/GitLab REST API; no clone, no local state)
     github_token: str | None = Field(default=None, alias="GITHUB_TOKEN")
     ws_protected_branches_raw: str = Field(default="main,master,production,prod,live", alias="ODOO_AGENT_WS_PROTECTED_BRANCHES")
     ws_autocheckpoint: bool = Field(default=True, alias="ODOO_AGENT_WS_AUTOCHECKPOINT")
