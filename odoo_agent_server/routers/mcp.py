@@ -728,7 +728,7 @@ _PROVIDER_COMPACT_TOOL_DESCRIPTIONS = {
         "Read-only addon architecture analysis with bounded source evidence and optional live checks."
     ),
     "rea.xray_module": (
-        "Read-only addon graph from local source or ws_id workspace, with source evidence."
+        "Read-only addon graph; ws_id also maps transitive/reverse dependencies and cross-module model/field links."
     ),
     "rea.upstream_compare": (
         "Compare workspace overrides and fields with matching Odoo Community source via GitHub; advisory only."
