@@ -825,12 +825,40 @@ For workspace upstream comparison, the connector reads the addon manifest's
 Odoo series and fetches matching Community source from `odoo/odoo` (for example
 `18.0`) through the configured GitHub token. This avoids relying on
 `/home/odoo/src` being present on Render. Enterprise/private source remains
-out of scope. Only direct manifest dependencies are compared in this phase;
-transitive dependency closure is a later phase.
+out of scope. Phase 9 resolves transitive and reverse dependencies among addons
+visible in the same GitHub repository; core, Enterprise, and external-repository
+dependencies remain unresolved when their source is not in that repository.
 
 `rea_self_heal` continues to use the existing checkout-backed debug/fix
 workflow. The stateless analysis tools do not imply that a repair, push,
 deployment, or module upgrade has occurred.
+
+
+
+## REA Phase 9 — Transitive dependency intelligence
+
+The stateless `rea_xray_module` response now includes a `rea_dependencies`
+section when called with a `ws_id`. It inspects addon manifests in the same
+GitHub repository and returns:
+
+- `transitive_dependencies`: bounded breadth-first dependency closure with depth.
+- `reverse_dependents`: direct and transitive sibling addons that depend on the target.
+- `dependency_cycles` and `cycle_modules`: detected cycles in the visible addon graph.
+- `cross_module_relationships`: source-evidenced model inheritance/delegation and relational-field links between addons.
+- `model_ownership`: module, model, role, and source location.
+- `unresolved_dependencies` and `ambiguous_dependencies`: dependencies not safely resolvable inside the repository.
+
+Traversal is cycle-safe and bounded to at most 100 modules, 240 Python files,
+a 2 MB source budget, and depth 12. Coverage reports manifest/file omissions
+instead of silently treating a partial scan as complete. The target module's
+current WIP overlay is included; sibling addons use the selected branch
+snapshot. Core, Enterprise, and external-repository dependencies are not
+pretended to be resolved.
+
+The stateless `rea_impact_predict` path now accepts this dependency evidence
+internally and reports affected reverse-dependent addons, cross-module links,
+and dependency-cycle risk alongside the existing component-level prediction.
+These results remain static and advisory, not proof of runtime impact.
 
 
 ## Odoo 19+ External JSON-2 transport
