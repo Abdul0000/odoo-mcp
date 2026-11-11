@@ -19,6 +19,7 @@ def _workspace(files):
         module="a_mod",
         branch="staging",
         base_commit=head["commit"],
+        overlay={},
     )
 
 
