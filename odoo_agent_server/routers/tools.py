@@ -197,6 +197,7 @@ from ..services.rea_upstream_service import ReaUpstreamService
 from ..services.rea_api_inspect_service import ReaApiInspectService
 from ..services.rea_runtime_trace_service import ReaRuntimeTraceService
 from ..services.rea_impact_service import ReaImpactService
+from ..services.rea_workspace_service import rea_workspace_snapshot
 from ..services.live_assertion_service import LiveAssertionService
 from ..services.functional_operation_service import FunctionalOperationService
 from ..services.module_test_service import ModuleTestService
@@ -480,7 +481,7 @@ _TOOL_DESCRIPTORS = [
         description=(
             "Read-only REA X-Ray: map a custom addon into an evidence-backed graph of modules, "
             "models, inheritance, relational fields, methods, views, actions, menus and UI-to-method links. "
-            "Uses bounded local AST/XML analysis; never executes addon code or contacts external hosts."
+            "Accepts a local addon path or stateless ws_id from ws_open; uses bounded AST/XML analysis and never executes addon code or contacts external hosts."
         ),
         read_only=True,
         idempotent=True,
@@ -488,7 +489,7 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(
         name="rea.upstream_compare",
         title="Compare addon with Odoo upstream",
-        description="Read-only comparison of custom model overrides and fields against installed Odoo source; returns evidence-backed advisory findings.",
+        description="Read-only comparison of custom overrides and fields against installed Odoo source. Supports stateless ws_id and fetches matching Community source from GitHub; findings are advisory.",
         read_only=True,
         idempotent=True,
     ),
@@ -502,14 +503,14 @@ _TOOL_DESCRIPTORS = [
     ToolDescriptor(
         name="rea.api_inspect",
         title="Inspect external API integrations",
-        description="Static, read-only inventory of addon HTTP/RPC calls, routes, endpoint configuration and TLS/timeout settings; never connects to endpoints.",
+        description="Static, read-only inventory of addon HTTP/RPC calls, routes, endpoint configuration and TLS/timeout settings. Supports ws_id; never connects to endpoints.",
         read_only=True,
         idempotent=True,
     ),
     ToolDescriptor(
         name="rea.impact_predict",
         title="Predict Odoo change impact",
-        description="Predict affected addon components and risk from proposed file diffs using the static architecture graph and optional exported trace evidence; advisory and read-only.",
+        description="Predict affected addon components and risk from proposed diffs using workspace source, architecture, upstream/API evidence and optional trace data; advisory and read-only.",
         read_only=True,
         idempotent=True,
     ),
@@ -9003,6 +9004,23 @@ async def _dispatch_inner(name: str, args: dict) -> object:
         request = ModuleAnalyzeRequest.model_validate(args)
         return await asyncio.to_thread(_workflow_module_analyze, request)
     if name == "rea.xray_module":
+        if request.ws_id:
+            with rea_workspace_snapshot(request.ws_id, max_files=request.max_files) as snapshot:
+                if snapshot["module_name"] != request.module_name:
+                    return {"status": "error", "error_code": "workspace_module_mismatch", "error": "module_name must match the module encoded in ws_id", "workspace_module": snapshot["module_name"]}
+                graph = await asyncio.to_thread(
+                    ReaXrayService().build,
+                    module_path=snapshot["module_path"],
+                    module_name=snapshot["module_name"],
+                    max_files=request.max_files,
+                )
+                return {
+                    "status": "analyzed",
+                    "module_name": snapshot["module_name"],
+                    "rea_xray": graph,
+                    "workspace_source": snapshot["source"],
+                    "workspace_coverage": snapshot["coverage"],
+                }
         request = ReaXrayRequest.model_validate(args)
         analysis_request = ModuleAnalyzeRequest(
             client_name=request.client_name,
@@ -9026,6 +9044,23 @@ async def _dispatch_inner(name: str, args: dict) -> object:
         )
         return result
     if name == "rea.upstream_compare":
+        if request.ws_id:
+            with rea_workspace_snapshot(request.ws_id) as snapshot:
+                if snapshot["module_name"] != request.module_name:
+                    return {"status": "error", "error_code": "workspace_module_mismatch", "error": "module_name must match the module encoded in ws_id", "workspace_module": snapshot["module_name"]}
+                report = await asyncio.to_thread(
+                    ReaUpstreamService().compare_workspace,
+                    files=snapshot["files"],
+                    module_name=snapshot["module_name"],
+                    workspace=snapshot["workspace"],
+                )
+                return {
+                    "status": report.get("status", "compared"),
+                    "module_name": snapshot["module_name"],
+                    "rea_upstream": report,
+                    "workspace_source": snapshot["source"],
+                    "workspace_coverage": snapshot["coverage"],
+                }
         request = ReaUpstreamRequest.model_validate(args)
         base_request = ModuleAnalyzeRequest(client_name=request.client_name, project_path=request.project_path, module_name=request.module_name)
         result = await asyncio.to_thread(_workflow_module_analyze, base_request)
@@ -9155,6 +9190,47 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             },
         }
     if name == "rea.impact_predict":
+        if request.ws_id:
+            with rea_workspace_snapshot(request.ws_id) as snapshot:
+                if snapshot["module_name"] != request.module_name:
+                    return {"status": "error", "error_code": "workspace_module_mismatch", "error": "module_name must match the module encoded in ws_id", "workspace_module": snapshot["module_name"]}
+                graph = await asyncio.to_thread(
+                    ReaXrayService().build,
+                    module_path=snapshot["module_path"],
+                    module_name=snapshot["module_name"],
+                    max_files=50,
+                )
+                upstream = await asyncio.to_thread(
+                    ReaUpstreamService().compare_workspace,
+                    files=snapshot["files"],
+                    module_name=snapshot["module_name"],
+                    workspace=snapshot["workspace"],
+                )
+                api_inspection = await asyncio.to_thread(
+                    ReaApiInspectService().inspect,
+                    module_path=snapshot["module_path"],
+                    module_name=snapshot["module_name"],
+                )
+                impact = await asyncio.to_thread(
+                    ReaImpactService().predict,
+                    module_path=snapshot["module_path"],
+                    module_name=snapshot["module_name"],
+                    changed_files=[item.model_dump() for item in request.changed_files],
+                    graph=graph,
+                    runtime_events=request.runtime_events,
+                    upstream_findings=upstream.get("findings", []),
+                    api_findings=api_inspection.get("findings", []),
+                )
+                impact["upstream_coverage"] = upstream.get("coverage", {})
+                impact["api_coverage"] = api_inspection.get("coverage", {})
+                impact["architecture_graph"] = graph.get("summary", {})
+                return {
+                    "status": "predicted",
+                    "module_name": snapshot["module_name"],
+                    "rea_impact": impact,
+                    "workspace_source": snapshot["source"],
+                    "workspace_coverage": snapshot["coverage"],
+                }
         request = ReaImpactRequest.model_validate(args)
         base_request = ModuleAnalyzeRequest(
             client_name=request.client_name,
@@ -9197,6 +9273,22 @@ async def _dispatch_inner(name: str, args: dict) -> object:
         result["rea_impact"]["architecture_graph"] = graph.get("summary", {})
         return result
     if name == "rea.api_inspect":
+        if request.ws_id:
+            with rea_workspace_snapshot(request.ws_id) as snapshot:
+                if snapshot["module_name"] != request.module_name:
+                    return {"status": "error", "error_code": "workspace_module_mismatch", "error": "module_name must match the module encoded in ws_id", "workspace_module": snapshot["module_name"]}
+                report = await asyncio.to_thread(
+                    ReaApiInspectService().inspect,
+                    module_path=snapshot["module_path"],
+                    module_name=snapshot["module_name"],
+                )
+                return {
+                    "status": "inspected",
+                    "module_name": snapshot["module_name"],
+                    "rea_api_inspection": report,
+                    "workspace_source": snapshot["source"],
+                    "workspace_coverage": snapshot["coverage"],
+                }
         request = ReaApiInspectRequest.model_validate(args)
         base_request = ModuleAnalyzeRequest(client_name=request.client_name, project_path=request.project_path, module_name=request.module_name)
         result = await asyncio.to_thread(_workflow_module_analyze, base_request)
