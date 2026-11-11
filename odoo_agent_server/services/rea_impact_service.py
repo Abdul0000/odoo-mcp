@@ -63,6 +63,7 @@ class ReaImpactService:
         runtime_events: list[dict[str, Any]] | None = None,
         upstream_findings: list[dict[str, Any]] | None = None,
         api_findings: list[dict[str, Any]] | None = None,
+        dependency_map: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         root = module_path.resolve(strict=True)
         if not root.is_dir() or not (root / "__manifest__.py").is_file():
@@ -71,6 +72,7 @@ class ReaImpactService:
             raise ValueError("changed_files must contain between 1 and 30 entries")
 
         graph = graph or {}
+        dependency_map = dependency_map or {}
         nodes = graph.get("nodes", [])
         edges = graph.get("edges", [])
         node_by_id = {str(n.get("id")): n for n in nodes if n.get("id")}
@@ -196,6 +198,30 @@ class ReaImpactService:
             if risk == "low":
                 risk = "medium"
 
+        reverse_dependents = dependency_map.get("reverse_dependents", [])
+        cross_module_relationships = dependency_map.get("cross_module_relationships", [])
+        dependency_cycles = dependency_map.get("dependency_cycles", [])
+        cycle_modules = set(dependency_map.get("cycle_modules", []))
+        affected_modules = [{"module": module_name, "depth": 0, "reason": "changed addon"}]
+        affected_modules.extend({
+            "module": item.get("module"), "depth": item.get("depth"),
+            "reason": "reverse dependency; may consume changed addon behavior",
+        } for item in reverse_dependents if isinstance(item, dict) and item.get("module"))
+        if reverse_dependents:
+            risk_reasons.append(
+                f"Changes may affect {len(reverse_dependents)} reverse-dependent addon(s) in this repository"
+            )
+            if risk == "low":
+                risk = "medium"
+            if len(reverse_dependents) >= 8:
+                risk = "high"
+        if module_name in cycle_modules:
+            risk_reasons.append("The addon participates in a dependency cycle; change propagation is harder to isolate")
+            risk = "high"
+        if cross_module_relationships and risk == "low":
+            risk = "medium"
+            risk_reasons.append("Cross-module model inheritance or relational-field links were found")
+
         return {
             "status": "predicted",
             "module_name": module_name,
@@ -208,10 +234,17 @@ class ReaImpactService:
                 "runtime_trace_matches": len(runtime_matches),
                 "upstream_matches": len(upstream_matches),
                 "api_integration_matches": len(api_matches),
+                "reverse_dependent_addons": len(reverse_dependents),
+                "cross_module_relationships": len(cross_module_relationships),
+                "dependency_cycles": len(dependency_cycles),
                 "graph_complete": bool((graph.get("coverage") or {}).get("complete", False)),
+                "dependency_map_complete": bool((dependency_map.get("coverage") or {}).get("complete", False)),
             },
             "changed_files": normalized,
             "impacted_components": sorted(impacted.values(), key=lambda x: (x["depth"], x["kind"] or "", x["name"] or "")),
+            "affected_modules": affected_modules[:100],
+            "cross_module_relationships": cross_module_relationships[:100],
+            "dependency_cycles": dependency_cycles[:30],
             "risk_reasons": list(dict.fromkeys(risk_reasons))[:50],
             "runtime_trace_matches": runtime_matches[:50],
             "upstream_matches": upstream_matches,
