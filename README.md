@@ -667,7 +667,7 @@ GitHub branch `mcp/wip/<client>-<module>`. `ws_id` is self-describing, so any ca
 rebuilds the workspace by replaying the journal on the current branch head. Conflicts are reported per edit.
 
 Requirements: each client in `ODOO_CLIENTS` needs an HTTPS `github.com` repo and a `token` with
-`contents:write` (or set `GITHUB_TOKEN`). SSH-only or non-GitHub repos keep using `workflow_odoo_code_change`.
+For GitHub, use a token with `contents:write` (or `GITHUB_TOKEN`). GitLab HTTPS/SSH projects are supported through the GitLab v4 API; set a project access token or personal access token with `api` scope in the client's `token` field. SSH URLs are parsed as repository addresses; API access still uses HTTPS and the token. Other providers keep using `workflow_odoo_code_change`.
 
 What `ws_edit` wires for you: new `.py` files get their `from . import` (creating `__init__.py` chains), new
 `views|security|data|report|wizard|demo` XML/CSV files are added to the manifest (security first), and *deleting* such a
@@ -797,7 +797,7 @@ Optional `runtime_events` and `proposed_changes` inputs activate the Phase 4 tra
 
 
 
-## REA Phase 8 — Stateless GitHub workspace analysis
+## REA Phase 8 — Stateless Git workspace analysis
 
 REA X-Ray, upstream comparison, external API inspection, and impact prediction
 accept an optional `ws_id` returned by `ws_open`. When supplied, the analyzer
