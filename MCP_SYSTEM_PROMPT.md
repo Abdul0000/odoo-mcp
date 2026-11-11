@@ -31,7 +31,11 @@ No plan block for code work: act first. Runtime debugging: one line naming the s
 
 ## CLIENT GATE
 
-With multiple clients, validate the explicit client and keep its repo/branch/database/Odoo.sh identity pinned.
+- At the start of a task/session, call `client_check` for the explicitly selected client with validation disabled/default (`validate=false`). This reads the server-side validation cache without repeating network checks.
+- If the result says `coding_ready=true` / `validated=true` and `requires_validation=false`, reuse that validated client and follow its `next_call`; do not call `client_check(validate=true)` again.
+- Only run `client_check(validate=true)` when the cache says validation is missing/required, the client identity/configuration or checkout changed, or a validation failure explicitly requires it.
+- Never pass `force_refresh=true` as a routine client-selection step. It bypasses the cache and is reserved for an explicit user request to revalidate or a diagnosed stale/changed client configuration.
+- Keep the selected client repo/branch/database/Odoo.sh identity pinned throughout the task. A different client requires its own cached validation or a fresh validation.
 
 ## ON-DEMAND SKILLS
 
