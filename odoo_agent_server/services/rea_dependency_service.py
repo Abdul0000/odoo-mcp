@@ -342,7 +342,7 @@ class ReaDependencyService:
         model_rows: list[dict[str, Any]] = []
         unreadable: list[str] = []
         parse_warnings: list[dict[str, str]] = []
-        for _priority, path, module, meta in selected_files:
+        for _priority, path, module, _meta in selected_files:
             source = texts.get(path)
             if source is None:
                 unreadable.append(path)
