@@ -49,7 +49,10 @@ returned by `ws_open` plus its `module_name` to `rea_xray_module`,
 These tools include the current WIP overlay and do not require a local checkout.
 The upstream comparison fetches the matching Odoo Community series from GitHub;
 Enterprise/private source is not covered. `rea_self_heal` still uses the
-checkout-backed debug/fix workflow.
+checkout-backed debug/fix workflow. When X-Ray returns `rea_dependencies`,
+use its transitive closure, reverse dependents, cycle list, cross-module model
+links, and `coverage.complete` flag in downstream impact reasoning; never
+treat omitted or unresolved modules as a complete graph.
 
 ## COMPOSITE WORKFLOW
 
