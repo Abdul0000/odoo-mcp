@@ -162,8 +162,6 @@ class ReaDependencyService:
         deps_by_root: dict[str, list[str]] = {}
         root_by_name = {name: roots[0] for name, roots in module_paths.items() if len(roots) == 1}
         ambiguous = sorted(name for name, roots in module_paths.items() if len(roots) > 1)
-        if target_name in ambiguous:
-            ambiguous_deps.add(target_name)
         for root, manifest in manifests.items():
             raw_dependencies = manifest.get("depends", [])
             if not isinstance(raw_dependencies, (list, tuple, set)):
@@ -175,6 +173,8 @@ class ReaDependencyService:
 
         unresolved: set[str] = set()
         ambiguous_deps: set[str] = set()
+        if target_name in ambiguous:
+            ambiguous_deps.add(target_name)
         forward_depth: dict[str, int] = {target_root: 0}
         forward_depth_hit = False
         forward_truncated = False
