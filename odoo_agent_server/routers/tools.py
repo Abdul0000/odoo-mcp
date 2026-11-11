@@ -9004,6 +9004,7 @@ async def _dispatch_inner(name: str, args: dict) -> object:
         request = ModuleAnalyzeRequest.model_validate(args)
         return await asyncio.to_thread(_workflow_module_analyze, request)
     if name == "rea.xray_module":
+        request = ReaXrayRequest.model_validate(args)
         if request.ws_id:
             with rea_workspace_snapshot(request.ws_id, max_files=request.max_files) as snapshot:
                 if snapshot["module_name"] != request.module_name:
@@ -9021,7 +9022,6 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     "workspace_source": snapshot["source"],
                     "workspace_coverage": snapshot["coverage"],
                 }
-        request = ReaXrayRequest.model_validate(args)
         analysis_request = ModuleAnalyzeRequest(
             client_name=request.client_name,
             project_path=request.project_path,
@@ -9044,6 +9044,7 @@ async def _dispatch_inner(name: str, args: dict) -> object:
         )
         return result
     if name == "rea.upstream_compare":
+        request = ReaUpstreamRequest.model_validate(args)
         if request.ws_id:
             with rea_workspace_snapshot(request.ws_id) as snapshot:
                 if snapshot["module_name"] != request.module_name:
@@ -9061,7 +9062,6 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     "workspace_source": snapshot["source"],
                     "workspace_coverage": snapshot["coverage"],
                 }
-        request = ReaUpstreamRequest.model_validate(args)
         base_request = ModuleAnalyzeRequest(client_name=request.client_name, project_path=request.project_path, module_name=request.module_name)
         result = await asyncio.to_thread(_workflow_module_analyze, base_request)
         if result.get("status") != "analyzed":
@@ -9190,6 +9190,7 @@ async def _dispatch_inner(name: str, args: dict) -> object:
             },
         }
     if name == "rea.impact_predict":
+        request = ReaImpactRequest.model_validate(args)
         if request.ws_id:
             with rea_workspace_snapshot(request.ws_id) as snapshot:
                 if snapshot["module_name"] != request.module_name:
@@ -9231,7 +9232,6 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     "workspace_source": snapshot["source"],
                     "workspace_coverage": snapshot["coverage"],
                 }
-        request = ReaImpactRequest.model_validate(args)
         base_request = ModuleAnalyzeRequest(
             client_name=request.client_name,
             project_path=request.project_path,
@@ -9273,6 +9273,7 @@ async def _dispatch_inner(name: str, args: dict) -> object:
         result["rea_impact"]["architecture_graph"] = graph.get("summary", {})
         return result
     if name == "rea.api_inspect":
+        request = ReaApiInspectRequest.model_validate(args)
         if request.ws_id:
             with rea_workspace_snapshot(request.ws_id) as snapshot:
                 if snapshot["module_name"] != request.module_name:
@@ -9289,7 +9290,6 @@ async def _dispatch_inner(name: str, args: dict) -> object:
                     "workspace_source": snapshot["source"],
                     "workspace_coverage": snapshot["coverage"],
                 }
-        request = ReaApiInspectRequest.model_validate(args)
         base_request = ModuleAnalyzeRequest(client_name=request.client_name, project_path=request.project_path, module_name=request.module_name)
         result = await asyncio.to_thread(_workflow_module_analyze, base_request)
         if result.get("status") != "analyzed":
