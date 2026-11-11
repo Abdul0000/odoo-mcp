@@ -9,7 +9,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from .workspace_factory import workspace_service
 
@@ -98,3 +98,19 @@ def rea_workspace_snapshot(
                 "complete": not omitted and not unreadable,
             },
         }
+
+
+def run_rea_workspace(
+    ws_id: str, module_name: str, analyzer: Callable[[dict[str, Any]], dict[str, Any]],
+    *, max_files: int = 80,
+) -> dict[str, Any]:
+    """Run one REA analyzer in the caller's worker thread within a temp snapshot."""
+    with rea_workspace_snapshot(ws_id, max_files=max_files) as snapshot:
+        if snapshot["module_name"] != module_name:
+            return {
+                "status": "error",
+                "error_code": "workspace_module_mismatch",
+                "error": "module_name must match the module encoded in ws_id",
+                "workspace_module": snapshot["module_name"],
+            }
+        return analyzer(snapshot)
