@@ -693,7 +693,7 @@ to compact JSON whenever TOON is not smaller, so it can never grow a response. `
 
 ### Running the offline tests
 ```
-python -m unittest tests.test_toon_service tests.test_workspace_service tests.test_ws_tool_wiring
+python -m unittest tests.test_toon_service tests.test_workspace_service tests.test_gitlab_commit_service tests.test_ws_tool_wiring
 ```
 (stdlib only; they use an in-memory fake of the GitHub Git Data API in `tests/support/fake_github.py`.)
 
