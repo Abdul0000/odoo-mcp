@@ -167,11 +167,16 @@ class ReaDependencyService:
         unresolved: set[str] = set()
         ambiguous_deps: set[str] = set()
         forward_depth: dict[str, int] = {target_root: 0}
+        forward_depth_hit = False
         queue = deque([target_root])
         while queue and len(forward_depth) < max_modules:
             root = queue.popleft()
             depth = forward_depth[root]
             if depth >= max_depth:
+                forward_depth_hit = forward_depth_hit or any(
+                    root_by_name.get(dep) not in forward_depth
+                    for dep in deps_by_root.get(root, []) if root_by_name.get(dep)
+                )
                 continue
             for dep in deps_by_root.get(root, []):
                 if dep in ambiguous:
@@ -184,6 +189,7 @@ class ReaDependencyService:
                 if dep_root not in forward_depth:
                     forward_depth[dep_root] = depth + 1
                     queue.append(dep_root)
+        forward_truncated = bool(queue)
 
         reverse_by_root: dict[str, list[str]] = {}
         for root, deps in deps_by_root.items():
@@ -192,20 +198,28 @@ class ReaDependencyService:
                 if dep_root:
                     reverse_by_root.setdefault(dep_root, []).append(root)
         reverse_depth: dict[str, int] = {target_root: 0}
+        reverse_depth_hit = False
         queue = deque([target_root])
         while queue and len(reverse_depth) < max_modules:
             root = queue.popleft()
             depth = reverse_depth[root]
             if depth >= max_depth:
+                reverse_depth_hit = reverse_depth_hit or any(
+                    dependent not in reverse_depth for dependent in reverse_by_root.get(root, [])
+                )
                 continue
             for dependent in sorted(reverse_by_root.get(root, [])):
                 if dependent not in reverse_depth:
                     reverse_depth[dependent] = depth + 1
                     queue.append(dependent)
+        reverse_truncated = bool(queue)
 
         included_roots = set(forward_depth) | set(reverse_depth)
         included_roots.add(target_root)
-        module_limit_hit = len(included_roots) > max_modules or len(manifest_paths) > candidate_limit
+        module_limit_hit = (
+            forward_truncated or reverse_truncated or forward_depth_hit or reverse_depth_hit
+            or len(included_roots) > max_modules or len(manifest_paths) > candidate_limit
+        )
         included_roots = set(sorted(included_roots, key=lambda p: (p != target_root, p))[:max_modules])
         forward_depth = {k: v for k, v in forward_depth.items() if k in included_roots}
         reverse_depth = {k: v for k, v in reverse_depth.items() if k in included_roots}
@@ -275,6 +289,7 @@ class ReaDependencyService:
         if fetch_files:
             texts.update(workspace.repo.blobs_text(fetch_files))
         source_chars = 0
+        files_scanned = 0
         model_rows: list[dict[str, Any]] = []
         unreadable: list[str] = []
         for _priority, path, module, meta in selected_files:
@@ -289,6 +304,7 @@ class ReaDependencyService:
                 omitted_files.append(path)
                 continue
             source_chars += len(source)
+            files_scanned += 1
             model_rows.extend(self._parse_models(source, path, module))
 
         model_modules: dict[str, set[str]] = {}
@@ -343,11 +359,14 @@ class ReaDependencyService:
             "coverage": {
                 "repository_addons": len(manifests),
                 "manifest_files_omitted": len(manifest_omitted),
+                "manifest_omitted_paths": manifest_omitted[:100],
                 "manifest_bytes_fetched": manifest_bytes,
+                "dependency_depth_truncated": forward_depth_hit or reverse_depth_hit,
+                "module_count_truncated": forward_truncated or reverse_truncated,
                 "candidate_manifests": len(manifest_paths),
                 "manifests_scanned": len(manifests),
                 "included_modules": len(included_roots),
-                "python_files_scanned": len(selected_files) - len(unreadable),
+                "python_files_scanned": files_scanned,
                 "python_files_omitted": len(set(omitted_files)),
                 "unreadable_files": unreadable[:100],
                 "source_chars": source_chars,
