@@ -1,7 +1,10 @@
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from odoo_agent_server.services.github_commit_service import GitHubRepo
 from odoo_agent_server.services.rea_dependency_service import ReaDependencyService
+from odoo_agent_server.services.rea_impact_service import ReaImpactService
 from tests.support.fake_github import FakeGitHub
 
 
@@ -75,6 +78,38 @@ def test_phase9_transitive_reverse_cycles_and_cross_module_model_fields():
     )
     assert result["coverage"]["complete"] is True
 
+
+
+def test_phase9_impact_prediction_includes_reverse_dependents_and_cycles():
+    with TemporaryDirectory(prefix="rea-impact-") as temp:
+        root = Path(temp)
+        (root / "models").mkdir()
+        (root / "__manifest__.py").write_text("{'depends': []}\\n", encoding="utf-8")
+        (root / "models" / "a.py").write_text("VALUE = 1\\n", encoding="utf-8")
+        dependency_map = {
+            "reverse_dependents": [
+                {"module": "d_mod", "depth": 1},
+                {"module": "e_mod", "depth": 2},
+            ],
+            "cross_module_relationships": [
+                {"source_module": "a_mod", "target_module": "b_mod", "kind": "extends_model"}
+            ],
+            "dependency_cycles": [["a_mod", "b_mod", "a_mod"]],
+            "cycle_modules": ["a_mod", "b_mod"],
+            "coverage": {"complete": True},
+        }
+        result = ReaImpactService().predict(
+            module_path=root,
+            module_name="a_mod",
+            changed_files=[{"path": "models/a.py", "diff": "+VALUE = 2"}],
+            dependency_map=dependency_map,
+        )
+
+    assert result["risk"] == "high"
+    assert {row["module"] for row in result["affected_modules"]} == {"a_mod", "d_mod", "e_mod"}
+    assert result["summary"]["reverse_dependent_addons"] == 2
+    assert result["summary"]["dependency_cycles"] == 1
+    assert result["dependency_cycles"] == dependency_map["dependency_cycles"]
 
 def test_phase9_reports_external_dependencies_and_respects_module_bound():
     files = {
