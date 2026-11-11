@@ -107,17 +107,25 @@ class ReaDependencyService:
         target_manifest_path = f"{target_root}/__manifest__.py" if target_root else "__manifest__.py"
         if target_manifest_path not in manifest_paths:
             raise ValueError("target addon manifest is missing from the GitHub workspace tree")
-        candidate_limit = min(len(manifest_paths), max_modules * 4 + 20)
+        candidate_limit = min(len(manifest_paths), max_modules * 2 + 20, 220)
         selected_manifest_paths = manifest_paths[:candidate_limit]
         if target_manifest_path not in selected_manifest_paths:
             selected_manifest_paths = [target_manifest_path] + selected_manifest_paths[:candidate_limit - 1]
         manifest_texts: dict[str, str] = {}
         for path, source in files.items():
             manifest_texts[f"{target_root}/{path}" if target_root else path] = source
-        fetch = {
-            path: tree[path]["sha"] for path in selected_manifest_paths
-            if path not in manifest_texts and int(tree[path].get("size", 0)) <= self.MAX_FILE_BYTES
-        }
+        manifest_bytes = 0
+        fetch: dict[str, str] = {}
+        manifest_omitted: list[str] = []
+        for path in selected_manifest_paths:
+            if path in manifest_texts:
+                continue
+            size = int(tree[path].get("size", 0))
+            if size > 64_000 or manifest_bytes + size > 1_500_000:
+                manifest_omitted.append(path)
+                continue
+            fetch[path] = tree[path]["sha"]
+            manifest_bytes += size
         if fetch:
             manifest_texts.update(workspace.repo.blobs_text(fetch))
         manifests: dict[str, dict[str, Any]] = {}
@@ -126,7 +134,8 @@ class ReaDependencyService:
         for path in selected_manifest_paths:
             source = manifest_texts.get(path)
             if source is None:
-                malformed.append(path)
+                if path not in manifest_omitted:
+                    malformed.append(path)
                 continue
             manifest = self._manifest(source)
             if manifest is None:
@@ -245,10 +254,17 @@ class ReaDependencyService:
         selected_files = candidates[:max_files]
         omitted_files = [row[1] for row in candidates[max_files:]]
         texts = {f"{target_root}/{path}" if target_root else path: source for path, source in files.items()}
-        fetch_files = {
-            path: meta["sha"] for _priority, path, _module, meta in selected_files
-            if path not in texts and int(meta.get("size", 0)) <= self.MAX_FILE_BYTES
-        }
+        fetch_files: dict[str, str] = {}
+        fetch_bytes = 0
+        for _priority, path, _module, meta in selected_files:
+            if path in texts:
+                continue
+            size = int(meta.get("size", 0))
+            if size > self.MAX_FILE_BYTES or fetch_bytes + size > self.MAX_TOTAL_CHARS:
+                omitted_files.append(path)
+                continue
+            fetch_files[path] = meta["sha"]
+            fetch_bytes += size
         if fetch_files:
             texts.update(workspace.repo.blobs_text(fetch_files))
         source_chars = 0
@@ -315,7 +331,7 @@ class ReaDependencyService:
                 for row in model_rows[:500]
             ],
             "coverage": {
-                "repository_addons": len(manifests),
+                "repository_addons": len(manifests),\n                "manifest_files_omitted": len(manifest_omitted),\n                "manifest_bytes_fetched": manifest_bytes,
                 "candidate_manifests": len(manifest_paths),
                 "manifests_scanned": len(manifests),
                 "included_modules": len(included_roots),
@@ -323,7 +339,7 @@ class ReaDependencyService:
                 "python_files_omitted": len(set(omitted_files)),
                 "unreadable_files": unreadable[:100],
                 "source_chars": source_chars,
-                "complete": not module_limit_hit and not malformed and not omitted_files and not unreadable,
+                "complete": not module_limit_hit and not malformed and not manifest_omitted and not omitted_files and not unreadable,
                 "manifest_scan_truncated": len(manifest_paths) > candidate_limit,
             },
             "warnings": [{"code": "MANIFEST_UNREADABLE", "path": p} for p in malformed[:50]],
