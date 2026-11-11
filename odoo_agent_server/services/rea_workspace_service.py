@@ -14,7 +14,6 @@ from typing import Any, Iterator
 from .workspace_factory import workspace_service
 
 
-_ALLOWED_SUFFIXES = {".py", ".xml"}
 _SKIP_PARTS = {".git", ".mcp-wip", "__pycache__", "static", "tests", "node_modules"}
 
 
