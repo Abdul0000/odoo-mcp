@@ -9,6 +9,7 @@ from fastapi import HTTPException
 from ..config import settings
 from .client_resolver_service import ClientResolverService
 from .github_commit_service import GitHubError, GitHubRepo, parse_repo
+from .gitlab_commit_service import GitLabRepo, parse_gitlab_repo
 from .workspace_service import ClientTarget, WorkspaceError, WorkspaceService
 
 
@@ -19,24 +20,46 @@ def _resolve(name: str | None) -> ClientTarget:
     token = client.token or settings.github_token
     if not token:
         raise WorkspaceError("github_token_missing", f"client '{client.name}' has no GitHub token (set 'token' in ODOO_CLIENTS or GITHUB_TOKEN with contents:write)")
-    try:
-        owner, repo = parse_repo(client.repo)
-    except ValueError as exc:
-        raise WorkspaceError("repo_not_github", str(exc), repo=client.public.get("repo")) from exc
-    return ClientTarget(client.name, _repo(owner, repo, token), client.branch)
+    repo_url = client.repo or ""
+    if "gitlab." in repo_url.lower() or "gitlab.com/" in repo_url.lower():
+        try:
+            base_url, project_path = parse_gitlab_repo(repo_url)
+        except ValueError as exc:
+            raise WorkspaceError("repo_url_invalid", str(exc), repo=client.public.get("repo")) from exc
+        repository = _gitlab_repo(base_url, project_path, token)
+    else:
+        try:
+            owner, repo_name = parse_repo(repo_url)
+        except ValueError as exc:
+            raise WorkspaceError("repo_provider_unsupported", str(exc), repo=client.public.get("repo"), hint="Use a GitHub or GitLab HTTPS/SSH repository URL.") from exc
+        repository = _github_repo(owner, repo_name, token)
+    return ClientTarget(client.name, repository, client.branch)
 
 
-_REPOS: dict[tuple[str, str, str], GitHubRepo] = {}
+_REPOS: dict[tuple[str, str, str, str], Any] = {}
 
 
-def _repo(owner: str, repo: str, token: str) -> GitHubRepo:
-    """One GitHubRepo per repo+token so its known-blob cache survives across tool calls."""
-    key = (owner, repo, hashlib.sha256(token.encode()).hexdigest()[:16])
+def _cache_key(provider: str, host: str, path: str, token: str) -> tuple[str, str, str, str]:
+    return provider, host, path, hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
+def _github_repo(owner: str, repo: str, token: str) -> GitHubRepo:
+    key = _cache_key("github", owner, repo, token)
     found = _REPOS.get(key)
     if found is None:
         if len(_REPOS) > 32:
             _REPOS.clear()
         found = _REPOS[key] = GitHubRepo(owner, repo, token)
+    return found
+
+
+def _gitlab_repo(base_url: str, project_path: str, token: str) -> GitLabRepo:
+    key = _cache_key("gitlab", base_url, project_path, token)
+    found = _REPOS.get(key)
+    if found is None:
+        if len(_REPOS) > 32:
+            _REPOS.clear()
+        found = _REPOS[key] = GitLabRepo(base_url, project_path, token)
     return found
 
 
