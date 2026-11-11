@@ -1147,16 +1147,23 @@ class WorkspaceService:
             repo = ws.repo
             changes = files + [FileChange(path=self._journal_name(ws), content=payload)]
             message = f"mcp wip: {ws.module} ({ops} ops, {len(files)} files)"
-            created = repo.create_tree_commit(parent=parent, base_tree=base_tree, changes=changes, message=message)
-            try:
-                if ws.wip_head is None and not repo.ref_exists(ws.wip_branch):
-                    repo.move_ref(ws.wip_branch, created["commit"], create=True)
-                else:
+            if hasattr(repo, "commit_to_branch"):
+                created = repo.commit_to_branch(
+                    ws.wip_branch, changes, message,
+                    expected_head=ws.wip_head or (None if not repo.ref_exists(ws.wip_branch) else parent),
+                    create_from=ws.base_commit,
+                )
+            else:
+                created = repo.create_tree_commit(parent=parent, base_tree=base_tree, changes=changes, message=message)
+                try:
+                    if ws.wip_head is None and not repo.ref_exists(ws.wip_branch):
+                        repo.move_ref(ws.wip_branch, created["commit"], create=True)
+                    else:
+                        repo.move_ref(ws.wip_branch, created["commit"])
+                except NonFastForward:
+                    head = repo.head(ws.wip_branch)
+                    created = repo.create_tree_commit(parent=head["commit"], base_tree=base_tree, changes=changes, message=message)
                     repo.move_ref(ws.wip_branch, created["commit"])
-            except NonFastForward:
-                head = repo.head(ws.wip_branch)
-                created = repo.create_tree_commit(parent=head["commit"], base_tree=base_tree, changes=changes, message=message)
-                repo.move_ref(ws.wip_branch, created["commit"])
             ws.wip_head = created["commit"]
             return {"saved": True, "branch": ws.wip_branch, "ops": ops, "files_visible_on_github": files_visible, "url": repo.web_url("tree", ws.wip_branch)}
         except Exception as exc:  # noqa: BLE001 - persistence is best effort, never blocks editing
@@ -1280,7 +1287,7 @@ class WorkspaceService:
                         conflicts.append({"path": bad_lint[0]["path"], "reason": "merged result fails lint after rebasing onto newer upstream commits", "findings": bad_lint[:10]})
                 return changes, conflicts
 
-            outcome = push_changes(repo, target_branch, message=message, key=key, build_changes=build, expected_base=expected)
+            outcome = (repo.push_workspace_changes(target_branch, message=message, key=key, build_changes=build, expected_base=expected) if hasattr(repo, "push_workspace_changes") else push_changes(repo, target_branch, message=message, key=key, build_changes=build, expected_base=expected))
             result: dict[str, Any] = {"status": outcome.status, "branch": target_branch, "attempts": outcome.attempts, "api_calls": outcome.api_calls}
             if outcome.status in {"pushed", "already_pushed", "no_changes"} and outcome.commit:
                 result.update({"commit": outcome.commit, "commit_short": outcome.commit[:12], "rebased_onto_newer_head": outcome.rebased})
@@ -1292,11 +1299,11 @@ class WorkspaceService:
                 result["urls"] = {"commit": repo.web_url("commit", outcome.commit), "branch": repo.web_url("tree", target_branch)}
                 default = repo.default_branch()
                 if default and default != target_branch:
-                    result["where"] = f"pushed to branch '{target_branch}', NOT the default branch '{default}': in GitHub use the branch dropdown, or open urls.commit"
+                    result["where"] = f"pushed to branch '{target_branch}', NOT the default branch '{default}': open urls.commit to inspect the pushed branch"
                 else:
                     result["where"] = f"pushed to '{target_branch}'"
                 result["next_call"] = {"tool": "workflow_module_install_and_check", "arguments": {"client_name": ws.client, "module_name": ws.module, "expected_sha": outcome.commit, "branch": target_branch}}
-                result["deploy_note"] = "Pushed to GitHub. This is not deployment: run next_call (Odoo.sh build + module upgrade proof)."
+                result["deploy_note"] = "Pushed to the configured Git provider. This is not deployment: run next_call (Odoo.sh build + module upgrade proof)."
             elif outcome.status == "conflict":
                 result["conflicts"] = outcome.conflicts
                 result["hint"] = "Upstream changed the same lines. Re-read those files with ws_read (they show the current branch state after ws_open fresh=true), then re-apply your intent."
