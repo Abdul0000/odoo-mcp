@@ -28,7 +28,8 @@ class ReaDependencyService:
 
     @staticmethod
     def _module_root(path: str) -> str:
-        return str(PurePosixPath(path).parent)
+        parent = PurePosixPath(path).parent
+        return "" if str(parent) == "." else str(parent)
 
     @staticmethod
     def _parse_models(source: str, path: str, module: str) -> list[dict[str, Any]]:
@@ -155,8 +156,11 @@ class ReaDependencyService:
         root_by_name = {name: roots[0] for name, roots in module_paths.items() if len(roots) == 1}
         ambiguous = sorted(name for name, roots in module_paths.items() if len(roots) > 1)
         for root, manifest in manifests.items():
+            raw_dependencies = manifest.get("depends", [])
+            if not isinstance(raw_dependencies, (list, tuple, set)):
+                raw_dependencies = []
             deps_by_root[root] = list(dict.fromkeys(
-                dep for dep in manifest.get("depends", [])
+                dep for dep in raw_dependencies
                 if isinstance(dep, str) and dep.strip()
             ))
 
