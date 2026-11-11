@@ -174,6 +174,7 @@ class ReaDependencyService:
         ambiguous_deps: set[str] = set()
         forward_depth: dict[str, int] = {target_root: 0}
         forward_depth_hit = False
+        forward_truncated = False
         queue = deque([target_root])
         while queue and len(forward_depth) < max_modules:
             root = queue.popleft()
@@ -193,9 +194,12 @@ class ReaDependencyService:
                     unresolved.add(dep)
                     continue
                 if dep_root not in forward_depth:
+                    if len(forward_depth) >= max_modules:
+                        forward_truncated = True
+                        break
                     forward_depth[dep_root] = depth + 1
                     queue.append(dep_root)
-        forward_truncated = bool(queue)
+        forward_truncated = forward_truncated or bool(queue)
 
         reverse_by_root: dict[str, list[str]] = {}
         for root, deps in deps_by_root.items():
@@ -205,6 +209,7 @@ class ReaDependencyService:
                     reverse_by_root.setdefault(dep_root, []).append(root)
         reverse_depth: dict[str, int] = {target_root: 0}
         reverse_depth_hit = False
+        reverse_truncated = False
         queue = deque([target_root])
         while queue and len(reverse_depth) < max_modules:
             root = queue.popleft()
@@ -216,9 +221,12 @@ class ReaDependencyService:
                 continue
             for dependent in sorted(reverse_by_root.get(root, [])):
                 if dependent not in reverse_depth:
+                    if len(reverse_depth) >= max_modules:
+                        reverse_truncated = True
+                        break
                     reverse_depth[dependent] = depth + 1
                     queue.append(dependent)
-        reverse_truncated = bool(queue)
+        reverse_truncated = reverse_truncated or bool(queue)
 
         included_roots = set(forward_depth) | set(reverse_depth)
         included_roots.add(target_root)
