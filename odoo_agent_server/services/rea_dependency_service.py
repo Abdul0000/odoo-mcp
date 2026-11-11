@@ -115,6 +115,12 @@ class ReaDependencyService:
         manifest_texts: dict[str, str] = {}
         for path, source in files.items():
             manifest_texts[f"{target_root}/{path}" if target_root else path] = source
+        if target_manifest_path in workspace.overlay:
+            overlay_manifest = workspace.overlay[target_manifest_path]
+            if isinstance(overlay_manifest, str):
+                manifest_texts[target_manifest_path] = overlay_manifest
+            elif overlay_manifest is None:
+                raise ValueError("target addon manifest was deleted in the current WIP overlay")
         manifest_bytes = 0
         fetch: dict[str, str] = {}
         manifest_omitted: list[str] = []
@@ -261,11 +267,25 @@ class ReaDependencyService:
             visit(name)
 
         candidates: list[tuple[int, str, str, dict[str, str]]] = []
+        target_prefix = f"{target_root}/" if target_root else ""
         for root in included_roots:
             prefix = f"{root}/" if root else ""
-            for path, meta in tree.items():
-                if not path.startswith(prefix) or not path.endswith(".py"):
-                    continue
+            module_files = {
+                path: meta for path, meta in tree.items()
+                if path.startswith(prefix) and path.endswith(".py")
+            }
+            if root == target_root:
+                for path, source in workspace.overlay.items():
+                    if not path.startswith(target_prefix) or not path.endswith(".py"):
+                        continue
+                    if source is None:
+                        module_files.pop(path, None)
+                    else:
+                        module_files[path] = {
+                            "sha": tree.get(path, {}).get("sha", ""),
+                            "size": str(len(source.encode("utf-8"))),
+                        }
+            for path, meta in module_files.items():
                 parts = PurePosixPath(path).parts
                 if any(part in self.SKIP_PARTS for part in parts):
                     continue
@@ -275,6 +295,13 @@ class ReaDependencyService:
         selected_files = candidates[:max_files]
         omitted_files = [row[1] for row in candidates[max_files:]]
         texts = {f"{target_root}/{path}" if target_root else path: source for path, source in files.items()}
+        for path, source in workspace.overlay.items():
+            if not path.startswith(target_prefix):
+                continue
+            if source is None:
+                texts.pop(path, None)
+            else:
+                texts[path] = source
         fetch_files: dict[str, str] = {}
         fetch_bytes = 0
         for _priority, path, _module, meta in selected_files:
